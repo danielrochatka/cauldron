@@ -1,0 +1,25 @@
+{
+  "name": "@procyonsoft/cauldron-astro",
+  "version": "0.1.0",
+  "description": "Astro integration layer for the Cauldron platform foundation.",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "peerDependencies": {
+    "astro": ">=4.0 <6.0"
+  },
+  "devDependencies": {
+    "astro": "^5.0.0",
+    "typescript": "^5.5.0"
+  }
+}

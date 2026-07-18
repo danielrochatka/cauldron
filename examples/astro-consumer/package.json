@@ -1,0 +1,13 @@
+{
+  "name": "cauldron-astro-consumer-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "astro check",
+    "build": "astro build"
+  },
+  "dependencies": {
+    "@procyonsoft/cauldron-astro": "file:../../packages/cauldron-astro",
+    "astro": "^5.0.0"
+  }
+}

@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.egg-info/
+dist/
+build/
+node_modules/
+packages/cauldron-astro/dist/
+examples/astro-consumer/dist/

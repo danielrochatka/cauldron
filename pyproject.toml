@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cauldron"
+dynamic = ["version"]
+description = "Private reusable CMS and AI application platform foundation for Procyonsoft."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Private" }
+authors = [{ name = "Procyonsoft" }]
+keywords = ["django", "cms", "ai", "platform"]
+classifiers = [
+  "Framework :: Django",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Private :: Do Not Upload",
+]
+dependencies = ["Django>=5.0,<6.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-django>=4.8"]
+
+[project.urls]
+Documentation = "https://procyonsoft.invalid/cauldron/docs"
+Source = "https://procyonsoft.invalid/cauldron/source"
+
+[tool.hatch.version]
+path = "src/cauldron/__init__.py"
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "tests.django_settings"
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"

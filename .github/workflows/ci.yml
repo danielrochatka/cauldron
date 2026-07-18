@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+jobs:
+  python:
+    name: Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install -e '.[dev]'
+
+      - name: Test
+        run: pytest
+
+      - name: Django consumer check (editable)
+        working-directory: examples/django-consumer
+        run: python manage.py check
+
+      - name: Build distributable wheel
+        run: python -m build
+
+      - name: Install wheel in clean environment
+        run: |
+          python -m venv .venv-wheel
+          .venv-wheel/bin/pip install dist/cauldron-*.whl
+
+      - name: Django consumer check (wheel)
+        working-directory: examples/django-consumer
+        run: ../../.venv-wheel/bin/python manage.py check
+
+  typescript:
+    name: TypeScript
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: packages/cauldron-astro/package-lock.json
+
+      - name: Install
+        working-directory: packages/cauldron-astro
+        run: npm ci
+
+      - name: Build
+        working-directory: packages/cauldron-astro
+        run: npm run build
+
+      - name: Verify committed dist matches source
+        run: git diff --exit-code packages/cauldron-astro/dist/
+
+      - name: Typecheck
+        working-directory: packages/cauldron-astro
+        run: npm run typecheck
+
+      - name: Pack integration artifact
+        working-directory: packages/cauldron-astro
+        run: |
+          TARBALL=$(npm pack 2>/dev/null)
+          echo "CAULDRON_ASTRO_TARBALL=$TARBALL" >> "$GITHUB_ENV"
+
+      - name: Install Astro consumer dependencies
+        working-directory: examples/astro-consumer
+        run: npm install
+
+      - name: Install packed integration into consumer
+        working-directory: examples/astro-consumer
+        run: npm install --no-save "../../packages/cauldron-astro/$CAULDRON_ASTRO_TARBALL"
+
+      - name: Build Astro consumer
+        working-directory: examples/astro-consumer
+        run: npm run build

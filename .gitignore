@@ -3,8 +3,7 @@ __pycache__/
 .pytest_cache/
 .venv/
 *.egg-info/
-dist/
+/dist/
 build/
 node_modules/
-packages/cauldron-astro/dist/
 examples/astro-consumer/dist/

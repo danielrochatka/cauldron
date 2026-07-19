@@ -116,6 +116,30 @@ def test_create_fails_when_file_exists(temp_site: Path):
     assert "already_exists" in codes
 
 
+def test_create_fails_on_duplicate_id(temp_site: Path):
+    repo = _make_repo(temp_site)
+    cs = ContentChangeSet(
+        id="cs.dupid",
+        operations=(
+            ContentOperation(
+                kind=ContentOperationKind.CREATE,
+                provider=PROVIDER_NAME,
+                collection="pages",
+                item_id="page.home",  # ID already used by home.md
+                slug="new-unique-slug",
+                data={"title": "T", "description": "D"},
+                schema="pages",
+                status=ContentStatus.PUBLISHED,
+            ),
+        ),
+    )
+    result = repo.apply(cs)
+    assert not result.success
+    codes = {i.code for i in result.validation_errors}
+    assert "duplicate_id" in codes
+    assert not (temp_site / "content" / "pages" / "new-unique-slug.md").exists()
+
+
 def test_create_invalid_slug(temp_site: Path):
     repo = _make_repo(temp_site)
     cs = ContentChangeSet(
@@ -165,6 +189,52 @@ def test_update_operation(temp_site: Path):
     assert fetched.data["title"] == "Home Updated"
     # description preserved via merge
     assert fetched.data["description"] == "Welcome to the home page."
+
+
+def test_update_rejects_invalid_slug_change(temp_site: Path):
+    repo = _make_repo(temp_site)
+    cs = ContentChangeSet(
+        id="cs.badslug-upd",
+        operations=(
+            ContentOperation(
+                kind=ContentOperationKind.UPDATE,
+                provider=PROVIDER_NAME,
+                collection="pages",
+                item_id="page.home",
+                slug="../escape",
+                data={"title": "Escaped"},
+                schema="pages",
+                status=ContentStatus.PUBLISHED,
+            ),
+        ),
+    )
+    result = repo.apply(cs)
+    assert not result.success
+    codes = {i.code for i in result.validation_errors}
+    assert "invalid_slug" in codes
+
+
+def test_update_rejects_duplicate_slug_change(temp_site: Path):
+    repo = _make_repo(temp_site)
+    cs = ContentChangeSet(
+        id="cs.dupslug-upd",
+        operations=(
+            ContentOperation(
+                kind=ContentOperationKind.UPDATE,
+                provider=PROVIDER_NAME,
+                collection="pages",
+                item_id="page.home",
+                slug="about",  # already used by page.about
+                data={"title": "Conflict"},
+                schema="pages",
+                status=ContentStatus.PUBLISHED,
+            ),
+        ),
+    )
+    result = repo.apply(cs)
+    assert not result.success
+    codes = {i.code for i in result.validation_errors}
+    assert "slug_conflict" in codes
 
 
 def test_update_stale_hash_conflict(temp_site: Path):

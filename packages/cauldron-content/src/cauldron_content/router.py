@@ -86,6 +86,40 @@ class ContentRouter:
                 conflicts=(),
                 validation_errors=(),
             )
-        collection = changeset.operations[0].collection
-        provider = self._resolve_provider(collection)
-        return self._get_repo(provider).apply(changeset)
+
+        # Group operations by provider, preserving order.
+        by_provider: dict[str, list] = {}
+        for op in changeset.operations:
+            provider = self._resolve_provider(op.collection)
+            if provider not in by_provider:
+                by_provider[provider] = []
+            by_provider[provider].append(op)
+
+        if len(by_provider) == 1:
+            provider = next(iter(by_provider))
+            return self._get_repo(provider).apply(changeset)
+
+        # Mixed providers: apply one sub-changeset per provider and merge.
+        all_applied: list = []
+        all_conflicts: list = []
+        all_errors: list = []
+        for provider, ops in by_provider.items():
+            sub = ContentChangeSet(
+                id=changeset.id,
+                operations=tuple(ops),
+                author=changeset.author,
+                description=changeset.description,
+                metadata=changeset.metadata,
+            )
+            result = self._get_repo(provider).apply(sub)
+            all_applied.extend(result.applied)
+            all_conflicts.extend(result.conflicts)
+            all_errors.extend(result.validation_errors)
+
+        success = not all_conflicts and not all_errors
+        return ApplyResult(
+            success=success,
+            applied=tuple(all_applied) if success else (),
+            conflicts=tuple(all_conflicts),
+            validation_errors=tuple(all_errors),
+        )

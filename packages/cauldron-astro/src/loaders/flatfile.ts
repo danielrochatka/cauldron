@@ -131,7 +131,17 @@ export function createCauldronContentLoader(
       for (const item of items) {
         store.set({
           id: item.id,
-          data: item as unknown as Record<string, unknown>,
+          data: {
+            ...item.data,
+            _cauldron: {
+              id: item.id,
+              collection: item.collection,
+              slug: item.slug,
+              status: item.status,
+              schema: item.schema,
+              hash: item.hash,
+            },
+          },
           body: item.body,
         });
       }

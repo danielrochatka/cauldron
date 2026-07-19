@@ -177,4 +177,14 @@ test('loader.load writes into the store and clears first', async () => {
   const ids = entries.map((e) => e.id);
   assert.ok(ids.includes('page.home'));
   assert.ok(!ids.includes('page.draft'), 'draft excluded by default');
+
+  // Front-matter fields must be at entry.data top level, not nested under entry.data.data
+  const home = entries.find((e) => e.id === 'page.home');
+  assert.ok(home, 'page.home entry not found');
+  assert.equal(typeof (home.data as Record<string, unknown>).title, 'string', 'title should be at data.title');
+  assert.equal((home.data as Record<string, unknown>).data, undefined, 'data.data should not exist');
+  // Cauldron metadata available under _cauldron
+  const cauldron = (home.data as Record<string, unknown>)._cauldron as Record<string, unknown>;
+  assert.ok(cauldron, '_cauldron metadata should be present');
+  assert.equal(cauldron.id, 'page.home');
 });

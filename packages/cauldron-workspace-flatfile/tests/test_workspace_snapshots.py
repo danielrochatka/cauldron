@@ -15,7 +15,7 @@ def test_capture_saves_existing_files(tmp_path):
     svc = SnapshotService(cfg)
     svc.capture("cs.1", [f1])
 
-    snap_file = cfg.snapshots_dir / "cs.1" / "a.md"
+    snap_file = cfg.snapshots_dir / "cs.1" / "0000_a.md"
     assert snap_file.exists()
     assert snap_file.read_text(encoding="utf-8") == "original"
 
@@ -79,6 +79,32 @@ def test_rollback_conflict_detected(tmp_path):
     f1.write_text("someone-else", encoding="utf-8")
     with pytest.raises(SnapshotConflict):
         svc.rollback("cs.1")
+
+
+def test_capture_disambiguates_same_basename_in_different_dirs(tmp_path):
+    cfg = WorkspaceConfig(workspace_root=tmp_path / "ws")
+    pages = tmp_path / "site" / "pages"
+    posts = tmp_path / "site" / "posts"
+    pages.mkdir(parents=True)
+    posts.mkdir(parents=True)
+    f_pages = pages / "home.md"
+    f_posts = posts / "home.md"
+    f_pages.write_text("pages-original", encoding="utf-8")
+    f_posts.write_text("posts-original", encoding="utf-8")
+
+    svc = SnapshotService(cfg)
+    svc.capture("cs.1", [f_pages, f_posts])
+
+    snap_dir = cfg.snapshots_dir / "cs.1"
+    assert (snap_dir / "0000_home.md").read_text(encoding="utf-8") == "pages-original"
+    assert (snap_dir / "0001_home.md").read_text(encoding="utf-8") == "posts-original"
+
+    # Rollback must restore both to the correct paths
+    f_pages.write_text("modified", encoding="utf-8")
+    f_posts.write_text("modified", encoding="utf-8")
+    svc.rollback("cs.1", force=True)
+    assert f_pages.read_text(encoding="utf-8") == "pages-original"
+    assert f_posts.read_text(encoding="utf-8") == "posts-original"
 
 
 def test_rollback_force_overrides_conflict(tmp_path):

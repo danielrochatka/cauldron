@@ -133,6 +133,42 @@ def test_apply_routes_by_first_operation_collection():
     assert repo.calls == [("apply", "cs.1")]
 
 
+def test_apply_routes_mixed_provider_changeset_per_provider():
+    reg = RepositoryRegistry()
+    r1 = _RecordingRepo("p1")
+    r2 = _RecordingRepo("p2")
+    reg.register("p1", r1)
+    reg.register("p2", r2)
+    router = ContentRouter(
+        reg,
+        RouterConfig(collections={"pages": "p1", "media": "p2"}),
+    )
+    cs = ContentChangeSet(
+        id="cs.mixed",
+        operations=(
+            ContentOperation(
+                kind=ContentOperationKind.CREATE,
+                provider="p1",
+                collection="pages",
+                item_id="id.1",
+            ),
+            ContentOperation(
+                kind=ContentOperationKind.CREATE,
+                provider="p2",
+                collection="media",
+                item_id="id.2",
+            ),
+        ),
+    )
+    result = router.apply(cs)
+    assert result.success is True
+    # Each provider receives only its own operation
+    assert len(r1.calls) == 1
+    assert r1.calls[0][0] == "apply"
+    assert len(r2.calls) == 1
+    assert r2.calls[0][0] == "apply"
+
+
 def test_apply_empty_changeset_returns_success():
     reg = RepositoryRegistry()
     router = ContentRouter(reg, RouterConfig())

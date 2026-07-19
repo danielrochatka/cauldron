@@ -26,14 +26,15 @@ class SnapshotService:
         snap_dir = safe_resolve(self._config.snapshots_dir, cs_id)
         snap_dir.mkdir(parents=True, exist_ok=True)
         manifest = {"cs_id": cs_id, "files": []}
-        for src_path in canonical_paths:
+        for i, src_path in enumerate(canonical_paths):
+            snap_name = f"{i:04d}_{src_path.name}"
             entry = {
-                "name": src_path.name,
+                "snap_name": snap_name,
                 "original_path": str(src_path),
                 "existed": src_path.exists(),
             }
             if entry["existed"]:
-                dest = snap_dir / src_path.name
+                dest = snap_dir / snap_name
                 shutil.copy2(src_path, dest)
             manifest["files"].append(entry)
         _atomic_write_json(snap_dir / "snapshot.json", manifest)
@@ -49,7 +50,7 @@ class SnapshotService:
         for entry in manifest["files"]:
             canonical = Path(entry["original_path"])
             if entry["existed"]:
-                backed_up = snap_dir / entry["name"]
+                backed_up = snap_dir / entry["snap_name"]
                 if canonical.exists() and not force:
                     current_data = canonical.read_bytes()
                     backed_data = backed_up.read_bytes()

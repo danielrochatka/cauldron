@@ -234,6 +234,16 @@ class FlatFileRepository:
                         item_id=op.item_id,
                     )
                 ]
+            for existing_item in self._load_collection(op.collection, include_drafts=True):
+                if existing_item.id == op.item_id:
+                    return [
+                        ValidationIssue(
+                            code="duplicate_id",
+                            message=f"Item ID {op.item_id!r} already exists in collection {op.collection!r}",
+                            collection=op.collection,
+                            item_id=op.item_id,
+                        )
+                    ]
             body = normalize_body(op.body)
             result_item = ContentItem(
                 id=op.item_id,
@@ -273,9 +283,41 @@ class FlatFileRepository:
                     actual_hash=existing.hash,
                     message=f"Item {op.item_id!r} hash mismatch (stale).",
                 )
+            new_slug = op.slug or existing.slug
+            if op.slug and op.slug != existing.slug:
+                if "/" in op.slug or ".." in op.slug:
+                    return [
+                        ValidationIssue(
+                            code="invalid_slug",
+                            message=f"Invalid slug: {op.slug!r}",
+                            collection=op.collection,
+                            item_id=op.item_id,
+                        )
+                    ]
+                candidate = (coll_dir / f"{op.slug}.md").resolve()
+                try:
+                    candidate.relative_to(self._config.content_dir)
+                except ValueError:
+                    return [
+                        ValidationIssue(
+                            code="path_escape",
+                            message="Target path escapes content_dir",
+                            collection=op.collection,
+                            item_id=op.item_id,
+                        )
+                    ]
+                for sibling in self._load_collection(op.collection, include_drafts=True):
+                    if sibling.id != op.item_id and sibling.slug == op.slug:
+                        return [
+                            ValidationIssue(
+                                code="slug_conflict",
+                                message=f"Slug {op.slug!r} is already used by item {sibling.id!r}",
+                                collection=op.collection,
+                                item_id=op.item_id,
+                            )
+                        ]
             merged_data = {**existing.data, **op.data}
             body = normalize_body(op.body) if op.body else existing.body
-            new_slug = op.slug or existing.slug
             new_schema = op.schema or existing.schema
             new_status = op.status
             result_item = ContentItem(

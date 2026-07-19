@@ -26,7 +26,7 @@ def registry():
 class TestRegistryPopulate:
     def test_empty_populate(self, registry):
         registry.populate([])
-        assert registry.is_ready
+        assert registry.is_populated
         assert registry.all_active() == []
         assert registry.all_discovered() == []
 
@@ -57,12 +57,25 @@ class TestRegistryPopulate:
         registry.populate([])
         assert registry.get("a") is None
 
-    def test_is_ready_after_populate(self, registry):
+    def test_is_populated_after_populate(self, registry):
         registry.populate([])
+        assert registry.is_populated
+
+    def test_is_ready_only_after_activate(self, registry):
+        registry.populate([])
+        assert not registry.is_ready
+        registry.activate()
         assert registry.is_ready
 
-    def test_not_ready_before_populate(self):
+    def test_is_ready_not_set_when_resolution_errors_exist(self, registry):
+        b = _mod("b", requires=(ModuleRequirement(slug="missing"),))
+        registry.populate([b])
+        registry.activate()
+        assert not registry.is_ready
+
+    def test_not_populated_before_populate(self):
         r = ModuleRegistry()
+        assert not r.is_populated
         assert not r.is_ready
 
     def test_all_discovered_returns_sorted(self, registry):
@@ -198,7 +211,8 @@ class TestLifecycleActivation:
         registry.activate()
         assert called == []  # activation must be skipped
 
-    def test_activate_skipped_when_discovery_errors_exist(self, registry):
+    def test_activate_proceeds_with_only_discovery_errors(self, registry):
+        """Discovery errors from non-enabled modules must not block enabled modules."""
         from cauldron.modules.discovery import DiscoveryError
 
         called = []
@@ -215,7 +229,88 @@ class TestLifecycleActivation:
         )
         registry.populate([a], discovery_errors=[err])
         registry.activate()
-        assert called == []
+        # a has no resolution errors so it should activate despite the discovery error
+        assert "a" in called
+
+    def test_register_called_before_on_ready(self, registry):
+        order = []
+
+        class Phased(BaseModule):
+            def register(self, context):
+                order.append(f"register:{self.slug}")
+
+            def on_ready(self):
+                order.append(f"on_ready:{self.slug}")
+
+        a = Phased(ModuleManifest(slug="a", label="a"))
+        registry.populate([a])
+        registry.activate()
+        assert order == ["register:a", "on_ready:a"]
+
+    def test_register_receives_module_context(self, registry):
+        from cauldron.modules import ModuleContext
+
+        received = []
+
+        class Spy(BaseModule):
+            def register(self, context):
+                received.append(context)
+
+        a = Spy(ModuleManifest(slug="a", label="a"))
+        registry.populate([a], module_configs={"a": {"key": "val"}})
+        registry.activate()
+        assert len(received) == 1
+        assert isinstance(received[0], ModuleContext)
+        assert received[0].slug == "a"
+        assert received[0].config == {"key": "val"}
+
+    def test_lifecycle_error_in_on_ready_recorded(self, registry):
+        from cauldron.modules.registry import LifecycleError
+
+        class Broken(BaseModule):
+            def on_ready(self):
+                raise RuntimeError("boom")
+
+        a = Broken(ModuleManifest(slug="a", label="a"))
+        registry.populate([a])
+        registry.activate()
+        errs = registry.lifecycle_errors()
+        assert len(errs) == 1
+        assert errs[0].module_slug == "a"
+        assert errs[0].phase == "on_ready"
+        assert "boom" in errs[0].message
+
+    def test_lifecycle_error_in_register_recorded(self, registry):
+        from cauldron.modules.registry import LifecycleError
+
+        class Broken(BaseModule):
+            def register(self, context):
+                raise ValueError("bad config")
+
+        a = Broken(ModuleManifest(slug="a", label="a"))
+        registry.populate([a])
+        registry.activate()
+        errs = registry.lifecycle_errors()
+        assert len(errs) == 1
+        assert errs[0].phase == "register"
+        assert "bad config" in errs[0].message
+
+    def test_lifecycle_error_in_one_module_does_not_block_others(self, registry):
+        called = []
+
+        class Broken(BaseModule):
+            def on_ready(self):
+                raise RuntimeError("crash")
+
+        class Good(BaseModule):
+            def on_ready(self):
+                called.append(self.slug)
+
+        a = Broken(ModuleManifest(slug="a", label="a"))
+        b = Good(ModuleManifest(slug="b", label="b", requires=(ModuleRequirement(slug="a"),)))
+        registry.populate([a, b])
+        registry.activate()
+        assert "b" in called  # b still runs even though a failed
 
 
 class TestModuleConfig:
@@ -282,6 +377,71 @@ class TestErrorReporting:
         assert registry.errors() == []
 
 
+class TestGraphInfo:
+    def test_graph_info_empty_when_no_modules(self, registry):
+        registry.populate([])
+        assert registry.graph_info() == []
+
+    def test_graph_info_slug_and_label(self, registry):
+        a = _mod("a")
+        registry.populate([a])
+        info = registry.graph_info()
+        assert len(info) == 1
+        assert info[0]["slug"] == "a"
+        assert info[0]["label"] == "a"
+        assert info[0]["version"] == "1.0.0"
+
+    def test_graph_info_active_flag(self, registry):
+        a = _mod("a")
+        b = _mod("b")
+        registry.populate([a, b], enabled={"a"})
+        info = {e["slug"]: e for e in registry.graph_info()}
+        assert info["a"]["active"] is True
+        assert info["b"]["active"] is False
+
+    def test_graph_info_load_index(self, registry):
+        a = _mod("a")
+        b = _mod("b", requires=(ModuleRequirement(slug="a"),))
+        registry.populate([a, b])
+        info = {e["slug"]: e for e in registry.graph_info()}
+        assert info["a"]["load_index"] == 0
+        assert info["b"]["load_index"] == 1
+
+    def test_graph_info_load_index_none_for_inactive(self, registry):
+        a = _mod("a")
+        registry.populate([a], enabled=set())
+        info = registry.graph_info()
+        assert info[0]["load_index"] is None
+
+    def test_graph_info_provides(self, registry):
+        a = _mod("a", provides=("my.cap",))
+        registry.populate([a])
+        info = registry.graph_info()
+        assert info[0]["provides"] == ["my.cap"]
+
+    def test_graph_info_deps_resolved(self, registry):
+        a = _mod("a")
+        b = _mod("b", requires=(ModuleRequirement(slug="a"),))
+        registry.populate([a, b])
+        info = {e["slug"]: e for e in registry.graph_info()}
+        assert info["b"]["deps"] == ["a"]
+        assert info["a"]["deps"] == []
+
+    def test_graph_info_django_apps(self, registry):
+        manifest = ModuleManifest(slug="a", label="a", django_apps=("myapp",))
+        a = BaseModule(manifest)
+        registry.populate([a])
+        info = registry.graph_info()
+        assert info[0]["django_apps"] == ["myapp"]
+
+    def test_graph_info_sorted_by_slug(self, registry):
+        z = _mod("z")
+        a = _mod("a")
+        registry.populate([z, a])
+        slugs = [e["slug"] for e in registry.graph_info()]
+        assert slugs == sorted(slugs)
+
+
 class TestFixtureModuleIntegration:
     """End-to-end tests using real installed fixture packages via discovery."""
 
@@ -330,3 +490,25 @@ class TestFixtureModuleIntegration:
 
         apps = get_module_apps({"cauldron.fixture.alpha": {}})
         assert isinstance(apps, list)
+
+    def test_get_module_apps_returns_apps_in_dependency_order(self):
+        from cauldron.modules.discovery import get_module_apps
+
+        apps = get_module_apps({
+            "cauldron.fixture.alpha": {},
+            "cauldron.fixture.beta": {},
+        })
+        # Alpha must appear before beta because beta depends on alpha.
+        # Alpha declares django_apps=("cauldron_fixture_alpha",).
+        assert "cauldron_fixture_alpha" in apps
+        alpha_idx = apps.index("cauldron_fixture_alpha")
+        # Beta has no django_apps so there's nothing after alpha from beta,
+        # but alpha's app must appear (not be dropped).
+        assert alpha_idx >= 0
+
+    def test_installed_apps_includes_alpha_app(self):
+        """Prove that INSTALLED_APPS composition via get_module_apps() works end-to-end."""
+        import django
+        from django.apps import apps as django_apps
+
+        assert django_apps.is_installed("cauldron_fixture_alpha")

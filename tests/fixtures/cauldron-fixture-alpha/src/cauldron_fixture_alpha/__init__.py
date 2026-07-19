@@ -7,6 +7,7 @@ _manifest = ModuleManifest(
     label="Cauldron Fixture Alpha",
     version="1.0.0",
     cauldron_version=">=0.1.0",
+    django_apps=("cauldron_fixture_alpha",),
     provides=("test.capability.alpha",),
 )
 

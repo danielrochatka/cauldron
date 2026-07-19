@@ -88,6 +88,11 @@ class ModuleManifest:
             raise ValueError("ModuleManifest.label must be non-empty.")
         _validate_version(self.version, "ModuleManifest.version")
         _validate_specifier(self.cauldron_version, "ModuleManifest.cauldron_version")
+        for app in self.django_apps:
+            if not isinstance(app, str) or not app:
+                raise ValueError(
+                    f"ModuleManifest.django_apps entries must be non-empty strings; got {app!r}."
+                )
         for cap in self.provides:
             _validate_slug(cap, "ModuleManifest.provides entry")
 
@@ -125,6 +130,14 @@ class ModuleManifest:
         )
 
 
+@dataclass(frozen=True)
+class ModuleContext:
+    """Passed to a module's register() phase with its resolved identity and config."""
+
+    slug: str
+    config: dict[str, Any]
+
+
 @runtime_checkable
 class CauldronModule(Protocol):
     """Protocol that entry-point objects must satisfy to be loaded as modules."""
@@ -153,6 +166,8 @@ class BaseModule:
     def django_apps(self) -> Sequence[str]:
         return self.manifest.django_apps
 
+    def register(self, context: ModuleContext) -> None:
+        """Called once before on_ready(). Override to perform early registration."""
+
     def on_ready(self) -> None:
         """Called after all modules are activated. Override to add startup logic."""
-

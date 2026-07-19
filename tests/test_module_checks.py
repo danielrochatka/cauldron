@@ -32,6 +32,8 @@ def reset_global_registry():
         "_errors": list(registry._errors),
         "_warnings": list(registry._warnings),
         "_discovery_errors": list(registry._discovery_errors),
+        "_lifecycle_errors": list(registry._lifecycle_errors),
+        "_populated": registry._populated,
         "_ready": registry._ready,
     }
     yield
@@ -169,3 +171,64 @@ class TestDiscoveryErrorChecks:
         messages = django_checks.run_checks()
         i002 = [m for m in messages if m.id == "cauldron.I002"]
         assert i002 == []  # no active modules when discovery failed
+
+
+class TestSettingsCheck:
+    def test_valid_cauldron_modules_produces_no_error(self):
+        _inject_modules([_mod("a")])
+        messages = django_checks.run_checks()
+        e001 = [m for m in messages if m.id == "cauldron.E001"]
+        assert e001 == []
+
+    def test_cauldron_modules_non_dict_emits_e001(self, settings):
+        settings.CAULDRON_MODULES = ["cauldron.content"]
+        messages = django_checks.run_checks()
+        e001 = [m for m in messages if m.id == "cauldron.E001"]
+        assert len(e001) == 1
+
+    def test_cauldron_modules_invalid_slug_key_emits_e001(self, settings):
+        settings.CAULDRON_MODULES = {"Bad-Slug": {}}
+        messages = django_checks.run_checks()
+        e001 = [m for m in messages if m.id == "cauldron.E001"]
+        assert len(e001) >= 1
+
+    def test_cauldron_modules_non_dict_value_emits_e001(self, settings):
+        settings.CAULDRON_MODULES = {"valid.slug": "not-a-dict"}
+        messages = django_checks.run_checks()
+        e001 = [m for m in messages if m.id == "cauldron.E001"]
+        assert len(e001) >= 1
+
+    def test_cauldron_capability_providers_non_dict_emits_e002(self, settings):
+        settings.CAULDRON_CAPABILITY_PROVIDERS = "not-a-dict"
+        messages = django_checks.run_checks()
+        e002 = [m for m in messages if m.id == "cauldron.E002"]
+        assert len(e002) == 1
+
+    def test_cauldron_capability_providers_invalid_value_emits_e002(self, settings):
+        settings.CAULDRON_CAPABILITY_PROVIDERS = {"valid.cap": 42}
+        messages = django_checks.run_checks()
+        e002 = [m for m in messages if m.id == "cauldron.E002"]
+        assert len(e002) >= 1
+
+
+class TestLifecycleErrorCheck:
+    def test_lifecycle_error_emits_e030(self):
+        from cauldron.modules.registry import LifecycleError, registry
+
+        err = LifecycleError(
+            module_slug="a",
+            phase="on_ready",
+            exception=RuntimeError("boom"),
+            message="Module 'a' raised in on_ready(): boom",
+        )
+        registry._lifecycle_errors = [err]
+        messages = django_checks.run_checks()
+        e030 = [m for m in messages if m.id == "cauldron.E030"]
+        assert len(e030) == 1
+        assert "a" in e030[0].obj
+
+    def test_no_e030_when_no_lifecycle_errors(self):
+        _inject_modules([_mod("a")])
+        messages = django_checks.run_checks()
+        e030 = [m for m in messages if m.id == "cauldron.E030"]
+        assert e030 == []

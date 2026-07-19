@@ -18,6 +18,82 @@ def cauldron_foundation_check(app_configs, **kwargs):
 
 
 @register()
+def cauldron_settings_check(app_configs, **kwargs):
+    """Validate CAULDRON_MODULES and CAULDRON_CAPABILITY_PROVIDERS settings."""
+    from django.conf import settings
+
+    from .modules import _validate_slug
+
+    messages = []
+
+    modules_setting = getattr(settings, "CAULDRON_MODULES", None)
+    if modules_setting is not None:
+        if not isinstance(modules_setting, dict):
+            messages.append(Error(
+                "CAULDRON_MODULES must be a dict mapping module slugs to config dicts.",
+                hint="Example: CAULDRON_MODULES = {'cauldron.content': {}}",
+                id="cauldron.E001",
+            ))
+        else:
+            for slug, config in modules_setting.items():
+                if not isinstance(slug, str):
+                    messages.append(Error(
+                        f"CAULDRON_MODULES key {slug!r} must be a string.",
+                        id="cauldron.E001",
+                    ))
+                else:
+                    try:
+                        _validate_slug(slug, "CAULDRON_MODULES key")
+                    except ValueError as exc:
+                        messages.append(Error(str(exc), id="cauldron.E001"))
+                if not isinstance(config, dict):
+                    messages.append(Error(
+                        f"CAULDRON_MODULES[{slug!r}] must be a dict, got"
+                        f" {type(config).__name__!r}.",
+                        hint="Use an empty dict {{}} for a module with no config.",
+                        id="cauldron.E001",
+                    ))
+
+    providers_setting = getattr(settings, "CAULDRON_CAPABILITY_PROVIDERS", None)
+    if providers_setting is not None:
+        if not isinstance(providers_setting, dict):
+            messages.append(Error(
+                "CAULDRON_CAPABILITY_PROVIDERS must be a dict mapping capability slugs"
+                " to module slugs.",
+                hint=(
+                    "Example: CAULDRON_CAPABILITY_PROVIDERS ="
+                    " {'cauldron.capability.auth': 'cauldron.oauth'}"
+                ),
+                id="cauldron.E002",
+            ))
+        else:
+            for cap, provider in providers_setting.items():
+                if not isinstance(cap, str):
+                    messages.append(Error(
+                        f"CAULDRON_CAPABILITY_PROVIDERS key {cap!r} must be a string.",
+                        id="cauldron.E002",
+                    ))
+                else:
+                    try:
+                        _validate_slug(cap, "CAULDRON_CAPABILITY_PROVIDERS key")
+                    except ValueError as exc:
+                        messages.append(Error(str(exc), id="cauldron.E002"))
+                if not isinstance(provider, str):
+                    messages.append(Error(
+                        f"CAULDRON_CAPABILITY_PROVIDERS[{cap!r}] must be a string module"
+                        f" slug, got {type(provider).__name__!r}.",
+                        id="cauldron.E002",
+                    ))
+                else:
+                    try:
+                        _validate_slug(provider, f"CAULDRON_CAPABILITY_PROVIDERS[{cap!r}]")
+                    except ValueError as exc:
+                        messages.append(Error(str(exc), id="cauldron.E002"))
+
+    return messages
+
+
+@register()
 def cauldron_module_graph_check(app_configs, **kwargs):
     """Validate the module dependency graph and report active modules."""
     from .modules.registry import registry
@@ -82,6 +158,20 @@ def cauldron_module_graph_check(app_configs, **kwargs):
                 hint="Update the optional dependency or relax the version constraint.",
                 obj=warn.module_slug,
                 id="cauldron.W010",
+            )
+        )
+
+    # Lifecycle errors -------------------------------------------------------
+    for err in registry.lifecycle_errors():
+        messages.append(
+            Error(
+                err.message,
+                hint=(
+                    f"Fix the exception in the module's {err.phase}() method."
+                    " See server logs for the full traceback."
+                ),
+                obj=err.module_slug,
+                id="cauldron.E030",
             )
         )
 

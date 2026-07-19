@@ -94,9 +94,10 @@ def discover_modules(*, entry_point_group: str = ENTRY_POINT_GROUP) -> Discovery
 def get_module_apps(
     enabled: dict[str, Any] | list[str],
     *,
+    capability_overrides: dict[str, str] | None = None,
     entry_point_group: str = ENTRY_POINT_GROUP,
 ) -> list[str]:
-    """Return Django app labels for the given enabled module slugs.
+    """Return Django app labels for the given enabled module slugs in dependency order.
 
     Call this from ``settings.py`` to compose ``INSTALLED_APPS`` before
     ``django.setup()`` runs::
@@ -115,17 +116,44 @@ def get_module_apps(
         ]
 
     *enabled* may be a ``dict`` (keys are active slugs) or a plain ``list``
-    of slugs.  Modules are processed in alphabetical slug order so that
-    ``INSTALLED_APPS`` is deterministic across environments.
+    of slugs.  Apps are returned in topological dependency order so that
+    Django's ``AppConfig.ready()`` chain fires in the correct sequence.
     """
+    from .resolver import resolve
+
     if isinstance(enabled, dict):
         slugs: set[str] = set(enabled.keys())
     else:
         slugs = set(enabled)
 
     result = discover_modules(entry_point_group=entry_point_group)
+    active_modules = [m for m in result.modules if m.slug in slugs]
+
+    # Build capability provider map for the active set only.
+    cap_providers: dict[str, list[str]] = {}
+    for m in active_modules:
+        for cap in sorted(m.manifest.provides):
+            cap_providers.setdefault(cap, []).append(m.slug)
+
+    resolution = resolve(
+        active_modules,
+        cap_providers,
+        cauldron_version="",  # version checks happen in registry; skip here
+        capability_overrides=capability_overrides or {},
+    )
+
+    module_by_slug = {m.slug: m for m in active_modules}
+
+    # Use the resolved load order; append any modules that fell out (errors)
+    # in alphabetical order so INSTALLED_APPS stays deterministic.
+    seen: set[str] = set(resolution.load_order)
+    ordered: list[str] = list(resolution.load_order)
+    for m in sorted(active_modules, key=lambda m: m.slug):
+        if m.slug not in seen:
+            ordered.append(m.slug)
+
     apps: list[str] = []
-    for module in result.modules:  # already sorted by slug
-        if module.slug in slugs:
-            apps.extend(module.django_apps())
+    for slug in ordered:
+        if slug in module_by_slug:
+            apps.extend(module_by_slug[slug].django_apps())
     return apps

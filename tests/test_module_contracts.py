@@ -131,6 +131,14 @@ class TestModuleManifest:
         with pytest.raises(ValueError, match="pattern"):
             ModuleManifest(slug="a", label="A", provides=("Bad-Cap",))
 
+    def test_empty_django_app_entry_raises(self):
+        with pytest.raises(ValueError, match="non-empty strings"):
+            ModuleManifest(slug="a", label="A", django_apps=("",))
+
+    def test_non_string_django_app_entry_raises(self):
+        with pytest.raises(ValueError, match="non-empty strings"):
+            ModuleManifest(slug="a", label="A", django_apps=(123,))  # type: ignore[arg-type]
+
     def test_valid_dotted_slug(self):
         m = ModuleManifest(slug="cauldron.content.core", label="Content Core")
         assert m.slug == "cauldron.content.core"
@@ -200,6 +208,29 @@ class TestBaseModule:
         mod = self._make()
         mod.on_ready()  # must not raise
 
+    def test_register_is_callable(self):
+        from cauldron.modules import ModuleContext
+
+        mod = self._make()
+        ctx = ModuleContext(slug="test.module", config={})
+        mod.register(ctx)  # must not raise
+
     def test_satisfies_protocol(self):
         mod = self._make()
         assert isinstance(mod, CauldronModule)
+
+
+class TestModuleContext:
+    def test_frozen(self):
+        from cauldron.modules import ModuleContext
+
+        ctx = ModuleContext(slug="a", config={})
+        with pytest.raises(Exception):
+            ctx.slug = "b"  # type: ignore[misc]
+
+    def test_slug_and_config_accessible(self):
+        from cauldron.modules import ModuleContext
+
+        ctx = ModuleContext(slug="my.module", config={"k": "v"})
+        assert ctx.slug == "my.module"
+        assert ctx.config == {"k": "v"}

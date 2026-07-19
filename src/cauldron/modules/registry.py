@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from . import CauldronModule
@@ -11,6 +12,16 @@ if TYPE_CHECKING:
     from .resolver import ResolutionError, ResolutionResult, ResolutionWarning
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class LifecycleError:
+    """Records an unhandled exception raised during a module's lifecycle phase."""
+
+    module_slug: str
+    phase: Literal["register", "on_ready"]
+    exception: Exception
+    message: str
 
 
 class ModuleRegistry:
@@ -25,6 +36,8 @@ class ModuleRegistry:
         self._errors: list[ResolutionError] = []
         self._warnings: list[ResolutionWarning] = []
         self._discovery_errors: list[DiscoveryError] = []
+        self._lifecycle_errors: list[LifecycleError] = []
+        self._populated = False
         self._ready = False
 
     def populate(
@@ -59,6 +72,8 @@ class ModuleRegistry:
         self._errors = []
         self._warnings = []
         self._discovery_errors = list(discovery_errors or [])
+        self._lifecycle_errors = []
+        self._populated = False
         self._ready = False
 
         for module in sorted(modules, key=lambda m: m.slug):
@@ -90,7 +105,7 @@ class ModuleRegistry:
             for slug in result.load_order
             if slug in active_modules
         }
-        self._ready = True
+        self._populated = True
 
         total_errors = len(self._errors) + len(self._discovery_errors)
         if total_errors:
@@ -99,25 +114,55 @@ class ModuleRegistry:
             logger.debug("Module resolution complete. %d module(s) active.", len(self._active))
 
     def activate(self) -> None:
-        """Call ``on_ready()`` on each active module in load order.
+        """Call ``register()`` then ``on_ready()`` on each active module in load order.
 
-        Activation is skipped entirely if any discovery or resolution errors
-        exist.  Callers should run ``python manage.py check`` to surface the
-        problems before proceeding.
+        Activation is skipped entirely if resolution errors exist (dependency
+        or version problems for active modules).  Discovery errors for modules
+        that are not enabled do not block activation of healthy modules.
+
+        Callers should run ``python manage.py check`` to surface all problems
+        before starting the application.
         """
-        if self.has_errors:
+        if self._errors:
             logger.error(
                 "Module activation skipped: resolve errors must be fixed first."
                 " Run 'python manage.py check' for details."
             )
             return
+
+        from . import ModuleContext
+
         for slug in self._load_order:
             module = self._active.get(slug)
-            if module is not None and hasattr(module, "on_ready"):
+            if module is None:
+                continue
+
+            if hasattr(module, "register"):
+                context = ModuleContext(slug=slug, config=self.get_module_config(slug))
+                try:
+                    module.register(context)  # type: ignore[union-attr]
+                except Exception as exc:
+                    self._lifecycle_errors.append(LifecycleError(
+                        module_slug=slug,
+                        phase="register",
+                        exception=exc,
+                        message=f"Module {slug!r} raised in register(): {exc}",
+                    ))
+                    logger.exception("register() raised in module %r.", slug)
+
+            if hasattr(module, "on_ready"):
                 try:
                     module.on_ready()  # type: ignore[union-attr]
-                except Exception:
+                except Exception as exc:
+                    self._lifecycle_errors.append(LifecycleError(
+                        module_slug=slug,
+                        phase="on_ready",
+                        exception=exc,
+                        message=f"Module {slug!r} raised in on_ready(): {exc}",
+                    ))
                     logger.exception("on_ready() raised in module %r.", slug)
+
+        self._ready = True
 
     # ------------------------------------------------------------------ query
 
@@ -146,6 +191,9 @@ class ModuleRegistry:
     def discovery_errors(self) -> list[DiscoveryError]:
         return list(self._discovery_errors)
 
+    def lifecycle_errors(self) -> list[LifecycleError]:
+        return list(self._lifecycle_errors)
+
     def dependency_graph(self) -> dict[str, list[str]]:
         """Machine-readable map of module slug to its resolved dependency slugs.
 
@@ -163,10 +211,42 @@ class ModuleRegistry:
             graph[slug] = sorted(set(deps))
         return graph
 
+    def graph_info(self) -> list[dict[str, Any]]:
+        """Rich module graph for tooling and visualizers.
+
+        Returns one entry per discovered module, sorted by slug.  Each entry
+        contains identity, status, load position, capabilities, requirements,
+        resolved dependencies, and Django apps.
+        """
+        load_index_map = {slug: i for i, slug in enumerate(self._load_order)}
+        dep_graph = self.dependency_graph()
+        result = []
+        for slug in sorted(self._discovered):
+            m = self._discovered[slug]
+            result.append({
+                "slug": slug,
+                "label": m.label,
+                "version": m.manifest.version,
+                "active": slug in self._active,
+                "load_index": load_index_map.get(slug),
+                "provides": sorted(m.manifest.provides),
+                "requires": [r.to_dict() for r in m.manifest.requires],
+                "optional": [r.to_dict() for r in m.manifest.optional],
+                "deps": dep_graph.get(slug, []),
+                "django_apps": list(m.django_apps()),
+            })
+        return result
+
     # ----------------------------------------------------------------- flags
 
     @property
+    def is_populated(self) -> bool:
+        """True after populate() has completed successfully."""
+        return self._populated
+
+    @property
     def is_ready(self) -> bool:
+        """True after activate() has completed (lifecycle phases finished)."""
         return self._ready
 
     @property

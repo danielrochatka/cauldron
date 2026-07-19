@@ -75,6 +75,8 @@ module = BaseModule(_manifest)
 | `version` | `str` | `"0.0.0"` | PEP 440 version string for this module. |
 | `cauldron_version` | `str` | `""` | PEP 440 specifier constraining the required Cauldron version, e.g. `">=0.1.0,<2.0.0"`. Empty means no constraint. |
 | `django_apps` | `tuple[str, ...]` | `()` | Django app labels this module registers. These must also appear in `INSTALLED_APPS` — see *Composing INSTALLED_APPS* below. |
+| `django_middleware` | `tuple[str, ...]` | `()` | Middleware class paths this module contributes. Used by `compose_django_settings()` to build `MIDDLEWARE`. |
+| `django_context_processors` | `tuple[str, ...]` | `()` | Context processor paths this module contributes. Used by `compose_django_settings()` to build the `context_processors` list in `TEMPLATES`. |
 | `settings` | `Mapping[str, object]` | `{}` | Default settings contributed by this module. |
 | `requires` | `tuple[ModuleRequirement, ...]` | `()` | Required dependencies. The module is not activated unless all required deps are satisfied. |
 | `optional` | `tuple[ModuleRequirement, ...]` | `()` | Optional dependencies. A version mismatch produces a warning; absence is silently ignored. |
@@ -165,7 +167,35 @@ Keys are active module slugs. Values are per-module configuration dicts accessib
 
 ## Composing INSTALLED_APPS
 
-Module Django apps must be present in `INSTALLED_APPS` **before `django.setup()` runs**.  Use `get_module_apps()` in `settings.py`:
+### Recommended: `compose_django_settings()`
+
+For full settings composition (apps, middleware, and context processors), use `compose_django_settings()` from `cauldron.django`:
+
+```python
+from cauldron.django import compose_django_settings
+
+CAULDRON_MODULES = {
+    "cauldron.django.state": {},
+    "cauldron.django.auth": {},
+}
+
+plan = compose_django_settings(
+    installed_apps=["django.contrib.contenttypes", "cauldron"],
+    middleware=["django.middleware.security.SecurityMiddleware"],
+    context_processors=["django.template.context_processors.request"],
+    module_settings=CAULDRON_MODULES,
+)
+
+INSTALLED_APPS = list(plan.installed_apps)
+MIDDLEWARE = list(plan.middleware)
+# Use plan.context_processors in TEMPLATES[0]["OPTIONS"]["context_processors"]
+```
+
+`compose_django_settings()` discovers installed modules via entry points, resolves dependency order, and collects `django_apps`, `django_middleware`, and `django_context_processors` from each module in topological load order. Base values are prepended; duplicates are removed preserving first occurrence.
+
+### Legacy: `get_module_apps()`
+
+For apps-only composition (backward compatible), use `get_module_apps()`:
 
 ```python
 from cauldron.modules.discovery import get_module_apps
@@ -183,7 +213,7 @@ INSTALLED_APPS = [
 ]
 ```
 
-`get_module_apps()` discovers installed modules via entry points and returns their `django_apps` tuples in alphabetical slug order. Modules not in `CAULDRON_MODULES` are ignored.
+`get_module_apps()` discovers installed modules via entry points and returns their `django_apps` tuples in dependency-resolved order. Modules not in `CAULDRON_MODULES` are ignored.
 
 ---
 

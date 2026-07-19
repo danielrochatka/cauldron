@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cauldron-fixture-beta"
+version = "1.0.0"
+requires-python = ">=3.11"
+dependencies = ["cauldron", "cauldron-fixture-alpha"]
+
+[project.entry-points."cauldron.modules"]
+"cauldron.fixture.beta" = "cauldron_fixture_beta:module"
+
+[tool.setuptools.packages.find]
+where = ["src"]

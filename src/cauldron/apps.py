@@ -11,6 +11,14 @@ class CauldronConfig(AppConfig):
     verbose_name = "Cauldron"
 
     def ready(self) -> None:
-        """Register Cauldron system checks when Django initializes."""
+        """Register system checks and activate the module runtime."""
+        from django.conf import settings
 
         from . import checks  # noqa: F401
+        from .modules.discovery import discover_modules
+        from .modules.registry import registry
+
+        disabled = set(getattr(settings, "CAULDRON_DISABLED_MODULES", []))
+        modules = discover_modules()
+        registry.populate(modules, disabled=disabled)
+        registry.activate()

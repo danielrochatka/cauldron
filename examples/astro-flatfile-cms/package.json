@@ -1,0 +1,14 @@
+{
+  "name": "cauldron-astro-flatfile-cms",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview"
+  },
+  "dependencies": {
+    "@procyonsoft/cauldron-astro": "file:../../packages/cauldron-astro",
+    "astro": "^5.0.0"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "body": "# About\n\nThis is the about page.\n",
+  "collection": "pages",
+  "data": {
+    "description": "About this site.",
+    "title": "About"
+  },
+  "hash": "01eb6e7f113555bd9e278ccbf06234d812ad929676700c8b989df104ae72fb50",
+  "id": "page.about",
+  "schema": "pages",
+  "slug": "about",
+  "status": "published"
+}

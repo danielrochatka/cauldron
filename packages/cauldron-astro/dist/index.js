@@ -11,3 +11,4 @@ export function cauldronAstro(options = {}) {
         },
     };
 }
+export { computeContentHash, createCauldronContentLoader, defineCauldronFlatFileSource, loadCauldronCollection, normalizeBody, } from './loaders/flatfile.js';

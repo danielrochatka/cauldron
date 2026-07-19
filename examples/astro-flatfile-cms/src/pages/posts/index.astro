@@ -1,0 +1,28 @@
+---
+import { getCollection } from 'astro:content';
+
+const entries = await getCollection('posts');
+const posts = entries.map((entry) => {
+  const data = entry.data as Record<string, unknown>;
+  return {
+    id: entry.id,
+    slug: String(data.slug ?? entry.id),
+    title: String(data.title ?? entry.id),
+  };
+});
+---
+<html>
+  <head>
+    <title>Posts</title>
+  </head>
+  <body>
+    <h1>Posts</h1>
+    <ul>
+      {posts.map((post) => (
+        <li>
+          <a href={`/posts/${post.slug}`}>{post.title}</a>
+        </li>
+      ))}
+    </ul>
+  </body>
+</html>

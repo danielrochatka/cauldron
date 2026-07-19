@@ -1,0 +1,16 @@
+{
+  "body": "# First Post\n\nHello, world! This is the first post.\n",
+  "collection": "posts",
+  "data": {
+    "tags": [
+      "hello",
+      "world"
+    ],
+    "title": "First Post"
+  },
+  "hash": "73c9b48c2babaed56d6f0fa46e8d47d2b9bd4e581e35452d2e5b3fa1c6546c0a",
+  "id": "post.first",
+  "schema": "posts",
+  "slug": "first-post",
+  "status": "published"
+}

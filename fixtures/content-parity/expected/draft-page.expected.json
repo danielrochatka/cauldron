@@ -1,0 +1,13 @@
+{
+  "body": "# Draft\n\nThis is unpublished content.\n",
+  "collection": "pages",
+  "data": {
+    "description": "This is a draft.",
+    "title": "Draft Page"
+  },
+  "hash": "5feface7561f73644b8e2a1c92237105a19bc27e0cde2eafe0b2dfccfcef75c6",
+  "id": "page.draft",
+  "schema": "pages",
+  "slug": "draft-page",
+  "status": "draft"
+}

@@ -20,6 +20,25 @@ The canonical future source of truth for ordinary CMS content is filesystem cont
 
 `@procyonsoft/cauldron-astro` exports `cauldronAstro`, `defineCauldronContentSource`, and theme/content TypeScript contracts. Placeholder folders reserve future content loader, schema, rendering helper, and build hook surfaces.
 
+## Content stack
+
+The content layer is split across three cooperating modules:
+
+- `cauldron.content` — value types (`ContentItem`, `ContentChangeSet`), the
+  canonical hash algorithm, the `RepositoryRegistry`, and the `ContentRouter`.
+- `cauldron.cms.flatfile` — the reference provider, reading Markdown + YAML
+  front matter validated against JSON Schema.
+- `cauldron.workspace.flatfile` — optional editor scratch space with
+  change-sets, snapshots, and file locks.
+
+The Astro loader in `@procyonsoft/cauldron-astro` reads the same on-disk
+layout and computes byte-identical content hashes, so build-time and edit-time
+agree on identity. See `docs/content-contracts.md`, `docs/flatfile-cms.md`,
+`docs/flatfile-workspace.md`, and `docs/astro-flatfile-content.md`.
+
 ## Deferred modules
 
-CMS editing, AI administration, RAG/vector search, imports, relational data, media, forms, publishing, deployment, billing, tenancy, and production operations are intentionally deferred.
+AI administration, LLM integration, Django-side content APIs beyond the
+`ContentRepository` protocol, SQL/Wagtail providers, media library, search,
+RAG/vector, imports, forms, deployment, billing, tenancy, and production
+operations are intentionally deferred.

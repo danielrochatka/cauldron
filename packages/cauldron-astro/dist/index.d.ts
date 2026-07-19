@@ -15,3 +15,5 @@ export type CauldronThemeContract = {
     name: string;
     entrypoint: string;
 };
+export { computeContentHash, createCauldronContentLoader, defineCauldronFlatFileSource, loadCauldronCollection, normalizeBody, } from './loaders/flatfile.js';
+export type { CauldronFlatFileSourceOptions, ContentItem, ContentStatus, FlatFileLoader, FlatFileLogger, FlatFileStore, } from './loaders/flatfile.js';

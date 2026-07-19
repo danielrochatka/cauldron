@@ -55,13 +55,38 @@ class TestTopologicalOrdering:
         assert order.index("c") < order.index("d")
         assert not result.has_errors
 
-    def test_deterministic_across_calls(self):
+
+class TestDeterminism:
+    def test_load_order_identical_across_calls(self):
         a = _mod("a")
         b = _mod("b", requires=(ModuleRequirement(slug="a"),))
         c = _mod("c", requires=(ModuleRequirement(slug="a"),))
         r1 = resolve([a, b, c], {})
         r2 = resolve([a, b, c], {})
         assert r1.load_order == r2.load_order
+
+    def test_independent_modules_in_alpha_order(self):
+        """Modules with no dependencies should be loaded alphabetically."""
+        z = _mod("z")
+        a = _mod("a")
+        m = _mod("m")
+        result = resolve([z, a, m], {})
+        assert result.load_order == ["a", "m", "z"]
+
+    def test_input_order_does_not_affect_output(self):
+        """Shuffling the input list must not change the result."""
+        a = _mod("a")
+        b = _mod("b", requires=(ModuleRequirement(slug="a"),))
+        c = _mod("c")
+        r1 = resolve([a, b, c], {})
+        r2 = resolve([c, b, a], {})
+        assert r1.load_order == r2.load_order
+
+    def test_dep_graph_keys_are_sorted(self):
+        z = _mod("z")
+        a = _mod("a")
+        result = resolve([z, a], {})
+        assert list(result.dep_graph.keys()) == sorted(result.dep_graph.keys())
 
 
 class TestCircularDependencyDetection:
@@ -181,7 +206,7 @@ class TestCauldronVersionCompatibility:
 
 
 class TestCapabilityResolution:
-    def test_capability_dep_resolved_to_provider(self):
+    def test_single_provider_resolves_cleanly(self):
         provider = _mod("provider", provides=("some.cap",))
         consumer = _mod("consumer", requires=(ModuleRequirement(slug="some.cap", kind="capability"),))
         caps = {"some.cap": ["provider"]}
@@ -189,20 +214,38 @@ class TestCapabilityResolution:
         assert not result.has_errors
         assert result.load_order.index("provider") < result.load_order.index("consumer")
 
-    def test_multiple_capability_providers_all_precede_consumer(self):
+    def test_capability_conflict_on_required_dep(self):
         p1 = _mod("p1", provides=("shared.cap",))
         p2 = _mod("p2", provides=("shared.cap",))
         consumer = _mod("consumer", requires=(ModuleRequirement(slug="shared.cap", kind="capability"),))
         caps = {"shared.cap": ["p1", "p2"]}
         result = resolve([p1, p2, consumer], caps)
-        assert not result.has_errors
-        order = result.load_order
-        assert order.index("p1") < order.index("consumer")
-        assert order.index("p2") < order.index("consumer")
+        conflict_errors = [e for e in result.errors if e.kind == ErrorKind.CAPABILITY_CONFLICT]
+        assert len(conflict_errors) == 1
+        assert "CAULDRON_CAPABILITY_PROVIDERS" in conflict_errors[0].message
 
-    def test_dep_graph_includes_capability_resolved_slugs(self):
-        provider = _mod("provider", provides=("cap",))
+    def test_capability_conflict_resolved_by_override(self):
+        p1 = _mod("p1", provides=("shared.cap",))
+        p2 = _mod("p2", provides=("shared.cap",))
+        consumer = _mod("consumer", requires=(ModuleRequirement(slug="shared.cap", kind="capability"),))
+        caps = {"shared.cap": ["p1", "p2"]}
+        result = resolve([p1, p2, consumer], caps, capability_overrides={"shared.cap": "p1"})
+        assert not result.has_errors
+        assert result.load_order.index("p1") < result.load_order.index("consumer")
+
+    def test_optional_capability_conflict_is_warning(self):
+        p1 = _mod("p1", provides=("shared.cap",))
+        p2 = _mod("p2", provides=("shared.cap",))
+        consumer = _mod("consumer", optional=(ModuleRequirement(slug="shared.cap", kind="capability"),))
+        caps = {"shared.cap": ["p1", "p2"]}
+        result = resolve([p1, p2, consumer], caps)
+        assert not result.has_errors
+        assert any("shared.cap" in w.message for w in result.warnings)
+
+    def test_dep_graph_uses_override_provider(self):
+        p1 = _mod("p1", provides=("cap",))
+        p2 = _mod("p2", provides=("cap",))
         consumer = _mod("consumer", requires=(ModuleRequirement(slug="cap", kind="capability"),))
-        caps = {"cap": ["provider"]}
-        result = resolve([provider, consumer], caps)
-        assert "provider" in result.dep_graph.get("consumer", [])
+        caps = {"cap": ["p1", "p2"]}
+        result = resolve([p1, p2, consumer], caps, capability_overrides={"cap": "p2"})
+        assert result.dep_graph.get("consumer") == ["p2"]

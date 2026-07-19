@@ -1,4 +1,6 @@
-"""Tests for ModuleManifest, ModuleRequirement, BaseModule, and CauldronModule protocol."""
+"""Tests for ModuleRequirement, ModuleManifest, BaseModule, and CauldronModule protocol."""
+
+import json
 
 import pytest
 
@@ -30,6 +32,38 @@ class TestModuleRequirement:
         with pytest.raises(Exception):
             req.slug = "other"  # type: ignore[misc]
 
+    # -- validation --
+
+    def test_empty_slug_raises(self):
+        with pytest.raises(ValueError, match="non-empty"):
+            ModuleRequirement(slug="")
+
+    def test_invalid_slug_raises(self):
+        with pytest.raises(ValueError, match="pattern"):
+            ModuleRequirement(slug="Bad-Slug")
+
+    def test_invalid_version_specifier_raises(self):
+        with pytest.raises(ValueError, match="specifier"):
+            ModuleRequirement(slug="a", version="not_a_specifier!")
+
+    def test_invalid_kind_raises(self):
+        with pytest.raises(ValueError, match="kind"):
+            ModuleRequirement(slug="a", kind="unknown")  # type: ignore[arg-type]
+
+    # -- serialization --
+
+    def test_round_trip_module(self):
+        req = ModuleRequirement(slug="cauldron.dep", version=">=1.0.0", kind="module")
+        assert ModuleRequirement.from_dict(req.to_dict()) == req
+
+    def test_round_trip_capability(self):
+        req = ModuleRequirement(slug="some.cap", kind="capability")
+        assert ModuleRequirement.from_dict(req.to_dict()) == req
+
+    def test_to_dict_is_json_serializable(self):
+        req = ModuleRequirement(slug="a", version=">=1.0.0")
+        json.dumps(req.to_dict())  # must not raise
+
 
 class TestModuleManifest:
     def test_minimal(self):
@@ -53,7 +87,7 @@ class TestModuleManifest:
             version="2.1.0",
             cauldron_version=">=0.1.0,<1.0.0",
             django_apps=("myapp",),
-            settings={"KEY": "value"},
+            settings={"key": "value"},
             requires=(req,),
             optional=(opt,),
             provides=("some.capability",),
@@ -61,7 +95,7 @@ class TestModuleManifest:
         assert m.version == "2.1.0"
         assert m.cauldron_version == ">=0.1.0,<1.0.0"
         assert m.django_apps == ("myapp",)
-        assert m.settings == {"KEY": "value"}
+        assert m.settings == {"key": "value"}
         assert m.requires == (req,)
         assert m.optional == (opt,)
         assert m.provides == ("some.capability",)
@@ -70,6 +104,74 @@ class TestModuleManifest:
         m = ModuleManifest(slug="test.module", label="Test")
         with pytest.raises(Exception):
             m.slug = "other"  # type: ignore[misc]
+
+    # -- validation --
+
+    def test_empty_slug_raises(self):
+        with pytest.raises(ValueError, match="non-empty"):
+            ModuleManifest(slug="", label="Test")
+
+    def test_invalid_slug_raises(self):
+        with pytest.raises(ValueError, match="pattern"):
+            ModuleManifest(slug="Bad_Slug", label="Test")
+
+    def test_empty_label_raises(self):
+        with pytest.raises(ValueError, match="label"):
+            ModuleManifest(slug="valid.slug", label="")
+
+    def test_invalid_version_raises(self):
+        with pytest.raises(ValueError, match="version"):
+            ModuleManifest(slug="a", label="A", version="not-a-version!")
+
+    def test_invalid_cauldron_version_raises(self):
+        with pytest.raises(ValueError, match="specifier"):
+            ModuleManifest(slug="a", label="A", cauldron_version="bad!specifier")
+
+    def test_invalid_provides_entry_raises(self):
+        with pytest.raises(ValueError, match="pattern"):
+            ModuleManifest(slug="a", label="A", provides=("Bad-Cap",))
+
+    def test_valid_dotted_slug(self):
+        m = ModuleManifest(slug="cauldron.content.core", label="Content Core")
+        assert m.slug == "cauldron.content.core"
+
+    # -- serialization --
+
+    def test_round_trip_minimal(self):
+        m = ModuleManifest(slug="a", label="A")
+        assert ModuleManifest.from_dict(m.to_dict()) == m
+
+    def test_round_trip_full(self):
+        req = ModuleRequirement(slug="dep.module", version=">=1.0.0")
+        opt = ModuleRequirement(slug="opt.cap", kind="capability")
+        m = ModuleManifest(
+            slug="test.module",
+            label="Test",
+            version="1.2.3",
+            cauldron_version=">=0.1.0",
+            django_apps=("app1",),
+            settings={"k": "v"},
+            requires=(req,),
+            optional=(opt,),
+            provides=("my.cap",),
+        )
+        assert ModuleManifest.from_dict(m.to_dict()) == m
+
+    def test_to_dict_is_json_serializable(self):
+        m = ModuleManifest(
+            slug="a",
+            label="A",
+            version="1.0.0",
+            provides=("my.cap",),
+        )
+        json.dumps(m.to_dict())  # must not raise
+
+    def test_from_dict_applies_defaults(self):
+        m = ModuleManifest.from_dict({"slug": "a", "label": "A"})
+        assert m.version == "0.0.0"
+        assert m.cauldron_version == ""
+        assert m.django_apps == ()
+        assert m.requires == ()
 
 
 class TestBaseModule:

@@ -20,33 +20,33 @@ def _mod(slug, *, version="1.0.0", requires=(), provides=()):
 
 @pytest.fixture(autouse=True)
 def reset_global_registry():
-    """Restore the global registry after each test to avoid cross-test contamination."""
+    """Snapshot and restore the global registry around each test."""
     from cauldron.modules.registry import registry
 
-    original_discovered = dict(registry._discovered)
-    original_active = dict(registry._active)
-    original_order = list(registry._load_order)
-    original_caps = dict(registry._capability_providers)
-    original_errors = list(registry._errors)
-    original_warnings = list(registry._warnings)
-    original_ready = registry._ready
-
+    snap = {
+        "_discovered": dict(registry._discovered),
+        "_active": dict(registry._active),
+        "_load_order": list(registry._load_order),
+        "_capability_providers": dict(registry._capability_providers),
+        "_module_configs": dict(registry._module_configs),
+        "_errors": list(registry._errors),
+        "_warnings": list(registry._warnings),
+        "_discovery_errors": list(registry._discovery_errors),
+        "_ready": registry._ready,
+    }
     yield
-
-    registry._discovered = original_discovered
-    registry._active = original_active
-    registry._load_order = original_order
-    registry._capability_providers = original_caps
-    registry._errors = original_errors
-    registry._warnings = original_warnings
-    registry._ready = original_ready
+    for attr, value in snap.items():
+        setattr(registry, attr, value)
 
 
-def _inject_modules(modules, *, disabled=None):
-    """Populate the global registry with given modules for check testing."""
+def _inject_modules(modules, *, enabled=None):
+    """Populate the global registry for check testing.
+
+    *enabled=None* activates all provided modules (test convenience default).
+    """
     from cauldron.modules.registry import registry
 
-    registry.populate(modules, disabled=disabled or set())
+    registry.populate(modules, enabled=enabled)
 
 
 class TestFoundationCheck:
@@ -108,9 +108,16 @@ class TestModuleGraphCheck:
         e014 = [m for m in messages if m.id == "cauldron.E014"]
         assert len(e014) == 2
 
-    def test_optional_version_mismatch_emits_w010(self):
-        from cauldron.modules.registry import registry
+    def test_capability_conflict_emits_e015(self):
+        p1 = _mod("p1", provides=("shared.cap",))
+        p2 = _mod("p2", provides=("shared.cap",))
+        consumer = _mod("consumer", requires=(ModuleRequirement(slug="shared.cap", kind="capability"),))
+        _inject_modules([p1, p2, consumer])
+        messages = django_checks.run_checks()
+        e015 = [m for m in messages if m.id == "cauldron.E015"]
+        assert len(e015) == 1
 
+    def test_optional_version_mismatch_emits_w010(self):
         a = _mod("a", version="1.0.0")
         b = BaseModule(ModuleManifest(
             slug="b",
@@ -121,3 +128,44 @@ class TestModuleGraphCheck:
         messages = django_checks.run_checks()
         w010 = [m for m in messages if m.id == "cauldron.W010"]
         assert len(w010) == 1
+
+
+class TestDiscoveryErrorChecks:
+    def test_load_failure_emits_e020(self):
+        from cauldron.modules.discovery import DiscoveryError
+        from cauldron.modules.registry import registry
+
+        err = DiscoveryError(
+            entry_point_name="broken.ep",
+            kind="load_failure",
+            message="failed to import",
+        )
+        registry.populate([], discovery_errors=[err])
+        messages = django_checks.run_checks()
+        e020 = [m for m in messages if m.id == "cauldron.E020"]
+        assert len(e020) == 1
+        assert "broken.ep" in e020[0].obj
+
+    def test_duplicate_slug_emits_e021(self):
+        from cauldron.modules.discovery import DiscoveryError
+        from cauldron.modules.registry import registry
+
+        err = DiscoveryError(
+            entry_point_name="dupe.ep",
+            kind="duplicate_slug",
+            message="slug conflict",
+        )
+        registry.populate([], discovery_errors=[err])
+        messages = django_checks.run_checks()
+        e021 = [m for m in messages if m.id == "cauldron.E021"]
+        assert len(e021) == 1
+
+    def test_discovery_errors_prevent_i002_for_errored_modules(self):
+        from cauldron.modules.discovery import DiscoveryError
+        from cauldron.modules.registry import registry
+
+        err = DiscoveryError("ep", "load_failure", "failed")
+        registry.populate([], discovery_errors=[err])
+        messages = django_checks.run_checks()
+        i002 = [m for m in messages if m.id == "cauldron.I002"]
+        assert i002 == []  # no active modules when discovery failed

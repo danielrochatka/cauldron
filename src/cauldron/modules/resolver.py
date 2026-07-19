@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import deque
+import heapq
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -20,6 +20,7 @@ class ErrorKind(Enum):
     VERSION_CONSTRAINT = "version_constraint"
     CAULDRON_VERSION = "cauldron_version"
     CIRCULAR_DEPENDENCY = "circular_dependency"
+    CAPABILITY_CONFLICT = "capability_conflict"
 
 
 @dataclass
@@ -52,14 +53,27 @@ def resolve(
     capability_providers: dict[str, list[str]],
     *,
     cauldron_version: str = "",
+    capability_overrides: dict[str, str] | None = None,
 ) -> ResolutionResult:
-    """Validate constraints, detect dependency problems, return topological load order."""
+    """Validate constraints, detect dependency problems, return deterministic load order.
+
+    *capability_overrides* maps a capability slug to the single module slug that
+    should be used when multiple providers are present.  Set via
+    ``CAULDRON_CAPABILITY_PROVIDERS`` in Django settings.
+    """
+    if capability_overrides is None:
+        capability_overrides = {}
+
     errors: list[ResolutionError] = []
     warnings: list[ResolutionWarning] = []
-    module_index: dict[str, CauldronModule] = {m.slug: m for m in modules}
+    # Sort input for determinism — insertion order should not affect output.
+    module_index: dict[str, CauldronModule] = {
+        m.slug: m for m in sorted(modules, key=lambda m: m.slug)
+    }
 
     if cauldron_version:
-        for slug, module in module_index.items():
+        for slug in sorted(module_index):
+            module = module_index[slug]
             constraint = module.manifest.cauldron_version
             if constraint and not _version_satisfies(cauldron_version, constraint):
                 errors.append(ResolutionError(
@@ -73,7 +87,8 @@ def resolve(
 
     dep_graph: dict[str, list[str]] = {slug: [] for slug in module_index}
 
-    for slug, module in module_index.items():
+    for slug in sorted(module_index):
+        module = module_index[slug]
         for req in module.manifest.requires:
             if req.kind == "module":
                 if req.slug not in module_index:
@@ -95,7 +110,7 @@ def resolve(
                     ))
                 dep_graph[slug].append(req.slug)
             elif req.kind == "capability":
-                providers = capability_providers.get(req.slug, [])
+                providers = sorted(capability_providers.get(req.slug, []))
                 if not providers:
                     errors.append(ResolutionError(
                         kind=ErrorKind.MISSING_CAPABILITY,
@@ -105,10 +120,26 @@ def resolve(
                             "but no active module provides it."
                         ),
                     ))
-                else:
+                elif len(providers) == 1:
                     dep_graph[slug].extend(providers)
+                else:
+                    override = capability_overrides.get(req.slug)
+                    if override and override in providers:
+                        dep_graph[slug].append(override)
+                    else:
+                        providers_str = ", ".join(repr(p) for p in providers)
+                        errors.append(ResolutionError(
+                            kind=ErrorKind.CAPABILITY_CONFLICT,
+                            module_slug=slug,
+                            message=(
+                                f"Module {slug!r} requires capability {req.slug!r} but"
+                                f" multiple providers exist: [{providers_str}]."
+                                " Set CAULDRON_CAPABILITY_PROVIDERS to resolve."
+                            ),
+                        ))
 
-    for slug, module in module_index.items():
+    for slug in sorted(module_index):
+        module = module_index[slug]
         for req in module.manifest.optional:
             if req.kind == "module" and req.slug in module_index:
                 dep = module_index[req.slug]
@@ -122,14 +153,30 @@ def resolve(
                     ))
                 dep_graph[slug].append(req.slug)
             elif req.kind == "capability":
-                providers = capability_providers.get(req.slug, [])
-                dep_graph[slug].extend(providers)
+                providers = sorted(capability_providers.get(req.slug, []))
+                if len(providers) > 1:
+                    override = capability_overrides.get(req.slug)
+                    if override and override in providers:
+                        dep_graph[slug].append(override)
+                    else:
+                        warnings.append(ResolutionWarning(
+                            module_slug=slug,
+                            message=(
+                                f"Module {slug!r} has optional dependency on capability"
+                                f" {req.slug!r} which has multiple providers:"
+                                f" [{', '.join(repr(p) for p in providers)}]."
+                                " Set CAULDRON_CAPABILITY_PROVIDERS to resolve."
+                            ),
+                        ))
+                        dep_graph[slug].extend(providers)
+                else:
+                    dep_graph[slug].extend(providers)
 
     dep_graph = {slug: sorted(set(deps)) for slug, deps in dep_graph.items()}
 
     load_order, cycle_nodes = _topological_sort(dep_graph)
 
-    for slug in cycle_nodes:
+    for slug in sorted(cycle_nodes):
         errors.append(ResolutionError(
             kind=ErrorKind.CIRCULAR_DEPENDENCY,
             module_slug=slug,
@@ -154,7 +201,12 @@ def _version_satisfies(version: str, constraint: str) -> bool:
 
 
 def _topological_sort(deps: dict[str, list[str]]) -> tuple[list[str], list[str]]:
-    """Kahn's algorithm. Returns (sorted_nodes, cycle_nodes)."""
+    """Kahn's algorithm with a min-heap queue for lexicographic determinism.
+
+    Returns *(sorted_nodes, cycle_nodes)*.  Within each topological level,
+    nodes are processed in alphabetical order so the output is stable
+    regardless of input dict ordering.
+    """
     dependents: dict[str, list[str]] = {n: [] for n in deps}
     in_degree: dict[str, int] = {n: 0 for n in deps}
 
@@ -164,17 +216,18 @@ def _topological_sort(deps: dict[str, list[str]]) -> tuple[list[str], list[str]]
                 dependents[dep].append(node)
                 in_degree[node] += 1
 
-    queue: deque[str] = deque(n for n, d in in_degree.items() if d == 0)
+    heap: list[str] = [n for n, d in in_degree.items() if d == 0]
+    heapq.heapify(heap)
     result: list[str] = []
 
-    while queue:
-        node = queue.popleft()
+    while heap:
+        node = heapq.heappop(heap)
         result.append(node)
-        for dependent in dependents[node]:
+        for dependent in sorted(dependents[node]):
             in_degree[dependent] -= 1
             if in_degree[dependent] == 0:
-                queue.append(dependent)
+                heapq.heappush(heap, dependent)
 
     processed = set(result)
-    cycle_nodes = [n for n in deps if n not in processed]
+    cycle_nodes = [n for n in sorted(deps) if n not in processed]
     return result, cycle_nodes

@@ -6,3 +6,6 @@ class CauldronDjangoAdminConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
     name = "cauldron_django_admin"
     verbose_name = "Cauldron Django Admin"
+
+    def ready(self) -> None:
+        from . import checks  # noqa: F401  — registers @checks.register decorators

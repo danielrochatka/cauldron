@@ -30,6 +30,12 @@ jobs:
           pip install -e packages/cauldron-django-auth
           pip install -e packages/cauldron-django-admin
 
+      - name: Install content modules
+        run: |
+          pip install -e packages/cauldron-content
+          pip install -e packages/cauldron-workspace-flatfile
+          pip install -e packages/cauldron-cms-flatfile
+
       - name: Test (core)
         run: pytest tests/ -v
 
@@ -41,6 +47,15 @@ jobs:
 
       - name: Test (cauldron-django-admin)
         run: pytest packages/cauldron-django-admin/tests/ -v
+
+      - name: Test (cauldron-content)
+        run: pytest packages/cauldron-content/tests/ -v
+
+      - name: Test (cauldron-workspace-flatfile)
+        run: pytest packages/cauldron-workspace-flatfile/tests/ -v
+
+      - name: Test (cauldron-cms-flatfile)
+        run: pytest packages/cauldron-cms-flatfile/tests/ -v
 
       - name: Django state consumer check
         working-directory: examples/django-state-consumer
@@ -70,6 +85,12 @@ jobs:
           python -m build packages/cauldron-django-state
           python -m build packages/cauldron-django-auth
           python -m build packages/cauldron-django-admin
+
+      - name: Build content module wheels
+        run: |
+          python -m build packages/cauldron-content
+          python -m build packages/cauldron-workspace-flatfile
+          python -m build packages/cauldron-cms-flatfile
 
       - name: Install core wheel in clean environment
         run: |
@@ -107,6 +128,10 @@ jobs:
         working-directory: packages/cauldron-astro
         run: npm run typecheck
 
+      - name: Test (cauldron-astro)
+        working-directory: packages/cauldron-astro
+        run: npm test
+
       - name: Pack integration artifact
         working-directory: packages/cauldron-astro
         run: |
@@ -124,3 +149,22 @@ jobs:
       - name: Build Astro consumer
         working-directory: examples/astro-consumer
         run: npm run build
+
+      - name: Install Astro flat-file example dependencies
+        working-directory: examples/astro-flatfile-cms
+        run: npm install
+
+      - name: Install packed integration into flat-file example
+        working-directory: examples/astro-flatfile-cms
+        run: npm install --no-save "../../packages/cauldron-astro/$CAULDRON_ASTRO_TARBALL"
+
+      - name: Build Astro flat-file example
+        working-directory: examples/astro-flatfile-cms
+        run: npm run build
+
+      - name: Verify draft content excluded from production build
+        run: |
+          if grep -qir "draft" examples/astro-flatfile-cms/dist/; then
+            echo "ERROR: draft content leaked into production build"
+            exit 1
+          fi

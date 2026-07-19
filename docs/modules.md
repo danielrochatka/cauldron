@@ -274,6 +274,23 @@ Keys and values are both deterministically sorted slug lists.
 
 ---
 
+## Content and flat-file CMS modules
+
+Three additional modules ship in this milestone:
+
+- `cauldron.content` (package `cauldron-content`) — value types, hash algorithm,
+  repository registry, and router. See [content contracts](content-contracts.md)
+  and [routing](content-routing.md).
+- `cauldron.cms.flatfile` (package `cauldron-cms-flatfile`) — Markdown +
+  JSON-schema repository implementation and management commands. See
+  [flat-file CMS](flatfile-cms.md).
+- `cauldron.workspace.flatfile` (package `cauldron-workspace-flatfile`) —
+  change-set store, snapshots, and file locks for editor UIs. See
+  [flat-file workspace](flatfile-workspace.md).
+
+The Astro loader at `@procyonsoft/cauldron-astro` reads the same layout; see
+[Astro flat-file content](astro-flatfile-content.md).
+
 ## Django system checks reference
 
 | ID | Level | Meaning |
@@ -290,5 +307,11 @@ Keys and values are both deterministically sorted slug lists.
 | `cauldron.E021` | Error | Duplicate module slug registered by two entry points. |
 | `cauldron.E022` | Error | Module manifest failed validation. |
 | `cauldron.W010` | Warning | Optional dependency version mismatch. |
+| `cauldron.content.I400` | Info | Routing configuration looks healthy. |
+| `cauldron.content.E400`–`E402` | Error | Invalid routing config. |
+| `cauldron.workspace.flatfile.I500` | Info | Workspace configuration looks healthy. |
+| `cauldron.workspace.flatfile.E500`–`E501` | Error | Invalid workspace config. |
+| `cauldron.cms.flatfile.I600` | Info | Flat-file CMS configuration looks healthy. |
+| `cauldron.cms.flatfile.E600`–`E602` | Error | Invalid site_root or content_root. |
 
 Run `python manage.py check` to surface all module graph issues before starting the application.

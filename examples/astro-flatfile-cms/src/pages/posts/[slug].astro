@@ -1,0 +1,26 @@
+---
+import { getCollection } from 'astro:content';
+
+export async function getStaticPaths() {
+  const posts = await getCollection('posts');
+  return posts.map((post) => {
+    const data = post.data as Record<string, unknown>;
+    return {
+      params: { slug: String(data.slug ?? post.id) },
+      props: { post },
+    };
+  });
+}
+
+const { post } = Astro.props as { post: { id: string; body: string; data: Record<string, unknown> } };
+const data = post.data;
+---
+<html>
+  <head>
+    <title>{String(data.title ?? post.id)}</title>
+  </head>
+  <body>
+    <h1>{String(data.title ?? post.id)}</h1>
+    <pre>{post.body}</pre>
+  </body>
+</html>

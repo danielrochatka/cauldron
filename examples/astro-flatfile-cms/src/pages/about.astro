@@ -1,0 +1,17 @@
+---
+import { getEntry } from 'astro:content';
+
+const entry = await getEntry('pages', 'page.about');
+if (!entry) throw new Error('page.about not found');
+const data = entry.data as Record<string, unknown>;
+---
+<html>
+  <head>
+    <title>{String(data.title ?? 'About')}</title>
+  </head>
+  <body>
+    <h1>{String(data.title ?? 'About')}</h1>
+    <p>{String(data.description ?? '')}</p>
+    <pre>{entry.body}</pre>
+  </body>
+</html>

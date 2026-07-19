@@ -4,10 +4,25 @@ __pycache__/
 .venv*/
 *.egg-info/
 /dist/
+packages/cauldron-content/dist/
+packages/cauldron-workspace-flatfile/dist/
+packages/cauldron-cms-flatfile/dist/
+packages/cauldron-django-state/dist/
+packages/cauldron-django-auth/dist/
+packages/cauldron-django-admin/dist/
 build/
 node_modules/
 .astro/
 examples/astro-consumer/dist/
+examples/astro-flatfile-cms/dist/
 *.sqlite3
 db.sqlite3
 examples/django-state-consumer/db.sqlite3
+
+# Workspace and preview data (per-site)
+examples/*/site/.cauldron/workspace/
+site/.cauldron/workspace/
+fixtures/content-parity/site/.cauldron/
+
+# TypeScript test build output
+packages/cauldron-astro/dist-test/

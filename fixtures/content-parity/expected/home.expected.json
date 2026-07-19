@@ -1,0 +1,13 @@
+{
+  "body": "# Home\n\nWelcome to Cauldron.\n",
+  "collection": "pages",
+  "data": {
+    "description": "Welcome to the home page.",
+    "title": "Home"
+  },
+  "hash": "8f739262c9631de084fa28da8e8d6df2c082626d4b496579ad504110c622b5b0",
+  "id": "page.home",
+  "schema": "pages",
+  "slug": "home",
+  "status": "published"
+}

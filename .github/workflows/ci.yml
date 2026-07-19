@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install
+      - name: Install core
         run: pip install -e '.[dev]'
 
       - name: Install test fixture modules
@@ -24,17 +24,54 @@ jobs:
           pip install -e tests/fixtures/cauldron-fixture-alpha
           pip install -e tests/fixtures/cauldron-fixture-beta
 
-      - name: Test
-        run: pytest
+      - name: Install Django modules
+        run: |
+          pip install -e packages/cauldron-django-state
+          pip install -e packages/cauldron-django-auth
+          pip install -e packages/cauldron-django-admin
+
+      - name: Test (core)
+        run: pytest tests/ -v
+
+      - name: Test (cauldron-django-state)
+        run: pytest packages/cauldron-django-state/tests/ -v
+
+      - name: Test (cauldron-django-auth)
+        run: pytest packages/cauldron-django-auth/tests/ -v
+
+      - name: Test (cauldron-django-admin)
+        run: pytest packages/cauldron-django-admin/tests/ -v
+
+      - name: Django state consumer check
+        working-directory: examples/django-state-consumer
+        run: python manage.py check
+
+      - name: Django state consumer migrate
+        working-directory: examples/django-state-consumer
+        run: python manage.py migrate --noinput
+
+      - name: Django state consumer status
+        working-directory: examples/django-state-consumer
+        run: python manage.py cauldron_state_status
+
+      - name: Django state consumer status (JSON)
+        working-directory: examples/django-state-consumer
+        run: python manage.py cauldron_state_status --json
 
       - name: Django consumer check (editable)
         working-directory: examples/django-consumer
         run: python manage.py check
 
-      - name: Build distributable wheel
+      - name: Build core wheel
         run: python -m build
 
-      - name: Install wheel in clean environment
+      - name: Build Django module wheels
+        run: |
+          python -m build packages/cauldron-django-state
+          python -m build packages/cauldron-django-auth
+          python -m build packages/cauldron-django-admin
+
+      - name: Install core wheel in clean environment
         run: |
           python -m venv .venv-wheel
           .venv-wheel/bin/pip install dist/cauldron-*.whl

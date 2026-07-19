@@ -1,0 +1,5 @@
+cauldron>=0.1.0
+cauldron-django-state>=0.1.0
+cauldron-django-auth>=0.1.0
+cauldron-django-admin>=0.1.0
+Django>=5.0,<6.0

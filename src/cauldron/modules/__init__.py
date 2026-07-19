@@ -77,6 +77,8 @@ class ModuleManifest:
     version: str = "0.0.0"
     cauldron_version: str = ""
     django_apps: tuple[str, ...] = field(default_factory=tuple)
+    django_middleware: tuple[str, ...] = field(default_factory=tuple)
+    django_context_processors: tuple[str, ...] = field(default_factory=tuple)
     settings: Mapping[str, object] = field(default_factory=dict)
     requires: tuple[ModuleRequirement, ...] = field(default_factory=tuple)
     optional: tuple[ModuleRequirement, ...] = field(default_factory=tuple)
@@ -93,6 +95,16 @@ class ModuleManifest:
                 raise ValueError(
                     f"ModuleManifest.django_apps entries must be non-empty strings; got {app!r}."
                 )
+        for mw in self.django_middleware:
+            if not isinstance(mw, str) or not mw:
+                raise ValueError(
+                    f"ModuleManifest.django_middleware entries must be non-empty strings; got {mw!r}."
+                )
+        for cp in self.django_context_processors:
+            if not isinstance(cp, str) or not cp:
+                raise ValueError(
+                    f"ModuleManifest.django_context_processors entries must be non-empty strings; got {cp!r}."
+                )
         for cap in self.provides:
             _validate_slug(cap, "ModuleManifest.provides entry")
 
@@ -104,6 +116,8 @@ class ModuleManifest:
             "version": self.version,
             "cauldron_version": self.cauldron_version,
             "django_apps": list(self.django_apps),
+            "django_middleware": list(self.django_middleware),
+            "django_context_processors": list(self.django_context_processors),
             "settings": dict(self.settings),
             "requires": [r.to_dict() for r in self.requires],
             "optional": [r.to_dict() for r in self.optional],
@@ -119,6 +133,8 @@ class ModuleManifest:
             version=data.get("version", "0.0.0"),
             cauldron_version=data.get("cauldron_version", ""),
             django_apps=tuple(data.get("django_apps", [])),
+            django_middleware=tuple(data.get("django_middleware", [])),
+            django_context_processors=tuple(data.get("django_context_processors", [])),
             settings=data.get("settings", {}),
             requires=tuple(
                 ModuleRequirement.from_dict(r) for r in data.get("requires", [])

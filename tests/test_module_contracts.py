@@ -73,6 +73,8 @@ class TestModuleManifest:
         assert m.version == "0.0.0"
         assert m.cauldron_version == ""
         assert m.django_apps == ()
+        assert m.django_middleware == ()
+        assert m.django_context_processors == ()
         assert m.settings == {}
         assert m.requires == ()
         assert m.optional == ()
@@ -139,6 +141,14 @@ class TestModuleManifest:
         with pytest.raises(ValueError, match="non-empty strings"):
             ModuleManifest(slug="a", label="A", django_apps=(123,))  # type: ignore[arg-type]
 
+    def test_empty_django_middleware_entry_raises(self):
+        with pytest.raises(ValueError, match="non-empty strings"):
+            ModuleManifest(slug="a", label="A", django_middleware=("",))
+
+    def test_empty_django_context_processor_entry_raises(self):
+        with pytest.raises(ValueError, match="non-empty strings"):
+            ModuleManifest(slug="a", label="A", django_context_processors=("",))
+
     def test_valid_dotted_slug(self):
         m = ModuleManifest(slug="cauldron.content.core", label="Content Core")
         assert m.slug == "cauldron.content.core"
@@ -179,7 +189,26 @@ class TestModuleManifest:
         assert m.version == "0.0.0"
         assert m.cauldron_version == ""
         assert m.django_apps == ()
+        assert m.django_middleware == ()
+        assert m.django_context_processors == ()
         assert m.requires == ()
+
+    def test_round_trip_with_middleware_and_context_processors(self):
+        m = ModuleManifest(
+            slug="test.module",
+            label="Test",
+            django_middleware=("my.middleware.Cls",),
+            django_context_processors=("my.ctx.proc",),
+        )
+        restored = ModuleManifest.from_dict(m.to_dict())
+        assert restored == m
+        assert restored.django_middleware == ("my.middleware.Cls",)
+        assert restored.django_context_processors == ("my.ctx.proc",)
+
+    def test_from_dict_middleware_context_processor_defaults_empty(self):
+        m = ModuleManifest.from_dict({"slug": "a", "label": "A"})
+        assert m.django_middleware == ()
+        assert m.django_context_processors == ()
 
 
 class TestBaseModule:

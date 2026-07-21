@@ -92,6 +92,57 @@ jobs:
           python -m build packages/cauldron-workspace-flatfile
           python -m build packages/cauldron-cms-flatfile
 
+      - name: Install content operations modules
+        run: |
+          pip install -e packages/cauldron-content-operations
+          pip install -e packages/cauldron-content-api
+          pip install -e packages/cauldron-admin-content
+
+      - name: Test (cauldron-content-operations)
+        run: pytest packages/cauldron-content-operations/tests/ -v
+
+      - name: Test (cauldron-content-api)
+        run: pytest packages/cauldron-content-api/tests/ -v
+
+      - name: Test (cauldron-admin-content)
+        run: pytest packages/cauldron-admin-content/tests/ -v
+
+      - name: Build content operations wheels
+        run: |
+          python -m build packages/cauldron-content-operations
+          python -m build packages/cauldron-content-api
+          python -m build packages/cauldron-admin-content
+
+      - name: Content control plane example: migrate
+        working-directory: examples/django-content-control-plane
+        run: |
+          pip install -e ../../packages/cauldron-cms-flatfile
+          python manage.py migrate --noinput
+
+      - name: Content control plane example: check
+        working-directory: examples/django-content-control-plane
+        run: python manage.py check
+
+      - name: Content control plane example: operations status
+        working-directory: examples/django-content-control-plane
+        run: python manage.py cauldron_content_operations_status
+
+      - name: Content control plane example: operations status JSON
+        working-directory: examples/django-content-control-plane
+        run: python manage.py cauldron_content_operations_status --json
+
+      - name: Content control plane example: reconcile dry-run
+        working-directory: examples/django-content-control-plane
+        run: python manage.py cauldron_content_reconcile --dry-run
+
+      - name: Content control plane example: reconcile dry-run JSON
+        working-directory: examples/django-content-control-plane
+        run: python manage.py cauldron_content_reconcile --dry-run --json
+
+      - name: Content control plane example: run tests
+        working-directory: examples/django-content-control-plane
+        run: python -m pytest tests/ -v
+
       - name: Install core wheel in clean environment
         run: |
           python -m venv .venv-wheel

@@ -276,7 +276,7 @@ Keys and values are both deterministically sorted slug lists.
 
 ## Content and flat-file CMS modules
 
-Three additional modules ship in this milestone:
+Three additional modules ship in the content foundation milestone:
 
 - `cauldron.content` (package `cauldron-content`) — value types, hash algorithm,
   repository registry, and router. See [content contracts](content-contracts.md)
@@ -290,6 +290,24 @@ Three additional modules ship in this milestone:
 
 The Astro loader at `@procyonsoft/cauldron-astro` reads the same layout; see
 [Astro flat-file content](astro-flatfile-content.md).
+
+## Content control plane modules
+
+Three modules implement the permissioned content control plane:
+
+- `cauldron.content.operations` (package `cauldron-content-operations`) — the
+  core `ContentOperationService` with lifecycle state machine, permissions,
+  audit log, idempotency, optimistic concurrency, and reconciliation.
+  See [content operations](content-operations.md),
+  [content permissions](content-permissions.md),
+  [content approvals](content-approvals.md),
+  [content audit](content-audit.md), and
+  [content reconciliation](content-reconciliation.md).
+- `cauldron.content.api` (package `cauldron-content-api`) — JSON HTTP API
+  exposing all content operations. See [content API](content-api.md).
+- `cauldron.admin.content` (package `cauldron-admin-content`) — Django Admin
+  integration with read-only audit views, lifecycle action endpoints, content
+  browser, and proposal form. See [content admin](content-admin.md).
 
 ## Django system checks reference
 

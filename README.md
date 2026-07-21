@@ -17,6 +17,15 @@ Cauldron is not copy-and-modify boilerplate. Django and Astro remain upstream de
 
 - Python distribution/import name: `cauldron` version `0.1.0`.
 - Astro package: `@procyonsoft/cauldron-astro` version `0.1.0`.
+- `packages/cauldron-content` — value types, hash algorithm, registry, router.
+- `packages/cauldron-cms-flatfile` — flat-file Markdown CMS provider.
+- `packages/cauldron-workspace-flatfile` — change-set store, snapshots, file locks.
+- `packages/cauldron-django-state` — Django state management module.
+- `packages/cauldron-django-auth` — Django authentication module.
+- `packages/cauldron-django-admin` — Django Admin integration module.
+- `packages/cauldron-content-operations` — permissioned content control plane service.
+- `packages/cauldron-content-api` — JSON HTTP API for content operations.
+- `packages/cauldron-admin-content` — Django Admin integration for content operations.
 
 ## Quick start
 

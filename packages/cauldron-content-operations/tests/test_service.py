@@ -360,3 +360,370 @@ def test_audit_actor_none_when_user_pk_none():
         resulting_state="proposed",
     )
     assert event.actor is None
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: Status validation
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_status_rejected():
+    user = _make_user(is_superuser=True, username="invst1")
+    service = _make_service()
+    result = service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}, "status": "INVALID_STATUS"}],
+        provider_name="flatfile",
+    )
+    assert not result.ok
+    assert result.error.code == "operations.invalid_status"
+
+
+def test_invalid_status_no_workspace_artifact():
+    """workspace.create is never called when status is invalid."""
+    from unittest.mock import MagicMock
+    from cauldron_content.contracts import ApplyResult
+    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.config import ContentOperationsConfig
+
+    user = _make_user(is_superuser=True, username="invst2")
+    ws = MagicMock()
+    router = MagicMock()
+    router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
+    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
+    service = ContentOperationService(router=router, workspace=ws, config=cfg)
+    service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}, "status": "BADSTATUS"}],
+        provider_name="flatfile",
+    )
+    ws.create.assert_not_called()
+
+
+def test_invalid_status_no_db_record():
+    from cauldron_content_operations.models import ContentChangeRequest
+    user = _make_user(is_superuser=True, username="invst3")
+    service = _make_service()
+    count_before = ContentChangeRequest.objects.count()
+    service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}, "status": "NOTVALID"}],
+        provider_name="flatfile",
+    )
+    assert ContentChangeRequest.objects.count() == count_before
+
+
+def test_valid_draft_status():
+    user = _make_user(is_superuser=True, username="draftstatus")
+    service = _make_service()
+    result = service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}, "status": "draft"}],
+        provider_name="flatfile",
+    )
+    assert result.ok
+
+
+def test_valid_published_status():
+    user = _make_user(is_superuser=True, username="pubstatus")
+    service = _make_service()
+    result = service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}, "status": "published"}],
+        provider_name="flatfile",
+    )
+    assert result.ok
+
+
+def test_missing_status_uses_default_draft():
+    user = _make_user(is_superuser=True, username="defstatus")
+    service = _make_service()
+    result = service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}}],
+        provider_name="flatfile",
+    )
+    assert result.ok
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: Force field rejection
+# ---------------------------------------------------------------------------
+
+
+def test_force_field_rejected_in_proposal():
+    user = _make_user(is_superuser=True, username="forceuser")
+    service = _make_service()
+    result = service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}, "force": True}],
+        provider_name="flatfile",
+    )
+    assert not result.ok
+    assert result.error.code == "operations.force_not_allowed"
+
+
+def test_force_false_also_rejected():
+    """Even force=False is forbidden; presence of the key is what matters."""
+    user = _make_user(is_superuser=True, username="forcefuser")
+    service = _make_service()
+    result = service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}, "force": False}],
+        provider_name="flatfile",
+    )
+    assert not result.ok
+    assert result.error.code == "operations.force_not_allowed"
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: Repository validation in validate_change_request
+# ---------------------------------------------------------------------------
+
+
+def _make_service_with_repo(validate_return=None, get_by_id_return=None):
+    from unittest.mock import MagicMock
+    from cauldron_content.contracts import ApplyResult, ValidationResult
+    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.config import ContentOperationsConfig
+
+    mock_repo = MagicMock()
+    mock_repo.validate.return_value = validate_return or ValidationResult.ok()
+
+    router = MagicMock()
+    router.list_items.return_value = []
+    router.get_by_id.return_value = get_by_id_return
+    router.resolve_provider.return_value = "flatfile"
+    router.get_repo.return_value = mock_repo
+    router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
+
+    saved: dict = {}
+
+    def _ws_create(cs):
+        saved[cs.id] = cs
+
+    def _ws_load(cs_id):
+        if cs_id not in saved:
+            raise KeyError(f"Changeset {cs_id!r} not found")
+        return saved[cs_id]
+
+    workspace = MagicMock()
+    workspace.create.side_effect = _ws_create
+    workspace.load_changeset.side_effect = _ws_load
+    workspace.save_application_result.return_value = None
+
+    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
+    return ContentOperationService(router=router, workspace=workspace, config=cfg), mock_repo
+
+
+def test_validation_calls_repository_validate():
+    """validate_change_request calls repo.validate() for CREATE operations."""
+    user = _make_user(is_superuser=True, username="valrep1")
+    service, mock_repo = _make_service_with_repo()
+    r = service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}}],
+        provider_name="flatfile",
+    )
+    assert r.ok
+    result = service.validate_change_request(r.request_id, user=user, expected_version=1)
+    assert result.ok
+    mock_repo.validate.assert_called_once()
+
+
+def test_validation_repo_issues_fail_validation():
+    """repo.validate() returning issues causes validation to fail."""
+    from cauldron_content.contracts import ValidationResult, ValidationIssue
+
+    user = _make_user(is_superuser=True, username="valrep2")
+    bad_vr = ValidationResult.failed([
+        ValidationIssue(code="schema.missing_field", message="Missing 'title'", collection="pages", item_id="p1")
+    ])
+    service, _ = _make_service_with_repo(validate_return=bad_vr)
+    r = service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}}],
+        provider_name="flatfile",
+    )
+    assert r.ok
+    result = service.validate_change_request(r.request_id, user=user, expected_version=1)
+    assert not result.ok
+    assert result.error.code == "validation.failed"
+
+
+def test_validation_update_requires_expected_hash():
+    """UPDATE without expected_hash fails validation."""
+    user = _make_user(is_superuser=True, username="valupd1")
+    service, _ = _make_service_with_repo()
+    r = service.create_change_request(
+        user=user,
+        operations=[{"kind": "update", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {"title": "X"}}],
+        provider_name="flatfile",
+    )
+    assert r.ok
+    result = service.validate_change_request(r.request_id, user=user, expected_version=1)
+    assert not result.ok
+    assert result.error.code == "validation.failed"
+    assert "update_requires_expected_hash" in str(result.error.details)
+
+
+def test_validation_delete_requires_expected_hash():
+    """DELETE without expected_hash fails validation."""
+    user = _make_user(is_superuser=True, username="valdel1")
+    service, _ = _make_service_with_repo()
+    r = service.create_change_request(
+        user=user,
+        operations=[{"kind": "delete", "collection": "pages", "item_id": "p1"}],
+        provider_name="flatfile",
+    )
+    assert r.ok
+    result = service.validate_change_request(r.request_id, user=user, expected_version=1)
+    assert not result.ok
+    assert result.error.code == "validation.failed"
+    assert "delete_requires_expected_hash" in str(result.error.details)
+
+
+def test_validation_stale_hash_blocked():
+    """UPDATE with stale expected_hash is blocked."""
+    from cauldron_content.contracts import ContentItem, ContentStatus
+
+    current_item = ContentItem(
+        id="p1", collection="pages", slug="p1",
+        status=ContentStatus.PUBLISHED, schema="", data={},
+        body="original", hash="actual_hash_abc", provider="flatfile",
+    )
+    user = _make_user(is_superuser=True, username="valstale")
+    service, _ = _make_service_with_repo(get_by_id_return=current_item)
+    r = service.create_change_request(
+        user=user,
+        operations=[{
+            "kind": "update", "collection": "pages", "item_id": "p1", "slug": "p1",
+            "data": {"title": "Updated"}, "expected_hash": "stale_hash_xyz",
+        }],
+        provider_name="flatfile",
+    )
+    assert r.ok
+    result = service.validate_change_request(r.request_id, user=user, expected_version=1)
+    assert not result.ok
+    assert result.error.code == "validation.failed"
+    assert "stale_hash" in str(result.error.details)
+
+
+# ---------------------------------------------------------------------------
+# Fix 5+6: Apply sequence and artifact failure handling
+# ---------------------------------------------------------------------------
+
+
+def test_adapter_prepare_failure_prevents_mutation(tmp_path):
+    """prepare() failure → apply_failed; router.apply is never called."""
+    from unittest.mock import MagicMock
+    from cauldron_content.contracts import ApplyResult, ContentChangeSet, ContentOperation, ContentOperationKind, ContentStatus
+    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.config import ContentOperationsConfig
+    from cauldron_content_operations.reversible import register_adapter, unregister_adapter
+    from cauldron_content_operations.models import ContentChangeRequest
+    import uuid
+
+    user = _make_user(is_superuser=True, username="prepfail")
+    locks_dir = tmp_path / "locks"
+    locks_dir.mkdir()
+
+    mock_adapter = MagicMock()
+    mock_adapter.supports_rollback = True
+    mock_adapter.prepare.side_effect = RuntimeError("disk full")
+
+    register_adapter("flatfile", mock_adapter)
+    try:
+        cs_id = str(uuid.uuid4())
+        op = ContentOperation(kind=ContentOperationKind.CREATE, provider="flatfile", collection="pages", item_id="p1", slug="p1", data={}, body="", schema="", status=ContentStatus.DRAFT, force=False)
+        cs = ContentChangeSet(id=cs_id, operations=(op,))
+
+        router = MagicMock()
+        router.resolve_provider.return_value = "flatfile"
+        router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
+
+        workspace = MagicMock()
+        workspace.load_changeset.return_value = cs
+        workspace.locks_dir = str(locks_dir)
+
+        cfg = ContentOperationsConfig(require_approval=False, allow_self_approval=True, max_operations_per_change_set=10)
+        service = ContentOperationService(router=router, workspace=workspace, config=cfg)
+
+        request_id = str(uuid.uuid4())
+        ContentChangeRequest.objects.create(
+            request_id=request_id,
+            workspace_changeset_id=cs_id,
+            provider_name="flatfile",
+            lifecycle_state="approved",
+            request_version=1,
+            created_by=user,
+        )
+
+        result = service.apply_change_request(request_id, user=user, expected_version=1)
+
+        assert not result.ok
+        assert result.error.code == "application.rollback_artifact_failed"
+        router.apply.assert_not_called()
+
+        cr = ContentChangeRequest.objects.get(request_id=request_id)
+        assert cr.lifecycle_state == "apply_failed"
+    finally:
+        unregister_adapter("flatfile")
+
+
+def test_result_persistence_failure_enters_reconciliation_required(tmp_path):
+    """record_applied() failure after successful mutation → reconciliation_required."""
+    from unittest.mock import MagicMock
+    from cauldron_content.contracts import ApplyResult, ContentChangeSet, ContentOperation, ContentOperationKind, ContentStatus
+    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.config import ContentOperationsConfig
+    from cauldron_content_operations.reversible import register_adapter, unregister_adapter
+    from cauldron_content_operations.models import ContentChangeRequest
+    import uuid
+
+    user = _make_user(is_superuser=True, username="reconreq")
+    locks_dir = tmp_path / "locks"
+    locks_dir.mkdir()
+
+    mock_adapter = MagicMock()
+    mock_adapter.supports_rollback = True
+    mock_adapter.prepare.return_value = None
+    mock_adapter.record_applied.side_effect = OSError("storage error")
+
+    register_adapter("flatfile", mock_adapter)
+    try:
+        cs_id = str(uuid.uuid4())
+        op = ContentOperation(kind=ContentOperationKind.CREATE, provider="flatfile", collection="pages", item_id="p1", slug="p1", data={}, body="", schema="", status=ContentStatus.DRAFT, force=False)
+        cs = ContentChangeSet(id=cs_id, operations=(op,))
+
+        router = MagicMock()
+        router.resolve_provider.return_value = "flatfile"
+        router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
+
+        workspace = MagicMock()
+        workspace.load_changeset.return_value = cs
+        workspace.locks_dir = str(locks_dir)
+
+        cfg = ContentOperationsConfig(require_approval=False, allow_self_approval=True, max_operations_per_change_set=10)
+        service = ContentOperationService(router=router, workspace=workspace, config=cfg)
+
+        request_id = str(uuid.uuid4())
+        ContentChangeRequest.objects.create(
+            request_id=request_id,
+            workspace_changeset_id=cs_id,
+            provider_name="flatfile",
+            lifecycle_state="approved",
+            request_version=1,
+            created_by=user,
+        )
+
+        result = service.apply_change_request(request_id, user=user, expected_version=1)
+
+        assert not result.ok
+        assert result.lifecycle_state == "reconciliation_required"
+
+        cr = ContentChangeRequest.objects.get(request_id=request_id)
+        assert cr.lifecycle_state == "reconciliation_required"
+        assert cr.last_error_code == "application.reconciliation_required"
+    finally:
+        unregister_adapter("flatfile")

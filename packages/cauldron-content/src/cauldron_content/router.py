@@ -62,6 +62,10 @@ class ContentRouter:
             raise RouterError(f"Provider {provider_name!r} is not registered.")
         return repo
 
+    def get_repo(self, provider_name: str) -> ContentRepository:
+        """Public access to the registered repository for a provider."""
+        return self._get_repo(provider_name)
+
     def list_items(
         self, collection: str, *, include_drafts: bool = False
     ) -> list[ContentItem]:

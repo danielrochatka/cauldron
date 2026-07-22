@@ -19,8 +19,8 @@ class ReversibleMutationAdapter(Protocol):
     def prepare(self, cs_id: str, changeset: Any) -> None:
         """Called just before a mutation to snapshot pre-application state."""
 
-    def record_applied(self, cs_id: str, applied_hashes: dict[str, str]) -> None:
-        """Persist the post-application content hashes for conflict detection."""
+    def record_applied(self, cs_id: str) -> None:
+        """Persist post-application hashes by reading canonical files after mutation."""
 
     def record_rolled_back(self, cs_id: str) -> None:
         """Persist that a rollback succeeded."""

@@ -127,11 +127,9 @@ def test_rollback_conflict_when_post_hash_mismatch(tmp_path):
     ops = (_update_op("pages", "home", "home"),)
     changeset = ContentChangeSet(id="cs.4", operations=ops)
     adapter.prepare("cs.4", changeset)
-    # Simulate application writing v2
+    # Simulate application writing v2; record_applied reads the file itself.
     f.write_text("v2", encoding="utf-8")
-    import hashlib
-    v2_hash = hashlib.sha256(b"v2").hexdigest()
-    adapter.record_applied("cs.4", {"home": v2_hash})
+    adapter.record_applied("cs.4")
     # Someone else edits it to v3
     f.write_text("v3", encoding="utf-8")
     with pytest.raises(RollbackConflict):
@@ -162,5 +160,120 @@ def test_inspect_reports_state(tmp_path):
     info = adapter.inspect("cs.6")
     assert info["has_rollback_artifact"] is True
     assert info["has_application_result"] is False
-    adapter.record_applied("cs.6", {"home": "abc"})
+    adapter.record_applied("cs.6")
     assert adapter.inspect("cs.6")["has_application_result"] is True
+
+
+# ---------------------------------------------------------------------------
+# Fix 4: Hash domain — record_applied stores raw SHA-256 from canonical files
+# ---------------------------------------------------------------------------
+
+
+def test_record_applied_stores_raw_file_hash(tmp_path):
+    """record_applied() stores the raw SHA-256 of the canonical file after mutation."""
+    import hashlib
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    f = content / "pages" / "home.md"
+    f.write_text("original", encoding="utf-8")
+
+    ops = (_update_op("pages", "home", "home"),)
+    changeset = ContentChangeSet(id="cs.rh1", operations=ops)
+    adapter.prepare("cs.rh1", changeset)
+    f.write_text("modified", encoding="utf-8")
+    adapter.record_applied("cs.rh1")
+
+    post_hashes = adapter.get_post_application_hashes("cs.rh1")
+    expected = hashlib.sha256(b"modified").hexdigest()
+    assert post_hashes.get("home") == expected
+
+
+def test_record_applied_stores_empty_hash_for_delete(tmp_path):
+    """record_applied() stores '' for items deleted by the changeset."""
+    from cauldron_content.contracts import ContentOperation, ContentOperationKind, ContentStatus
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    f = content / "pages" / "gone.md"
+    f.write_text("---\nid: gone\n---\nbody", encoding="utf-8")
+
+    op = ContentOperation(
+        kind=ContentOperationKind.DELETE,
+        provider="flatfile", collection="pages", item_id="gone", slug="gone",
+        status=ContentStatus.PUBLISHED,
+    )
+    changeset = ContentChangeSet(id="cs.rd1", operations=(op,))
+    adapter.prepare("cs.rd1", changeset)
+    f.unlink()
+    adapter.record_applied("cs.rd1")
+
+    post_hashes = adapter.get_post_application_hashes("cs.rd1")
+    assert post_hashes.get("gone") == ""
+
+
+def test_rollback_conflict_file_deleted_after_apply(tmp_path):
+    """File present after apply, then deleted externally → conflict on rollback."""
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    f = content / "pages" / "home.md"
+    f.write_text("v1", encoding="utf-8")
+
+    ops = (_update_op("pages", "home", "home"),)
+    changeset = ContentChangeSet(id="cs.cda", operations=ops)
+    adapter.prepare("cs.cda", changeset)
+    f.write_text("v2", encoding="utf-8")
+    adapter.record_applied("cs.cda")  # records hash of "v2"
+
+    # File deleted externally after application
+    f.unlink()
+
+    with pytest.raises(RollbackConflict):
+        adapter.rollback("cs.cda")
+
+
+def test_rollback_conflict_deleted_file_recreated(tmp_path):
+    """File deleted by apply, then recreated externally → conflict on rollback."""
+    from cauldron_content.contracts import ContentOperation, ContentOperationKind, ContentStatus
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    f = content / "pages" / "gone.md"
+    f.write_text("---\nid: gone\n---\nbody", encoding="utf-8")
+
+    op = ContentOperation(
+        kind=ContentOperationKind.DELETE,
+        provider="flatfile", collection="pages", item_id="gone", slug="gone",
+        status=ContentStatus.PUBLISHED,
+    )
+    changeset = ContentChangeSet(id="cs.cdr", operations=(op,))
+    adapter.prepare("cs.cdr", changeset)
+    f.unlink()
+    adapter.record_applied("cs.cdr")  # post_hash = "" for "gone"
+
+    # File recreated externally after delete
+    f.write_text("---\nid: gone\n---\nrecreated", encoding="utf-8")
+
+    with pytest.raises(RollbackConflict):
+        adapter.rollback("cs.cdr")
+
+
+def test_rollback_delete_op_restores_file(tmp_path):
+    """Rolling back a DELETE operation restores the original file."""
+    from cauldron_content.contracts import ContentOperation, ContentOperationKind, ContentStatus
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    f = content / "pages" / "deleted.md"
+    f.write_text("---\nid: deleted\n---\noriginal body", encoding="utf-8")
+
+    op = ContentOperation(
+        kind=ContentOperationKind.DELETE,
+        provider="flatfile", collection="pages", item_id="deleted", slug="deleted",
+        status=ContentStatus.PUBLISHED,
+    )
+    changeset = ContentChangeSet(id="cs.rbdel", operations=(op,))
+    adapter.prepare("cs.rbdel", changeset)
+    f.unlink()
+    adapter.record_applied("cs.rbdel")
+
+    # Rollback with force (no external changes since delete)
+    adapter.rollback("cs.rbdel", force=True, is_superuser=True)
+    assert f.exists()
+    assert "original body" in f.read_text(encoding="utf-8")

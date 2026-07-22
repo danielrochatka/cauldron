@@ -78,9 +78,24 @@ class FlatFileReversibleMutationAdapter:
             files.append(entry)
         _atomic_write_json(self._art_path(cs_id), {"cs_id": cs_id, "files": files})
 
-    def record_applied(self, cs_id: str, applied_hashes: dict[str, str]) -> None:
-        """Record post-application hashes for rollback conflict detection."""
-        _atomic_write_json(self._post_hashes_path(cs_id), dict(applied_hashes))
+    def record_applied(self, cs_id: str) -> None:
+        """Scan canonical files from the rollback artifact and store raw SHA-256 hashes.
+
+        Must be called after mutation. Delete operations are recorded as empty string
+        (expected absent). This ensures rollback conflict detection operates in the
+        same hash domain as the rollback itself.
+        """
+        artifact = _read_json(self._art_path(cs_id))
+        post_hashes: dict[str, str] = {}
+        for entry in artifact.get("files", []):
+            item_id = entry.get("item_id", "")
+            canonical = Path(entry["canonical_path"])
+            kind = entry.get("kind", "")
+            if kind == "delete" or not canonical.exists():
+                post_hashes[item_id] = ""
+            else:
+                post_hashes[item_id] = self._file_hash(canonical)
+        _atomic_write_json(self._post_hashes_path(cs_id), post_hashes)
 
     def record_rolled_back(self, cs_id: str) -> None:
         _atomic_write_json(self._rollback_result_path(cs_id), {"rolled_back": True})
@@ -115,16 +130,31 @@ class FlatFileReversibleMutationAdapter:
             snap_name = entry["snap_name"]
             kind = entry.get("kind", "")
 
-            if not force and post_hashes and canonical.exists():
-                current_hash = self._file_hash(canonical)
+            if not force and post_hashes:
                 item_id = entry.get("item_id", "")
                 post_hash = post_hashes.get(item_id, "")
-                if post_hash and current_hash != post_hash:
-                    raise RollbackConflict(
-                        f"Content at {canonical.name!r} changed after application "
-                        f"(post-apply hash: {post_hash[:8]}..., current: {current_hash[:8]}...). "
-                        "Use force=True to overwrite."
-                    )
+                file_exists_now = canonical.exists()
+                if post_hash == "":
+                    # Expected absent (was a delete operation).
+                    if file_exists_now:
+                        raise RollbackConflict(
+                            f"File {canonical.name!r} was deleted by the changeset but has "
+                            "been recreated since. Use force=True to overwrite."
+                        )
+                else:
+                    # Expected present.
+                    if not file_exists_now:
+                        raise RollbackConflict(
+                            f"File {canonical.name!r} was deleted after application. "
+                            "Use force=True to overwrite."
+                        )
+                    current_hash = self._file_hash(canonical)
+                    if current_hash != post_hash:
+                        raise RollbackConflict(
+                            f"Content at {canonical.name!r} changed after application "
+                            f"(post-apply hash: {post_hash[:8]}..., current: {current_hash[:8]}...). "
+                            "Use force=True to overwrite."
+                        )
 
             if entry.get("existed"):
                 backed_up = snap_dir / snap_name

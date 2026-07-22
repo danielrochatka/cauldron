@@ -258,6 +258,29 @@ class ContentOperationService:
                 ),
             )
 
+        # Reject the force field and invalid status before any workspace or DB writes.
+        from cauldron_content.contracts import ContentStatus as _CS
+        for op_data in operations:
+            if "force" in op_data:
+                return ChangeRequestResult(
+                    ok=False,
+                    error=OperationError(
+                        "operations.force_not_allowed",
+                        "The 'force' field is not permitted in public proposals.",
+                    ),
+                )
+            _status_str = op_data.get("status", "draft")
+            try:
+                _CS(_status_str)
+            except ValueError:
+                return ChangeRequestResult(
+                    ok=False,
+                    error=OperationError(
+                        "operations.invalid_status",
+                        f"Invalid status: {_status_str!r}. Valid values are 'draft' and 'published'.",
+                    ),
+                )
+
         payload_hash = _compute_payload_hash(operations)
 
         # Idempotency check — scoped to (creator, key).
@@ -309,11 +332,8 @@ class ContentOperationService:
                                 message=f"Invalid operation kind: {kind_str!r}",
                             ),
                         )
-                    status_str = op_data.get("status", "draft")
-                    try:
-                        status = ContentStatus(status_str)
-                    except ValueError:
-                        status = ContentStatus.DRAFT
+                    # status already validated above; no coercion needed.
+                    status = ContentStatus(op_data.get("status", "draft"))
 
                     ops.append(ContentOperation(
                         kind=kind,
@@ -326,7 +346,7 @@ class ContentOperationService:
                         body=op_data.get("body", ""),
                         schema=op_data.get("schema", ""),
                         status=status,
-                        force=bool(op_data.get("force", False)),
+                        force=False,  # never accept caller-supplied force
                     ))
 
                 changeset = ContentChangeSet(
@@ -527,6 +547,104 @@ class ContentOperationService:
                         "validation.failed",
                         f"Validation failed: {len(validation_issues)} issue(s).",
                         details=tuple(str(i) for i in validation_issues[:5]),
+                    ),
+                )
+
+            # Repository validation: call repo.validate() per operation via the routed repository.
+            repo_issues: list[dict] = []
+            for op in changeset.operations:
+                kind_value = op.kind.value if hasattr(op.kind, "value") else str(op.kind)
+                _coll = op.collection
+                _item_id = op.item_id
+                try:
+                    _prov = self._router.resolve_provider(_coll)
+                    _repo = self._router.get_repo(_prov)
+                except Exception as exc:
+                    repo_issues.append({"code": "routing_error", "collection": _coll, "item_id": _item_id, "detail": str(exc)[:100]})
+                    continue
+
+                if kind_value == "create":
+                    try:
+                        from cauldron_content.contracts import ContentItem
+                        from cauldron_content.hashing import compute_content_hash
+                        _slug = op.slug or _item_id
+                        _status_val = op.status.value if hasattr(op.status, "value") else str(op.status)
+                        _h = compute_content_hash(item_id=_item_id, collection=_coll, slug=_slug, status=_status_val, schema=op.schema, data=dict(op.data), body=op.body)
+                        _candidate = ContentItem(id=_item_id, collection=_coll, slug=_slug, status=op.status, schema=op.schema, data=dict(op.data), body=op.body, hash=_h, provider=_prov)
+                        _vr = _repo.validate(_candidate)
+                        if not _vr.valid:
+                            for _issue in _vr.issues:
+                                repo_issues.append({"code": _issue.code, "collection": _coll, "item_id": _item_id, "message": _issue.message})
+                    except Exception as exc:
+                        repo_issues.append({"code": "validation_error", "collection": _coll, "item_id": _item_id, "detail": str(exc)[:100]})
+
+                elif kind_value == "update":
+                    if not op.expected_hash:
+                        repo_issues.append({"code": "validation.update_requires_expected_hash", "collection": _coll, "item_id": _item_id})
+                        continue
+                    try:
+                        _current = self._router.get_by_id(_item_id, _coll, include_drafts=True)
+                    except Exception as exc:
+                        repo_issues.append({"code": "routing_error", "collection": _coll, "item_id": _item_id, "detail": str(exc)[:100]})
+                        continue
+                    if _current is None:
+                        repo_issues.append({"code": "validation.item_not_found", "collection": _coll, "item_id": _item_id})
+                        continue
+                    if _current.hash != op.expected_hash:
+                        repo_issues.append({"code": "validation.stale_hash", "collection": _coll, "item_id": _item_id})
+                        continue
+                    try:
+                        from cauldron_content.contracts import ContentItem
+                        from cauldron_content.hashing import compute_content_hash
+                        _merged = {**dict(_current.data), **dict(op.data)}
+                        _slug = op.slug or _current.slug
+                        _body = op.body if op.body else _current.body
+                        _schema = op.schema if op.schema else _current.schema
+                        _status = op.status
+                        _status_val = _status.value if hasattr(_status, "value") else str(_status)
+                        _h = compute_content_hash(item_id=_item_id, collection=_coll, slug=_slug, status=_status_val, schema=_schema, data=_merged, body=_body)
+                        _candidate = ContentItem(id=_item_id, collection=_coll, slug=_slug, status=_status, schema=_schema, data=_merged, body=_body, hash=_h, provider=_prov)
+                        _vr = _repo.validate(_candidate)
+                        if not _vr.valid:
+                            for _issue in _vr.issues:
+                                repo_issues.append({"code": _issue.code, "collection": _coll, "item_id": _item_id, "message": _issue.message})
+                    except Exception as exc:
+                        repo_issues.append({"code": "validation_error", "collection": _coll, "item_id": _item_id, "detail": str(exc)[:100]})
+
+                elif kind_value == "delete":
+                    if not op.expected_hash:
+                        repo_issues.append({"code": "validation.delete_requires_expected_hash", "collection": _coll, "item_id": _item_id})
+                        continue
+                    try:
+                        _current = self._router.get_by_id(_item_id, _coll, include_drafts=True)
+                    except Exception as exc:
+                        repo_issues.append({"code": "routing_error", "collection": _coll, "item_id": _item_id, "detail": str(exc)[:100]})
+                        continue
+                    if _current is None:
+                        repo_issues.append({"code": "validation.item_not_found", "collection": _coll, "item_id": _item_id})
+                        continue
+                    if _current.hash != op.expected_hash:
+                        repo_issues.append({"code": "validation.stale_hash", "collection": _coll, "item_id": _item_id})
+
+            if repo_issues:
+                append_audit_event(
+                    change_request=cr,
+                    event_type=AuditEventType.VALIDATION_FAILED,
+                    actor=user,
+                    previous_state=current_state.value,
+                    resulting_state=current_state.value,
+                    correlation_id=correlation_id,
+                    detail={"issues": repo_issues[:10]},
+                )
+                cr.last_error_code = "validation.failed"
+                cr.last_error_summary = f"{len(repo_issues)} validation issue(s)."
+                cr.save(update_fields=["last_error_code", "last_error_summary", "updated_at"])
+                return ChangeRequestResult(
+                    ok=False,
+                    error=OperationError(
+                        "validation.failed",
+                        f"Validation failed: {len(repo_issues)} issue(s).",
+                        details=tuple(str(i) for i in repo_issues[:5]),
                     ),
                 )
 
@@ -752,7 +870,7 @@ class ContentOperationService:
 
         with request_lock(request_id, locks_dir, timeout=timeout):
             with provider_lock(provider_name, locks_dir, timeout=timeout):
-                # Mark as applying inside a transaction
+                # Step 1: Verify version and state under row lock (read-only — no save).
                 with transaction.atomic():
                     try:
                         cr = ContentChangeRequest.objects.select_for_update().get(request_id=request_id)
@@ -783,12 +901,46 @@ class ContentOperationService:
                                 assert_transition(current_state, LifecycleState.APPLYING)
                             except LifecycleError as exc:
                                 return ChangeRequestResult(ok=False, error=OperationError(exc.code, exc.message))
+                    # Row lock released here — no mutation yet.
 
+                # Step 2: Prepare rollback artifact BEFORE marking applying and BEFORE mutation.
+                adapter = get_adapter(provider_name)
+                if adapter is not None and adapter.supports_rollback:
+                    try:
+                        adapter.prepare(cr.workspace_changeset_id, changeset)
+                    except Exception as exc:
+                        _prep_err = str(exc)[:500]
+                        with transaction.atomic():
+                            cr2 = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
+                            cr2.lifecycle_state = LifecycleState.APPLY_FAILED.value
+                            cr2.request_version += 1
+                            cr2.last_error_code = "application.rollback_artifact_failed"
+                            cr2.last_error_summary = _prep_err
+                            cr2.save(update_fields=["lifecycle_state", "request_version", "last_error_code", "last_error_summary", "updated_at"])
+                            append_audit_event(
+                                change_request=cr2,
+                                event_type=AuditEventType.APPLICATION_FAILED,
+                                actor=user,
+                                previous_state=current_state.value,
+                                resulting_state=LifecycleState.APPLY_FAILED.value,
+                                provider=cr.provider_name,
+                                correlation_id=correlation_id,
+                                detail={"error_code": "application.rollback_artifact_failed", "error_summary": _prep_err},
+                            )
+                        return ChangeRequestResult(
+                            ok=False,
+                            error=OperationError("application.rollback_artifact_failed", "Failed to prepare rollback artifact; apply aborted."),
+                            request_id=request_id,
+                            lifecycle_state=LifecycleState.APPLY_FAILED.value,
+                        )
+
+                # Step 3: Mark applying now that the snapshot is ready.
+                with transaction.atomic():
+                    cr = ContentChangeRequest.objects.select_for_update().get(request_id=request_id)
                     cr.lifecycle_state = LifecycleState.APPLYING.value
                     cr.request_version += 1
                     cr.applied_by = user if (hasattr(user, "pk") and user.pk is not None) else None
                     cr.save(update_fields=["lifecycle_state", "request_version", "applied_by", "updated_at"])
-
                     append_audit_event(
                         change_request=cr,
                         event_type=AuditEventType.APPLICATION_STARTED,
@@ -798,18 +950,9 @@ class ContentOperationService:
                         provider=cr.provider_name,
                         correlation_id=correlation_id,
                     )
-                # Transaction committed — applying state is durable
+                # Applying state is now durable.
 
-                # Prepare reversible snapshot before mutation
-                adapter = get_adapter(provider_name)
-                if adapter is not None and adapter.supports_rollback:
-                    try:
-                        adapter.prepare(cr.workspace_changeset_id, changeset)
-                    except Exception:
-                        # Rollback support is best-effort; do not block application.
-                        pass
-
-                # Apply through router
+                # Step 4: Apply through router.
                 try:
                     apply_result = self._router.apply(changeset)
                 except Exception as exc:
@@ -857,36 +1000,63 @@ class ContentOperationService:
                         )
                     return ChangeRequestResult(ok=False, error=OperationError("application.conflicts", cr2.last_error_summary), request_id=request_id, lifecycle_state=LifecycleState.APPLY_FAILED.value)
 
-                # Record post-application hashes for rollback and reconciliation
-                post_hashes: dict[str, str] = {}
-                for item in apply_result.applied:
-                    post_hashes[item.id] = item.hash
+                # Steps 5+6: Record post-application state and persist result artifact.
+                # Any failure after a successful mutation → reconciliation_required.
+                _recon_needed = False
+                _recon_error = ""
+
                 if adapter is not None and adapter.supports_rollback:
                     try:
-                        adapter.record_applied(cr.workspace_changeset_id, post_hashes)
-                    except Exception:
-                        pass
+                        adapter.record_applied(cr.workspace_changeset_id)
+                    except Exception as exc:
+                        _recon_needed = True
+                        _recon_error = str(exc)[:500]
 
-                result_meta = {
-                    "applied_count": len(apply_result.applied),
-                    "correlation_id": correlation_id,
-                    "post_hashes": post_hashes,
-                }
-                try:
-                    self._workspace.save_application_result(cr.workspace_changeset_id, result_meta)
-                except Exception:
-                    # Non-fatal — DB state will still be marked applied below;
-                    # reconciliation may need to inspect this later.
-                    pass
+                _result_meta: dict = {}
+                if not _recon_needed:
+                    _result_meta = {
+                        "applied_count": len(apply_result.applied),
+                        "correlation_id": correlation_id,
+                    }
+                    try:
+                        self._workspace.save_application_result(cr.workspace_changeset_id, _result_meta)
+                    except Exception as exc:
+                        _recon_needed = True
+                        _recon_error = str(exc)[:500]
 
-                # Mark applied durably
+                if _recon_needed:
+                    with transaction.atomic():
+                        cr2 = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
+                        cr2.lifecycle_state = LifecycleState.RECONCILIATION_REQUIRED.value
+                        cr2.request_version += 1
+                        cr2.last_error_code = "application.reconciliation_required"
+                        cr2.last_error_summary = _recon_error
+                        cr2.save(update_fields=["lifecycle_state", "request_version", "last_error_code", "last_error_summary", "updated_at"])
+                        append_audit_event(
+                            change_request=cr2,
+                            event_type=AuditEventType.APPLICATION_FAILED,
+                            actor=user,
+                            previous_state=LifecycleState.APPLYING.value,
+                            resulting_state=LifecycleState.RECONCILIATION_REQUIRED.value,
+                            provider=cr.provider_name,
+                            correlation_id=correlation_id,
+                            detail={"error_code": "application.reconciliation_required", "error_summary": _recon_error},
+                        )
+                    return ChangeRequestResult(
+                        ok=False,
+                        error=OperationError("application.reconciliation_required", "Post-application persistence failed; reconciliation required."),
+                        request_id=request_id,
+                        lifecycle_state=LifecycleState.RECONCILIATION_REQUIRED.value,
+                    )
+
+                # Step 7: Mark applied durably.
                 with transaction.atomic():
                     cr2 = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
                     cr2.lifecycle_state = LifecycleState.APPLIED.value
                     cr2.request_version += 1
                     cr2.applied_at = datetime.now(timezone.utc)
                     cr2.application_result_meta = {
-                        "applied_count": result_meta["applied_count"],
+                        "applied_count": _result_meta["applied_count"],
                         "correlation_id": correlation_id,
                     }
                     cr2.last_error_code = ""
@@ -903,7 +1073,7 @@ class ContentOperationService:
                         resulting_state=LifecycleState.APPLIED.value,
                         provider=cr.provider_name,
                         correlation_id=correlation_id,
-                        detail={"applied_count": result_meta["applied_count"]},
+                        detail={"applied_count": _result_meta["applied_count"]},
                     )
 
         return ChangeRequestResult(ok=True, request_id=request_id, lifecycle_state=LifecycleState.APPLIED.value, request_version=cr2.request_version)

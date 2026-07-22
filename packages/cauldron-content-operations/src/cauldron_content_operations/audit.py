@@ -4,10 +4,14 @@ from __future__ import annotations
 import uuid
 from typing import Any, Optional
 
-from django.db import IntegrityError
+from django.db import IntegrityError, transaction
 from django.db.models import Max
 
 from .models import ContentAuditEvent, ContentChangeRequest
+
+
+class AuditSequenceError(Exception):
+    """Raised when a valid audit sequence number cannot be allocated."""
 
 
 class AuditEventType:
@@ -31,6 +35,9 @@ class AuditEventType:
     CONTENT_VIEWED = "content.viewed"
 
 
+_MAX_RETRIES = 3
+
+
 def append_audit_event(
     *,
     change_request: ContentChangeRequest,
@@ -46,8 +53,9 @@ def append_audit_event(
 
     Must be called inside an active transaction where the caller has already
     obtained ``select_for_update()`` on the change request. The sequence
-    number is computed as ``MAX(sequence) + 1`` under that lock to avoid the
-    race that plain ``count()+1`` would introduce.
+    number is computed as ``MAX(sequence) + 1`` under that lock. On
+    IntegrityError from a race, the INSERT is retried inside a fresh
+    savepoint so the outer transaction stays valid.
     """
 
     def _next_seq() -> int:
@@ -58,25 +66,36 @@ def append_audit_event(
         )
         return int(max_seq or 0) + 1
 
-    event = ContentAuditEvent(
-        event_id=str(uuid.uuid4()),
-        change_request=change_request,
-        sequence=_next_seq(),
-        event_type=event_type,
-        actor=actor if (hasattr(actor, "pk") and actor.pk is not None) else None,
-        previous_state=previous_state,
-        resulting_state=resulting_state,
-        provider=provider,
-        detail=detail or {},
-        correlation_id=correlation_id,
-    )
-    try:
-        event.save()
-        return event
-    except IntegrityError:
-        # Rare race: another writer beat us on the (change_request, sequence)
-        # UniqueConstraint. Recompute and try again exactly once.
-        event.sequence = _next_seq()
-        event.event_id = str(uuid.uuid4())
-        event.save()
-        return event
+    last_exc: Optional[Exception] = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            with transaction.atomic():
+                event = ContentAuditEvent(
+                    event_id=str(uuid.uuid4()),
+                    change_request=change_request,
+                    sequence=_next_seq(),
+                    event_type=event_type,
+                    actor=actor if (hasattr(actor, "pk") and actor.pk is not None) else None,
+                    previous_state=previous_state,
+                    resulting_state=resulting_state,
+                    provider=provider,
+                    detail=detail or {},
+                    correlation_id=correlation_id,
+                )
+                event.save()
+                return event
+        except IntegrityError as exc:
+            last_exc = exc
+            if attempt == _MAX_RETRIES - 1:
+                raise AuditSequenceError(
+                    "Failed to allocate audit sequence after retries."
+                ) from exc
+            # Loop and try again with a new savepoint and freshly computed sequence.
+            continue
+
+    # Should not be reachable.
+    if last_exc is not None:
+        raise AuditSequenceError(
+            "Failed to allocate audit sequence after retries."
+        ) from last_exc
+    raise AuditSequenceError("Failed to allocate audit sequence after retries.")

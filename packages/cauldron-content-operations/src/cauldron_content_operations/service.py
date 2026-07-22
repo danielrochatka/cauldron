@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 
 from .audit import AuditEventType, append_audit_event
 from .config import ContentOperationsConfig, get_operations_config
@@ -100,8 +100,116 @@ def _build_detail(change_request: ContentChangeRequest) -> ChangeRequestDetail:
 
 
 def _compute_payload_hash(operations_data: list[dict]) -> str:
+    """Legacy hasher retained only for tests that inspect deterministic dicts.
+
+    Production code paths use ``compute_changeset_hash`` on the persisted
+    ContentChangeSet (see :func:`_compute_canonical_changeset_hash`).
+    """
     payload_str = json.dumps(operations_data, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(payload_str.encode()).hexdigest()
+
+
+def _compute_canonical_changeset_hash(changeset: Any) -> str:
+    """Compute the canonical hash of a ContentChangeSet.
+
+    Falls back to a local implementation if ``cauldron_workspace_flatfile`` is
+    unavailable (e.g. tests without the workspace package installed).
+    """
+    try:
+        from cauldron_workspace_flatfile.store import compute_changeset_hash
+        return compute_changeset_hash(changeset)
+    except Exception:
+        # Fallback: hash a deterministic representation.
+        ops = []
+        for op in changeset.operations:
+            kind = op.kind.value if hasattr(op.kind, "value") else str(op.kind)
+            status = op.status.value if hasattr(op.status, "value") else str(op.status)
+            ops.append({
+                "body": op.body or "",
+                "collection": op.collection or "",
+                "data": dict(op.data or {}),
+                "expected_hash": op.expected_hash or "",
+                "force": False,
+                "item_id": op.item_id or "",
+                "kind": kind,
+                "provider": op.provider or "",
+                "schema": op.schema or "",
+                "slug": op.slug or "",
+                "status": status,
+            })
+        payload = {"operations": ops}
+        serialized = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _load_workspace_changeset_with_integrity(
+    workspace: Any,
+    cs_id: str,
+    expected_hash: str,
+) -> tuple[Any, Optional[OperationError]]:
+    """Load a changeset and verify it against the expected canonical hash.
+
+    Returns (changeset, None) on success, or (None, error) on integrity failure
+    or force-tampering. Any operation with force=True in the persisted payload
+    is rejected because public proposals must never carry force through.
+    """
+    # Prefer load_changeset_with_hash when the workspace supports it; fall back
+    # to load_changeset + local canonical hashing otherwise. This keeps tests
+    # that mock only load_changeset() working.
+    try:
+        if hasattr(workspace, "load_changeset_with_hash"):
+            loaded = workspace.load_changeset_with_hash(cs_id)
+            # MagicMock will return a MagicMock, not a tuple. Guard against that.
+            if (
+                isinstance(loaded, tuple)
+                and len(loaded) == 2
+                and isinstance(loaded[1], str)
+            ):
+                changeset, actual_hash = loaded
+            else:
+                changeset = workspace.load_changeset(cs_id)
+                actual_hash = _compute_canonical_changeset_hash(changeset)
+        else:
+            changeset = workspace.load_changeset(cs_id)
+            actual_hash = _compute_canonical_changeset_hash(changeset)
+    except Exception as exc:
+        return None, OperationError(
+            "workspace.load_failed",
+            f"Failed to load proposal: {str(exc)[:200]}",
+        )
+
+    # Detect manual force tampering.
+    for op in getattr(changeset, "operations", ()) or ():
+        if bool(getattr(op, "force", False)):
+            return None, OperationError(
+                "workspace.force_not_allowed",
+                "Persisted changeset contains a force=True operation; refusing.",
+            )
+
+    if expected_hash and actual_hash and actual_hash != expected_hash:
+        return None, OperationError(
+            "workspace.payload_integrity_mismatch",
+            "Persisted workspace payload does not match the recorded hash.",
+        )
+    return changeset, None
+
+
+def _safe_workspace_transition(workspace: Any, cs_id: str, new_state: Any) -> None:
+    """Best-effort workspace state transition, silencing recoverable errors.
+
+    Workspace state is informational for validation/rejection/approval; SQL is
+    authoritative. Callers that need to escalate a failure (apply/rollback)
+    should call ``workspace.transition`` directly.
+    """
+    if workspace is None:
+        return
+    try:
+        workspace.transition(cs_id, new_state)
+    except Exception:
+        # Do not block SQL lifecycle progression on workspace observability failures.
+        pass
 
 
 def _require_positive_version(expected_version: Any) -> Optional[ChangeRequestResult]:
@@ -220,6 +328,16 @@ class ContentOperationService:
     ) -> ChangeRequestResult:
         _check_permission(user, "propose_content_changes")
 
+        # Item 3: workspace is mandatory for proposals — refuse fast, no side effects.
+        if self._workspace is None:
+            return ChangeRequestResult(
+                ok=False,
+                error=OperationError(
+                    "workspace.unavailable",
+                    "Workspace is required for content proposals.",
+                ),
+            )
+
         cfg = self._config
         if not isinstance(operations, list) or len(operations) == 0:
             return ChangeRequestResult(
@@ -238,16 +356,31 @@ class ContentOperationService:
                 ),
             )
 
-        # Mixed-provider detection: reject proposals that would touch more than
-        # one provider so callers must submit separate change requests per provider.
+        # Item 2: validate operation dict shape, resolve providers, and enforce
+        # a single authoritative provider per proposal.
         providers_seen: set[str] = set()
-        for op_data in operations:
+        for i, op_data in enumerate(operations):
+            if not isinstance(op_data, dict):
+                return ChangeRequestResult(
+                    ok=False,
+                    error=OperationError(
+                        "operations.invalid_operation",
+                        f"Operation {i} must be a JSON object.",
+                    ),
+                )
             try:
-                provider = self._router.resolve_provider(op_data.get("collection", ""))
-                providers_seen.add(provider)
-            except Exception:
-                # Routing errors surface later during validation; do not fail here.
-                pass
+                routed = self._router.resolve_provider(op_data.get("collection", ""))
+            except Exception as exc:
+                return ChangeRequestResult(
+                    ok=False,
+                    error=OperationError(
+                        "operations.unroutable_collection",
+                        f"Cannot route collection "
+                        f"{op_data.get('collection', '')!r}: {str(exc)[:120]}",
+                    ),
+                )
+            providers_seen.add(routed)
+
         if len(providers_seen) > 1:
             return ChangeRequestResult(
                 ok=False,
@@ -257,6 +390,21 @@ class ContentOperationService:
                     "Split operations by provider.",
                 ),
             )
+
+        # Authoritative provider is whatever routing resolved to.
+        routed_provider = next(iter(providers_seen))
+
+        # If the caller asserted a provider, it must match routing.
+        if provider_name and provider_name != routed_provider:
+            return ChangeRequestResult(
+                ok=False,
+                error=OperationError(
+                    "operations.provider_mismatch",
+                    f"Caller asserted {provider_name!r} but routing resolved to "
+                    f"{routed_provider!r}.",
+                ),
+            )
+        authoritative_provider = routed_provider
 
         # Reject the force field and invalid status before any workspace or DB writes.
         from cauldron_content.contracts import ContentStatus as _CS
@@ -281,9 +429,57 @@ class ContentOperationService:
                     ),
                 )
 
-        payload_hash = _compute_payload_hash(operations)
+        # Build the ContentChangeSet up-front so we can compute the canonical
+        # hash independent of caller-dict key ordering.
+        from cauldron_content.contracts import (
+            ContentChangeSet,
+            ContentOperation,
+            ContentOperationKind,
+            ContentStatus,
+        )
 
-        # Idempotency check — scoped to (creator, key).
+        ops: list = []
+        for op_data in operations:
+            kind_str = op_data.get("kind", "create")
+            try:
+                kind = ContentOperationKind(kind_str)
+            except ValueError:
+                return ChangeRequestResult(
+                    ok=False,
+                    error=OperationError(
+                        code="operations.invalid_kind",
+                        message=f"Invalid operation kind: {kind_str!r}",
+                    ),
+                )
+            status = ContentStatus(op_data.get("status", "draft"))
+            ops.append(ContentOperation(
+                kind=kind,
+                # Item 2: force the authoritative provider on every op.
+                provider=authoritative_provider,
+                collection=op_data.get("collection", ""),
+                item_id=op_data.get("item_id", ""),
+                slug=op_data.get("slug", ""),
+                expected_hash=op_data.get("expected_hash", ""),
+                data=op_data.get("data", {}),
+                body=op_data.get("body", ""),
+                schema=op_data.get("schema", ""),
+                status=status,
+                force=False,
+            ))
+
+        request_id = str(uuid.uuid4())
+        cs_id = str(uuid.uuid4())
+        changeset = ContentChangeSet(
+            id=cs_id,
+            operations=tuple(ops),
+            author=str(user.get_username()) if hasattr(user, "get_username") else str(user),
+            description=description,
+        )
+
+        # Item 1: canonical hash on the built changeset, not caller dict.
+        payload_hash = _compute_canonical_changeset_hash(changeset)
+
+        # Idempotency check — scoped to (creator, key). Uses canonical hash.
         if idempotency_key:
             user_pk = getattr(user, "pk", None)
             qs = ContentChangeRequest.objects.filter(idempotency_key=idempotency_key)
@@ -307,82 +503,85 @@ class ContentOperationService:
                     meta={"idempotent": True},
                 )
 
-        request_id = str(uuid.uuid4())
-        cs_id = str(uuid.uuid4())
+        # Persist to workspace first, then to SQL. On integrity error at SQL
+        # insert (concurrent idempotency-key insert), clean up the orphan and
+        # return the winning record.
+        try:
+            self._workspace.create(changeset)
+        except Exception as exc:
+            return ChangeRequestResult(
+                ok=False,
+                error=OperationError(
+                    code="workspace.create_failed",
+                    message="Failed to create workspace change set.",
+                    details=(str(exc)[:200],),
+                ),
+            )
 
-        if self._workspace is not None:
+        # Item 13: concurrent-insert race — wrap SQL create in a savepoint and
+        # handle the (creator, idempotency_key) UniqueConstraint gracefully.
+        try:
+            with transaction.atomic():
+                cr = ContentChangeRequest.objects.create(
+                    request_id=request_id,
+                    workspace_changeset_id=cs_id,
+                    provider_name=authoritative_provider,
+                    lifecycle_state=LifecycleState.PROPOSED.value,
+                    payload_hash=payload_hash,
+                    idempotency_key=idempotency_key,
+                    created_by=user if (hasattr(user, "pk") and user.pk is not None) else None,
+                )
+                append_audit_event(
+                    change_request=cr,
+                    event_type=AuditEventType.PROPOSAL_CREATED,
+                    actor=user,
+                    resulting_state=LifecycleState.PROPOSED.value,
+                    provider=authoritative_provider,
+                    correlation_id=request_id,
+                )
+        except IntegrityError:
+            # Someone else won the concurrent insert. Clean up our workspace
+            # orphan (never the winner's) and re-query the winner.
             try:
-                from cauldron_content.contracts import (
-                    ContentChangeSet,
-                    ContentOperation,
-                    ContentOperationKind,
-                    ContentStatus,
-                )
-
-                ops = []
-                for op_data in operations:
-                    kind_str = op_data.get("kind", "create")
-                    try:
-                        kind = ContentOperationKind(kind_str)
-                    except ValueError:
-                        return ChangeRequestResult(
-                            ok=False,
-                            error=OperationError(
-                                code="operations.invalid_kind",
-                                message=f"Invalid operation kind: {kind_str!r}",
-                            ),
-                        )
-                    # status already validated above; no coercion needed.
-                    status = ContentStatus(op_data.get("status", "draft"))
-
-                    ops.append(ContentOperation(
-                        kind=kind,
-                        provider=op_data.get("provider", provider_name),
-                        collection=op_data.get("collection", ""),
-                        item_id=op_data.get("item_id", ""),
-                        slug=op_data.get("slug", ""),
-                        expected_hash=op_data.get("expected_hash", ""),
-                        data=op_data.get("data", {}),
-                        body=op_data.get("body", ""),
-                        schema=op_data.get("schema", ""),
-                        status=status,
-                        force=False,  # never accept caller-supplied force
-                    ))
-
-                changeset = ContentChangeSet(
-                    id=cs_id,
-                    operations=tuple(ops),
-                    author=str(user.get_username()) if hasattr(user, "get_username") else str(user),
-                    description=description,
-                )
-                self._workspace.create(changeset)
-            except Exception as exc:
+                if hasattr(self._workspace, "cleanup_orphan"):
+                    self._workspace.cleanup_orphan(cs_id)
+            except Exception:
+                pass
+            if not idempotency_key:
                 return ChangeRequestResult(
                     ok=False,
                     error=OperationError(
-                        code="workspace.create_failed",
-                        message="Failed to create workspace change set.",
-                        details=(str(exc)[:200],),
+                        "idempotency.create_conflict",
+                        "Concurrent create conflict; retry with an idempotency key.",
                     ),
                 )
-
-        with transaction.atomic():
-            cr = ContentChangeRequest.objects.create(
-                request_id=request_id,
-                workspace_changeset_id=cs_id,
-                provider_name=provider_name,
-                lifecycle_state=LifecycleState.PROPOSED.value,
-                payload_hash=payload_hash,
-                idempotency_key=idempotency_key,
-                created_by=user if (hasattr(user, "pk") and user.pk is not None) else None,
-            )
-            append_audit_event(
-                change_request=cr,
-                event_type=AuditEventType.PROPOSAL_CREATED,
-                actor=user,
-                resulting_state=LifecycleState.PROPOSED.value,
-                provider=provider_name,
-                correlation_id=request_id,
+            user_pk = getattr(user, "pk", None)
+            qs = ContentChangeRequest.objects.filter(idempotency_key=idempotency_key)
+            if user_pk is not None:
+                qs = qs.filter(created_by_id=user_pk)
+            winner = qs.first()
+            if winner is None:
+                return ChangeRequestResult(
+                    ok=False,
+                    error=OperationError(
+                        "idempotency.create_conflict",
+                        "Concurrent create conflict and winning record not found.",
+                    ),
+                )
+            if winner.payload_hash and winner.payload_hash != payload_hash:
+                return ChangeRequestResult(
+                    ok=False,
+                    error=OperationError(
+                        "idempotency.payload_mismatch",
+                        "Idempotency key reused with a different payload.",
+                    ),
+                )
+            return ChangeRequestResult(
+                ok=True,
+                request_id=winner.request_id,
+                lifecycle_state=winner.lifecycle_state,
+                request_version=winner.request_version,
+                meta={"idempotent": True},
             )
 
         return ChangeRequestResult(
@@ -482,16 +681,24 @@ class ContentOperationService:
                         "Workspace is not configured; cannot validate proposal.",
                     ),
                 )
-            try:
-                changeset = self._workspace.load_changeset(cr.workspace_changeset_id)
-            except Exception as exc:
-                return ChangeRequestResult(
-                    ok=False,
-                    error=OperationError(
-                        "workspace.load_failed",
-                        f"Failed to load proposal: {str(exc)[:200]}",
-                    ),
+            changeset, load_err = _load_workspace_changeset_with_integrity(
+                self._workspace, cr.workspace_changeset_id, cr.payload_hash,
+            )
+            if load_err is not None:
+                # Audit the mismatch and bail without state mutation.
+                append_audit_event(
+                    change_request=cr,
+                    event_type=AuditEventType.VALIDATION_FAILED,
+                    actor=user,
+                    previous_state=current_state.value,
+                    resulting_state=current_state.value,
+                    correlation_id=correlation_id,
+                    detail={
+                        "error_code": load_err.code,
+                        "error_summary": load_err.message[:200],
+                    },
                 )
+                return ChangeRequestResult(ok=False, error=load_err)
 
             if not changeset.operations:
                 return ChangeRequestResult(
@@ -669,6 +876,15 @@ class ContentOperationService:
                 correlation_id=correlation_id,
             )
 
+        # Item 14: mirror the workspace manifest state (best-effort).
+        try:
+            from cauldron_workspace_flatfile.store import ChangeSetState as _WsState
+            _safe_workspace_transition(
+                self._workspace, cr.workspace_changeset_id, _WsState.VALIDATED,
+            )
+        except Exception:
+            pass
+
         return ChangeRequestResult(
             ok=True,
             request_id=request_id,
@@ -788,6 +1004,15 @@ class ContentOperationService:
                 detail={"reason": reason[:500] if reason else ""},
             )
 
+        # Item 14: mirror rejection to the workspace manifest.
+        try:
+            from cauldron_workspace_flatfile.store import ChangeSetState as _WsState
+            _safe_workspace_transition(
+                self._workspace, cr.workspace_changeset_id, _WsState.REJECTED,
+            )
+        except Exception:
+            pass
+
         return ChangeRequestResult(ok=True, request_id=request_id, lifecycle_state=LifecycleState.REJECTED.value, request_version=cr.request_version)
 
     def apply_change_request(
@@ -827,18 +1052,30 @@ class ContentOperationService:
                 ),
             )
 
-        # Load changeset via the public workspace API so we can determine the
-        # provider before acquiring locks.
-        try:
-            changeset = self._workspace.load_changeset(cr_check.workspace_changeset_id)
-        except Exception as exc:
-            return ChangeRequestResult(
-                ok=False,
-                error=OperationError(
-                    "workspace.load_failed",
-                    f"Failed to load proposal: {str(exc)[:200]}",
-                ),
-            )
+        # Load changeset with integrity check (Item 1). Also refuses persisted
+        # force=True operations.
+        changeset, load_err = _load_workspace_changeset_with_integrity(
+            self._workspace, cr_check.workspace_changeset_id, cr_check.payload_hash,
+        )
+        if load_err is not None:
+            try:
+                cr_audit = ContentChangeRequest.objects.get(request_id=request_id)
+                append_audit_event(
+                    change_request=cr_audit,
+                    event_type=AuditEventType.APPLICATION_FAILED,
+                    actor=user,
+                    previous_state=cr_audit.lifecycle_state,
+                    resulting_state=cr_audit.lifecycle_state,
+                    provider=cr_audit.provider_name,
+                    correlation_id=correlation_id,
+                    detail={
+                        "error_code": load_err.code,
+                        "error_summary": load_err.message[:200],
+                    },
+                )
+            except Exception:
+                pass
+            return ChangeRequestResult(ok=False, error=load_err)
 
         providers_seen: set[str] = set()
         for op in changeset.operations:
@@ -854,7 +1091,8 @@ class ContentOperationService:
                     "Mixed providers not supported in a single change request.",
                 ),
             )
-        provider_name = next(iter(providers_seen)) if providers_seen else cr_check.provider_name
+        # Authoritative provider is what SQL stored at proposal creation.
+        provider_name = cr_check.provider_name
 
         locks_dir = self._resolved_locks_dir()
         if locks_dir is None:
@@ -973,6 +1211,13 @@ class ContentOperationService:
                             correlation_id=correlation_id,
                             detail={"error_code": "application.exception", "error_summary": str(exc)[:200]},
                         )
+                    try:
+                        from cauldron_workspace_flatfile.store import ChangeSetState as _WsState
+                        _safe_workspace_transition(
+                            self._workspace, cr.workspace_changeset_id, _WsState.FAILED,
+                        )
+                    except Exception:
+                        pass
                     return ChangeRequestResult(ok=False, error=OperationError("application.exception", "Application failed."), request_id=request_id, lifecycle_state=LifecycleState.APPLY_FAILED.value)
 
                 if not apply_result.success:
@@ -1076,6 +1321,15 @@ class ContentOperationService:
                         detail={"applied_count": _result_meta["applied_count"]},
                     )
 
+                # Item 14: mirror apply success in workspace manifest.
+                try:
+                    from cauldron_workspace_flatfile.store import ChangeSetState as _WsState
+                    _safe_workspace_transition(
+                        self._workspace, cr.workspace_changeset_id, _WsState.APPLIED,
+                    )
+                except Exception:
+                    pass
+
         return ChangeRequestResult(ok=True, request_id=request_id, lifecycle_state=LifecycleState.APPLIED.value, request_version=cr2.request_version)
 
     def rollback_change_request(
@@ -1090,6 +1344,15 @@ class ContentOperationService:
         version_err = _require_positive_version(expected_version)
         if version_err:
             return version_err
+        # Item 6: enforce superuser check before touching any state.
+        if force and not getattr(user, "is_superuser", False):
+            return ChangeRequestResult(
+                ok=False,
+                error=OperationError(
+                    "rollback.force_requires_superuser",
+                    "Forced rollback requires superuser privileges.",
+                ),
+            )
         correlation_id = str(uuid.uuid4())
 
         try:
@@ -1181,6 +1444,9 @@ class ContentOperationService:
                     )
 
                 # Perform rollback via adapter (outside DB transaction)
+                rollback_ok = False
+                rollback_error = ""
+                rollback_error_code = "rollback.failed"
                 try:
                     adapter.rollback(
                         cr.workspace_changeset_id,
@@ -1188,27 +1454,48 @@ class ContentOperationService:
                         is_superuser=bool(getattr(user, "is_superuser", False)),
                     )
                     rollback_ok = True
-                    rollback_error = ""
                 except PermissionError as exc:
-                    rollback_ok = False
                     rollback_error = str(exc)
+                    rollback_error_code = "rollback.force_requires_superuser"
                 except Exception as exc:
-                    rollback_ok = False
+                    # Detect the "post state unavailable" branch from Item 6.
+                    exc_type_name = type(exc).__name__
+                    if exc_type_name == "RollbackPostStateUnavailable":
+                        rollback_error_code = "rollback.post_state_unavailable"
                     rollback_error = str(exc)[:500]
 
-                # Record rollback result artifact
+                # Item 9: verify state, then persist result. Any failure after
+                # a successful rollback → reconciliation_required.
+                verification_failed = False
+                verification_reason = ""
+                persistence_failed = False
+                persistence_reason = ""
                 if rollback_ok:
                     try:
-                        self._workspace.save_rollback_result(
-                            cr.workspace_changeset_id,
-                            {"correlation_id": correlation_id},
-                        )
-                    except Exception:
-                        pass
+                        vr = adapter.verify_rolled_back_state(cr.workspace_changeset_id)
+                        if getattr(vr, "status", "") != "verified":
+                            verification_failed = True
+                            verification_reason = getattr(vr, "reason", "") or "verification failed"
+                    except Exception as exc:
+                        # An adapter without the verify method is acceptable.
+                        # A raised exception is not.
+                        if not isinstance(exc, AttributeError):
+                            verification_failed = True
+                            verification_reason = str(exc)[:200]
+
+                    if not verification_failed:
+                        try:
+                            self._workspace.save_rollback_result(
+                                cr.workspace_changeset_id,
+                                {"correlation_id": correlation_id},
+                            )
+                        except Exception as exc:
+                            persistence_failed = True
+                            persistence_reason = str(exc)[:200]
 
                 with transaction.atomic():
                     cr2 = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
-                    if rollback_ok:
+                    if rollback_ok and not verification_failed and not persistence_failed:
                         cr2.lifecycle_state = LifecycleState.ROLLED_BACK.value
                         cr2.rolled_back_at = datetime.now(timezone.utc)
                         cr2.last_error_code = ""
@@ -1224,9 +1511,31 @@ class ContentOperationService:
                             provider=cr.provider_name,
                             correlation_id=correlation_id,
                         )
+                    elif rollback_ok and (verification_failed or persistence_failed):
+                        # Post-mutation reconciliation branch (Item 9).
+                        code = (
+                            "rollback.verification_failed" if verification_failed
+                            else "rollback.result_persistence_failed"
+                        )
+                        summary = verification_reason if verification_failed else persistence_reason
+                        cr2.lifecycle_state = LifecycleState.RECONCILIATION_REQUIRED.value
+                        cr2.last_error_code = code
+                        cr2.last_error_summary = summary
+                        cr2.request_version += 1
+                        cr2.save(update_fields=["lifecycle_state", "last_error_code", "last_error_summary", "request_version", "updated_at"])
+                        append_audit_event(
+                            change_request=cr2,
+                            event_type=AuditEventType.RECONCILIATION_FAILED,
+                            actor=user,
+                            previous_state=LifecycleState.ROLLING_BACK.value,
+                            resulting_state=LifecycleState.RECONCILIATION_REQUIRED.value,
+                            provider=cr.provider_name,
+                            correlation_id=correlation_id,
+                            detail={"error_code": code, "error_summary": summary},
+                        )
                     else:
                         cr2.lifecycle_state = LifecycleState.ROLLBACK_FAILED.value
-                        cr2.last_error_code = "rollback.failed"
+                        cr2.last_error_code = rollback_error_code
                         cr2.last_error_summary = rollback_error
                         cr2.request_version += 1
                         cr2.save(update_fields=["lifecycle_state", "last_error_code", "last_error_summary", "request_version", "updated_at"])
@@ -1238,12 +1547,24 @@ class ContentOperationService:
                             resulting_state=LifecycleState.ROLLBACK_FAILED.value,
                             provider=cr.provider_name,
                             correlation_id=correlation_id,
-                            detail={"error_summary": rollback_error},
+                            detail={"error_summary": rollback_error, "error_code": rollback_error_code},
                         )
 
-        if rollback_ok:
+        if rollback_ok and not verification_failed and not persistence_failed:
             return ChangeRequestResult(ok=True, request_id=request_id, lifecycle_state=LifecycleState.ROLLED_BACK.value, request_version=cr2.request_version)
-        return ChangeRequestResult(ok=False, error=OperationError("rollback.failed", rollback_error), request_id=request_id, lifecycle_state=LifecycleState.ROLLBACK_FAILED.value)
+        if rollback_ok and (verification_failed or persistence_failed):
+            code = (
+                "rollback.verification_failed" if verification_failed
+                else "rollback.result_persistence_failed"
+            )
+            summary = verification_reason if verification_failed else persistence_reason
+            return ChangeRequestResult(
+                ok=False,
+                error=OperationError(code, summary or code),
+                request_id=request_id,
+                lifecycle_state=LifecycleState.RECONCILIATION_REQUIRED.value,
+            )
+        return ChangeRequestResult(ok=False, error=OperationError(rollback_error_code, rollback_error), request_id=request_id, lifecycle_state=LifecycleState.ROLLBACK_FAILED.value)
 
     def get_audit_history(
         self,
@@ -1288,9 +1609,11 @@ class ContentOperationService:
 
         if self._workspace is None:
             return None
-        try:
-            changeset = self._workspace.load_changeset(cr.workspace_changeset_id)
-        except Exception:
+        # Item 1: preview must operate on integrity-verified payload.
+        changeset, load_err = _load_workspace_changeset_with_integrity(
+            self._workspace, cr.workspace_changeset_id, cr.payload_hash,
+        )
+        if load_err is not None or changeset is None:
             return None
 
         previews = []
@@ -1423,23 +1746,58 @@ class ContentOperationService:
         if state == LifecycleState.APPLYING.value:
             if app_result and app_result.get("result_type") == "applied":
                 if adapter is not None:
-                    post_hashes = app_result.get("post_hashes", {}) or {}
-                    if post_hashes and not self._verify_post_hashes(cr, post_hashes):
+                    try:
+                        vr = adapter.verify_applied_state(cr.workspace_changeset_id)
+                    except Exception as exc:
                         entry["action"] = "leave_ambiguous"
-                        entry["reason"] = "Post-application hashes do not match current state."
+                        entry["reason"] = f"Verification error: {str(exc)[:120]}"
+                        return
+                    if vr.status != "verified":
+                        entry["action"] = "leave_ambiguous"
+                        entry["reason"] = f"Applied state {vr.status}: {vr.reason[:120]}"
                         return
                 entry["action"] = "would_finalize_applied"
-                entry["reason"] = "Application result present."
+                entry["reason"] = "Application result present and provider state verified."
             else:
                 entry["action"] = "leave_ambiguous"
                 entry["reason"] = "No confirmed application result found."
         elif state == LifecycleState.ROLLING_BACK.value:
             if rb_result and rb_result.get("result_type") == "rolled_back":
+                if adapter is not None:
+                    try:
+                        vr = adapter.verify_rolled_back_state(cr.workspace_changeset_id)
+                    except Exception as exc:
+                        entry["action"] = "leave_ambiguous"
+                        entry["reason"] = f"Verification error: {str(exc)[:120]}"
+                        return
+                    if vr.status != "verified":
+                        entry["action"] = "leave_ambiguous"
+                        entry["reason"] = f"Rollback state {vr.status}: {vr.reason[:120]}"
+                        return
                 entry["action"] = "would_finalize_rolled_back"
-                entry["reason"] = "Rollback result present."
+                entry["reason"] = "Rollback result present and provider state verified."
             else:
                 entry["action"] = "leave_ambiguous"
                 entry["reason"] = "No confirmed rollback result found."
+        elif state == LifecycleState.RECONCILIATION_REQUIRED.value:
+            # Try to disambiguate: prefer proven applied, then proven rolled_back.
+            if adapter is not None:
+                try:
+                    vapp = adapter.verify_applied_state(cr.workspace_changeset_id)
+                    vrb = adapter.verify_rolled_back_state(cr.workspace_changeset_id)
+                except Exception:
+                    vapp = None
+                    vrb = None
+                if vapp is not None and vapp.status == "verified" and app_result:
+                    entry["action"] = "would_finalize_applied"
+                    entry["reason"] = "Verified applied state via provider."
+                    return
+                if vrb is not None and vrb.status == "verified" and rb_result:
+                    entry["action"] = "would_finalize_rolled_back"
+                    entry["reason"] = "Verified rolled-back state via provider."
+                    return
+            entry["action"] = "requires_manual_review"
+            entry["reason"] = "State remains ambiguous — needs manual review."
         else:
             entry["action"] = "requires_manual_review"
             entry["reason"] = f"State {state!r} requires manual review."
@@ -1474,52 +1832,82 @@ class ContentOperationService:
         )
 
         if state == LifecycleState.APPLYING.value:
-            if app_result and app_result.get("result_type") == "applied":
-                post_hashes = app_result.get("post_hashes", {}) or {}
-                hashes_match = True
-                if adapter is not None and post_hashes:
-                    hashes_match = self._verify_post_hashes(cr, post_hashes)
-                if hashes_match:
-                    entry["action"] = "finalize_applied"
-                    self._finalize_applied(cr, user, app_result)
-                    entry["applied"] = True
-                else:
-                    entry["action"] = "leave_ambiguous"
-                    entry["reason"] = "Post-application hashes do not match current state."
-                    self._mark_reconciliation_required(cr, user)
+            typed_applied = bool(app_result and app_result.get("result_type") == "applied")
+            verified = False
+            reason = ""
+            if typed_applied and adapter is not None:
+                try:
+                    vr = adapter.verify_applied_state(cr.workspace_changeset_id)
+                    verified = vr.status == "verified"
+                    reason = vr.reason
+                except Exception as exc:
+                    verified = False
+                    reason = str(exc)[:120]
+            if typed_applied and verified:
+                entry["action"] = "finalize_applied"
+                self._finalize_applied(cr, user, app_result)
+                entry["applied"] = True
             else:
                 entry["action"] = "leave_ambiguous"
-                entry["reason"] = "No confirmed application result found."
+                entry["reason"] = (
+                    "No confirmed application result found."
+                    if not typed_applied else
+                    f"Provider verification failed: {reason[:120]}"
+                )
                 self._mark_reconciliation_required(cr, user)
         elif state == LifecycleState.ROLLING_BACK.value:
-            # NEVER finalize rolling_back as applied based on application result.
-            if rb_result and rb_result.get("result_type") == "rolled_back":
+            # NEVER finalize rolling_back as applied.
+            typed_rb = bool(rb_result and rb_result.get("result_type") == "rolled_back")
+            verified = False
+            reason = ""
+            if typed_rb and adapter is not None:
+                try:
+                    vr = adapter.verify_rolled_back_state(cr.workspace_changeset_id)
+                    verified = vr.status == "verified"
+                    reason = vr.reason
+                except Exception as exc:
+                    verified = False
+                    reason = str(exc)[:120]
+            if typed_rb and verified:
+                # Guard: never rewrite rolling_back → applied.
+                assert cr.lifecycle_state != LifecycleState.APPLIED.value
                 entry["action"] = "finalize_rolled_back"
                 self._finalize_rolled_back(cr, user, rb_result)
                 entry["applied"] = True
             else:
                 entry["action"] = "leave_ambiguous"
-                entry["reason"] = "No confirmed rollback result found."
+                entry["reason"] = (
+                    "No confirmed rollback result found."
+                    if not typed_rb else
+                    f"Provider verification failed: {reason[:120]}"
+                )
                 self._mark_reconciliation_required(cr, user)
+        elif state == LifecycleState.RECONCILIATION_REQUIRED.value:
+            # Attempt safe disambiguation using provider verification.
+            if adapter is not None:
+                try:
+                    vapp = adapter.verify_applied_state(cr.workspace_changeset_id)
+                except Exception:
+                    vapp = None
+                try:
+                    vrb = adapter.verify_rolled_back_state(cr.workspace_changeset_id)
+                except Exception:
+                    vrb = None
+                if vapp is not None and vapp.status == "verified" and app_result:
+                    entry["action"] = "finalize_applied"
+                    self._finalize_applied(cr, user, app_result)
+                    entry["applied"] = True
+                    return
+                if vrb is not None and vrb.status == "verified" and rb_result:
+                    entry["action"] = "finalize_rolled_back"
+                    self._finalize_rolled_back(cr, user, rb_result)
+                    entry["applied"] = True
+                    return
+            entry["action"] = "requires_manual_review"
+            entry["reason"] = "State remains ambiguous — needs manual review."
         else:
             entry["action"] = "requires_manual_review"
             entry["reason"] = f"State {state!r} requires manual review."
-
-    def _verify_post_hashes(
-        self,
-        cr: ContentChangeRequest,
-        post_hashes: dict[str, str],
-    ) -> bool:
-        for item_id, expected in post_hashes.items():
-            try:
-                item = self._router.get_by_id(item_id, include_drafts=True)
-            except Exception:
-                return False
-            if item is None:
-                return False
-            if item.hash != expected:
-                return False
-        return True
 
     def _finalize_applied(
         self,

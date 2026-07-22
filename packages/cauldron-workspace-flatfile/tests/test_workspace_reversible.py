@@ -255,6 +255,244 @@ def test_rollback_conflict_deleted_file_recreated(tmp_path):
         adapter.rollback("cs.cdr")
 
 
+# ---------------------------------------------------------------------------
+# Item 4: Safe rollback paths — tampered artifacts cannot escape content_root
+# ---------------------------------------------------------------------------
+
+
+def test_item4_tampered_rel_path_traversal_refused(tmp_path):
+    """rel_path containing '..' must not be accepted during rollback."""
+    from cauldron_workspace_flatfile.paths import PathEscapeError
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    f = content / "pages" / "home.md"
+    f.write_text("original", encoding="utf-8")
+
+    ops = (_update_op("pages", "home", "home"),)
+    changeset = ContentChangeSet(id="cs.item4.trav", operations=ops)
+    adapter.prepare("cs.item4.trav", changeset)
+    f.write_text("modified", encoding="utf-8")
+    adapter.record_applied("cs.item4.trav")
+
+    # Tamper: point rel_path outside content_root.
+    art_path = cfg.snapshots_dir / "cs.item4.trav" / "rollback_artifact.json"
+    art = json.loads(art_path.read_text())
+    art["files"][0]["rel_path"] = "../../etc/passwd"
+    art["files"][0]["canonical_path"] = "/etc/passwd"
+    art_path.write_text(json.dumps(art))
+
+    with pytest.raises((PathEscapeError, RollbackConflict)):
+        adapter.rollback("cs.item4.trav", force=True, is_superuser=True)
+
+
+def test_item4_tampered_rel_path_absolute_refused(tmp_path):
+    """Absolute rel_path must be refused."""
+    from cauldron_workspace_flatfile.paths import PathEscapeError
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    f = content / "pages" / "home.md"
+    f.write_text("original", encoding="utf-8")
+
+    ops = (_update_op("pages", "home", "home"),)
+    changeset = ContentChangeSet(id="cs.item4.abs", operations=ops)
+    adapter.prepare("cs.item4.abs", changeset)
+    f.write_text("modified", encoding="utf-8")
+    adapter.record_applied("cs.item4.abs")
+
+    art_path = cfg.snapshots_dir / "cs.item4.abs" / "rollback_artifact.json"
+    art = json.loads(art_path.read_text())
+    art["files"][0]["rel_path"] = "/etc/passwd"
+    art_path.write_text(json.dumps(art))
+
+    with pytest.raises((PathEscapeError, RollbackConflict)):
+        adapter.rollback("cs.item4.abs", force=True, is_superuser=True)
+
+
+def test_item4_prepare_stores_rel_path(tmp_path):
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    (content / "pages" / "home.md").write_text("hi", encoding="utf-8")
+    ops = (_update_op("pages", "home", "home"),)
+    changeset = ContentChangeSet(id="cs.item4.rel", operations=ops)
+    adapter.prepare("cs.item4.rel", changeset)
+    art = json.loads(
+        (cfg.snapshots_dir / "cs.item4.rel" / "rollback_artifact.json").read_text()
+    )
+    assert art["files"][0]["rel_path"] == "pages/home.md"
+
+
+# ---------------------------------------------------------------------------
+# Item 6: Non-forced rollback requires post-application state
+# ---------------------------------------------------------------------------
+
+
+def test_item6_missing_post_state_blocks_non_forced_rollback(tmp_path):
+    from cauldron_workspace_flatfile.reversible import RollbackPostStateUnavailable
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    f = content / "pages" / "home.md"
+    f.write_text("v1", encoding="utf-8")
+    ops = (_update_op("pages", "home", "home"),)
+    changeset = ContentChangeSet(id="cs.item6.miss", operations=ops)
+    adapter.prepare("cs.item6.miss", changeset)
+    f.write_text("v2", encoding="utf-8")
+    # Do NOT call record_applied.
+    with pytest.raises(RollbackPostStateUnavailable):
+        adapter.rollback("cs.item6.miss")
+
+
+def test_item6_corrupt_post_state_blocks_non_forced_rollback(tmp_path):
+    from cauldron_workspace_flatfile.reversible import RollbackPostStateUnavailable
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    f = content / "pages" / "home.md"
+    f.write_text("v1", encoding="utf-8")
+    ops = (_update_op("pages", "home", "home"),)
+    changeset = ContentChangeSet(id="cs.item6.corr", operations=ops)
+    adapter.prepare("cs.item6.corr", changeset)
+    f.write_text("v2", encoding="utf-8")
+    adapter.record_applied("cs.item6.corr")
+    # Corrupt the file.
+    state_path = cfg.snapshots_dir / "cs.item6.corr" / "post_application_state.json"
+    state_path.write_text("not-json{", encoding="utf-8")
+    with pytest.raises(RollbackPostStateUnavailable):
+        adapter.rollback("cs.item6.corr")
+
+
+def test_item6_partial_post_state_blocks_non_forced_rollback(tmp_path):
+    from cauldron_workspace_flatfile.reversible import RollbackPostStateUnavailable
+    from cauldron_content.contracts import ContentOperation, ContentOperationKind, ContentStatus
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    f1 = content / "pages" / "one.md"
+    f2 = content / "pages" / "two.md"
+    f1.write_text("v1", encoding="utf-8")
+    f2.write_text("v1", encoding="utf-8")
+    ops = (
+        _update_op("pages", "one", "one"),
+        _update_op("pages", "two", "two"),
+    )
+    changeset = ContentChangeSet(id="cs.item6.part", operations=ops)
+    adapter.prepare("cs.item6.part", changeset)
+    f1.write_text("v2", encoding="utf-8")
+    f2.write_text("v2", encoding="utf-8")
+    adapter.record_applied("cs.item6.part")
+
+    # Truncate to only one record.
+    state_path = cfg.snapshots_dir / "cs.item6.part" / "post_application_state.json"
+    doc = json.loads(state_path.read_text())
+    doc["records"] = doc["records"][:1]
+    state_path.write_text(json.dumps(doc))
+    with pytest.raises(RollbackPostStateUnavailable):
+        adapter.rollback("cs.item6.part")
+
+
+def test_item6_successful_rollback_of_create(tmp_path):
+    """Full happy path for non-forced rollback of a create op."""
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    f = content / "pages" / "new.md"
+    ops = (_create_op("pages", "new", "new"),)
+    changeset = ContentChangeSet(id="cs.item6.crok", operations=ops)
+    adapter.prepare("cs.item6.crok", changeset)
+    f.write_text("just created", encoding="utf-8")
+    adapter.record_applied("cs.item6.crok")
+    adapter.rollback("cs.item6.crok")
+    assert not f.exists()
+
+
+def test_item6_successful_rollback_of_update(tmp_path):
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    f = content / "pages" / "home.md"
+    f.write_text("v1", encoding="utf-8")
+    ops = (_update_op("pages", "home", "home"),)
+    changeset = ContentChangeSet(id="cs.item6.upok", operations=ops)
+    adapter.prepare("cs.item6.upok", changeset)
+    f.write_text("v2", encoding="utf-8")
+    adapter.record_applied("cs.item6.upok")
+    adapter.rollback("cs.item6.upok")
+    assert f.read_text() == "v1"
+
+
+def test_item6_duplicate_item_ids_across_collections(tmp_path):
+    """Same item_id in different collections is safe with the per-op state records."""
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    (content / "posts").mkdir()
+    p1 = content / "pages" / "shared.md"
+    p2 = content / "posts" / "shared.md"
+    p1.write_text("pages-v1", encoding="utf-8")
+    p2.write_text("posts-v1", encoding="utf-8")
+    ops = (
+        _update_op("pages", "shared", "shared"),
+        _update_op("posts", "shared", "shared"),
+    )
+    changeset = ContentChangeSet(id="cs.item6.dup", operations=ops)
+    adapter.prepare("cs.item6.dup", changeset)
+    p1.write_text("pages-v2", encoding="utf-8")
+    p2.write_text("posts-v2", encoding="utf-8")
+    adapter.record_applied("cs.item6.dup")
+    adapter.rollback("cs.item6.dup")
+    assert p1.read_text() == "pages-v1"
+    assert p2.read_text() == "posts-v1"
+
+
+# ---------------------------------------------------------------------------
+# Item 7: Provider verification methods
+# ---------------------------------------------------------------------------
+
+
+def test_item7_verify_applied_state_ok(tmp_path):
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    f = content / "pages" / "home.md"
+    f.write_text("v1", encoding="utf-8")
+    ops = (_update_op("pages", "home", "home"),)
+    changeset = ContentChangeSet(id="cs.item7.applied", operations=ops)
+    adapter.prepare("cs.item7.applied", changeset)
+    f.write_text("v2", encoding="utf-8")
+    adapter.record_applied("cs.item7.applied")
+    vr = adapter.verify_applied_state("cs.item7.applied")
+    assert vr.status == "verified"
+
+
+def test_item7_verify_applied_state_mismatch(tmp_path):
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    f = content / "pages" / "home.md"
+    f.write_text("v1", encoding="utf-8")
+    ops = (_update_op("pages", "home", "home"),)
+    changeset = ContentChangeSet(id="cs.item7.mm", operations=ops)
+    adapter.prepare("cs.item7.mm", changeset)
+    f.write_text("v2", encoding="utf-8")
+    adapter.record_applied("cs.item7.mm")
+    f.write_text("v3", encoding="utf-8")
+    vr = adapter.verify_applied_state("cs.item7.mm")
+    assert vr.status == "mismatch"
+
+
+def test_item7_verify_applied_state_missing(tmp_path):
+    adapter, cfg, content = _make_adapter(tmp_path)
+    vr = adapter.verify_applied_state("no-such-cs")
+    assert vr.status == "missing_evidence"
+
+
+def test_item7_verify_rolled_back_state_ok(tmp_path):
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    f = content / "pages" / "home.md"
+    f.write_text("v1", encoding="utf-8")
+    ops = (_update_op("pages", "home", "home"),)
+    changeset = ContentChangeSet(id="cs.item7.rbok", operations=ops)
+    adapter.prepare("cs.item7.rbok", changeset)
+    f.write_text("v2", encoding="utf-8")
+    adapter.record_applied("cs.item7.rbok")
+    adapter.rollback("cs.item7.rbok")
+    vr = adapter.verify_rolled_back_state("cs.item7.rbok")
+    assert vr.status == "verified"
+
+
 def test_rollback_delete_op_restores_file(tmp_path):
     """Rolling back a DELETE operation restores the original file."""
     from cauldron_content.contracts import ContentOperation, ContentOperationKind, ContentStatus

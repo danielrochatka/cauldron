@@ -22,6 +22,16 @@ def _get_service():
     return get_service()
 
 
+def _handle_config_error(request):
+    """Render a generic error message when the service cannot be built."""
+    import logging
+    logging.getLogger(__name__).exception("Admin service factory misconfiguration")
+    messages.error(
+        request,
+        "The content service is not available. Please contact your administrator.",
+    )
+
+
 @method_decorator([login_required, staff_member_required], name="dispatch")
 class ContentBrowserView(View):
     """Browse published and draft content via ContentOperationService."""
@@ -31,7 +41,18 @@ class ContentBrowserView(View):
     def get(self, request: HttpRequest) -> Any:
         collection = request.GET.get("collection", "")
         include_drafts = request.GET.get("include_drafts", "").lower() in ("1", "true", "yes")
-        service = _get_service()
+        from django.core.exceptions import ImproperlyConfigured
+        try:
+            service = _get_service()
+        except ImproperlyConfigured:
+            _handle_config_error(request)
+            return render(request, self.template_name, {
+                "collections": [],
+                "selected_collection": "",
+                "items": [],
+                "include_drafts": False,
+                "error": "Service unavailable",
+            })
 
         collections = []
         items = []
@@ -75,7 +96,12 @@ class ContentProposalView(View):
         operation = form.to_operation()
         provider_name = form.cleaned_data.get("provider_name", "")
         description = form.cleaned_data.get("description", "")
-        service = _get_service()
+        from django.core.exceptions import ImproperlyConfigured
+        try:
+            service = _get_service()
+        except ImproperlyConfigured:
+            _handle_config_error(request)
+            return render(request, self.template_name, {"form": form})
         try:
             result = service.create_change_request(
                 user=request.user,

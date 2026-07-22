@@ -6,7 +6,28 @@ change request without having to know provider-specific details.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
+
+
+@dataclass(frozen=True)
+class VerificationResult:
+    """Provider-verification response used by reconciliation.
+
+    Statuses:
+      * ``"verified"`` — on-disk / provider state matches recorded state
+      * ``"missing_evidence"`` — no artifact was found to verify against
+      * ``"mismatch"`` — a real content divergence exists
+      * ``"corrupt_evidence"`` — the artifact exists but is unreadable/malformed
+      * ``"unsupported"`` — verification is not available for this cs_id
+    """
+
+    status: str
+    reason: str = ""
+    details: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "details", dict(self.details))
 
 
 @runtime_checkable
@@ -20,7 +41,7 @@ class ReversibleMutationAdapter(Protocol):
         """Called just before a mutation to snapshot pre-application state."""
 
     def record_applied(self, cs_id: str) -> None:
-        """Persist post-application hashes by reading canonical files after mutation."""
+        """Persist post-application state by reading canonical files after mutation."""
 
     def record_rolled_back(self, cs_id: str) -> None:
         """Persist that a rollback succeeded."""
@@ -35,7 +56,7 @@ class ReversibleMutationAdapter(Protocol):
         """Restore the pre-application state.
 
         Implementations should refuse to overwrite content that has diverged
-        from the recorded post-application hashes unless ``force`` is True
+        from the recorded post-application state unless ``force`` is True
         (which itself must require ``is_superuser`` when supplied by callers).
         """
 
@@ -47,6 +68,12 @@ class ReversibleMutationAdapter(Protocol):
         """Return an inspection payload used by reconciliation and diagnostics."""
 
     def get_post_application_hashes(self, cs_id: str) -> dict[str, str]: ...
+
+    def verify_applied_state(self, cs_id: str) -> "VerificationResult":
+        """Confirm on-disk state matches the recorded post-application state."""
+
+    def verify_rolled_back_state(self, cs_id: str) -> "VerificationResult":
+        """Confirm on-disk state matches the recorded pre-application state."""
 
 
 _registry: dict[str, ReversibleMutationAdapter] = {}

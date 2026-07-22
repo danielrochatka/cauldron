@@ -143,6 +143,35 @@ class TestChangeRequestListView:
         assert ".json" not in body_str
 
 
+class TestServiceFactoryFailClosed:
+    """Item 11: service factory raises ImproperlyConfigured, views translate."""
+
+    def test_missing_workspace_root_raises(self):
+        from django.test import override_settings
+        from django.core.exceptions import ImproperlyConfigured
+        from cauldron_content_api.service_factory import get_service
+        with override_settings(CAULDRON_MODULES={"cauldron.content": {}}):
+            with pytest.raises(ImproperlyConfigured):
+                get_service()
+
+    def test_view_catches_and_returns_internal_error_envelope(self):
+        from django.core.exceptions import ImproperlyConfigured
+        from cauldron_content_api.views import CollectionsView
+        user = _make_user(is_superuser=True, username="factoryuser")
+        req = _make_request("get", "/collections/", user=user)
+        with patch("cauldron_content_api.views.get_service") as mock_svc_fn:
+            mock_svc_fn.side_effect = ImproperlyConfigured("bad workspace")
+            view = CollectionsView.as_view()
+            response = view(req)
+        assert response.status_code == 500
+        body = json.loads(response.content)
+        assert body["error"]["code"] == "internal_error"
+        # No path leakage.
+        body_str = json.dumps(body)
+        assert "/home/" not in body_str
+        assert "workspace_root" not in body_str.lower()
+
+
 class TestErrorEnvelopes:
     def test_error_envelope_structure(self):
         from cauldron_content_api.envelope import error_response

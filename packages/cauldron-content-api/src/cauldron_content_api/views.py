@@ -135,9 +135,17 @@ class CollectionsView(View):
             collections = service.list_collections(user=request.user)
             return success_response({"collections": collections})
         except Exception as exc:
+            from django.core.exceptions import ImproperlyConfigured
             from cauldron_content_operations.service import PermissionDenied
             if isinstance(exc, PermissionDenied):
                 return error_response(exc.code, exc.message, status=403)
+            if isinstance(exc, ImproperlyConfigured):
+                logger.error("Service factory misconfiguration: %s", exc)
+                return error_response(
+                    "internal_error",
+                    "The service is not configured correctly.",
+                    status=500,
+                )
             return unexpected_error_response(exc)
 
 
@@ -157,9 +165,17 @@ class CollectionItemsView(View):
                 meta={"total": len(items), "limit": limit, "offset": offset},
             )
         except Exception as exc:
+            from django.core.exceptions import ImproperlyConfigured
             from cauldron_content_operations.service import PermissionDenied
             if isinstance(exc, PermissionDenied):
                 return error_response(exc.code, exc.message, status=403)
+            if isinstance(exc, ImproperlyConfigured):
+                logger.error("Service factory misconfiguration: %s", exc)
+                return error_response(
+                    "internal_error",
+                    "The service is not configured correctly.",
+                    status=500,
+                )
             return unexpected_error_response(exc)
 
 
@@ -178,9 +194,17 @@ class CollectionItemDetailView(View):
             response["ETag"] = f'"{item.hash}"'
             return response
         except Exception as exc:
+            from django.core.exceptions import ImproperlyConfigured
             from cauldron_content_operations.service import PermissionDenied
             if isinstance(exc, PermissionDenied):
                 return error_response(exc.code, exc.message, status=403)
+            if isinstance(exc, ImproperlyConfigured):
+                logger.error("Service factory misconfiguration: %s", exc)
+                return error_response(
+                    "internal_error",
+                    "The service is not configured correctly.",
+                    status=500,
+                )
             return unexpected_error_response(exc)
 
 
@@ -201,9 +225,17 @@ class ChangeRequestListView(View):
             )
             return success_response({"change_requests": [i.to_dict() for i in items]})
         except Exception as exc:
+            from django.core.exceptions import ImproperlyConfigured
             from cauldron_content_operations.service import PermissionDenied
             if isinstance(exc, PermissionDenied):
                 return error_response(exc.code, exc.message, status=403)
+            if isinstance(exc, ImproperlyConfigured):
+                logger.error("Service factory misconfiguration: %s", exc)
+                return error_response(
+                    "internal_error",
+                    "The service is not configured correctly.",
+                    status=500,
+                )
             return unexpected_error_response(exc)
 
     def post(self, request: HttpRequest) -> JsonResponse:
@@ -272,9 +304,17 @@ class ChangeRequestListView(View):
                 idempotency_key=idempotency_key,
             )
         except Exception as exc:
+            from django.core.exceptions import ImproperlyConfigured
             from cauldron_content_operations.service import PermissionDenied
             if isinstance(exc, PermissionDenied):
                 return error_response(exc.code, exc.message, status=403)
+            if isinstance(exc, ImproperlyConfigured):
+                logger.error("Service factory misconfiguration: %s", exc)
+                return error_response(
+                    "internal_error",
+                    "The service is not configured correctly.",
+                    status=500,
+                )
             return unexpected_error_response(exc)
 
         if not result.ok:
@@ -298,9 +338,17 @@ class ChangeRequestDetailView(View):
             response["ETag"] = f'"{detail.request_version}"'
             return response
         except Exception as exc:
+            from django.core.exceptions import ImproperlyConfigured
             from cauldron_content_operations.service import PermissionDenied
             if isinstance(exc, PermissionDenied):
                 return error_response(exc.code, exc.message, status=403)
+            if isinstance(exc, ImproperlyConfigured):
+                logger.error("Service factory misconfiguration: %s", exc)
+                return error_response(
+                    "internal_error",
+                    "The service is not configured correctly.",
+                    status=500,
+                )
             return unexpected_error_response(exc)
 
 
@@ -316,9 +364,17 @@ class ChangeRequestPreviewView(View):
                 return error_response("not_found", f"Change request {request_id!r} not found.", status=404)
             return success_response(preview.to_dict())
         except Exception as exc:
+            from django.core.exceptions import ImproperlyConfigured
             from cauldron_content_operations.service import PermissionDenied
             if isinstance(exc, PermissionDenied):
                 return error_response(exc.code, exc.message, status=403)
+            if isinstance(exc, ImproperlyConfigured):
+                logger.error("Service factory misconfiguration: %s", exc)
+                return error_response(
+                    "internal_error",
+                    "The service is not configured correctly.",
+                    status=500,
+                )
             return unexpected_error_response(exc)
 
 
@@ -332,9 +388,17 @@ class ChangeRequestAuditView(View):
             events = service.get_audit_history(request_id, user=request.user)
             return success_response({"events": [e.to_dict() for e in events]})
         except Exception as exc:
+            from django.core.exceptions import ImproperlyConfigured
             from cauldron_content_operations.service import PermissionDenied
             if isinstance(exc, PermissionDenied):
                 return error_response(exc.code, exc.message, status=403)
+            if isinstance(exc, ImproperlyConfigured):
+                logger.error("Service factory misconfiguration: %s", exc)
+                return error_response(
+                    "internal_error",
+                    "The service is not configured correctly.",
+                    status=500,
+                )
             return unexpected_error_response(exc)
 
 
@@ -353,9 +417,17 @@ class ChangeRequestValidateView(View):
             service = get_service()
             result = service.validate_change_request(request_id, user=request.user, expected_version=expected_version)
         except Exception as exc:
+            from django.core.exceptions import ImproperlyConfigured
             from cauldron_content_operations.service import PermissionDenied
             if isinstance(exc, PermissionDenied):
                 return error_response(exc.code, exc.message, status=403)
+            if isinstance(exc, ImproperlyConfigured):
+                logger.error("Service factory misconfiguration: %s", exc)
+                return error_response(
+                    "internal_error",
+                    "The service is not configured correctly.",
+                    status=500,
+                )
             return unexpected_error_response(exc)
         if not result.ok:
             return _service_error_to_response(result.error)
@@ -377,9 +449,17 @@ class ChangeRequestApproveView(View):
             service = get_service()
             result = service.approve_change_request(request_id, user=request.user, expected_version=expected_version)
         except Exception as exc:
+            from django.core.exceptions import ImproperlyConfigured
             from cauldron_content_operations.service import PermissionDenied
             if isinstance(exc, PermissionDenied):
                 return error_response(exc.code, exc.message, status=403)
+            if isinstance(exc, ImproperlyConfigured):
+                logger.error("Service factory misconfiguration: %s", exc)
+                return error_response(
+                    "internal_error",
+                    "The service is not configured correctly.",
+                    status=500,
+                )
             return unexpected_error_response(exc)
         if not result.ok:
             return _service_error_to_response(result.error)
@@ -402,9 +482,17 @@ class ChangeRequestRejectView(View):
             service = get_service()
             result = service.reject_change_request(request_id, user=request.user, reason=reason, expected_version=expected_version)
         except Exception as exc:
+            from django.core.exceptions import ImproperlyConfigured
             from cauldron_content_operations.service import PermissionDenied
             if isinstance(exc, PermissionDenied):
                 return error_response(exc.code, exc.message, status=403)
+            if isinstance(exc, ImproperlyConfigured):
+                logger.error("Service factory misconfiguration: %s", exc)
+                return error_response(
+                    "internal_error",
+                    "The service is not configured correctly.",
+                    status=500,
+                )
             return unexpected_error_response(exc)
         if not result.ok:
             return _service_error_to_response(result.error)
@@ -426,9 +514,17 @@ class ChangeRequestApplyView(View):
             service = get_service()
             result = service.apply_change_request(request_id, user=request.user, expected_version=expected_version)
         except Exception as exc:
+            from django.core.exceptions import ImproperlyConfigured
             from cauldron_content_operations.service import PermissionDenied
             if isinstance(exc, PermissionDenied):
                 return error_response(exc.code, exc.message, status=403)
+            if isinstance(exc, ImproperlyConfigured):
+                logger.error("Service factory misconfiguration: %s", exc)
+                return error_response(
+                    "internal_error",
+                    "The service is not configured correctly.",
+                    status=500,
+                )
             return unexpected_error_response(exc)
         if not result.ok:
             return _service_error_to_response(result.error)
@@ -451,9 +547,17 @@ class ChangeRequestRollbackView(View):
             service = get_service()
             result = service.rollback_change_request(request_id, user=request.user, force=force, expected_version=expected_version)
         except Exception as exc:
+            from django.core.exceptions import ImproperlyConfigured
             from cauldron_content_operations.service import PermissionDenied
             if isinstance(exc, PermissionDenied):
                 return error_response(exc.code, exc.message, status=403)
+            if isinstance(exc, ImproperlyConfigured):
+                logger.error("Service factory misconfiguration: %s", exc)
+                return error_response(
+                    "internal_error",
+                    "The service is not configured correctly.",
+                    status=500,
+                )
             return unexpected_error_response(exc)
         if not result.ok:
             return _service_error_to_response(result.error)

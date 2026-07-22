@@ -71,3 +71,119 @@ def test_content_proposal_form_invalid_json():
     })
     assert not form.is_valid()
     assert "structured_data" in form.errors
+
+
+# ---------------------------------------------------------------------------
+# Item 10: Admin optimistic concurrency — expected_version from POST body
+# ---------------------------------------------------------------------------
+
+
+def test_item10_missing_expected_version_rejects():
+    """If the admin action POST is missing expected_version, error out."""
+    from unittest.mock import patch
+    from django.test import RequestFactory
+    from django.contrib.messages.storage.cookie import CookieStorage
+    from cauldron_content_operations.models import ContentChangeRequest
+    from django.contrib import admin as _admin
+    import cauldron_admin_content.admin  # noqa
+    admin_class = _admin.site._registry[ContentChangeRequest]
+
+    cr = ContentChangeRequest.objects.create(
+        workspace_changeset_id="cs-item10-missing",
+        provider_name="flatfile",
+    )
+    factory = RequestFactory()
+    request = factory.post(f"/admin/x/{cr.request_id}/validate/", data={})
+    request._messages = CookieStorage(request)
+
+    with patch.object(admin_class, "_detail_url", return_value="/back"):
+        ver, redirect = admin_class._load_expected_version(request, cr.request_id)
+    assert ver is None
+    assert redirect is not None
+
+
+def test_item10_stale_expected_version_from_post_body():
+    """Submitting expected_version from POST returns that value (not the DB version)."""
+    from unittest.mock import patch
+    from django.test import RequestFactory
+    from django.contrib.messages.storage.cookie import CookieStorage
+    from cauldron_content_operations.models import ContentChangeRequest
+    from django.contrib import admin as _admin
+    import cauldron_admin_content.admin  # noqa
+    admin_class = _admin.site._registry[ContentChangeRequest]
+
+    cr = ContentChangeRequest.objects.create(
+        workspace_changeset_id="cs-item10-stale",
+        provider_name="flatfile",
+        request_version=5,
+    )
+    factory = RequestFactory()
+    request = factory.post(
+        f"/admin/x/{cr.request_id}/validate/",
+        data={"expected_version": "2"},  # stale, but this is what should be passed
+    )
+    request._messages = CookieStorage(request)
+    with patch.object(admin_class, "_detail_url", return_value="/back"):
+        ver, redirect = admin_class._load_expected_version(request, cr.request_id)
+    assert ver == 2  # From POST, not DB (which is 5)
+    assert redirect is None
+
+
+def test_item10_valid_expected_version_accepted():
+    from unittest.mock import patch
+    from django.test import RequestFactory
+    from django.contrib.messages.storage.cookie import CookieStorage
+    from cauldron_content_operations.models import ContentChangeRequest
+    from django.contrib import admin as _admin
+    import cauldron_admin_content.admin  # noqa
+    admin_class = _admin.site._registry[ContentChangeRequest]
+
+    cr = ContentChangeRequest.objects.create(
+        workspace_changeset_id="cs-item10-valid",
+        provider_name="flatfile",
+    )
+    factory = RequestFactory()
+    request = factory.post(
+        f"/admin/x/{cr.request_id}/validate/",
+        data={"expected_version": "1"},
+    )
+    request._messages = CookieStorage(request)
+    with patch.object(admin_class, "_detail_url", return_value="/back"):
+        ver, redirect = admin_class._load_expected_version(request, cr.request_id)
+    assert ver == 1
+    assert redirect is None
+
+
+# ---------------------------------------------------------------------------
+# Item 11: Service factory fails closed on missing workspace
+# ---------------------------------------------------------------------------
+
+
+def test_item11_admin_service_factory_missing_workspace():
+    from django.test import override_settings
+    from django.core.exceptions import ImproperlyConfigured
+    from cauldron_admin_content.service_factory import get_service
+    with override_settings(CAULDRON_MODULES={"cauldron.content": {}, "cauldron.admin.content": {}}):
+        with pytest.raises(ImproperlyConfigured):
+            get_service()
+
+
+def test_item11_admin_service_factory_bad_workspace(tmp_path):
+    """Non-existent workspace_root or bad init raises ImproperlyConfigured."""
+    from unittest.mock import patch
+    from django.test import override_settings
+    from django.core.exceptions import ImproperlyConfigured
+    from cauldron_admin_content.service_factory import get_service
+    with override_settings(
+        CAULDRON_MODULES={
+            "cauldron.content": {},
+            "cauldron.workspace.flatfile": {"workspace_root": str(tmp_path / "ok")},
+            "cauldron.admin.content": {},
+        }
+    ):
+        with patch(
+            "cauldron_workspace_flatfile.store.ChangeSetStore.__init__",
+            side_effect=RuntimeError("boom"),
+        ):
+            with pytest.raises(ImproperlyConfigured):
+                get_service()

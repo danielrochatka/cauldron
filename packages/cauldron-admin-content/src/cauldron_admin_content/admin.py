@@ -115,12 +115,35 @@ class ContentChangeRequestAdmin(admin.ModelAdmin):
             return self._changelist_url()
 
     def _load_expected_version(self, request: HttpRequest, request_id: str):
+        """Parse the submitted ``expected_version`` from the POST body.
+
+        Item 10: the version must be supplied by the client (from the form as
+        rendered at load time) — never re-read the latest DB version and use
+        it as expected, or optimistic concurrency degenerates to no check at
+        all.
+        """
+        raw = request.POST.get("expected_version", "") if request.method == "POST" else ""
         try:
-            cr = ContentChangeRequest.objects.get(request_id=request_id)
-            return cr.request_version, None
+            ver = int(raw)
+        except (TypeError, ValueError):
+            messages.error(
+                request,
+                "Version is required. Reload the page and try again.",
+            )
+            return None, HttpResponseRedirect(self._detail_url(request_id))
+        if ver <= 0:
+            messages.error(
+                request,
+                "Version is required. Reload the page and try again.",
+            )
+            return None, HttpResponseRedirect(self._detail_url(request_id))
+        # Confirm the record exists so we can render a helpful redirect.
+        try:
+            ContentChangeRequest.objects.get(request_id=request_id)
         except ContentChangeRequest.DoesNotExist:
             messages.error(request, "Change request not found.")
             return None, HttpResponseRedirect(self._changelist_url())
+        return ver, None
 
     def _handle_result(self, request, request_id, result, success_msg, fail_prefix):
         if result.ok:
@@ -141,8 +164,14 @@ class ContentChangeRequestAdmin(admin.ModelAdmin):
         expected_version, redirect = self._load_expected_version(request, request_id)
         if redirect is not None:
             return redirect
+        from django.core.exceptions import ImproperlyConfigured
         try:
-            service = _get_service()
+            try:
+                service = _get_service()
+            except ImproperlyConfigured:
+                logger.exception("Admin service factory misconfiguration")
+                messages.error(request, "The content service is not available. Please contact your administrator.")
+                return HttpResponseRedirect(self._detail_url(request_id))
             result = service.validate_change_request(
                 request_id, user=request.user, expected_version=expected_version
             )
@@ -164,8 +193,14 @@ class ContentChangeRequestAdmin(admin.ModelAdmin):
         expected_version, redirect = self._load_expected_version(request, request_id)
         if redirect is not None:
             return redirect
+        from django.core.exceptions import ImproperlyConfigured
         try:
-            service = _get_service()
+            try:
+                service = _get_service()
+            except ImproperlyConfigured:
+                logger.exception("Admin service factory misconfiguration")
+                messages.error(request, "The content service is not available. Please contact your administrator.")
+                return HttpResponseRedirect(self._detail_url(request_id))
             result = service.approve_change_request(
                 request_id, user=request.user, expected_version=expected_version
             )
@@ -188,8 +223,14 @@ class ContentChangeRequestAdmin(admin.ModelAdmin):
         if redirect is not None:
             return redirect
         reason = request.POST.get("reason", "")
+        from django.core.exceptions import ImproperlyConfigured
         try:
-            service = _get_service()
+            try:
+                service = _get_service()
+            except ImproperlyConfigured:
+                logger.exception("Admin service factory misconfiguration")
+                messages.error(request, "The content service is not available. Please contact your administrator.")
+                return HttpResponseRedirect(self._detail_url(request_id))
             result = service.reject_change_request(
                 request_id,
                 user=request.user,
@@ -214,8 +255,14 @@ class ContentChangeRequestAdmin(admin.ModelAdmin):
         expected_version, redirect = self._load_expected_version(request, request_id)
         if redirect is not None:
             return redirect
+        from django.core.exceptions import ImproperlyConfigured
         try:
-            service = _get_service()
+            try:
+                service = _get_service()
+            except ImproperlyConfigured:
+                logger.exception("Admin service factory misconfiguration")
+                messages.error(request, "The content service is not available. Please contact your administrator.")
+                return HttpResponseRedirect(self._detail_url(request_id))
             result = service.apply_change_request(
                 request_id, user=request.user, expected_version=expected_version
             )
@@ -237,8 +284,14 @@ class ContentChangeRequestAdmin(admin.ModelAdmin):
         expected_version, redirect = self._load_expected_version(request, request_id)
         if redirect is not None:
             return redirect
+        from django.core.exceptions import ImproperlyConfigured
         try:
-            service = _get_service()
+            try:
+                service = _get_service()
+            except ImproperlyConfigured:
+                logger.exception("Admin service factory misconfiguration")
+                messages.error(request, "The content service is not available. Please contact your administrator.")
+                return HttpResponseRedirect(self._detail_url(request_id))
             result = service.rollback_change_request(
                 request_id, user=request.user, expected_version=expected_version
             )

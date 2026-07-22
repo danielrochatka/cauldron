@@ -351,3 +351,60 @@ def test_health_missing_root(tmp_path: Path):
     repo = FlatFileRepository(FlatFileCMSConfig(site_root=tmp_path / "does-not-exist"))
     h = repo.health()
     assert not h.healthy
+
+
+# ---------------------------------------------------------------------------
+# Item 3: collection-aware get_by_id
+# ---------------------------------------------------------------------------
+
+
+def test_item3_same_id_in_two_collections_scoped_correctly(tmp_path: Path):
+    """The same item_id in ``pages`` and ``posts`` must resolve per collection."""
+    site = tmp_path / "site"
+    (site / "content" / "pages").mkdir(parents=True)
+    (site / "content" / "posts").mkdir(parents=True)
+    (site / "schemas").mkdir(parents=True)
+    (site / "content" / "pages" / "shared.md").write_text(
+        "---\nid: shared\nslug: shared\nstatus: published\nschema: pages\ntitle: Pages Shared\n---\nPages body",
+        encoding="utf-8",
+    )
+    (site / "content" / "posts" / "shared.md").write_text(
+        "---\nid: shared\nslug: shared\nstatus: published\nschema: posts\ntitle: Posts Shared\n---\nPosts body",
+        encoding="utf-8",
+    )
+    (site / "schemas" / "pages.schema.json").write_text('{"type":"object"}')
+    (site / "schemas" / "posts.schema.json").write_text('{"type":"object"}')
+    repo = FlatFileRepository(FlatFileCMSConfig(site_root=site))
+    unscoped = repo.get_by_id("shared")
+    assert unscoped is not None
+    pages_item = repo.get_by_id("shared", collection="pages")
+    posts_item = repo.get_by_id("shared", collection="posts")
+    assert pages_item is not None and pages_item.collection == "pages"
+    assert posts_item is not None and posts_item.collection == "posts"
+    assert pages_item.body != posts_item.body
+
+
+def test_item3_get_by_id_unknown_collection_returns_none(tmp_path: Path):
+    site = tmp_path / "site"
+    (site / "content" / "pages").mkdir(parents=True)
+    (site / "schemas").mkdir(parents=True)
+    (site / "content" / "pages" / "one.md").write_text(
+        "---\nid: one\nslug: one\nstatus: published\nschema: pages\ntitle: One\n---\nBody",
+        encoding="utf-8",
+    )
+    repo = FlatFileRepository(FlatFileCMSConfig(site_root=site))
+    assert repo.get_by_id("one", collection="does-not-exist") is None
+
+
+# ---------------------------------------------------------------------------
+# Item 4: safe collection resolution — traversal refused
+# ---------------------------------------------------------------------------
+
+
+def test_item4_collection_traversal_returns_empty(tmp_path: Path):
+    site = tmp_path / "site"
+    (site / "content" / "pages").mkdir(parents=True)
+    (site / "schemas").mkdir(parents=True)
+    repo = FlatFileRepository(FlatFileCMSConfig(site_root=site))
+    assert repo.list_items("../../etc") == []
+    assert repo.list_items("/etc") == []

@@ -1,16 +1,24 @@
 """Build a ContentOperationService from Django settings."""
 from __future__ import annotations
 
+import logging
+
 from django.core.exceptions import ImproperlyConfigured
+
+
+logger = logging.getLogger(__name__)
 
 
 def get_service():
     """Return a configured ContentOperationService from current Django settings.
 
-    Raises :class:`ImproperlyConfigured` when the workspace cannot be built —
-    the caller (view) is responsible for translating this into a bounded
-    ``internal_error`` envelope. Filesystem paths are never leaked in the
-    exception message.
+    Item 14: raises :class:`ImproperlyConfigured` on missing content_root or
+    workspace_root, adapter construction failures, or content_root/workspace
+    mismatch. Never swallows adapter registration failures.
+
+    A stale globally-registered adapter from a previous configuration is
+    unregistered before we install a new one so config drift cannot leave
+    a mismatched adapter in place.
     """
     from django.conf import settings
     from cauldron_content.registry import registry
@@ -49,24 +57,41 @@ def get_service():
             f"Failed to initialize workspace for cauldron.content.api: {type(exc).__name__}"
         ) from exc
 
-    # Best-effort adapter registration for the flatfile provider.
+    # Item 14: flat-file adapter registration is required.
+    cms_cfg = modules.get("cauldron.cms.flatfile") or {}
+    content_root = cms_cfg.get("content_root", "")
+    if not content_root:
+        raise ImproperlyConfigured(
+            "content_root is required for cauldron.content.api; "
+            "configure CAULDRON_MODULES['cauldron.cms.flatfile']['content_root']."
+        )
     try:
-        cms_cfg = modules.get("cauldron.cms.flatfile") or {}
-        content_root = cms_cfg.get("content_root", "")
-        if content_root:
-            from cauldron_workspace_flatfile.reversible import (
-                FlatFileReversibleMutationAdapter,
+        from cauldron_workspace_flatfile.reversible import (
+            FlatFileReversibleMutationAdapter,
+        )
+        from cauldron_content_operations.reversible import (
+            register_adapter, get_adapter, unregister_adapter,
+        )
+        adapter = FlatFileReversibleMutationAdapter(workspace_config, content_root)
+        if str(adapter._content_root) != str(
+            __import__("pathlib").Path(content_root).resolve()
+        ):
+            raise ImproperlyConfigured(
+                "Constructed flatfile adapter has a content_root mismatch."
             )
-            from cauldron_content_operations.reversible import register_adapter, get_adapter
-            if get_adapter("flatfile") is None:
-                register_adapter(
-                    "flatfile",
-                    FlatFileReversibleMutationAdapter(workspace_config, content_root),
-                )
-    except Exception:
-        # Adapter registration is best-effort; missing registration should not
-        # prevent the API from serving unrelated endpoints.
-        pass
+        existing = get_adapter("flatfile")
+        if existing is not None and existing is not adapter:
+            existing_root = getattr(existing, "_content_root", None)
+            if existing_root is not None and str(existing_root) != str(adapter._content_root):
+                unregister_adapter("flatfile")
+        register_adapter("flatfile", adapter)
+    except ImproperlyConfigured:
+        raise
+    except Exception as exc:
+        raise ImproperlyConfigured(
+            "Failed to register flatfile reversible adapter for "
+            f"cauldron.content.api: {type(exc).__name__}"
+        ) from exc
 
     return ContentOperationService(
         router=router,

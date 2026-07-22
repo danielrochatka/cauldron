@@ -89,7 +89,21 @@ class ContentRouter:
             raise RouterError(
                 "Cannot route get_by_id without collection or default provider."
             )
-        return self._get_repo(provider).get_by_id(item_id, include_drafts=include_drafts)
+        repo = self._get_repo(provider)
+        # Item 3: forward collection to collection-aware repositories so the
+        # search stays within op.collection. Fall back gracefully for older
+        # repositories.
+        try:
+            return repo.get_by_id(
+                item_id, include_drafts=include_drafts, collection=collection,
+            )
+        except TypeError:
+            item = repo.get_by_id(item_id, include_drafts=include_drafts)
+            # Item 3 fallback filter: if the repo does not accept a collection
+            # kwarg, drop items from the wrong collection.
+            if item is not None and collection and item.collection != collection:
+                return None
+            return item
 
     def get_by_slug(
         self,

@@ -1,6 +1,8 @@
 """Django system checks for cauldron.content.api."""
 from __future__ import annotations
 
+from pathlib import Path
+
 from django.core import checks
 
 
@@ -31,5 +33,83 @@ def check_api_dependencies(app_configs, **kwargs):
         errors.append(checks.Info(
             "cauldron.content.api configuration looks healthy.",
             id="cauldron.content.api.I001",
+        ))
+    return errors
+
+
+@checks.register(checks.Tags.compatibility)
+def check_api_configuration(app_configs, **kwargs):
+    """Item 14: verify the runtime configuration required to build a
+    ContentOperationService for the API.
+
+    Emits stable error IDs so operators can filter/monitor:
+      * content_api.E001 — missing workspace root
+      * content_api.E002 — missing content root
+      * content_api.E003 — workspace init failure
+      * content_api.E004 — lock-directory failure
+      * content_api.E005 — adapter registration failure
+      * content_api.E006 — adapter/configuration mismatch
+    """
+    if not _is_api_active():
+        return []
+    from django.conf import settings
+    modules = getattr(settings, "CAULDRON_MODULES", {}) or {}
+    errors = []
+    ws_cfg = modules.get("cauldron.workspace.flatfile") or {}
+    wp = ws_cfg.get("workspace_root", "")
+    if not wp:
+        errors.append(checks.Error(
+            "cauldron.workspace.flatfile.workspace_root is required.",
+            id="content_api.E001",
+        ))
+    cms_cfg = modules.get("cauldron.cms.flatfile") or {}
+    content_root = cms_cfg.get("content_root", "")
+    if not content_root:
+        errors.append(checks.Error(
+            "cauldron.cms.flatfile.content_root is required for cauldron.content.api.",
+            id="content_api.E002",
+        ))
+    if errors:
+        return errors
+
+    workspace_config = None
+    try:
+        from cauldron_workspace_flatfile.config import WorkspaceConfig
+        workspace_config = WorkspaceConfig(workspace_root=wp)
+    except Exception as exc:  # pragma: no cover - defensive
+        errors.append(checks.Error(
+            f"Failed to construct workspace config: {type(exc).__name__}",
+            id="content_api.E003",
+        ))
+        return errors
+    try:
+        locks_dir = Path(workspace_config.locks_dir)
+        locks_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        errors.append(checks.Error(
+            "Workspace locks directory could not be prepared.",
+            id="content_api.E004",
+        ))
+    try:
+        from cauldron_workspace_flatfile.reversible import (
+            FlatFileReversibleMutationAdapter,
+        )
+        adapter = FlatFileReversibleMutationAdapter(workspace_config, content_root)
+    except Exception as exc:
+        errors.append(checks.Error(
+            f"Failed to construct flatfile reversible adapter: {type(exc).__name__}",
+            id="content_api.E005",
+        ))
+        return errors
+    try:
+        if str(adapter._content_root) != str(Path(content_root).resolve()):
+            errors.append(checks.Error(
+                "Adapter/configuration mismatch: content_root does not match.",
+                id="content_api.E006",
+            ))
+    except Exception:
+        errors.append(checks.Error(
+            "Adapter/configuration mismatch: cannot verify content_root.",
+            id="content_api.E006",
         ))
     return errors

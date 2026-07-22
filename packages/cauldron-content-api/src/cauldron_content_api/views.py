@@ -82,6 +82,9 @@ def _service_error_to_response(error) -> JsonResponse:
         return error_response(code, message, status=400)
     if code.startswith("conflict.") or code.startswith("lifecycle."):
         return error_response(code, message, status=409)
+    # Item 17: structured lock-timeout errors map to 409.
+    if code == "operations.busy":
+        return error_response(code, message, status=409)
     if code.startswith("validation."):
         return error_response(code, message, status=422)
     if code.startswith("auth."):

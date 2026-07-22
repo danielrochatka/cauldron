@@ -49,7 +49,14 @@ class FlatFileRepository:
         return sorted(p.name for p in content_dir.iterdir() if p.is_dir())
 
     def _load_collection(self, collection: str, include_drafts: bool) -> list[ContentItem]:
-        coll_dir = self._config.content_dir / collection
+        # Item 4: containment-safe collection resolution — reject traversal,
+        # absolute names, path separators embedded in the collection segment,
+        # and symlink escapes.
+        try:
+            from cauldron_workspace_flatfile.paths import safe_resolve as _safe_resolve
+            coll_dir = _safe_resolve(self._config.content_dir, collection)
+        except Exception:
+            return []
         if not coll_dir.exists():
             return []
         items: list[ContentItem] = []
@@ -78,8 +85,21 @@ class FlatFileRepository:
         return self._load_collection(collection, include_drafts)
 
     def get_by_id(
-        self, item_id: str, *, include_drafts: bool = False
+        self,
+        item_id: str,
+        *,
+        include_drafts: bool = False,
+        collection: str = "",
     ) -> Optional[ContentItem]:
+        # Item 3: when a collection is provided, restrict the search to that
+        # collection. Otherwise fall back to a full-collection scan.
+        if collection:
+            for item in self._load_collection(collection, include_drafts=True):
+                if item.id == item_id:
+                    if not include_drafts and item.status == ContentStatus.DRAFT:
+                        return None
+                    return item
+            return None
         for coll in self.list_collections():
             for item in self._load_collection(coll, include_drafts=True):
                 if item.id == item_id:
@@ -180,10 +200,26 @@ class FlatFileRepository:
         )
 
     def _stage_operation(self, op: ContentOperation):
-        coll_dir = self._config.content_dir / op.collection
+        # Item 4: containment-safe collection resolution.
+        try:
+            from cauldron_workspace_flatfile.paths import safe_resolve as _safe_resolve
+            coll_dir = _safe_resolve(self._config.content_dir, op.collection)
+        except Exception:
+            return [
+                ValidationIssue(
+                    code="path_escape",
+                    message="Collection path escapes content_dir",
+                    collection=op.collection,
+                    item_id=op.item_id,
+                )
+            ]
 
         if op.kind == ContentOperationKind.DELETE:
-            existing = self.get_by_id(op.item_id, include_drafts=True)
+            # Item 3: resolve inside op.collection only so same-id items in
+            # other collections cannot mis-route.
+            existing = self.get_by_id(
+                op.item_id, include_drafts=True, collection=op.collection,
+            )
             if existing is None:
                 return [
                     ValidationIssue(
@@ -265,7 +301,10 @@ class FlatFileRepository:
             return (target, _serialize_content_item(result_item), result_item)
 
         if op.kind == ContentOperationKind.UPDATE:
-            existing = self.get_by_id(op.item_id, include_drafts=True)
+            # Item 3: resolve inside op.collection only.
+            existing = self.get_by_id(
+                op.item_id, include_drafts=True, collection=op.collection,
+            )
             if existing is None:
                 return [
                     ValidationIssue(

@@ -37,10 +37,25 @@ def _make_service(workspace_root=None):
     router.get_by_id.return_value = None
     router.resolve_provider.return_value = "flatfile"
 
-    # Build a mock workspace
+    # Build a workspace mock that echoes the created changeset back on load,
+    # so that integrity checks on approve/apply/preview find the same payload
+    # that was originally created.
     workspace = MagicMock()
-    workspace.create.return_value = None
+    _saved: dict = {}
+
+    def _ws_create(cs):
+        _saved[cs.id] = cs
+
+    def _ws_load(cs_id):
+        return _saved.get(cs_id)
+
+    workspace.create.side_effect = _ws_create
+    workspace.load_changeset.side_effect = _ws_load
     workspace.save_result.return_value = None
+    workspace.save_application_result.return_value = None
+    workspace.save_rollback_result.return_value = None
+    workspace.load_application_result.return_value = None
+    workspace.load_rollback_result.return_value = None
 
     # Return success by default
     from cauldron_content.contracts import ApplyResult
@@ -1254,6 +1269,237 @@ def test_item8_reconcile_rolling_back_never_finalizes_as_applied(tmp_path):
     cr.refresh_from_db()
     assert cr.lifecycle_state != "applied"
     assert cr.lifecycle_state == "reconciliation_required"
+
+
+# ---------------------------------------------------------------------------
+# Item 1: payload integrity during approval
+# ---------------------------------------------------------------------------
+
+
+def test_item1_approval_blocks_on_payload_tampering(tmp_path):
+    """Tampering payload.json between validation and approval blocks approve."""
+    from cauldron_content_operations.models import ContentChangeRequest
+    from cauldron_workspace_flatfile.config import WorkspaceConfig
+    from cauldron_workspace_flatfile.store import ChangeSetStore
+    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.config import ContentOperationsConfig
+    from unittest.mock import MagicMock
+
+    proposer = _make_user(is_superuser=True, username="item1apA")
+    ws_root = tmp_path / "ws"
+    workspace = ChangeSetStore(WorkspaceConfig(workspace_root=ws_root))
+    router = MagicMock()
+    router.resolve_provider.return_value = "flatfile"
+    from cauldron_content.contracts import ApplyResult
+    router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
+    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=True, max_operations_per_change_set=10)
+    service = ContentOperationService(router=router, workspace=workspace, config=cfg)
+
+    r = service.create_change_request(
+        user=proposer,
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {"t": "a"}}],
+        provider_name="",
+    )
+    assert r.ok
+    # Advance through validation.
+    v = service.validate_change_request(r.request_id, user=proposer, expected_version=1)
+    assert v.ok
+    # Tamper payload.json between validate and approve.
+    cr = ContentChangeRequest.objects.get(request_id=r.request_id)
+    import json
+    payload = json.loads((ws_root / "change-sets" / cr.workspace_changeset_id / "payload.json").read_text())
+    payload["operations"][0]["data"] = {"t": "TAMPERED"}
+    (ws_root / "change-sets" / cr.workspace_changeset_id / "payload.json").write_text(json.dumps(payload))
+    ap = service.approve_change_request(r.request_id, user=proposer, expected_version=v.request_version)
+    assert not ap.ok
+    assert ap.error.code == "workspace.payload_integrity_mismatch"
+    # State was not mutated.
+    cr.refresh_from_db()
+    assert cr.lifecycle_state == "validated"
+
+
+def test_item1_approval_blocks_on_force_persisted(tmp_path):
+    """force=True persisted in payload blocks approve."""
+    from cauldron_content_operations.models import ContentChangeRequest
+    from cauldron_workspace_flatfile.config import WorkspaceConfig
+    from cauldron_workspace_flatfile.store import ChangeSetStore
+    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.config import ContentOperationsConfig
+    from unittest.mock import MagicMock
+
+    user = _make_user(is_superuser=True, username="item1apF")
+    ws_root = tmp_path / "ws"
+    workspace = ChangeSetStore(WorkspaceConfig(workspace_root=ws_root))
+    router = MagicMock()
+    router.resolve_provider.return_value = "flatfile"
+    from cauldron_content.contracts import ApplyResult
+    router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
+    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=True, max_operations_per_change_set=10)
+    service = ContentOperationService(router=router, workspace=workspace, config=cfg)
+
+    r = service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}}],
+        provider_name="",
+    )
+    assert r.ok
+    v = service.validate_change_request(r.request_id, user=user, expected_version=1)
+    assert v.ok
+    cr = ContentChangeRequest.objects.get(request_id=r.request_id)
+    import json
+    payload_path = ws_root / "change-sets" / cr.workspace_changeset_id / "payload.json"
+    payload = json.loads(payload_path.read_text())
+    payload["operations"][0]["force"] = True
+    payload_path.write_text(json.dumps(payload))
+    ap = service.approve_change_request(r.request_id, user=user, expected_version=v.request_version)
+    assert not ap.ok
+    assert ap.error.code in (
+        "workspace.force_not_allowed",
+        "workspace.payload_integrity_mismatch",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Item 2: provider routing drift
+# ---------------------------------------------------------------------------
+
+
+def test_item2_router_drift_between_proposal_and_apply(tmp_path):
+    """Changing router configuration after proposal creation blocks apply."""
+    from unittest.mock import MagicMock
+    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.config import ContentOperationsConfig
+    from cauldron_workspace_flatfile.config import WorkspaceConfig
+    from cauldron_workspace_flatfile.store import ChangeSetStore
+    from cauldron_content.contracts import ApplyResult
+
+    user = _make_user(is_superuser=True, username="item2drift")
+    ws = ChangeSetStore(WorkspaceConfig(workspace_root=tmp_path / "ws"))
+    router = MagicMock()
+    router.resolve_provider.return_value = "flatfile"
+    router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
+    cfg = ContentOperationsConfig(require_approval=False, allow_self_approval=True, max_operations_per_change_set=10)
+    service = ContentOperationService(router=router, workspace=ws, config=cfg)
+
+    r = service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}}],
+        provider_name="",
+    )
+    assert r.ok
+    # Change routing to a different provider.
+    router.resolve_provider.return_value = "different-provider"
+    ap = service.apply_change_request(r.request_id, user=user, expected_version=r.request_version)
+    assert not ap.ok
+    assert ap.error.code == "operations.provider_route_changed"
+
+
+# ---------------------------------------------------------------------------
+# Item 9: duplicate targets during validation
+# ---------------------------------------------------------------------------
+
+
+def test_item9_duplicate_targets_rejected_at_proposal():
+    user = _make_user(is_superuser=True, username="item9dup")
+    service = _make_service()
+    result = service.create_change_request(
+        user=user,
+        operations=[
+            {"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}},
+            {"kind": "update", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}, "expected_hash": "abc"},
+        ],
+        provider_name="flatfile",
+    )
+    assert not result.ok
+    assert result.error.code == "operations.duplicate_target"
+
+
+# ---------------------------------------------------------------------------
+# Item 17: structured lock-timeout errors
+# ---------------------------------------------------------------------------
+
+
+def test_item17_lock_timeout_returns_busy(tmp_path):
+    """A TimeoutError from request_lock is mapped to operations.busy."""
+    from unittest.mock import patch, MagicMock
+    from contextlib import contextmanager
+    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.config import ContentOperationsConfig
+    from cauldron_content_operations.models import ContentChangeRequest
+    from cauldron_workspace_flatfile.config import WorkspaceConfig
+    from cauldron_workspace_flatfile.store import ChangeSetStore
+    from cauldron_content.contracts import ApplyResult
+
+    user = _make_user(is_superuser=True, username="item17busy")
+    ws = ChangeSetStore(WorkspaceConfig(workspace_root=tmp_path / "ws"))
+    router = MagicMock()
+    router.resolve_provider.return_value = "flatfile"
+    router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
+    cfg = ContentOperationsConfig(require_approval=False, allow_self_approval=True, max_operations_per_change_set=10)
+    service = ContentOperationService(router=router, workspace=ws, config=cfg)
+
+    r = service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}}],
+        provider_name="",
+    )
+    assert r.ok
+
+    @contextmanager
+    def _timeout(*a, **kw):
+        raise TimeoutError("simulated")
+        yield
+
+    with patch("cauldron_content_operations.service.request_lock", _timeout):
+        result = service.apply_change_request(r.request_id, user=user, expected_version=1)
+    assert not result.ok
+    assert result.error.code == "operations.busy"
+
+
+# ---------------------------------------------------------------------------
+# Item 18: cleanup on pre-durability failure
+# ---------------------------------------------------------------------------
+
+
+def test_item18_audit_insert_failure_cleans_workspace(tmp_path):
+    """If the audit event insert fails, the workspace changeset is cleaned up."""
+    from unittest.mock import patch, MagicMock
+    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.config import ContentOperationsConfig
+    from cauldron_content_operations.models import ContentChangeRequest
+    from cauldron_content_operations.audit import AuditSequenceError
+    from cauldron_workspace_flatfile.config import WorkspaceConfig
+    from cauldron_workspace_flatfile.store import ChangeSetStore
+
+    user = _make_user(is_superuser=True, username="item18aud")
+    ws_root = tmp_path / "ws"
+    ws = ChangeSetStore(WorkspaceConfig(workspace_root=ws_root))
+    router = MagicMock()
+    router.resolve_provider.return_value = "flatfile"
+    from cauldron_content.contracts import ApplyResult
+    router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
+    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
+    service = ContentOperationService(router=router, workspace=ws, config=cfg)
+
+    # Patch audit append to raise on every call to simulate failure after
+    # workspace create but before durable SQL record.
+    with patch(
+        "cauldron_content_operations.service.append_audit_event",
+        side_effect=AuditSequenceError("simulated"),
+    ):
+        try:
+            service.create_change_request(
+                user=user,
+                operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}}],
+                provider_name="",
+            )
+        except AuditSequenceError:
+            pass
+    # No durable ContentChangeRequest, and workspace changeset was cleaned up.
+    assert ContentChangeRequest.objects.count() == 0
+    change_sets_dir = ws_root / "change-sets"
+    if change_sets_dir.exists():
+        assert list(change_sets_dir.iterdir()) == []
 
 
 def test_item14_reject_transitions_workspace_state(tmp_path):

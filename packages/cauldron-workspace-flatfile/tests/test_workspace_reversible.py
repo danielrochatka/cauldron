@@ -515,3 +515,219 @@ def test_rollback_delete_op_restores_file(tmp_path):
     adapter.rollback("cs.rbdel", force=True, is_superuser=True)
     assert f.exists()
     assert "original body" in f.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Item 5: rollback artifacts store rel_path only
+# ---------------------------------------------------------------------------
+
+
+def test_item5_new_artifact_omits_canonical_path(tmp_path):
+    """Newly written rollback artifacts contain only rel_path, not canonical_path."""
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    (content / "pages" / "home.md").write_text("hi", encoding="utf-8")
+    ops = (_update_op("pages", "home", "home"),)
+    changeset = ContentChangeSet(id="cs.item5", operations=ops)
+    adapter.prepare("cs.item5", changeset)
+    art = json.loads(
+        (cfg.snapshots_dir / "cs.item5" / "rollback_artifact.json").read_text()
+    )
+    assert "canonical_path" not in art["files"][0]
+    assert art["files"][0]["rel_path"] == "pages/home.md"
+
+
+def test_item5_legacy_artifact_still_readable(tmp_path):
+    """Legacy artifacts with canonical_path but no rel_path still work."""
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    f = content / "pages" / "home.md"
+    f.write_text("v1", encoding="utf-8")
+    ops = (_update_op("pages", "home", "home"),)
+    changeset = ContentChangeSet(id="cs.legacy", operations=ops)
+    adapter.prepare("cs.legacy", changeset)
+    art_path = cfg.snapshots_dir / "cs.legacy" / "rollback_artifact.json"
+    art = json.loads(art_path.read_text())
+    # Simulate legacy format: keep only canonical_path, drop rel_path.
+    for entry in art["files"]:
+        entry["canonical_path"] = str(f)
+        entry.pop("rel_path", None)
+        entry.pop("snap_sha256", None)
+    art_path.write_text(json.dumps(art))
+    f.write_text("v2", encoding="utf-8")
+    adapter.record_applied("cs.legacy")
+    # rollback with force so we don't need post-state matching.
+    adapter.rollback("cs.legacy", force=True, is_superuser=True)
+    assert f.read_text() == "v1"
+
+
+# ---------------------------------------------------------------------------
+# Item 6: snapshot file security
+# ---------------------------------------------------------------------------
+
+
+def test_item6_snap_name_absolute_refused(tmp_path):
+    """An absolute snap_name in the artifact is rejected."""
+    from cauldron_workspace_flatfile.reversible import RollbackArtifactInvalid
+    from cauldron_workspace_flatfile.paths import PathEscapeError
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    f = content / "pages" / "home.md"
+    f.write_text("v1", encoding="utf-8")
+    ops = (_update_op("pages", "home", "home"),)
+    changeset = ContentChangeSet(id="cs.snapabs", operations=ops)
+    adapter.prepare("cs.snapabs", changeset)
+    art_path = cfg.snapshots_dir / "cs.snapabs" / "rollback_artifact.json"
+    art = json.loads(art_path.read_text())
+    art["files"][0]["snap_name"] = "/etc/passwd"
+    art_path.write_text(json.dumps(art))
+    with pytest.raises((PathEscapeError, RollbackArtifactInvalid)):
+        adapter.rollback("cs.snapabs", force=True, is_superuser=True)
+
+
+def test_item6_snap_name_traversal_refused(tmp_path):
+    """A traversal snap_name in the artifact is rejected."""
+    from cauldron_workspace_flatfile.reversible import RollbackArtifactInvalid
+    from cauldron_workspace_flatfile.paths import PathEscapeError
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    f = content / "pages" / "home.md"
+    f.write_text("v1", encoding="utf-8")
+    ops = (_update_op("pages", "home", "home"),)
+    changeset = ContentChangeSet(id="cs.snaptrav", operations=ops)
+    adapter.prepare("cs.snaptrav", changeset)
+    art_path = cfg.snapshots_dir / "cs.snaptrav" / "rollback_artifact.json"
+    art = json.loads(art_path.read_text())
+    art["files"][0]["snap_name"] = "../../etc/passwd"
+    art_path.write_text(json.dumps(art))
+    with pytest.raises((PathEscapeError, RollbackArtifactInvalid)):
+        adapter.rollback("cs.snaptrav", force=True, is_superuser=True)
+
+
+def test_item6_snap_hash_mismatch_refused(tmp_path):
+    """A snapshot file whose contents changed after prepare is refused."""
+    from cauldron_workspace_flatfile.reversible import RollbackArtifactInvalid
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    f = content / "pages" / "home.md"
+    f.write_text("v1", encoding="utf-8")
+    ops = (_update_op("pages", "home", "home"),)
+    changeset = ContentChangeSet(id="cs.snaphash", operations=ops)
+    adapter.prepare("cs.snaphash", changeset)
+    # Tamper the snapshot file after prepare.
+    snap_dir = cfg.snapshots_dir / "cs.snaphash"
+    snap_file = next(p for p in snap_dir.iterdir() if p.name.startswith("0000_"))
+    snap_file.write_text("tampered", encoding="utf-8")
+    f.write_text("v2", encoding="utf-8")
+    adapter.record_applied("cs.snaphash")
+    with pytest.raises(RollbackArtifactInvalid):
+        adapter.rollback("cs.snaphash", force=True, is_superuser=True)
+
+
+# ---------------------------------------------------------------------------
+# Item 7: preflight-atomic rollback
+# ---------------------------------------------------------------------------
+
+
+def test_item7_preflight_fails_when_second_entry_invalid(tmp_path):
+    """A malicious second entry causes zero mutations to entry #1."""
+    from cauldron_workspace_flatfile.reversible import RollbackArtifactInvalid
+    from cauldron_workspace_flatfile.paths import PathEscapeError
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    f1 = content / "pages" / "one.md"
+    f2 = content / "pages" / "two.md"
+    f1.write_text("v1-one", encoding="utf-8")
+    f2.write_text("v1-two", encoding="utf-8")
+    ops = (
+        _update_op("pages", "one", "one"),
+        _update_op("pages", "two", "two"),
+    )
+    changeset = ContentChangeSet(id="cs.preflight", operations=ops)
+    adapter.prepare("cs.preflight", changeset)
+    f1.write_text("v2-one", encoding="utf-8")
+    f2.write_text("v2-two", encoding="utf-8")
+    adapter.record_applied("cs.preflight")
+    # Tamper the second entry to have a bad rel_path.
+    art_path = cfg.snapshots_dir / "cs.preflight" / "rollback_artifact.json"
+    art = json.loads(art_path.read_text())
+    art["files"][1]["rel_path"] = "../../etc/passwd"
+    art_path.write_text(json.dumps(art))
+    # v2 remains on both files. Rollback must not touch f1 or f2.
+    with pytest.raises((PathEscapeError, RollbackArtifactInvalid)):
+        adapter.rollback("cs.preflight", force=True, is_superuser=True)
+    assert f1.read_text() == "v2-one"
+    assert f2.read_text() == "v2-two"
+
+
+# ---------------------------------------------------------------------------
+# Item 8: PreparationResult
+# ---------------------------------------------------------------------------
+
+
+def test_item8_prepare_returns_typed_result(tmp_path):
+    from cauldron_workspace_flatfile.reversible import PreparationResult
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    (content / "pages" / "home.md").write_text("hi", encoding="utf-8")
+    ops = (_update_op("pages", "home", "home"),)
+    changeset = ContentChangeSet(id="cs.prepresult", operations=ops)
+    result = adapter.prepare("cs.prepresult", changeset)
+    assert isinstance(result, PreparationResult)
+    assert len(result.artifact_digest) == 64
+    assert result.entry_count == 1
+
+
+def test_item8_unknown_kind_rejected_by_record_applied(tmp_path):
+    """Item 8: record_applied must reject unknown op kinds instead of treating
+    them as informational."""
+    from cauldron_workspace_flatfile.reversible import RollbackPostStateUnavailable
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    (content / "pages" / "home.md").write_text("hi", encoding="utf-8")
+    ops = (_update_op("pages", "home", "home"),)
+    changeset = ContentChangeSet(id="cs.unkkind", operations=ops)
+    adapter.prepare("cs.unkkind", changeset)
+    # Corrupt the artifact to introduce an unknown kind.
+    art_path = cfg.snapshots_dir / "cs.unkkind" / "rollback_artifact.json"
+    art = json.loads(art_path.read_text())
+    art["files"][0]["kind"] = "bogus"
+    art_path.write_text(json.dumps(art))
+    with pytest.raises(RollbackPostStateUnavailable):
+        adapter.record_applied("cs.unkkind")
+
+
+def test_item8_empty_artifact_verify_rejects(tmp_path):
+    """Empty rollback artifact fails verification (never verified)."""
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    (content / "pages" / "home.md").write_text("hi", encoding="utf-8")
+    ops = (_update_op("pages", "home", "home"),)
+    changeset = ContentChangeSet(id="cs.empty", operations=ops)
+    adapter.prepare("cs.empty", changeset)
+    # Empty the artifact files list.
+    art_path = cfg.snapshots_dir / "cs.empty" / "rollback_artifact.json"
+    art = json.loads(art_path.read_text())
+    art["files"] = []
+    art_path.write_text(json.dumps(art))
+    vr = adapter.verify_rolled_back_state("cs.empty")
+    assert vr.status != "verified"
+
+
+# ---------------------------------------------------------------------------
+# Item 9: duplicate targets in a single changeset
+# ---------------------------------------------------------------------------
+
+
+def test_item9_duplicate_targets_rejected_by_prepare(tmp_path):
+    from cauldron_workspace_flatfile.reversible import DuplicateTargetError
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    (content / "pages" / "home.md").write_text("v1", encoding="utf-8")
+    ops = (
+        _update_op("pages", "home", "home"),
+        _update_op("pages", "home", "home"),  # duplicate target
+    )
+    changeset = ContentChangeSet(id="cs.item9", operations=ops)
+    with pytest.raises(DuplicateTargetError):
+        adapter.prepare("cs.item9", changeset)

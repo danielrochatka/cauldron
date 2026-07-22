@@ -189,3 +189,13 @@ class TestErrorEnvelopes:
         assert "data" in body
         assert "meta" in body
         assert body["data"]["key"] == "value"
+
+
+class TestItem17BusyCode:
+    def test_operations_busy_maps_to_409(self):
+        """Item 17: operations.busy errors map to HTTP 409."""
+        from cauldron_content_api.views import _service_error_to_response
+        from cauldron_content_operations.results import OperationError
+        err = OperationError("operations.busy", "Try again shortly.")
+        resp = _service_error_to_response(err)
+        assert resp.status_code == 409

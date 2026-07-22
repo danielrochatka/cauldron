@@ -104,6 +104,12 @@ class ContentChangeRequest(models.Model):
     application_result_meta = models.JSONField(default=dict, blank=True)
     reconciliation_meta = models.JSONField(default=dict, blank=True)
 
+    # Item 8 / 10 / 12: durable request metadata (recovery evidence, reconciliation
+    # failure reasons, provider markers) and SHA-256 of the rollback artifact
+    # written by the reversible adapter.
+    metadata = models.JSONField(default=dict, blank=True)
+    rollback_artifact_digest = models.CharField(max_length=64, blank=True, default="")
+
     def __str__(self) -> str:
         return f"ContentChangeRequest({self.request_id}, {self.lifecycle_state})"
 

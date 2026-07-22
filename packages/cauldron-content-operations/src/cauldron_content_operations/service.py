@@ -4,7 +4,9 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from contextlib import nullcontext
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from django.db import transaction
@@ -12,7 +14,7 @@ from django.db import transaction
 from .audit import AuditEventType, append_audit_event
 from .config import ContentOperationsConfig, get_operations_config
 from .lifecycle import LifecycleError, LifecycleState, assert_transition
-from .locking import request_lock
+from .locking import provider_lock, request_lock
 from .models import ContentAuditEvent, ContentChangeRequest
 from .results import (
     AuditEventDetail,
@@ -23,6 +25,7 @@ from .results import (
     OperationError,
     OperationPreview,
 )
+from .reversible import get_adapter
 
 
 class PermissionDenied(Exception):
@@ -101,6 +104,27 @@ def _compute_payload_hash(operations_data: list[dict]) -> str:
     return hashlib.sha256(payload_str.encode()).hexdigest()
 
 
+def _require_positive_version(expected_version: Any) -> Optional[ChangeRequestResult]:
+    """Return an error result if ``expected_version`` is not a positive int."""
+    if isinstance(expected_version, bool) or not isinstance(expected_version, int):
+        return ChangeRequestResult(
+            ok=False,
+            error=OperationError(
+                "conflict.version_required",
+                "A positive expected_version is required.",
+            ),
+        )
+    if expected_version <= 0:
+        return ChangeRequestResult(
+            ok=False,
+            error=OperationError(
+                "conflict.version_required",
+                "A positive expected_version is required.",
+            ),
+        )
+    return None
+
+
 class ContentOperationService:
     """
     The single application service for permissioned content mutations.
@@ -114,46 +138,29 @@ class ContentOperationService:
         *,
         router: Any,          # ContentRouter
         workspace: Any,       # ChangeSetStore (optional, may be None)
-        snapshots: Any,       # SnapshotService (optional, may be None)
+        snapshots: Any = None,  # Legacy SnapshotService (retained for compat, unused by new code)
         config: Optional[ContentOperationsConfig] = None,
+        locks_dir: Optional[Path] = None,
     ) -> None:
         self._router = router
         self._workspace = workspace
         self._snapshots = snapshots
         self._config = config or get_operations_config()
+        self._locks_dir = Path(locks_dir) if locks_dir is not None else None
 
     # -------------------------------------------------------------------------
-    # Private workspace helpers
+    # Locks
     # -------------------------------------------------------------------------
 
-    def _read_cs_payload(self, cs_id: str) -> Optional[dict]:
-        """Read payload.json from workspace for a changeset."""
-        if self._workspace is None:
-            return None
-        try:
-            import json as _json
-            from cauldron_workspace_flatfile.paths import safe_resolve
-            cs_dir = safe_resolve(self._workspace._config.change_sets_dir, cs_id)
-            with open(cs_dir / "payload.json", "r", encoding="utf-8") as f:
-                return _json.load(f)
-        except Exception:
-            return None
-
-    def _read_cs_result(self, cs_id: str) -> Optional[dict]:
-        """Read result.json from workspace for a changeset."""
-        if self._workspace is None:
-            return None
-        try:
-            import json as _json
-            from cauldron_workspace_flatfile.paths import safe_resolve
-            cs_dir = safe_resolve(self._workspace._config.change_sets_dir, cs_id)
-            result_path = cs_dir / "result.json"
-            if not result_path.exists():
+    def _resolved_locks_dir(self) -> Optional[Path]:
+        if self._locks_dir is not None:
+            return self._locks_dir
+        if self._workspace is not None:
+            try:
+                return Path(self._workspace.locks_dir)
+            except AttributeError:
                 return None
-            with open(result_path, "r", encoding="utf-8") as f:
-                return _json.load(f)
-        except Exception:
-            return None
+        return None
 
     # -------------------------------------------------------------------------
     # Read operations
@@ -162,14 +169,11 @@ class ContentOperationService:
     def list_collections(self, *, user: Any) -> list[str]:
         _check_permission(user, "view_published_content")
         try:
-            from cauldron_content.registry import registry
-            collections: set[str] = set()
-            for provider_name in registry.names():
-                repo = registry.get(provider_name)
-                if repo is not None:
-                    collections.update(repo.list_collections())
-            return sorted(collections)
-        except Exception:
+            return self._router.list_collections()
+        except Exception as exc:
+            from cauldron_content.router import RouterError
+            if isinstance(exc, RouterError):
+                raise
             return []
 
     def list_items(
@@ -217,6 +221,14 @@ class ContentOperationService:
         _check_permission(user, "propose_content_changes")
 
         cfg = self._config
+        if not isinstance(operations, list) or len(operations) == 0:
+            return ChangeRequestResult(
+                ok=False,
+                error=OperationError(
+                    code="operations.empty",
+                    message="At least one operation is required.",
+                ),
+            )
         if len(operations) > cfg.max_operations_per_change_set:
             return ChangeRequestResult(
                 ok=False,
@@ -226,12 +238,44 @@ class ContentOperationService:
                 ),
             )
 
-        # Idempotency check
+        # Mixed-provider detection: reject proposals that would touch more than
+        # one provider so callers must submit separate change requests per provider.
+        providers_seen: set[str] = set()
+        for op_data in operations:
+            try:
+                provider = self._router.resolve_provider(op_data.get("collection", ""))
+                providers_seen.add(provider)
+            except Exception:
+                # Routing errors surface later during validation; do not fail here.
+                pass
+        if len(providers_seen) > 1:
+            return ChangeRequestResult(
+                ok=False,
+                error=OperationError(
+                    "operations.mixed_providers_not_supported",
+                    "A change request may only target one provider. "
+                    "Split operations by provider.",
+                ),
+            )
+
+        payload_hash = _compute_payload_hash(operations)
+
+        # Idempotency check — scoped to (creator, key).
         if idempotency_key:
-            existing = ContentChangeRequest.objects.filter(
-                idempotency_key=idempotency_key
-            ).first()
+            user_pk = getattr(user, "pk", None)
+            qs = ContentChangeRequest.objects.filter(idempotency_key=idempotency_key)
+            if user_pk is not None:
+                qs = qs.filter(created_by_id=user_pk)
+            existing = qs.first()
             if existing is not None:
+                if existing.payload_hash and existing.payload_hash != payload_hash:
+                    return ChangeRequestResult(
+                        ok=False,
+                        error=OperationError(
+                            "idempotency.payload_mismatch",
+                            "Idempotency key reused with a different payload.",
+                        ),
+                    )
                 return ChangeRequestResult(
                     ok=True,
                     request_id=existing.request_id,
@@ -240,7 +284,6 @@ class ContentOperationService:
                     meta={"idempotent": True},
                 )
 
-        payload_hash = _compute_payload_hash(operations)
         request_id = str(uuid.uuid4())
         cs_id = str(uuid.uuid4())
 
@@ -293,8 +336,6 @@ class ContentOperationService:
                     description=description,
                 )
                 self._workspace.create(changeset)
-            except ChangeRequestResult:
-                raise
             except Exception as exc:
                 return ChangeRequestResult(
                     ok=False,
@@ -313,7 +354,7 @@ class ContentOperationService:
                 lifecycle_state=LifecycleState.PROPOSED.value,
                 payload_hash=payload_hash,
                 idempotency_key=idempotency_key,
-                created_by=user if hasattr(user, "pk") else None,
+                created_by=user if (hasattr(user, "pk") and user.pk is not None) else None,
             )
             append_audit_event(
                 change_request=cr,
@@ -332,7 +373,7 @@ class ContentOperationService:
         )
 
     def get_change_request(self, request_id: str, *, user: Any) -> Optional[ChangeRequestDetail]:
-        _check_permission(user, "view_published_content")
+        _check_permission(user, "view_content_change_requests")
         try:
             cr = ContentChangeRequest.objects.get(request_id=request_id)
         except ContentChangeRequest.DoesNotExist:
@@ -347,7 +388,7 @@ class ContentOperationService:
         limit: int = 50,
         offset: int = 0,
     ) -> list[ChangeRequestDetail]:
-        _check_permission(user, "view_published_content")
+        _check_permission(user, "view_content_change_requests")
         qs = ContentChangeRequest.objects.all()
         if lifecycle_state:
             qs = qs.filter(lifecycle_state=lifecycle_state)
@@ -362,6 +403,9 @@ class ContentOperationService:
         expected_version: int = 0,
     ) -> ChangeRequestResult:
         _check_permission(user, "validate_content_changes")
+        version_err = _require_positive_version(expected_version)
+        if version_err:
+            return version_err
         correlation_id = str(uuid.uuid4())
 
         with transaction.atomic():
@@ -373,7 +417,7 @@ class ContentOperationService:
                     error=OperationError("not_found", f"Change request {request_id!r} not found."),
                 )
 
-            if expected_version and cr.request_version != expected_version:
+            if cr.request_version != expected_version:
                 return ChangeRequestResult(
                     ok=False,
                     error=OperationError(
@@ -409,43 +453,60 @@ class ContentOperationService:
                 correlation_id=correlation_id,
             )
 
-            # Load and validate via router
-            cs_data = self._read_cs_payload(cr.workspace_changeset_id)
+            # Workspace must be present for validation — fail closed otherwise.
+            if self._workspace is None:
+                return ChangeRequestResult(
+                    ok=False,
+                    error=OperationError(
+                        "workspace.unavailable",
+                        "Workspace is not configured; cannot validate proposal.",
+                    ),
+                )
+            try:
+                changeset = self._workspace.load_changeset(cr.workspace_changeset_id)
+            except Exception as exc:
+                return ChangeRequestResult(
+                    ok=False,
+                    error=OperationError(
+                        "workspace.load_failed",
+                        f"Failed to load proposal: {str(exc)[:200]}",
+                    ),
+                )
 
-            validation_issues = []
-            if cs_data:
+            if not changeset.operations:
+                return ChangeRequestResult(
+                    ok=False,
+                    error=OperationError(
+                        "validation.empty_operations",
+                        "Proposal contains no operations.",
+                    ),
+                )
+
+            validation_issues: list[dict] = []
+            providers_seen: set[str] = set()
+            for op in changeset.operations:
+                if not op.collection:
+                    validation_issues.append({"code": "missing_collection", "item_id": op.item_id})
+                if not op.item_id:
+                    validation_issues.append({"code": "missing_item_id", "collection": op.collection})
                 try:
-                    from cauldron_content.contracts import (
-                        ContentChangeSet,
-                        ContentOperation,
-                        ContentOperationKind,
-                        ContentStatus,
-                    )
-                    ops = []
-                    for op_data in cs_data.get("operations", []):
-                        kind = ContentOperationKind(op_data["kind"])
-                        status = ContentStatus(op_data.get("status", "draft"))
-                        ops.append(ContentOperation(
-                            kind=kind,
-                            provider=op_data.get("provider", ""),
-                            collection=op_data.get("collection", ""),
-                            item_id=op_data.get("item_id", ""),
-                            slug=op_data.get("slug", ""),
-                            expected_hash=op_data.get("expected_hash", ""),
-                            data=op_data.get("data", {}),
-                            body=op_data.get("body", ""),
-                            schema=op_data.get("schema", ""),
-                            status=status,
-                            force=op_data.get("force", False),
-                        ))
-                    # Basic structural validation (schema validation via provider)
-                    for op in ops:
-                        if not op.collection:
-                            validation_issues.append({"code": "missing_collection", "item_id": op.item_id})
-                        if not op.item_id:
-                            validation_issues.append({"code": "missing_item_id", "collection": op.collection})
+                    provider = self._router.resolve_provider(op.collection)
+                    providers_seen.add(provider)
                 except Exception as exc:
-                    validation_issues.append({"code": "parse_error", "detail": str(exc)[:200]})
+                    validation_issues.append({
+                        "code": "routing_error",
+                        "collection": op.collection,
+                        "detail": str(exc)[:100],
+                    })
+
+            if len(providers_seen) > 1:
+                return ChangeRequestResult(
+                    ok=False,
+                    error=OperationError(
+                        "operations.mixed_providers_not_supported",
+                        "Mixed providers not supported in a single change request.",
+                    ),
+                )
 
             if validation_issues:
                 append_audit_event(
@@ -471,7 +532,7 @@ class ContentOperationService:
 
             cr.lifecycle_state = LifecycleState.VALIDATED.value
             cr.request_version += 1
-            cr.validated_by = user if hasattr(user, "pk") else None
+            cr.validated_by = user if (hasattr(user, "pk") and user.pk is not None) else None
             cr.validated_at = datetime.now(timezone.utc)
             cr.last_error_code = ""
             cr.last_error_summary = ""
@@ -506,6 +567,9 @@ class ContentOperationService:
     ) -> ChangeRequestResult:
         cfg = self._config
         _check_permission(user, "approve_content_changes")
+        version_err = _require_positive_version(expected_version)
+        if version_err:
+            return version_err
         correlation_id = str(uuid.uuid4())
 
         with transaction.atomic():
@@ -514,8 +578,14 @@ class ContentOperationService:
             except ContentChangeRequest.DoesNotExist:
                 return ChangeRequestResult(ok=False, error=OperationError("not_found", f"Not found: {request_id!r}"))
 
-            if expected_version and cr.request_version != expected_version:
-                return ChangeRequestResult(ok=False, error=OperationError("conflict.version", f"Version conflict: expected {expected_version}, got {cr.request_version}."))
+            if cr.request_version != expected_version:
+                return ChangeRequestResult(
+                    ok=False,
+                    error=OperationError(
+                        "conflict.version",
+                        f"Version conflict: expected {expected_version}, got {cr.request_version}.",
+                    ),
+                )
 
             # Self-approval check
             if not cfg.allow_self_approval and hasattr(user, "pk") and cr.created_by_id == user.pk:
@@ -538,7 +608,7 @@ class ContentOperationService:
 
             cr.lifecycle_state = LifecycleState.APPROVED.value
             cr.request_version += 1
-            cr.approved_by = user if hasattr(user, "pk") else None
+            cr.approved_by = user if (hasattr(user, "pk") and user.pk is not None) else None
             cr.approved_at = datetime.now(timezone.utc)
             cr.save(update_fields=["lifecycle_state", "request_version", "approved_by", "approved_at", "updated_at"])
 
@@ -563,6 +633,9 @@ class ContentOperationService:
         expected_version: int = 0,
     ) -> ChangeRequestResult:
         _check_permission(user, "reject_content_changes")
+        version_err = _require_positive_version(expected_version)
+        if version_err:
+            return version_err
         correlation_id = str(uuid.uuid4())
 
         with transaction.atomic():
@@ -571,7 +644,7 @@ class ContentOperationService:
             except ContentChangeRequest.DoesNotExist:
                 return ChangeRequestResult(ok=False, error=OperationError("not_found", f"Not found: {request_id!r}"))
 
-            if expected_version and cr.request_version != expected_version:
+            if cr.request_version != expected_version:
                 return ChangeRequestResult(ok=False, error=OperationError("conflict.version", "Version conflict."))
 
             current_state = cr.current_state
@@ -582,7 +655,7 @@ class ContentOperationService:
 
             cr.lifecycle_state = LifecycleState.REJECTED.value
             cr.request_version += 1
-            cr.rejected_by = user if hasattr(user, "pk") else None
+            cr.rejected_by = user if (hasattr(user, "pk") and user.pk is not None) else None
             cr.rejected_at = datetime.now(timezone.utc)
             cr.save(update_fields=["lifecycle_state", "request_version", "rejected_by", "rejected_at", "updated_at"])
 
@@ -607,6 +680,9 @@ class ContentOperationService:
         expected_version: int = 0,
     ) -> ChangeRequestResult:
         _check_permission(user, "apply_content_changes")
+        version_err = _require_positive_version(expected_version)
+        if version_err:
+            return version_err
         cfg = self._config
         correlation_id = str(uuid.uuid4())
 
@@ -614,167 +690,221 @@ class ContentOperationService:
         try:
             cr_check = ContentChangeRequest.objects.get(request_id=request_id)
             if cr_check.current_state == LifecycleState.APPLIED:
-                return ChangeRequestResult(ok=True, request_id=request_id, lifecycle_state=LifecycleState.APPLIED.value, request_version=cr_check.request_version, meta={"idempotent": True})
+                return ChangeRequestResult(
+                    ok=True,
+                    request_id=request_id,
+                    lifecycle_state=LifecycleState.APPLIED.value,
+                    request_version=cr_check.request_version,
+                    meta={"idempotent": True},
+                )
         except ContentChangeRequest.DoesNotExist:
             return ChangeRequestResult(ok=False, error=OperationError("not_found", f"Not found: {request_id!r}"))
 
-        with request_lock(request_id):
-            # Step 2-7: Mark as applying inside a transaction
-            with transaction.atomic():
-                try:
-                    cr = ContentChangeRequest.objects.select_for_update().get(request_id=request_id)
-                except ContentChangeRequest.DoesNotExist:
-                    return ChangeRequestResult(ok=False, error=OperationError("not_found", "Not found."))
+        if self._workspace is None:
+            return ChangeRequestResult(
+                ok=False,
+                error=OperationError(
+                    "workspace.unavailable",
+                    "Workspace is not configured; cannot apply.",
+                ),
+            )
 
-                if expected_version and cr.request_version != expected_version:
-                    return ChangeRequestResult(ok=False, error=OperationError("conflict.version", "Version conflict."))
+        # Load changeset via the public workspace API so we can determine the
+        # provider before acquiring locks.
+        try:
+            changeset = self._workspace.load_changeset(cr_check.workspace_changeset_id)
+        except Exception as exc:
+            return ChangeRequestResult(
+                ok=False,
+                error=OperationError(
+                    "workspace.load_failed",
+                    f"Failed to load proposal: {str(exc)[:200]}",
+                ),
+            )
 
-                current_state = cr.current_state
-
-                # If require_approval is True, must be APPROVED; if False, VALIDATED is also acceptable
-                if cfg.require_approval:
-                    if current_state != LifecycleState.APPROVED:
-                        try:
-                            assert_transition(current_state, LifecycleState.APPLYING)
-                        except LifecycleError as exc:
-                            return ChangeRequestResult(ok=False, error=OperationError(exc.code, exc.message))
-                else:
-                    allowed = {LifecycleState.APPROVED, LifecycleState.VALIDATED}
-                    if current_state not in allowed:
-                        try:
-                            assert_transition(current_state, LifecycleState.APPLYING)
-                        except LifecycleError as exc:
-                            return ChangeRequestResult(ok=False, error=OperationError(exc.code, exc.message))
-
-                cr.lifecycle_state = LifecycleState.APPLYING.value
-                cr.request_version += 1
-                cr.applied_by = user if hasattr(user, "pk") else None
-                cr.save(update_fields=["lifecycle_state", "request_version", "applied_by", "updated_at"])
-
-                append_audit_event(
-                    change_request=cr,
-                    event_type=AuditEventType.APPLICATION_STARTED,
-                    actor=user,
-                    previous_state=current_state.value,
-                    resulting_state=LifecycleState.APPLYING.value,
-                    provider=cr.provider_name,
-                    correlation_id=correlation_id,
-                )
-            # Transaction committed — applying state is durable
-
-            # Step 8-10: Apply through router
+        providers_seen: set[str] = set()
+        for op in changeset.operations:
             try:
-                cs_data = self._read_cs_payload(cr.workspace_changeset_id)
-                if cs_data is None:
-                    raise ValueError("No payload data found for changeset.")
-                from cauldron_content.contracts import (
-                    ContentChangeSet,
-                    ContentOperation,
-                    ContentOperationKind,
-                    ContentStatus,
-                )
-                ops = []
-                for op_data in cs_data.get("operations", []):
-                    kind = ContentOperationKind(op_data["kind"])
-                    status = ContentStatus(op_data.get("status", "draft"))
-                    ops.append(ContentOperation(
-                        kind=kind,
-                        provider=op_data.get("provider", ""),
-                        collection=op_data.get("collection", ""),
-                        item_id=op_data.get("item_id", ""),
-                        slug=op_data.get("slug", ""),
-                        expected_hash=op_data.get("expected_hash", ""),
-                        data=op_data.get("data", {}),
-                        body=op_data.get("body", ""),
-                        schema=op_data.get("schema", ""),
-                        status=status,
-                        force=op_data.get("force", False),
-                    ))
-                changeset = ContentChangeSet(
-                    id=cr.workspace_changeset_id,
-                    operations=tuple(ops),
-                )
-                apply_result = self._router.apply(changeset)
-            except Exception as exc:
-                # Application failed
-                with transaction.atomic():
-                    cr2 = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
-                    cr2.lifecycle_state = LifecycleState.APPLY_FAILED.value
-                    cr2.request_version += 1
-                    cr2.last_error_code = "application.exception"
-                    cr2.last_error_summary = str(exc)[:500]
-                    cr2.save(update_fields=["lifecycle_state", "request_version", "last_error_code", "last_error_summary", "updated_at"])
-                    append_audit_event(
-                        change_request=cr2,
-                        event_type=AuditEventType.APPLICATION_FAILED,
-                        actor=user,
-                        previous_state=LifecycleState.APPLYING.value,
-                        resulting_state=LifecycleState.APPLY_FAILED.value,
-                        provider=cr.provider_name,
-                        correlation_id=correlation_id,
-                        detail={"error_code": "application.exception", "error_summary": str(exc)[:200]},
-                    )
-                return ChangeRequestResult(ok=False, error=OperationError("application.exception", "Application failed."), request_id=request_id, lifecycle_state=LifecycleState.APPLY_FAILED.value)
-
-            if not apply_result.success:
-                error_detail = {
-                    "conflicts": len(apply_result.conflicts),
-                    "validation_errors": len(apply_result.validation_errors),
-                }
-                with transaction.atomic():
-                    cr2 = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
-                    cr2.lifecycle_state = LifecycleState.APPLY_FAILED.value
-                    cr2.request_version += 1
-                    cr2.last_error_code = "application.conflicts"
-                    cr2.last_error_summary = f"Conflicts: {len(apply_result.conflicts)}, Validation errors: {len(apply_result.validation_errors)}"
-                    cr2.application_result_meta = error_detail
-                    cr2.save(update_fields=["lifecycle_state", "request_version", "last_error_code", "last_error_summary", "application_result_meta", "updated_at"])
-                    append_audit_event(
-                        change_request=cr2,
-                        event_type=AuditEventType.APPLICATION_FAILED,
-                        actor=user,
-                        previous_state=LifecycleState.APPLYING.value,
-                        resulting_state=LifecycleState.APPLY_FAILED.value,
-                        provider=cr.provider_name,
-                        correlation_id=correlation_id,
-                        detail=error_detail,
-                    )
-                return ChangeRequestResult(ok=False, error=OperationError("application.conflicts", cr2.last_error_summary), request_id=request_id, lifecycle_state=LifecycleState.APPLY_FAILED.value)
-
-            # Save workspace result
-            result_meta = {
-                "applied_count": len(apply_result.applied),
-                "correlation_id": correlation_id,
-            }
-            try:
-                if self._workspace is not None:
-                    self._workspace.save_result(cr.workspace_changeset_id, result_meta)
+                providers_seen.add(self._router.resolve_provider(op.collection))
             except Exception:
-                pass  # Non-fatal — state will be marked applied below
+                pass
+        if len(providers_seen) > 1:
+            return ChangeRequestResult(
+                ok=False,
+                error=OperationError(
+                    "operations.mixed_providers_not_supported",
+                    "Mixed providers not supported in a single change request.",
+                ),
+            )
+        provider_name = next(iter(providers_seen)) if providers_seen else cr_check.provider_name
 
-            # Steps 11-16: Mark applied
-            with transaction.atomic():
-                cr2 = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
-                cr2.lifecycle_state = LifecycleState.APPLIED.value
-                cr2.request_version += 1
-                cr2.applied_at = datetime.now(timezone.utc)
-                cr2.application_result_meta = result_meta
-                cr2.last_error_code = ""
-                cr2.last_error_summary = ""
-                cr2.save(update_fields=[
-                    "lifecycle_state", "request_version", "applied_at",
-                    "application_result_meta", "last_error_code", "last_error_summary", "updated_at",
-                ])
-                append_audit_event(
-                    change_request=cr2,
-                    event_type=AuditEventType.APPLICATION_SUCCEEDED,
-                    actor=user,
-                    previous_state=LifecycleState.APPLYING.value,
-                    resulting_state=LifecycleState.APPLIED.value,
-                    provider=cr.provider_name,
-                    correlation_id=correlation_id,
-                    detail=result_meta,
-                )
+        locks_dir = self._resolved_locks_dir()
+        if locks_dir is None:
+            return ChangeRequestResult(
+                ok=False,
+                error=OperationError(
+                    "workspace.unavailable",
+                    "Workspace locks directory is unavailable; cannot apply safely.",
+                ),
+            )
+
+        timeout = float(cfg.lock_timeout)
+
+        with request_lock(request_id, locks_dir, timeout=timeout):
+            with provider_lock(provider_name, locks_dir, timeout=timeout):
+                # Mark as applying inside a transaction
+                with transaction.atomic():
+                    try:
+                        cr = ContentChangeRequest.objects.select_for_update().get(request_id=request_id)
+                    except ContentChangeRequest.DoesNotExist:
+                        return ChangeRequestResult(ok=False, error=OperationError("not_found", "Not found."))
+
+                    if cr.request_version != expected_version:
+                        return ChangeRequestResult(
+                            ok=False,
+                            error=OperationError(
+                                "conflict.version",
+                                f"Version conflict: expected {expected_version}, got {cr.request_version}.",
+                            ),
+                        )
+
+                    current_state = cr.current_state
+
+                    if cfg.require_approval:
+                        if current_state != LifecycleState.APPROVED:
+                            try:
+                                assert_transition(current_state, LifecycleState.APPLYING)
+                            except LifecycleError as exc:
+                                return ChangeRequestResult(ok=False, error=OperationError(exc.code, exc.message))
+                    else:
+                        allowed = {LifecycleState.APPROVED, LifecycleState.VALIDATED}
+                        if current_state not in allowed:
+                            try:
+                                assert_transition(current_state, LifecycleState.APPLYING)
+                            except LifecycleError as exc:
+                                return ChangeRequestResult(ok=False, error=OperationError(exc.code, exc.message))
+
+                    cr.lifecycle_state = LifecycleState.APPLYING.value
+                    cr.request_version += 1
+                    cr.applied_by = user if (hasattr(user, "pk") and user.pk is not None) else None
+                    cr.save(update_fields=["lifecycle_state", "request_version", "applied_by", "updated_at"])
+
+                    append_audit_event(
+                        change_request=cr,
+                        event_type=AuditEventType.APPLICATION_STARTED,
+                        actor=user,
+                        previous_state=current_state.value,
+                        resulting_state=LifecycleState.APPLYING.value,
+                        provider=cr.provider_name,
+                        correlation_id=correlation_id,
+                    )
+                # Transaction committed — applying state is durable
+
+                # Prepare reversible snapshot before mutation
+                adapter = get_adapter(provider_name)
+                if adapter is not None and adapter.supports_rollback:
+                    try:
+                        adapter.prepare(cr.workspace_changeset_id, changeset)
+                    except Exception:
+                        # Rollback support is best-effort; do not block application.
+                        pass
+
+                # Apply through router
+                try:
+                    apply_result = self._router.apply(changeset)
+                except Exception as exc:
+                    with transaction.atomic():
+                        cr2 = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
+                        cr2.lifecycle_state = LifecycleState.APPLY_FAILED.value
+                        cr2.request_version += 1
+                        cr2.last_error_code = "application.exception"
+                        cr2.last_error_summary = str(exc)[:500]
+                        cr2.save(update_fields=["lifecycle_state", "request_version", "last_error_code", "last_error_summary", "updated_at"])
+                        append_audit_event(
+                            change_request=cr2,
+                            event_type=AuditEventType.APPLICATION_FAILED,
+                            actor=user,
+                            previous_state=LifecycleState.APPLYING.value,
+                            resulting_state=LifecycleState.APPLY_FAILED.value,
+                            provider=cr.provider_name,
+                            correlation_id=correlation_id,
+                            detail={"error_code": "application.exception", "error_summary": str(exc)[:200]},
+                        )
+                    return ChangeRequestResult(ok=False, error=OperationError("application.exception", "Application failed."), request_id=request_id, lifecycle_state=LifecycleState.APPLY_FAILED.value)
+
+                if not apply_result.success:
+                    error_detail = {
+                        "conflicts": len(apply_result.conflicts),
+                        "validation_errors": len(apply_result.validation_errors),
+                    }
+                    with transaction.atomic():
+                        cr2 = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
+                        cr2.lifecycle_state = LifecycleState.APPLY_FAILED.value
+                        cr2.request_version += 1
+                        cr2.last_error_code = "application.conflicts"
+                        cr2.last_error_summary = f"Conflicts: {len(apply_result.conflicts)}, Validation errors: {len(apply_result.validation_errors)}"
+                        cr2.application_result_meta = error_detail
+                        cr2.save(update_fields=["lifecycle_state", "request_version", "last_error_code", "last_error_summary", "application_result_meta", "updated_at"])
+                        append_audit_event(
+                            change_request=cr2,
+                            event_type=AuditEventType.APPLICATION_FAILED,
+                            actor=user,
+                            previous_state=LifecycleState.APPLYING.value,
+                            resulting_state=LifecycleState.APPLY_FAILED.value,
+                            provider=cr.provider_name,
+                            correlation_id=correlation_id,
+                            detail=error_detail,
+                        )
+                    return ChangeRequestResult(ok=False, error=OperationError("application.conflicts", cr2.last_error_summary), request_id=request_id, lifecycle_state=LifecycleState.APPLY_FAILED.value)
+
+                # Record post-application hashes for rollback and reconciliation
+                post_hashes: dict[str, str] = {}
+                for item in apply_result.applied:
+                    post_hashes[item.id] = item.hash
+                if adapter is not None and adapter.supports_rollback:
+                    try:
+                        adapter.record_applied(cr.workspace_changeset_id, post_hashes)
+                    except Exception:
+                        pass
+
+                result_meta = {
+                    "applied_count": len(apply_result.applied),
+                    "correlation_id": correlation_id,
+                    "post_hashes": post_hashes,
+                }
+                try:
+                    self._workspace.save_application_result(cr.workspace_changeset_id, result_meta)
+                except Exception:
+                    # Non-fatal — DB state will still be marked applied below;
+                    # reconciliation may need to inspect this later.
+                    pass
+
+                # Mark applied durably
+                with transaction.atomic():
+                    cr2 = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
+                    cr2.lifecycle_state = LifecycleState.APPLIED.value
+                    cr2.request_version += 1
+                    cr2.applied_at = datetime.now(timezone.utc)
+                    cr2.application_result_meta = {
+                        "applied_count": result_meta["applied_count"],
+                        "correlation_id": correlation_id,
+                    }
+                    cr2.last_error_code = ""
+                    cr2.last_error_summary = ""
+                    cr2.save(update_fields=[
+                        "lifecycle_state", "request_version", "applied_at",
+                        "application_result_meta", "last_error_code", "last_error_summary", "updated_at",
+                    ])
+                    append_audit_event(
+                        change_request=cr2,
+                        event_type=AuditEventType.APPLICATION_SUCCEEDED,
+                        actor=user,
+                        previous_state=LifecycleState.APPLYING.value,
+                        resulting_state=LifecycleState.APPLIED.value,
+                        provider=cr.provider_name,
+                        correlation_id=correlation_id,
+                        detail={"applied_count": result_meta["applied_count"]},
+                    )
 
         return ChangeRequestResult(ok=True, request_id=request_id, lifecycle_state=LifecycleState.APPLIED.value, request_version=cr2.request_version)
 
@@ -787,90 +917,159 @@ class ContentOperationService:
         expected_version: int = 0,
     ) -> ChangeRequestResult:
         _check_permission(user, "rollback_content_changes")
+        version_err = _require_positive_version(expected_version)
+        if version_err:
+            return version_err
         correlation_id = str(uuid.uuid4())
 
         try:
             cr_check = ContentChangeRequest.objects.get(request_id=request_id)
             if cr_check.current_state == LifecycleState.ROLLED_BACK:
-                return ChangeRequestResult(ok=True, request_id=request_id, lifecycle_state=LifecycleState.ROLLED_BACK.value, request_version=cr_check.request_version, meta={"idempotent": True})
+                return ChangeRequestResult(
+                    ok=True,
+                    request_id=request_id,
+                    lifecycle_state=LifecycleState.ROLLED_BACK.value,
+                    request_version=cr_check.request_version,
+                    meta={"idempotent": True},
+                )
         except ContentChangeRequest.DoesNotExist:
             return ChangeRequestResult(ok=False, error=OperationError("not_found", f"Not found: {request_id!r}"))
 
-        with request_lock(request_id):
-            with transaction.atomic():
+        provider_name = cr_check.provider_name
+        adapter = get_adapter(provider_name)
+        if adapter is None or not adapter.supports_rollback:
+            return ChangeRequestResult(
+                ok=False,
+                error=OperationError(
+                    "rollback.not_supported",
+                    f"Provider {provider_name!r} does not support rollback.",
+                ),
+            )
+        if not adapter.has_rollback_artifact(cr_check.workspace_changeset_id):
+            return ChangeRequestResult(
+                ok=False,
+                error=OperationError(
+                    "rollback.no_artifact",
+                    "No rollback artifact found for this change request.",
+                ),
+            )
+
+        locks_dir = self._resolved_locks_dir()
+        if locks_dir is None:
+            return ChangeRequestResult(
+                ok=False,
+                error=OperationError(
+                    "workspace.unavailable",
+                    "Workspace locks directory is unavailable; cannot roll back safely.",
+                ),
+            )
+        timeout = float(self._config.lock_timeout)
+
+        with request_lock(request_id, locks_dir, timeout=timeout):
+            with provider_lock(provider_name, locks_dir, timeout=timeout):
+                with transaction.atomic():
+                    try:
+                        cr = ContentChangeRequest.objects.select_for_update().get(request_id=request_id)
+                    except ContentChangeRequest.DoesNotExist:
+                        return ChangeRequestResult(ok=False, error=OperationError("not_found", "Not found."))
+
+                    if cr.request_version != expected_version:
+                        return ChangeRequestResult(
+                            ok=False,
+                            error=OperationError(
+                                "conflict.version",
+                                f"Version conflict: expected {expected_version}, got {cr.request_version}.",
+                            ),
+                        )
+
+                    current_state = cr.current_state
+                    try:
+                        assert_transition(current_state, LifecycleState.ROLLING_BACK)
+                    except LifecycleError as exc:
+                        return ChangeRequestResult(ok=False, error=OperationError(exc.code, exc.message))
+
+                    cr.lifecycle_state = LifecycleState.ROLLING_BACK.value
+                    cr.request_version += 1
+                    cr.rolled_back_by = user if (hasattr(user, "pk") and user.pk is not None) else None
+                    cr.save(update_fields=["lifecycle_state", "request_version", "rolled_back_by", "updated_at"])
+
+                    detail: dict[str, Any] = {}
+                    if force:
+                        detail["forced"] = True
+                        detail["forced_by"] = (
+                            user.get_username() if hasattr(user, "get_username") else str(user)
+                        )
+                    append_audit_event(
+                        change_request=cr,
+                        event_type=AuditEventType.ROLLBACK_STARTED,
+                        actor=user,
+                        previous_state=current_state.value,
+                        resulting_state=LifecycleState.ROLLING_BACK.value,
+                        provider=cr.provider_name,
+                        correlation_id=correlation_id,
+                        detail=detail,
+                    )
+
+                # Perform rollback via adapter (outside DB transaction)
                 try:
-                    cr = ContentChangeRequest.objects.select_for_update().get(request_id=request_id)
-                except ContentChangeRequest.DoesNotExist:
-                    return ChangeRequestResult(ok=False, error=OperationError("not_found", "Not found."))
+                    adapter.rollback(
+                        cr.workspace_changeset_id,
+                        force=force,
+                        is_superuser=bool(getattr(user, "is_superuser", False)),
+                    )
+                    rollback_ok = True
+                    rollback_error = ""
+                except PermissionError as exc:
+                    rollback_ok = False
+                    rollback_error = str(exc)
+                except Exception as exc:
+                    rollback_ok = False
+                    rollback_error = str(exc)[:500]
 
-                if expected_version and cr.request_version != expected_version:
-                    return ChangeRequestResult(ok=False, error=OperationError("conflict.version", "Version conflict."))
-
-                current_state = cr.current_state
-                try:
-                    assert_transition(current_state, LifecycleState.ROLLING_BACK)
-                except LifecycleError as exc:
-                    return ChangeRequestResult(ok=False, error=OperationError(exc.code, exc.message))
-
-                cr.lifecycle_state = LifecycleState.ROLLING_BACK.value
-                cr.request_version += 1
-                cr.rolled_back_by = user if hasattr(user, "pk") else None
-                cr.save(update_fields=["lifecycle_state", "request_version", "rolled_back_by", "updated_at"])
-
-                append_audit_event(
-                    change_request=cr,
-                    event_type=AuditEventType.ROLLBACK_STARTED,
-                    actor=user,
-                    previous_state=current_state.value,
-                    resulting_state=LifecycleState.ROLLING_BACK.value,
-                    provider=cr.provider_name,
-                    correlation_id=correlation_id,
-                )
-
-            # Perform rollback via snapshots
-            try:
-                if self._snapshots is not None:
-                    self._snapshots.rollback(cr.workspace_changeset_id, force=force)
-                rollback_ok = True
-                rollback_error = ""
-            except Exception as exc:
-                rollback_ok = False
-                rollback_error = str(exc)[:500]
-
-            with transaction.atomic():
-                cr2 = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
+                # Record rollback result artifact
                 if rollback_ok:
-                    cr2.lifecycle_state = LifecycleState.ROLLED_BACK.value
-                    cr2.rolled_back_at = datetime.now(timezone.utc)
-                    cr2.last_error_code = ""
-                    cr2.last_error_summary = ""
-                    cr2.request_version += 1
-                    cr2.save(update_fields=["lifecycle_state", "rolled_back_at", "last_error_code", "last_error_summary", "request_version", "updated_at"])
-                    append_audit_event(
-                        change_request=cr2,
-                        event_type=AuditEventType.ROLLBACK_SUCCEEDED,
-                        actor=user,
-                        previous_state=LifecycleState.ROLLING_BACK.value,
-                        resulting_state=LifecycleState.ROLLED_BACK.value,
-                        provider=cr.provider_name,
-                        correlation_id=correlation_id,
-                    )
-                else:
-                    cr2.lifecycle_state = LifecycleState.ROLLBACK_FAILED.value
-                    cr2.last_error_code = "rollback.failed"
-                    cr2.last_error_summary = rollback_error
-                    cr2.request_version += 1
-                    cr2.save(update_fields=["lifecycle_state", "last_error_code", "last_error_summary", "request_version", "updated_at"])
-                    append_audit_event(
-                        change_request=cr2,
-                        event_type=AuditEventType.ROLLBACK_FAILED,
-                        actor=user,
-                        previous_state=LifecycleState.ROLLING_BACK.value,
-                        resulting_state=LifecycleState.ROLLBACK_FAILED.value,
-                        provider=cr.provider_name,
-                        correlation_id=correlation_id,
-                        detail={"error_summary": rollback_error},
-                    )
+                    try:
+                        self._workspace.save_rollback_result(
+                            cr.workspace_changeset_id,
+                            {"correlation_id": correlation_id},
+                        )
+                    except Exception:
+                        pass
+
+                with transaction.atomic():
+                    cr2 = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
+                    if rollback_ok:
+                        cr2.lifecycle_state = LifecycleState.ROLLED_BACK.value
+                        cr2.rolled_back_at = datetime.now(timezone.utc)
+                        cr2.last_error_code = ""
+                        cr2.last_error_summary = ""
+                        cr2.request_version += 1
+                        cr2.save(update_fields=["lifecycle_state", "rolled_back_at", "last_error_code", "last_error_summary", "request_version", "updated_at"])
+                        append_audit_event(
+                            change_request=cr2,
+                            event_type=AuditEventType.ROLLBACK_SUCCEEDED,
+                            actor=user,
+                            previous_state=LifecycleState.ROLLING_BACK.value,
+                            resulting_state=LifecycleState.ROLLED_BACK.value,
+                            provider=cr.provider_name,
+                            correlation_id=correlation_id,
+                        )
+                    else:
+                        cr2.lifecycle_state = LifecycleState.ROLLBACK_FAILED.value
+                        cr2.last_error_code = "rollback.failed"
+                        cr2.last_error_summary = rollback_error
+                        cr2.request_version += 1
+                        cr2.save(update_fields=["lifecycle_state", "last_error_code", "last_error_summary", "request_version", "updated_at"])
+                        append_audit_event(
+                            change_request=cr2,
+                            event_type=AuditEventType.ROLLBACK_FAILED,
+                            actor=user,
+                            previous_state=LifecycleState.ROLLING_BACK.value,
+                            resulting_state=LifecycleState.ROLLBACK_FAILED.value,
+                            provider=cr.provider_name,
+                            correlation_id=correlation_id,
+                            detail={"error_summary": rollback_error},
+                        )
 
         if rollback_ok:
             return ChangeRequestResult(ok=True, request_id=request_id, lifecycle_state=LifecycleState.ROLLED_BACK.value, request_version=cr2.request_version)
@@ -911,53 +1110,54 @@ class ContentOperationService:
         *,
         user: Any,
     ) -> Optional[ChangeSetPreview]:
-        _check_permission(user, "view_published_content")
+        _check_permission(user, "view_content_change_requests")
         try:
             cr = ContentChangeRequest.objects.get(request_id=request_id)
         except ContentChangeRequest.DoesNotExist:
             return None
 
-        cs_data = self._read_cs_payload(cr.workspace_changeset_id)
-        if cs_data is None:
+        if self._workspace is None:
+            return None
+        try:
+            changeset = self._workspace.load_changeset(cr.workspace_changeset_id)
+        except Exception:
             return None
 
         previews = []
-        for op_data in cs_data.get("operations", []):
-            item_id = op_data.get("item_id", "")
-            collection = op_data.get("collection", "")
+        for op in changeset.operations:
+            item_id = op.item_id
+            collection = op.collection
             current_item = None
             try:
-                current_item = self._router.get_by_id(item_id, collection, include_drafts=True)
+                can_see_drafts = getattr(user, "is_superuser", False) or user.has_perm("cauldron_content_operations.view_draft_content")
+                current_item = self._router.get_by_id(item_id, collection, include_drafts=can_see_drafts)
             except Exception:
                 pass
 
             from cauldron_content.hashing import compute_content_hash
-            from cauldron_content.contracts import ContentStatus
-            proposed_data = op_data.get("data", {})
-            proposed_body = op_data.get("body", "")
-            proposed_slug = op_data.get("slug", item_id)
+            proposed_data = dict(op.data)
+            proposed_body = op.body
+            proposed_slug = op.slug or item_id
+            status_str = op.status.value if hasattr(op.status, "value") else str(op.status)
 
-            # Compute proposed hash using canonical function
             try:
-                status_str = op_data.get("status", "draft")
                 proposed_hash = compute_content_hash(
                     item_id=item_id,
                     collection=collection,
                     slug=proposed_slug,
                     status=status_str,
-                    schema=op_data.get("schema", ""),
+                    schema=op.schema,
                     data=proposed_data,
                     body=proposed_body,
                 )
             except Exception:
                 proposed_hash = ""
 
-            # Simple text diff summary (escaped)
             import html
             current_body = current_item.body if current_item else ""
             current_data = dict(current_item.data) if current_item else {}
             current_hash = current_item.hash if current_item else ""
-            has_conflict = bool(op_data.get("expected_hash") and current_item and op_data["expected_hash"] != current_hash)
+            has_conflict = bool(op.expected_hash and current_item and op.expected_hash != current_hash)
 
             diff_lines = []
             if current_body != proposed_body:
@@ -966,11 +1166,12 @@ class ContentOperationService:
                 diff_lines.append("Structured data changed")
             diff_summary = html.escape("; ".join(diff_lines) if diff_lines else "No text changes")
 
+            kind_str = op.kind.value if hasattr(op.kind, "value") else str(op.kind)
             previews.append(OperationPreview(
-                operation_type=op_data.get("kind", ""),
+                operation_type=kind_str,
                 collection=collection,
                 item_id=item_id,
-                provider=op_data.get("provider", cr.provider_name),
+                provider=op.provider or cr.provider_name,
                 current_hash=current_hash,
                 proposed_hash=proposed_hash,
                 current_data=current_data,
@@ -991,20 +1192,24 @@ class ContentOperationService:
         dry_run: bool = False,
     ) -> list[dict[str, Any]]:
         """Inspect and optionally finalize interrupted change requests."""
-        # Only superusers or users with apply_content_changes can reconcile
         _check_permission(user, "apply_content_changes")
 
-        transitional = ContentChangeRequest.objects.filter(
-            lifecycle_state__in=[
-                LifecycleState.APPLYING.value,
-                LifecycleState.ROLLING_BACK.value,
-                LifecycleState.RECONCILIATION_REQUIRED.value,
-            ]
+        transitional = list(
+            ContentChangeRequest.objects.filter(
+                lifecycle_state__in=[
+                    LifecycleState.APPLYING.value,
+                    LifecycleState.ROLLING_BACK.value,
+                    LifecycleState.RECONCILIATION_REQUIRED.value,
+                ]
+            )
         )
 
-        results = []
+        locks_dir = self._resolved_locks_dir()
+        timeout = float(self._config.lock_timeout)
+
+        results: list[dict[str, Any]] = []
         for cr in transitional:
-            entry = {
+            entry: dict[str, Any] = {
                 "request_id": cr.request_id,
                 "current_state": cr.lifecycle_state,
                 "action": None,
@@ -1012,34 +1217,215 @@ class ContentOperationService:
                 "applied": False,
             }
 
-            # Try to read workspace result
-            result_data = self._read_cs_result(cr.workspace_changeset_id)
+            def _lock_ctx():
+                if locks_dir is not None:
+                    return request_lock(cr.request_id, locks_dir, timeout=timeout)
+                return nullcontext()
 
-            if result_data is not None:
-                # Result file exists — application likely completed
-                entry["action"] = "finalize_applied"
-                entry["reason"] = "Workspace result file found; application likely completed."
-                if not dry_run:
-                    with transaction.atomic():
-                        cr2 = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
-                        cr2.lifecycle_state = LifecycleState.APPLIED.value
-                        cr2.request_version += 1
-                        cr2.applied_at = cr2.applied_at or datetime.now(timezone.utc)
-                        cr2.reconciliation_meta = {"reconciled": True, "result_data": result_data}
-                        cr2.save(update_fields=["lifecycle_state", "request_version", "applied_at", "reconciliation_meta", "updated_at"])
-                        append_audit_event(
-                            change_request=cr2,
-                            event_type=AuditEventType.RECONCILIATION_COMPLETED,
-                            actor=user,
-                            previous_state=cr.lifecycle_state,
-                            resulting_state=LifecycleState.APPLIED.value,
-                            provider=cr.provider_name,
-                        )
-                    entry["applied"] = True
-            else:
-                entry["action"] = "leave_ambiguous"
-                entry["reason"] = "No workspace result file; cannot safely determine completion. Manual review required."
+            if dry_run:
+                # Read-only inspection: no locks, no mutations.
+                self._reconcile_inspect(cr, entry)
+                results.append(entry)
+                continue
 
+            with _lock_ctx():
+                self._reconcile_one(cr, user, entry)
             results.append(entry)
 
         return results
+
+    # -------------------------------------------------------------------------
+    # Reconciliation helpers
+    # -------------------------------------------------------------------------
+
+    def _reconcile_inspect(self, cr: ContentChangeRequest, entry: dict) -> None:
+        """Populate ``entry`` without mutating DB, workspace, or providers."""
+        adapter = get_adapter(cr.provider_name) if cr.provider_name else None
+        app_result = (
+            self._workspace.load_application_result(cr.workspace_changeset_id)
+            if self._workspace is not None else None
+        )
+        rb_result = (
+            self._workspace.load_rollback_result(cr.workspace_changeset_id)
+            if self._workspace is not None else None
+        )
+        state = cr.lifecycle_state
+        if state == LifecycleState.APPLYING.value:
+            if app_result and app_result.get("result_type") == "applied":
+                if adapter is not None:
+                    post_hashes = app_result.get("post_hashes", {}) or {}
+                    if post_hashes and not self._verify_post_hashes(cr, post_hashes):
+                        entry["action"] = "leave_ambiguous"
+                        entry["reason"] = "Post-application hashes do not match current state."
+                        return
+                entry["action"] = "would_finalize_applied"
+                entry["reason"] = "Application result present."
+            else:
+                entry["action"] = "leave_ambiguous"
+                entry["reason"] = "No confirmed application result found."
+        elif state == LifecycleState.ROLLING_BACK.value:
+            if rb_result and rb_result.get("result_type") == "rolled_back":
+                entry["action"] = "would_finalize_rolled_back"
+                entry["reason"] = "Rollback result present."
+            else:
+                entry["action"] = "leave_ambiguous"
+                entry["reason"] = "No confirmed rollback result found."
+        else:
+            entry["action"] = "requires_manual_review"
+            entry["reason"] = f"State {state!r} requires manual review."
+
+    def _reconcile_one(
+        self,
+        cr: ContentChangeRequest,
+        user: Any,
+        entry: dict,
+    ) -> None:
+        adapter = get_adapter(cr.provider_name) if cr.provider_name else None
+
+        with transaction.atomic():
+            cr2 = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
+            append_audit_event(
+                change_request=cr2,
+                event_type=AuditEventType.RECONCILIATION_STARTED,
+                actor=user,
+                previous_state=cr2.lifecycle_state,
+                resulting_state=cr2.lifecycle_state,
+                provider=cr2.provider_name,
+            )
+
+        state = cr.lifecycle_state
+        app_result = (
+            self._workspace.load_application_result(cr.workspace_changeset_id)
+            if self._workspace is not None else None
+        )
+        rb_result = (
+            self._workspace.load_rollback_result(cr.workspace_changeset_id)
+            if self._workspace is not None else None
+        )
+
+        if state == LifecycleState.APPLYING.value:
+            if app_result and app_result.get("result_type") == "applied":
+                post_hashes = app_result.get("post_hashes", {}) or {}
+                hashes_match = True
+                if adapter is not None and post_hashes:
+                    hashes_match = self._verify_post_hashes(cr, post_hashes)
+                if hashes_match:
+                    entry["action"] = "finalize_applied"
+                    self._finalize_applied(cr, user, app_result)
+                    entry["applied"] = True
+                else:
+                    entry["action"] = "leave_ambiguous"
+                    entry["reason"] = "Post-application hashes do not match current state."
+                    self._mark_reconciliation_required(cr, user)
+            else:
+                entry["action"] = "leave_ambiguous"
+                entry["reason"] = "No confirmed application result found."
+                self._mark_reconciliation_required(cr, user)
+        elif state == LifecycleState.ROLLING_BACK.value:
+            # NEVER finalize rolling_back as applied based on application result.
+            if rb_result and rb_result.get("result_type") == "rolled_back":
+                entry["action"] = "finalize_rolled_back"
+                self._finalize_rolled_back(cr, user, rb_result)
+                entry["applied"] = True
+            else:
+                entry["action"] = "leave_ambiguous"
+                entry["reason"] = "No confirmed rollback result found."
+                self._mark_reconciliation_required(cr, user)
+        else:
+            entry["action"] = "requires_manual_review"
+            entry["reason"] = f"State {state!r} requires manual review."
+
+    def _verify_post_hashes(
+        self,
+        cr: ContentChangeRequest,
+        post_hashes: dict[str, str],
+    ) -> bool:
+        for item_id, expected in post_hashes.items():
+            try:
+                item = self._router.get_by_id(item_id, include_drafts=True)
+            except Exception:
+                return False
+            if item is None:
+                return False
+            if item.hash != expected:
+                return False
+        return True
+
+    def _finalize_applied(
+        self,
+        cr: ContentChangeRequest,
+        user: Any,
+        app_result: dict,
+    ) -> None:
+        with transaction.atomic():
+            cr2 = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
+            cr2.lifecycle_state = LifecycleState.APPLIED.value
+            cr2.request_version += 1
+            cr2.applied_at = cr2.applied_at or datetime.now(timezone.utc)
+            cr2.reconciliation_meta = {
+                "reconciled": True,
+                "source": "application_result",
+                "applied_count": app_result.get("applied_count"),
+            }
+            cr2.save(update_fields=[
+                "lifecycle_state", "request_version", "applied_at",
+                "reconciliation_meta", "updated_at",
+            ])
+            append_audit_event(
+                change_request=cr2,
+                event_type=AuditEventType.RECONCILIATION_COMPLETED,
+                actor=user,
+                previous_state=cr.lifecycle_state,
+                resulting_state=LifecycleState.APPLIED.value,
+                provider=cr.provider_name,
+            )
+
+    def _finalize_rolled_back(
+        self,
+        cr: ContentChangeRequest,
+        user: Any,
+        rb_result: dict,
+    ) -> None:
+        with transaction.atomic():
+            cr2 = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
+            cr2.lifecycle_state = LifecycleState.ROLLED_BACK.value
+            cr2.request_version += 1
+            cr2.rolled_back_at = cr2.rolled_back_at or datetime.now(timezone.utc)
+            cr2.reconciliation_meta = {
+                "reconciled": True,
+                "source": "rollback_result",
+            }
+            cr2.save(update_fields=[
+                "lifecycle_state", "request_version", "rolled_back_at",
+                "reconciliation_meta", "updated_at",
+            ])
+            append_audit_event(
+                change_request=cr2,
+                event_type=AuditEventType.RECONCILIATION_COMPLETED,
+                actor=user,
+                previous_state=cr.lifecycle_state,
+                resulting_state=LifecycleState.ROLLED_BACK.value,
+                provider=cr.provider_name,
+            )
+
+    def _mark_reconciliation_required(
+        self,
+        cr: ContentChangeRequest,
+        user: Any,
+    ) -> None:
+        with transaction.atomic():
+            cr2 = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
+            if cr2.lifecycle_state == LifecycleState.RECONCILIATION_REQUIRED.value:
+                return
+            previous = cr2.lifecycle_state
+            cr2.lifecycle_state = LifecycleState.RECONCILIATION_REQUIRED.value
+            cr2.request_version += 1
+            cr2.save(update_fields=["lifecycle_state", "request_version", "updated_at"])
+            append_audit_event(
+                change_request=cr2,
+                event_type=AuditEventType.RECONCILIATION_FAILED,
+                actor=user,
+                previous_state=previous,
+                resulting_state=LifecycleState.RECONCILIATION_REQUIRED.value,
+                provider=cr.provider_name,
+            )

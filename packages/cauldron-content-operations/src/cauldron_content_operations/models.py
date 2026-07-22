@@ -27,9 +27,9 @@ class ContentChangeRequest(models.Model):
         ]
         constraints = [
             models.UniqueConstraint(
-                fields=["idempotency_key"],
-                condition=models.Q(idempotency_key__isnull=False) & ~models.Q(idempotency_key=""),
-                name="ccr_unique_idempotency_key",
+                fields=["created_by", "idempotency_key"],
+                condition=models.Q(idempotency_key__gt=""),
+                name="ccr_unique_creator_idempotency_key",
             ),
         ]
 
@@ -166,6 +166,7 @@ class ContentPermissionProxy(models.Model):
         permissions = (
             ("view_published_content", "Can view published content"),
             ("view_draft_content", "Can view draft content"),
+            ("view_content_change_requests", "Can view content change requests"),
             ("propose_content_changes", "Can propose content changes"),
             ("validate_content_changes", "Can validate content changes"),
             ("approve_content_changes", "Can approve content changes"),

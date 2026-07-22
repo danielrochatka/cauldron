@@ -35,6 +35,27 @@ class ContentRouter:
             f"No provider configured for collection {collection!r} and no default provider set."
         )
 
+    def resolve_provider(self, collection: str) -> str:
+        """Public: resolve the provider name for a collection.
+
+        Raises :class:`RouterError` when the collection is not routable.
+        """
+        return self._resolve_provider(collection)
+
+    def list_collections(self) -> list[str]:
+        """Return all collections visible across all registered providers."""
+        collections: set[str] = set()
+        for name in self._registry.names():
+            repo = self._registry.get(name)
+            if repo is None:
+                continue
+            try:
+                collections.update(repo.list_collections())
+            except Exception:
+                # A single misbehaving provider must not break enumeration.
+                continue
+        return sorted(collections)
+
     def _get_repo(self, provider_name: str) -> ContentRepository:
         repo = self._registry.get(provider_name)
         if repo is None:

@@ -152,6 +152,33 @@ jobs:
         working-directory: examples/django-consumer
         run: ../../.venv-wheel/bin/python manage.py check
 
+      - name: Install content module wheels into clean environment
+        run: |
+          .venv-wheel/bin/pip install packages/cauldron-django-state/dist/cauldron_django_state-*.whl
+          .venv-wheel/bin/pip install packages/cauldron-django-auth/dist/cauldron_django_auth-*.whl
+          .venv-wheel/bin/pip install packages/cauldron-django-admin/dist/cauldron_django_admin-*.whl
+          .venv-wheel/bin/pip install packages/cauldron-content/dist/cauldron_content-*.whl
+          .venv-wheel/bin/pip install packages/cauldron-workspace-flatfile/dist/cauldron_workspace_flatfile-*.whl
+          .venv-wheel/bin/pip install packages/cauldron-cms-flatfile/dist/cauldron_cms_flatfile-*.whl
+          .venv-wheel/bin/pip install packages/cauldron-content-operations/dist/cauldron_content_operations-*.whl
+          .venv-wheel/bin/pip install packages/cauldron-content-api/dist/cauldron_content_api-*.whl
+          .venv-wheel/bin/pip install packages/cauldron-admin-content/dist/cauldron_admin_content-*.whl
+          .venv-wheel/bin/pip install pytest pytest-django
+
+      - name: Content control plane example: migrate (wheel)
+        working-directory: examples/django-content-control-plane
+        run: |
+          rm -f db.sqlite3
+          ../../.venv-wheel/bin/python manage.py migrate --noinput
+
+      - name: Content control plane example: check (wheel)
+        working-directory: examples/django-content-control-plane
+        run: ../../.venv-wheel/bin/python manage.py check
+
+      - name: Content control plane example: run tests (wheel)
+        working-directory: examples/django-content-control-plane
+        run: ../../.venv-wheel/bin/python -m pytest tests/ -v
+
   typescript:
     name: TypeScript
     runs-on: ubuntu-latest

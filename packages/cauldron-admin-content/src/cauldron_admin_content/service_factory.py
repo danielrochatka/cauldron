@@ -21,6 +21,7 @@ def get_service():
 
     workspace = None
     snapshots = None
+    locks_dir = None
     ws_cfg_dict = modules.get("cauldron.workspace.flatfile") or {}
     wp = ws_cfg_dict.get("workspace_root", "")
     if wp:
@@ -31,6 +32,7 @@ def get_service():
             workspace_config = WorkspaceConfig(workspace_root=wp)
             workspace = ChangeSetStore(workspace_config)
             snapshots = SnapshotService(workspace_config)
+            locks_dir = workspace_config.locks_dir
         except Exception:
             pass
 
@@ -39,4 +41,5 @@ def get_service():
         workspace=workspace,
         snapshots=snapshots,
         config=get_operations_config(),
+        locks_dir=locks_dir,
     )

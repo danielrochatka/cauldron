@@ -78,3 +78,11 @@ def test_permissions_exist():
     from django.contrib.auth.models import Permission
     perm = Permission.objects.filter(codename="view_published_content").first()
     assert perm is not None
+
+
+@pytest.mark.django_db
+def test_view_change_requests_permission_present():
+    """Migration 0002 must expose the new permission."""
+    from django.contrib.auth.models import Permission
+    perm = Permission.objects.filter(codename="view_content_change_requests").first()
+    assert perm is not None

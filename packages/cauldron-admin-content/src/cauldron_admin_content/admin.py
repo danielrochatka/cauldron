@@ -2,14 +2,12 @@
 from __future__ import annotations
 
 import html
-import json
 import logging
 from typing import Any
 
 from django.contrib import admin, messages
 from django.http import HttpRequest, HttpResponseRedirect
 from django.urls import reverse
-from django.utils.html import format_html
 
 from cauldron_content_operations.models import ContentAuditEvent, ContentChangeRequest
 
@@ -19,6 +17,10 @@ logger = logging.getLogger(__name__)
 def _get_service():
     from .service_factory import get_service
     return get_service()
+
+
+def _is_version_error(code: str) -> bool:
+    return code in ("conflict.version", "conflict.version_required")
 
 
 @admin.register(ContentChangeRequest)
@@ -112,75 +114,144 @@ class ContentChangeRequestAdmin(admin.ModelAdmin):
         except ContentChangeRequest.DoesNotExist:
             return self._changelist_url()
 
+    def _load_expected_version(self, request: HttpRequest, request_id: str):
+        try:
+            cr = ContentChangeRequest.objects.get(request_id=request_id)
+            return cr.request_version, None
+        except ContentChangeRequest.DoesNotExist:
+            messages.error(request, "Change request not found.")
+            return None, HttpResponseRedirect(self._changelist_url())
+
+    def _handle_result(self, request, request_id, result, success_msg, fail_prefix):
+        if result.ok:
+            messages.success(request, success_msg)
+            return
+        if result.error and _is_version_error(result.error.code):
+            messages.error(
+                request,
+                "Another user changed this request. Please reload and try again.",
+            )
+            return
+        detail = result.error.message if result.error else "unknown error"
+        messages.error(request, f"{fail_prefix}: {html.escape(detail)}")
+
     def validate_view(self, request: HttpRequest, request_id: str):
         if request.method != "POST":
             return HttpResponseRedirect(self._detail_url(request_id))
+        expected_version, redirect = self._load_expected_version(request, request_id)
+        if redirect is not None:
+            return redirect
         try:
             service = _get_service()
-            result = service.validate_change_request(request_id, user=request.user)
-            if result.ok:
-                messages.success(request, f"Change request {request_id} validated successfully.")
-            else:
-                messages.error(request, f"Validation failed: {html.escape(result.error.message)}")
-        except Exception as exc:
-            messages.error(request, f"Unexpected error: {html.escape(str(exc)[:200])}")
+            result = service.validate_change_request(
+                request_id, user=request.user, expected_version=expected_version
+            )
+            self._handle_result(
+                request,
+                request_id,
+                result,
+                f"Change request {request_id} validated successfully.",
+                "Validation failed",
+            )
+        except Exception:
+            logger.exception("Unexpected error in validate_view for %s", request_id)
+            messages.error(request, "An unexpected error occurred. Please check server logs.")
         return HttpResponseRedirect(self._detail_url(request_id))
 
     def approve_view(self, request: HttpRequest, request_id: str):
         if request.method != "POST":
             return HttpResponseRedirect(self._detail_url(request_id))
+        expected_version, redirect = self._load_expected_version(request, request_id)
+        if redirect is not None:
+            return redirect
         try:
             service = _get_service()
-            result = service.approve_change_request(request_id, user=request.user)
-            if result.ok:
-                messages.success(request, f"Change request {request_id} approved.")
-            else:
-                messages.error(request, f"Approval failed: {html.escape(result.error.message)}")
-        except Exception as exc:
-            messages.error(request, f"Unexpected error: {html.escape(str(exc)[:200])}")
+            result = service.approve_change_request(
+                request_id, user=request.user, expected_version=expected_version
+            )
+            self._handle_result(
+                request,
+                request_id,
+                result,
+                f"Change request {request_id} approved.",
+                "Approval failed",
+            )
+        except Exception:
+            logger.exception("Unexpected error in approve_view for %s", request_id)
+            messages.error(request, "An unexpected error occurred. Please check server logs.")
         return HttpResponseRedirect(self._detail_url(request_id))
 
     def reject_view(self, request: HttpRequest, request_id: str):
         if request.method != "POST":
             return HttpResponseRedirect(self._detail_url(request_id))
+        expected_version, redirect = self._load_expected_version(request, request_id)
+        if redirect is not None:
+            return redirect
         reason = request.POST.get("reason", "")
         try:
             service = _get_service()
-            result = service.reject_change_request(request_id, user=request.user, reason=reason)
-            if result.ok:
-                messages.success(request, f"Change request {request_id} rejected.")
-            else:
-                messages.error(request, f"Rejection failed: {html.escape(result.error.message)}")
-        except Exception as exc:
-            messages.error(request, f"Unexpected error: {html.escape(str(exc)[:200])}")
+            result = service.reject_change_request(
+                request_id,
+                user=request.user,
+                reason=reason,
+                expected_version=expected_version,
+            )
+            self._handle_result(
+                request,
+                request_id,
+                result,
+                f"Change request {request_id} rejected.",
+                "Rejection failed",
+            )
+        except Exception:
+            logger.exception("Unexpected error in reject_view for %s", request_id)
+            messages.error(request, "An unexpected error occurred. Please check server logs.")
         return HttpResponseRedirect(self._detail_url(request_id))
 
     def apply_view(self, request: HttpRequest, request_id: str):
         if request.method != "POST":
             return HttpResponseRedirect(self._detail_url(request_id))
+        expected_version, redirect = self._load_expected_version(request, request_id)
+        if redirect is not None:
+            return redirect
         try:
             service = _get_service()
-            result = service.apply_change_request(request_id, user=request.user)
-            if result.ok:
-                messages.success(request, f"Change request {request_id} applied.")
-            else:
-                messages.error(request, f"Apply failed: {html.escape(result.error.message)}")
-        except Exception as exc:
-            messages.error(request, f"Unexpected error: {html.escape(str(exc)[:200])}")
+            result = service.apply_change_request(
+                request_id, user=request.user, expected_version=expected_version
+            )
+            self._handle_result(
+                request,
+                request_id,
+                result,
+                f"Change request {request_id} applied.",
+                "Apply failed",
+            )
+        except Exception:
+            logger.exception("Unexpected error in apply_view for %s", request_id)
+            messages.error(request, "An unexpected error occurred. Please check server logs.")
         return HttpResponseRedirect(self._detail_url(request_id))
 
     def rollback_view(self, request: HttpRequest, request_id: str):
         if request.method != "POST":
             return HttpResponseRedirect(self._detail_url(request_id))
+        expected_version, redirect = self._load_expected_version(request, request_id)
+        if redirect is not None:
+            return redirect
         try:
             service = _get_service()
-            result = service.rollback_change_request(request_id, user=request.user)
-            if result.ok:
-                messages.success(request, f"Change request {request_id} rolled back.")
-            else:
-                messages.error(request, f"Rollback failed: {html.escape(result.error.message)}")
-        except Exception as exc:
-            messages.error(request, f"Unexpected error: {html.escape(str(exc)[:200])}")
+            result = service.rollback_change_request(
+                request_id, user=request.user, expected_version=expected_version
+            )
+            self._handle_result(
+                request,
+                request_id,
+                result,
+                f"Change request {request_id} rolled back.",
+                "Rollback failed",
+            )
+        except Exception:
+            logger.exception("Unexpected error in rollback_view for %s", request_id)
+            messages.error(request, "An unexpected error occurred. Please check server logs.")
         return HttpResponseRedirect(self._detail_url(request_id))
 
 

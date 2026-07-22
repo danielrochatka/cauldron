@@ -40,20 +40,53 @@ def test_audit_event_sequence_constraint():
     assert e2.sequence == 2
 
 
-def test_idempotency_key_unique():
+def test_idempotency_key_unique_per_creator():
+    """The idempotency_key uniqueness is scoped to the creating user."""
+    from django.contrib.auth import get_user_model
     from django.db import IntegrityError
     from cauldron_content_operations.models import ContentChangeRequest
+
+    User = get_user_model()
+    u1 = User.objects.create_user(username="idem_a", password="pw")
+    u2 = User.objects.create_user(username="idem_b", password="pw")
+
     ContentChangeRequest.objects.create(
         workspace_changeset_id="cs-3",
         provider_name="flatfile",
         idempotency_key="unique-key-1",
+        created_by=u1,
     )
+    # Same key + same creator should still collide.
     with pytest.raises(IntegrityError):
         ContentChangeRequest.objects.create(
             workspace_changeset_id="cs-4",
             provider_name="flatfile",
             idempotency_key="unique-key-1",
+            created_by=u1,
         )
+
+
+def test_idempotency_key_not_shared_across_creators():
+    """Different creators may reuse the same idempotency key."""
+    from django.contrib.auth import get_user_model
+    from cauldron_content_operations.models import ContentChangeRequest
+
+    User = get_user_model()
+    u1 = User.objects.create_user(username="idem_c", password="pw")
+    u2 = User.objects.create_user(username="idem_d", password="pw")
+    ContentChangeRequest.objects.create(
+        workspace_changeset_id="cs-5",
+        provider_name="flatfile",
+        idempotency_key="shared-key",
+        created_by=u1,
+    )
+    # Should succeed (different creator).
+    ContentChangeRequest.objects.create(
+        workspace_changeset_id="cs-6",
+        provider_name="flatfile",
+        idempotency_key="shared-key",
+        created_by=u2,
+    )
 
 
 def test_auth_user_model_respected():

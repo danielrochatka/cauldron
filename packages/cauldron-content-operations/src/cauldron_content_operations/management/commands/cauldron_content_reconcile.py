@@ -35,6 +35,7 @@ class Command(BaseCommand):
 
             workspace = None
             snapshots = None
+            locks_dir = None
             ws_cfg_dict = modules.get("cauldron.workspace.flatfile") or {}
             wp = ws_cfg_dict.get("workspace_root", "")
             if wp:
@@ -45,6 +46,7 @@ class Command(BaseCommand):
                     workspace_config = WorkspaceConfig(workspace_root=wp)
                     workspace = ChangeSetStore(workspace_config)
                     snapshots = SnapshotService(workspace_config)
+                    locks_dir = workspace_config.locks_dir
                 except Exception:
                     pass
 
@@ -53,6 +55,7 @@ class Command(BaseCommand):
                 workspace=workspace,
                 snapshots=snapshots,
                 config=get_operations_config(),
+                locks_dir=locks_dir,
             )
         except Exception as exc:
             self.stderr.write(f"Failed to initialize service: {exc}")

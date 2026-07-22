@@ -73,6 +73,8 @@ class ContentItemResult:
         )
 
     def to_dict(self) -> dict[str, Any]:
+        # ``source_ref`` is intentionally excluded from the public serialization
+        # because it may leak filesystem paths or provider-internal identifiers.
         return {
             "id": self.id,
             "collection": self.collection,
@@ -83,7 +85,6 @@ class ContentItemResult:
             "body": self.body,
             "hash": self.hash,
             "provider": self.provider,
-            "source_ref": self.source_ref,
         }
 
 

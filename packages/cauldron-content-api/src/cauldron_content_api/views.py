@@ -29,7 +29,7 @@ def _require_authenticated(request: HttpRequest):
 
 
 def _parse_json_body(request: HttpRequest):
-    """Return (data, error_response) tuple."""
+    """Return (data, error_response) tuple. Requires application/json content-type."""
     ct = request.content_type or ""
     if "application/json" not in ct:
         return None, error_response("request.unsupported_content_type", "Content-Type must be application/json.", status=400)
@@ -46,12 +46,40 @@ def _parse_json_body(request: HttpRequest):
         return None, error_response("request.invalid_json", "Request body must be valid JSON.", status=400)
 
 
+def _parse_optional_json_body(request: HttpRequest):
+    """Return (data, error_response) tuple for endpoints where a JSON body is optional.
+
+    Returns ({}, None) when the body is absent or non-JSON content-type.
+    Only returns an error when content-type is application/json but the body is malformed.
+    """
+    ct = request.content_type or ""
+    if "application/json" not in ct:
+        return {}, None
+    try:
+        content_length = int(request.META.get("CONTENT_LENGTH") or 0)
+    except (ValueError, TypeError):
+        content_length = 0
+    if content_length > MAX_REQUEST_BODY_BYTES:
+        return None, error_response("request.body_too_large", "Request body exceeds size limit.", status=400)
+    body = request.body
+    if not body:
+        return {}, None
+    try:
+        data = json.loads(body)
+        return data if isinstance(data, dict) else {}, None
+    except (json.JSONDecodeError, ValueError):
+        return None, error_response("request.invalid_json", "Request body must be valid JSON.", status=400)
+
+
 def _service_error_to_response(error) -> JsonResponse:
     """Map a service OperationError to an HTTP response."""
     code = error.code
     message = error.message
     if code in ("not_found",):
         return error_response(code, message, status=404)
+    # A missing/invalid expected_version from the client is a request error.
+    if code == "conflict.version_required":
+        return error_response(code, message, status=400)
     if code.startswith("conflict.") or code.startswith("lifecycle."):
         return error_response(code, message, status=409)
     if code.startswith("validation."):
@@ -61,6 +89,30 @@ def _service_error_to_response(error) -> JsonResponse:
     if code == "approval.self_approval_denied":
         return error_response(code, message, status=403)
     return error_response(code, message, status=400)
+
+
+def _parse_expected_version(data: dict):
+    """Return (expected_version, error_response) tuple."""
+    raw = data.get("expected_version") if isinstance(data, dict) else None
+    if raw is None:
+        return None, error_response(
+            "conflict.version_required",
+            "expected_version is required.",
+            status=400,
+        )
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None, error_response(
+            "conflict.version_required",
+            "expected_version must be a positive integer.",
+            status=400,
+        )
+    if raw <= 0:
+        return None, error_response(
+            "conflict.version_required",
+            "expected_version must be a positive integer.",
+            status=400,
+        )
+    return raw, None
 
 
 def _pagination_params(request: HttpRequest) -> tuple[int, int]:
@@ -161,12 +213,55 @@ class ChangeRequestListView(View):
         data, parse_err = _parse_json_body(request)
         if parse_err:
             return parse_err
+        if not isinstance(data, dict):
+            return error_response("request.invalid_body", "Request body must be a JSON object.", status=400)
         operations = data.get("operations", [])
         if not isinstance(operations, list):
             return error_response("request.invalid_operations", "operations must be a list.", status=400)
+        if len(operations) == 0:
+            return error_response("request.empty_operations", "operations must not be empty.", status=400)
+        for i, op in enumerate(operations):
+            if not isinstance(op, dict):
+                return error_response(
+                    "request.invalid_operation",
+                    f"Operation {i} must be a JSON object.",
+                    status=400,
+                )
+            coll = op.get("collection")
+            if not isinstance(coll, str) or not coll:
+                return error_response(
+                    "request.missing_field",
+                    f"Operation {i} missing required field: collection",
+                    status=400,
+                )
+            item_id = op.get("item_id")
+            if not isinstance(item_id, str) or not item_id:
+                return error_response(
+                    "request.missing_field",
+                    f"Operation {i} missing required field: item_id",
+                    status=400,
+                )
         provider_name = data.get("provider_name", "")
+        if not isinstance(provider_name, str):
+            return error_response(
+                "request.invalid_field",
+                "provider_name must be a string.",
+                status=400,
+            )
         description = data.get("description", "")
+        if not isinstance(description, str):
+            return error_response(
+                "request.invalid_field",
+                "description must be a string.",
+                status=400,
+            )
         idempotency_key = data.get("idempotency_key", "")
+        if not isinstance(idempotency_key, str):
+            return error_response(
+                "request.invalid_field",
+                "idempotency_key must be a string.",
+                status=400,
+            )
         try:
             service = get_service()
             result = service.create_change_request(
@@ -248,10 +343,12 @@ class ChangeRequestValidateView(View):
         err = _require_authenticated(request)
         if err:
             return err
-        data, parse_err = _parse_json_body(request)
-        expected_version = 0
-        if data and isinstance(data, dict):
-            expected_version = int(data.get("expected_version", 0))
+        data, parse_err = _parse_optional_json_body(request)
+        if parse_err:
+            return parse_err
+        expected_version, ver_err = _parse_expected_version(data)
+        if ver_err:
+            return ver_err
         try:
             service = get_service()
             result = service.validate_change_request(request_id, user=request.user, expected_version=expected_version)
@@ -270,8 +367,12 @@ class ChangeRequestApproveView(View):
         err = _require_authenticated(request)
         if err:
             return err
-        data, _ = _parse_json_body(request)
-        expected_version = int((data or {}).get("expected_version", 0))
+        data, parse_err = _parse_optional_json_body(request)
+        if parse_err:
+            return parse_err
+        expected_version, ver_err = _parse_expected_version(data)
+        if ver_err:
+            return ver_err
         try:
             service = get_service()
             result = service.approve_change_request(request_id, user=request.user, expected_version=expected_version)
@@ -290,9 +391,13 @@ class ChangeRequestRejectView(View):
         err = _require_authenticated(request)
         if err:
             return err
-        data, _ = _parse_json_body(request)
-        expected_version = int((data or {}).get("expected_version", 0))
-        reason = str((data or {}).get("reason", ""))
+        data, parse_err = _parse_optional_json_body(request)
+        if parse_err:
+            return parse_err
+        expected_version, ver_err = _parse_expected_version(data)
+        if ver_err:
+            return ver_err
+        reason = str(data.get("reason", ""))
         try:
             service = get_service()
             result = service.reject_change_request(request_id, user=request.user, reason=reason, expected_version=expected_version)
@@ -311,8 +416,12 @@ class ChangeRequestApplyView(View):
         err = _require_authenticated(request)
         if err:
             return err
-        data, _ = _parse_json_body(request)
-        expected_version = int((data or {}).get("expected_version", 0))
+        data, parse_err = _parse_optional_json_body(request)
+        if parse_err:
+            return parse_err
+        expected_version, ver_err = _parse_expected_version(data)
+        if ver_err:
+            return ver_err
         try:
             service = get_service()
             result = service.apply_change_request(request_id, user=request.user, expected_version=expected_version)
@@ -331,9 +440,13 @@ class ChangeRequestRollbackView(View):
         err = _require_authenticated(request)
         if err:
             return err
-        data, _ = _parse_json_body(request)
-        expected_version = int((data or {}).get("expected_version", 0))
-        force = bool((data or {}).get("force", False))
+        data, parse_err = _parse_optional_json_body(request)
+        if parse_err:
+            return parse_err
+        expected_version, ver_err = _parse_expected_version(data)
+        if ver_err:
+            return ver_err
+        force = bool(data.get("force", False))
         try:
             service = get_service()
             result = service.rollback_change_request(request_id, user=request.user, force=force, expected_version=expected_version)

@@ -812,3 +812,76 @@ def test_item13_invalid_slug_returns_none(tmp_path):
     )
     got = adapter._canonical_path_for_op(op)
     assert got is None
+
+
+# ---------------------------------------------------------------------------
+# Hardening: expected_entry_count binding & completion marker
+# ---------------------------------------------------------------------------
+
+
+def test_expected_entry_count_mismatch_rejected(tmp_path):
+    """Rollback with a mismatched expected_entry_count is refused."""
+    from cauldron_workspace_flatfile.reversible import RollbackArtifactInvalid
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    op = _create_op("pages", "p1")
+    cs = ContentChangeSet(id="cs-hard-ec", operations=(op,))
+    prep = adapter.prepare("cs-hard-ec", cs)
+    # Wrong expected entry count → RollbackArtifactInvalid before mutation.
+    with pytest.raises(RollbackArtifactInvalid):
+        adapter._preflight_rollback(
+            "cs-hard-ec",
+            force=True,
+            expected_artifact_digest=prep.artifact_digest,
+            expected_entry_count=42,
+        )
+
+
+def test_expected_entry_count_correct_accepted(tmp_path):
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    op = _create_op("pages", "p1")
+    cs = ContentChangeSet(id="cs-hard-ec-ok", operations=(op,))
+    prep = adapter.prepare("cs-hard-ec-ok", cs)
+    # Correct expected entry count → preflight succeeds.
+    plan = adapter._preflight_rollback(
+        "cs-hard-ec-ok",
+        force=True,
+        expected_artifact_digest=prep.artifact_digest,
+        expected_entry_count=prep.entry_count,
+    )
+    assert plan
+
+
+def test_record_rolled_back_writes_bound_marker(tmp_path):
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    op = _create_op("pages", "p1")
+    cs = ContentChangeSet(id="cs-hard-marker", operations=(op,))
+    prep = adapter.prepare("cs-hard-marker", cs)
+    adapter.record_rolled_back("cs-hard-marker")
+    marker = adapter.load_rollback_completion("cs-hard-marker")
+    assert marker is not None
+    assert marker["result_type"] == "rolled_back"
+    assert marker["artifact_digest"] == prep.artifact_digest
+    assert marker["entry_count"] == prep.entry_count
+    assert marker["adapter_version"] == 2
+
+
+def test_load_rollback_completion_missing_returns_none(tmp_path):
+    adapter, cfg, content = _make_adapter(tmp_path)
+    assert adapter.load_rollback_completion("no-such-cs") is None
+
+
+def test_load_rollback_completion_rejects_malformed(tmp_path):
+    import json
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    op = _create_op("pages", "p1")
+    cs = ContentChangeSet(id="cs-hard-mal", operations=(op,))
+    adapter.prepare("cs-hard-mal", cs)
+    # Write a marker with wrong result_type.
+    marker_path = adapter._rollback_result_path("cs-hard-mal")
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(json.dumps({"result_type": "applied", "cs_id": "cs-hard-mal"}))
+    assert adapter.load_rollback_completion("cs-hard-mal") is None

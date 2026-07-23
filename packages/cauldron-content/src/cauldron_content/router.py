@@ -91,10 +91,11 @@ class ContentRouter:
                 "Cannot route get_by_id without collection or default provider."
             )
         repo = self._get_repo(provider)
-        # Item 14: capability-detect a ``collection`` kwarg rather than
-        # relying on ``TypeError`` fallback. If the repo does not accept
-        # ``collection``, scan the requested collection directly so the
-        # search never leaks results from other collections.
+        # Item 11: capability-detect a ``collection`` kwarg using the
+        # ``CollectionAwareRepository`` protocol rather than the presence of
+        # ``**kwargs``. A repo that only accepts ``**kwargs`` MUST fall back
+        # to the list_items path so we never accidentally leak same-id items
+        # from other collections.
         try:
             sig = inspect.signature(repo.get_by_id)
         except (TypeError, ValueError):
@@ -102,10 +103,10 @@ class ContentRouter:
         supports_collection = False
         if sig is not None:
             for name, param in sig.parameters.items():
-                if name == "collection":
-                    supports_collection = True
-                    break
-                if param.kind == inspect.Parameter.VAR_KEYWORD:
+                if name == "collection" and param.kind in (
+                    inspect.Parameter.KEYWORD_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                ):
                     supports_collection = True
                     break
         if supports_collection:

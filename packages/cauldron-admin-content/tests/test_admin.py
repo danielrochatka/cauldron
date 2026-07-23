@@ -243,6 +243,7 @@ def test_item14_ok_registration_replaces_stale_adapter(tmp_path):
     from unittest.mock import MagicMock
     stale = MagicMock()
     stale._content_root = "/some/stale/path"
+    stale.reversible_adapter_version = 2
     register_adapter("flatfile", stale)
     try:
         (tmp_path / "content").mkdir()
@@ -430,8 +431,93 @@ def test_item10_template_gates_actions_on_permissions_and_state():
         "approve_content_changes",
         "reject_content_changes",
         "apply_content_changes",
+        "rollback_content_changes",
     ):
         assert perm in text, f"Missing permission gate: {perm}"
     # Each of the five state branches is present.
     for state in ("proposed", "validated", "approved", "applied"):
         assert state in text, f"Missing state branch: {state}"
+
+
+# ---------------------------------------------------------------------------
+# Item 9: rollback button gated on rollback_content_changes only
+# ---------------------------------------------------------------------------
+
+
+def test_item9_rollback_button_uses_rollback_permission_gate():
+    """Rollback branch must gate on rollback_content_changes exclusively."""
+    import cauldron_admin_content
+    from pathlib import Path
+    tpl_path = (
+        Path(cauldron_admin_content.__file__).parent
+        / "templates" / "admin" / "cauldron_content_operations"
+        / "contentchangerequest" / "change_form.html"
+    )
+    text = tpl_path.read_text(encoding="utf-8")
+    idx = text.find('original.lifecycle_state == "applied"')
+    assert idx > 0
+    # Grab the section for the "applied" state.
+    tail = text[idx: idx + 500]
+    assert "rollback_content_changes" in tail
+    # apply_content_changes must not gate the rollback button.
+    assert "apply_content_changes" not in tail
+
+
+def test_item9_render_only_with_rollback_permission():
+    """User with rollback_content_changes sees rollback button; user with only
+    apply_content_changes does NOT.
+    """
+    from django.template import Context, Template
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Permission
+    from django.contrib.contenttypes.models import ContentType
+    from cauldron_content_operations.models import ContentChangeRequest
+
+    User = get_user_model()
+    with_rollback = User.objects.create_user(
+        username="i9-rb", password="p", is_staff=True,
+    )
+    with_apply = User.objects.create_user(
+        username="i9-apply", password="p", is_staff=True,
+    )
+    # Ensure permissions exist (they are declared in the ContentChangeRequest Meta).
+    ct = ContentType.objects.get_for_model(ContentChangeRequest)
+    for codename in ("rollback_content_changes", "apply_content_changes"):
+        Permission.objects.get_or_create(
+            codename=codename, content_type=ct,
+            defaults={"name": codename.replace("_", " ")},
+        )
+    with_rollback.user_permissions.add(
+        Permission.objects.get(codename="rollback_content_changes", content_type=ct)
+    )
+    with_apply.user_permissions.add(
+        Permission.objects.get(codename="apply_content_changes", content_type=ct)
+    )
+    # Rehydrate to pick up cached perms.
+    with_rollback = User.objects.get(pk=with_rollback.pk)
+    with_apply = User.objects.get(pk=with_apply.pk)
+
+    cr = ContentChangeRequest.objects.create(
+        workspace_changeset_id="cs-i9-btn",
+        provider_name="flatfile",
+        lifecycle_state="applied",
+        request_version=1,
+    )
+
+    tpl = Template(
+        "{% if original.lifecycle_state == 'applied' %}"
+        "{% if perms.cauldron_content_operations.rollback_content_changes %}"
+        "ROLLBACK-BUTTON"
+        "{% endif %}"
+        "{% endif %}"
+    )
+    ctx_rb = Context({"original": cr, "perms": _perms(with_rollback)})
+    ctx_apply = Context({"original": cr, "perms": _perms(with_apply)})
+    assert "ROLLBACK-BUTTON" in tpl.render(ctx_rb)
+    assert "ROLLBACK-BUTTON" not in tpl.render(ctx_apply)
+
+
+def _perms(user):
+    """Return a dict-like object matching Django admin ``perms`` template var."""
+    from django.contrib.auth.context_processors import PermWrapper
+    return PermWrapper(user)

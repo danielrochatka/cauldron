@@ -647,6 +647,7 @@ def test_adapter_prepare_failure_prevents_mutation(tmp_path):
 
     mock_adapter = MagicMock()
     mock_adapter.supports_rollback = True
+    mock_adapter.reversible_adapter_version = 2
     mock_adapter.prepare.side_effect = RuntimeError("disk full")
 
     register_adapter("flatfile", mock_adapter)
@@ -706,7 +707,12 @@ def test_result_persistence_failure_enters_reconciliation_required(tmp_path):
 
     mock_adapter = MagicMock()
     mock_adapter.supports_rollback = True
-    mock_adapter.prepare.return_value = None
+    mock_adapter.reversible_adapter_version = 2
+    # Return realistic prep evidence so service.py Item 3 validation passes.
+    class _P:
+        artifact_digest = "a" * 64
+        entry_count = 1
+    mock_adapter.prepare.return_value = _P()
     mock_adapter.record_applied.side_effect = OSError("storage error")
 
     register_adapter("flatfile", mock_adapter)
@@ -1148,7 +1154,8 @@ def _get_ws_cs_id(request_id):
 
 def test_item8_reconcile_applying_finalizes_with_verified(tmp_path):
     from unittest.mock import MagicMock
-    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content.contracts import ContentChangeSet, ContentOperation, ContentOperationKind, ContentStatus
+    from cauldron_content_operations.service import ContentOperationService, _compute_canonical_changeset_hash
     from cauldron_content_operations.config import ContentOperationsConfig
     from cauldron_content_operations.models import ContentChangeRequest
     from cauldron_content_operations.reversible import (
@@ -1164,17 +1171,31 @@ def test_item8_reconcile_applying_finalizes_with_verified(tmp_path):
     cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=ws, config=cfg)
 
+    cs_id = "cs-item8-1"
+    op = ContentOperation(kind=ContentOperationKind.CREATE, provider="flatfile", collection="pages", item_id="p1", slug="p1", data={}, body="", schema="", status=ContentStatus.DRAFT, force=False)
+    cs = ContentChangeSet(id=cs_id, operations=(op,))
+    ws.create(cs)
+    # Advance workspace to VALIDATED so the Item 8 APPLIED sync in reconcile succeeds.
+    from cauldron_workspace_flatfile.store import ChangeSetState as _WsState
+    ws.transition(cs_id, _WsState.VALIDATED)
+    payload_hash = _compute_canonical_changeset_hash(cs)
     cr = ContentChangeRequest.objects.create(
         request_id="rid-item8-1",
-        workspace_changeset_id="cs-item8-1",
+        workspace_changeset_id=cs_id,
         provider_name="flatfile",
         lifecycle_state="applying",
+        payload_hash=payload_hash,
+        rollback_artifact_digest="a" * 64,
+        metadata={"rollback_artifact_entry_count": 1, "application_completed": True},
     )
-    ws.create.__self__ if False else None  # keep type checker quiet
     ws.save_application_result("cs-item8-1", {"applied_count": 1, "correlation_id": "c1"})
 
     adapter = MagicMock()
+    adapter.supports_rollback = True
+    adapter.reversible_adapter_version = 2
     adapter.verify_applied_state.return_value = VerificationResult(status="verified")
+    adapter.verify_rolled_back_state.return_value = VerificationResult(status="missing_evidence")
+    adapter.load_rollback_completion.return_value = None
     register_adapter("flatfile", adapter)
     try:
         results = service.reconcile(user=user, dry_run=False)
@@ -1215,9 +1236,13 @@ def test_item8_reconcile_applying_leaves_when_verify_fails(tmp_path):
     ws.save_application_result("cs-item8-2", {"applied_count": 1, "correlation_id": "c2"})
 
     adapter = MagicMock()
+    adapter.supports_rollback = True
+    adapter.reversible_adapter_version = 2
     adapter.verify_applied_state.return_value = VerificationResult(
         status="mismatch", reason="drifted",
     )
+    adapter.verify_rolled_back_state.return_value = VerificationResult(status="missing_evidence")
+    adapter.load_rollback_completion.return_value = None
     register_adapter("flatfile", adapter)
     try:
         results = service.reconcile(user=user, dry_run=False)
@@ -1260,8 +1285,11 @@ def test_item8_reconcile_rolling_back_never_finalizes_as_applied(tmp_path):
     ws.save_application_result("cs-item8-3", {"applied_count": 1, "correlation_id": "c3"})
 
     adapter = MagicMock()
+    adapter.supports_rollback = True
+    adapter.reversible_adapter_version = 2
     adapter.verify_applied_state.return_value = VerificationResult(status="verified")
     adapter.verify_rolled_back_state.return_value = VerificationResult(status="missing_evidence")
+    adapter.load_rollback_completion.return_value = None
     register_adapter("flatfile", adapter)
     try:
         results = service.reconcile(user=user, dry_run=False)

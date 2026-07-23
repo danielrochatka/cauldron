@@ -64,7 +64,7 @@
         </button>
       {% endif %}
     {% elif original.lifecycle_state == "applied" %}
-      {% if perms.cauldron_content_operations.apply_content_changes %}
+      {% if perms.cauldron_content_operations.rollback_content_changes %}
         <button type="submit"
                 formaction="{% url 'admin:cauldron_content_operations_contentchangerequest_rollback' original.request_id %}"
                 formmethod="post">

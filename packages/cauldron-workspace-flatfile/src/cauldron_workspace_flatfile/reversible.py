@@ -108,6 +108,11 @@ class PreparationResult:
 class FlatFileReversibleMutationAdapter:
     """Reversible mutation adapter for the flatfile CMS provider."""
 
+    # Item 2: declare the protocol version we implement so
+    # ``ContentOperationService._adapter_fully_supports_rollback`` can enforce
+    # a version match at registration and at every apply/rollback/reconcile.
+    reversible_adapter_version = 2
+
     def __init__(self, config: WorkspaceConfig, content_root: Path) -> None:
         self._config = config
         self._content_root = Path(content_root).resolve()
@@ -336,7 +341,70 @@ class FlatFileReversibleMutationAdapter:
         _atomic_write_json(self._post_hashes_path(cs_id), legacy_hashes)
 
     def record_rolled_back(self, cs_id: str) -> None:
-        _atomic_write_json(self._rollback_result_path(cs_id), {"rolled_back": True})
+        """Persist the durable provider completion marker (Item 7).
+
+        The marker binds to the artifact digest and entry count so
+        reconciliation can trust it as independent evidence that canonical
+        rollback completed. Callers pass ``cs_id`` only — the marker is
+        derived from the artifact itself.
+        """
+        art_path = self._art_path(cs_id)
+        if art_path.exists():
+            try:
+                artifact = _read_json(art_path)
+                files = artifact.get("files") or []
+                entry_count = len(files)
+            except Exception:
+                entry_count = 0
+            try:
+                digest = self._artifact_digest(art_path)
+            except Exception:
+                digest = ""
+        else:
+            entry_count = 0
+            digest = ""
+        _atomic_write_json(
+            self._rollback_result_path(cs_id),
+            {
+                "result_type": "rolled_back",
+                "cs_id": cs_id,
+                "artifact_digest": digest,
+                "entry_count": entry_count,
+                "adapter_version": self.reversible_adapter_version,
+            },
+        )
+
+    def load_rollback_completion(self, cs_id: str) -> dict | None:
+        """Load the provider rollback-completion marker (Item 7).
+
+        Returns ``None`` if the marker is missing, unreadable, malformed, or
+        the recorded evidence is contradictory. Callers should further bind
+        the returned dict's ``artifact_digest`` and ``entry_count`` to
+        trusted SQL evidence before finalizing.
+        """
+        path = self._rollback_result_path(cs_id)
+        if not path.exists():
+            return None
+        try:
+            data = _read_json(path)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        if data.get("result_type") != "rolled_back":
+            return None
+        if data.get("cs_id") != cs_id:
+            return None
+        digest = data.get("artifact_digest")
+        if not isinstance(digest, str) or len(digest) != 64:
+            return None
+        entry_count = data.get("entry_count")
+        if not isinstance(entry_count, int) or isinstance(entry_count, bool) or entry_count <= 0:
+            return None
+        adapter_version = data.get("adapter_version")
+        if adapter_version != self.reversible_adapter_version:
+            return None
+        return data
 
     # ------------------------------------------------------------------
     # Rollback preflight (Item 7)
@@ -348,6 +416,7 @@ class FlatFileReversibleMutationAdapter:
         *,
         force: bool,
         expected_artifact_digest: str = "",
+        expected_entry_count: int = 0,
     ) -> list[dict]:
         """Validate the entire rollback plan before any mutation.
 
@@ -390,6 +459,12 @@ class FlatFileReversibleMutationAdapter:
         if expected_artifact_digest and expected_artifact_digest != actual_digest:
             raise RollbackArtifactInvalid(
                 f"Artifact digest mismatch for {cs_id!r}"
+            )
+        # Item 4: bind to SQL-recorded entry count when provided.
+        if expected_entry_count and len(files) != int(expected_entry_count):
+            raise RollbackArtifactInvalid(
+                f"Artifact entry count {len(files)} != expected "
+                f"{expected_entry_count} for {cs_id!r}"
             )
 
         # Item 8: op index integrity — contiguous, unique, starting at 0.
@@ -565,6 +640,7 @@ class FlatFileReversibleMutationAdapter:
         force: bool = False,
         is_superuser: bool = False,
         expected_artifact_digest: str = "",
+        expected_entry_count: int = 0,
     ) -> None:
         if force and not is_superuser:
             raise PermissionError("Forced rollback requires superuser privileges.")
@@ -574,6 +650,7 @@ class FlatFileReversibleMutationAdapter:
             cs_id,
             force=force,
             expected_artifact_digest=expected_artifact_digest,
+            expected_entry_count=expected_entry_count,
         )
 
         # Phase 2: execute plan. Track compensation state.

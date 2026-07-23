@@ -30,22 +30,14 @@ from .validator import SchemaError, load_schema, validate_item
 
 
 def _valid_identifier_segment(value: str) -> bool:
-    """Local identifier-segment guard (Item 13).
+    """Item 12: use the shared canonical validator from ``cauldron_content``.
 
-    Mirrors :func:`cauldron_content_operations._identifiers.validate_identifier_segment`
-    without importing it, so cauldron-cms-flatfile stays independent.
+    Returns ``True`` iff the segment passes the shared safety rules.
     """
-    if not isinstance(value, str) or value == "":
-        return False
-    if "/" in value or "\\" in value:
-        return False
-    if value.startswith(("/", "\\")):
-        return False
-    if value in (".", ".."):
-        return False
-    if any(ord(ch) < 0x20 for ch in value):
-        return False
-    if len(value) >= 2 and value[1] == ":" and value[0].isalpha():
+    from cauldron_content._identifiers import validate_identifier_segment
+    try:
+        validate_identifier_segment(value, "segment")
+    except Exception:
         return False
     return True
 

@@ -65,6 +65,11 @@ class VerificationResult:
 class ReversibleMutationAdapter(Protocol):
     """Protocol describing provider-specific rollback support (version 2)."""
 
+    # Item 2: adapters MUST declare a protocol version. The service refuses
+    # adapters whose ``reversible_adapter_version`` does not match
+    # ``REVERSIBLE_ADAPTER_VERSION``.
+    reversible_adapter_version: int
+
     @property
     def supports_rollback(self) -> bool: ...
 
@@ -89,12 +94,15 @@ class ReversibleMutationAdapter(Protocol):
         force: bool = False,
         is_superuser: bool = False,
         expected_artifact_digest: str = "",
+        expected_entry_count: int = 0,
     ) -> None:
-        """Restore the pre-application state, bound to the trusted digest.
+        """Restore the pre-application state, bound to the trusted digest and count.
 
         Implementations should refuse to overwrite content that has diverged
         from the recorded post-application state unless ``force`` is True
         (which itself must require ``is_superuser`` when supplied by callers).
+        ``expected_entry_count`` binds the mutation to the SQL-recorded number
+        of entries; an artifact with a different entry count MUST be refused.
         """
 
     def has_application_result(self, cs_id: str) -> bool: ...
@@ -132,12 +140,34 @@ class ReversibleMutationAdapter(Protocol):
         entry count the adapter MUST return ``"missing_evidence"``.
         """
 
+    def load_rollback_completion(self, cs_id: str) -> dict | None:
+        """Return the durable provider rollback completion marker (Item 7).
+
+        The marker must include ``result_type='rolled_back'``, ``cs_id``,
+        ``artifact_digest``, ``entry_count`` and ``adapter_version``. Return
+        ``None`` if missing or malformed.
+        """
+
 
 _registry: dict[str, ReversibleMutationAdapter] = {}
 
 
+class AdapterVersionMismatch(Exception):
+    """Raised when a registered adapter's version does not match the protocol."""
+
+
 def register_adapter(provider_name: str, adapter: ReversibleMutationAdapter) -> None:
-    """Register a rollback adapter for a provider (typically at app startup)."""
+    """Register a rollback adapter for a provider (typically at app startup).
+
+    Item 2: refuses to register an adapter whose
+    ``reversible_adapter_version`` does not match ``REVERSIBLE_ADAPTER_VERSION``.
+    """
+    version = getattr(adapter, "reversible_adapter_version", None)
+    if version != REVERSIBLE_ADAPTER_VERSION:
+        raise AdapterVersionMismatch(
+            f"Adapter for {provider_name!r} advertises version {version!r}, "
+            f"expected {REVERSIBLE_ADAPTER_VERSION}."
+        )
     _registry[provider_name] = adapter
 
 

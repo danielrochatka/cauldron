@@ -10,6 +10,9 @@ packages/cauldron-cms-flatfile/dist/
 packages/cauldron-django-state/dist/
 packages/cauldron-django-auth/dist/
 packages/cauldron-django-admin/dist/
+packages/cauldron-content-operations/dist/
+packages/cauldron-content-api/dist/
+packages/cauldron-admin-content/dist/
 build/
 node_modules/
 .astro/

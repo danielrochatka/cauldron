@@ -1,6 +1,7 @@
 """Routes content operations to the correct provider."""
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -35,11 +36,36 @@ class ContentRouter:
             f"No provider configured for collection {collection!r} and no default provider set."
         )
 
+    def resolve_provider(self, collection: str) -> str:
+        """Public: resolve the provider name for a collection.
+
+        Raises :class:`RouterError` when the collection is not routable.
+        """
+        return self._resolve_provider(collection)
+
+    def list_collections(self) -> list[str]:
+        """Return all collections visible across all registered providers."""
+        collections: set[str] = set()
+        for name in self._registry.names():
+            repo = self._registry.get(name)
+            if repo is None:
+                continue
+            try:
+                collections.update(repo.list_collections())
+            except Exception:
+                # A single misbehaving provider must not break enumeration.
+                continue
+        return sorted(collections)
+
     def _get_repo(self, provider_name: str) -> ContentRepository:
         repo = self._registry.get(provider_name)
         if repo is None:
             raise RouterError(f"Provider {provider_name!r} is not registered.")
         return repo
+
+    def get_repo(self, provider_name: str) -> ContentRepository:
+        """Public access to the registered repository for a provider."""
+        return self._get_repo(provider_name)
 
     def list_items(
         self, collection: str, *, include_drafts: bool = False
@@ -64,7 +90,47 @@ class ContentRouter:
             raise RouterError(
                 "Cannot route get_by_id without collection or default provider."
             )
-        return self._get_repo(provider).get_by_id(item_id, include_drafts=include_drafts)
+        repo = self._get_repo(provider)
+        # Item 11: capability-detect a ``collection`` kwarg using the
+        # ``CollectionAwareRepository`` protocol rather than the presence of
+        # ``**kwargs``. A repo that only accepts ``**kwargs`` MUST fall back
+        # to the list_items path so we never accidentally leak same-id items
+        # from other collections.
+        try:
+            sig = inspect.signature(repo.get_by_id)
+        except (TypeError, ValueError):
+            sig = None
+        supports_collection = False
+        if sig is not None:
+            for name, param in sig.parameters.items():
+                if name == "collection" and param.kind in (
+                    inspect.Parameter.KEYWORD_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                ):
+                    supports_collection = True
+                    break
+        if supports_collection:
+            return repo.get_by_id(
+                item_id, include_drafts=include_drafts, collection=collection,
+            )
+        # Fallback: enumerate only the requested collection so a same-id
+        # item in a different collection cannot pollute the result.
+        if collection:
+            items = repo.list_items(collection, include_drafts=True)
+            for it in items:
+                if it.id == item_id:
+                    if not include_drafts and getattr(it, "status", None) is not None:
+                        # ContentStatus enum; DRAFT filter.
+                        try:
+                            from .contracts import ContentStatus
+                            if it.status == ContentStatus.DRAFT and not include_drafts:
+                                return None
+                        except Exception:
+                            pass
+                    return it
+            return None
+        # No collection and no collection-aware repo: preserve legacy behaviour.
+        return repo.get_by_id(item_id, include_drafts=include_drafts)
 
     def get_by_slug(
         self,

@@ -1,0 +1,15 @@
+{% extends "admin/base_site.html" %}
+{% block title %}Create Content Proposal{% endblock %}
+{% block content %}
+<h1>Create Content Proposal</h1>
+{% if messages %}
+{% for message in messages %}
+<p class="{{ message.tags }}">{{ message|escape }}</p>
+{% endfor %}
+{% endif %}
+<form method="post">
+    {% csrf_token %}
+    {{ form.as_p }}
+    <button type="submit">Submit Proposal</button>
+</form>
+{% endblock %}

@@ -183,3 +183,161 @@ def test_get_by_slug_routes_by_collection():
     router = ContentRouter(reg, RouterConfig(collections={"pages": "p"}))
     router.get_by_slug("pages", "home")
     assert repo.calls[0][:3] == ("get_by_slug", "pages", "home")
+
+
+class _CollectionAwareRepo(_RecordingRepo):
+    """Repo whose ``get_by_id`` accepts a ``collection`` kwarg."""
+
+    def get_by_id(self, item_id, *, include_drafts=False, collection=None):
+        self.calls.append(("get_by_id", item_id, include_drafts, collection))
+        for it in self._items:
+            if it.id == item_id and (collection is None or it.collection == collection):
+                return it
+        return None
+
+
+def test_item14_router_forwards_collection_when_supported():
+    """Item 14: capability-detect ``collection`` kwarg and forward it."""
+    reg = RepositoryRegistry()
+    items = [
+        _item(collection="pages", slug="home", id_="home"),
+        _item(collection="posts", slug="home", id_="home"),
+    ]
+    repo = _CollectionAwareRepo("p", items=items)
+    reg.register("p", repo)
+    router = ContentRouter(reg, RouterConfig(default_provider="p"))
+    got = router.get_by_id("home", collection="posts")
+    assert got is not None
+    assert got.collection == "posts"
+
+
+def test_item14_router_falls_back_to_list_items_when_no_collection_param():
+    """Item 14: repo without ``collection`` kwarg → fall back to list_items
+    scoped to the requested collection, not a naive ``get_by_id`` on any
+    collection (which could return a same-id item from a different one).
+    """
+    reg = RepositoryRegistry()
+    # _RecordingRepo.get_by_id has NO ``collection`` kwarg. Two items share
+    # the same ``id`` across different collections.
+    items = [
+        _item(collection="pages", slug="home", id_="home"),
+        _item(collection="posts", slug="home", id_="home"),
+    ]
+    repo = _RecordingRepo("p", items=items)
+    reg.register("p", repo)
+    router = ContentRouter(reg, RouterConfig(default_provider="p"))
+    got = router.get_by_id("home", collection="posts")
+    assert got is not None
+    assert got.collection == "posts"
+    # The router must have called list_items on the requested collection.
+    assert any(c[0] == "list_items" and c[1] == "posts" for c in repo.calls)
+
+
+# ---------------------------------------------------------------------------
+# Item 11: **kwargs-only repos are NOT treated as collection-aware
+# ---------------------------------------------------------------------------
+
+
+class _KwargsOnlyRepo:
+    """A repo whose get_by_id accepts arbitrary kwargs but does NOT declare
+    ``collection`` as an explicit parameter.
+
+    Item 11: the router MUST NOT use this repo's get_by_id with a collection
+    kwarg — it should fall back to list_items scoped to the requested
+    collection.
+    """
+
+    def __init__(self, items):
+        self._items = items
+        self.calls = []
+
+    def describe(self): ...
+    def list_collections(self): return []
+    def list_items(self, collection, *, include_drafts=False):
+        self.calls.append(("list_items", collection, include_drafts))
+        return [i for i in self._items if i.collection == collection]
+
+    def get_by_id(self, item_id, **kwargs):
+        # Never has an explicit `collection` param — the router must not
+        # rely on **kwargs for capability detection.
+        self.calls.append(("get_by_id", item_id, kwargs))
+        return next((i for i in self._items if i.id == item_id), None)
+
+    def get_by_slug(self, collection, slug, *, include_drafts=False):
+        return next(
+            (i for i in self._items if i.collection == collection and i.slug == slug),
+            None,
+        )
+
+    def validate(self, item): ...
+    def apply(self, changeset): ...
+    def health(self): ...
+
+
+def test_item11_kwargs_only_repo_uses_list_items_fallback():
+    a = _item(collection="alpha", slug="s1", id_="shared-id")
+    b = _item(collection="beta", slug="s2", id_="shared-id")
+    repo = _KwargsOnlyRepo([a, b])
+    registry = RepositoryRegistry()
+    registry.register("p1", repo)
+    router = ContentRouter(registry, RouterConfig(default_provider="p1"))
+    result = router.get_by_id("shared-id", collection="alpha", include_drafts=True)
+    # Fallback should scan alpha only.
+    assert result is not None
+    assert result.collection == "alpha"
+    # Router must have used list_items, NOT get_by_id with a collection kwarg.
+    kinds = [c[0] for c in repo.calls]
+    assert "list_items" in kinds
+    for c in repo.calls:
+        if c[0] == "get_by_id":
+            # If get_by_id was called it must NOT have received a collection kwarg.
+            assert "collection" not in c[2], c
+
+
+class _ExplicitCollectionRepo:
+    def __init__(self, items):
+        self._items = items
+        self.calls = []
+
+    def describe(self): ...
+    def list_collections(self): return []
+    def list_items(self, collection, *, include_drafts=False):
+        return [i for i in self._items if i.collection == collection]
+
+    def get_by_id(self, item_id, *, include_drafts=False, collection=""):
+        self.calls.append(("get_by_id", item_id, include_drafts, collection))
+        return next(
+            (i for i in self._items if i.id == item_id and (not collection or i.collection == collection)),
+            None,
+        )
+
+    def get_by_slug(self, collection, slug, *, include_drafts=False): ...
+    def validate(self, item): ...
+    def apply(self, changeset): ...
+    def health(self): ...
+
+
+def test_item11_explicit_collection_kwarg_detected():
+    a = _item(collection="alpha", slug="s1", id_="id-a")
+    b = _item(collection="beta", slug="s2", id_="id-b")
+    repo = _ExplicitCollectionRepo([a, b])
+    registry = RepositoryRegistry()
+    registry.register("p1", repo)
+    router = ContentRouter(registry, RouterConfig(default_provider="p1"))
+    router.get_by_id("id-a", collection="alpha", include_drafts=True)
+    # Router must have delegated to repo.get_by_id with collection kwarg.
+    assert repo.calls
+    assert repo.calls[0] == ("get_by_id", "id-a", True, "alpha")
+
+
+def test_item11_protocol_type_check():
+    from cauldron_content.repository import CollectionAwareRepository
+    aware = _ExplicitCollectionRepo([])
+    kwargs_only = _KwargsOnlyRepo([])
+    # runtime_checkable protocol: aware repo satisfies it; kwargs-only does not.
+    assert isinstance(aware, CollectionAwareRepository)
+    # kwargs-only structurally does have get_by_id, but it doesn't accept the
+    # exact keyword signature. runtime_checkable protocols only check the
+    # method's presence, so this is a structural fit — the router uses signature
+    # inspection to distinguish them.
+    assert callable(getattr(kwargs_only, "get_by_id", None))

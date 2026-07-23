@@ -36,9 +36,27 @@ layout and computes byte-identical content hashes, so build-time and edit-time
 agree on identity. See `docs/content-contracts.md`, `docs/flatfile-cms.md`,
 `docs/flatfile-workspace.md`, and `docs/astro-flatfile-content.md`.
 
+## Content control plane
+
+The content control plane adds a permissioned mutation layer on top of the content stack:
+
+- `ContentOperationService` is the **single application service** for all content mutations.
+  API layers, the Django Admin, and future AI agents all delegate to this service.
+  Authorization is enforced here — callers must not re-implement permission checks.
+- A lifecycle state machine (`PROPOSED → VALIDATED → APPROVED → APPLYING → APPLIED`)
+  provides auditability, reversibility, and separation of duties.
+- The `ContentPermissionProxy` model hosts nine permission codenames that map to each
+  lifecycle action. Groups can be configured to enforce four-eyes approval.
+- An append-only `ContentAuditEvent` table records every state transition with actor,
+  timestamps, and correlation IDs.
+- Reconciliation (`cauldron_content_reconcile`) detects and finalizes requests that were
+  interrupted during application.
+
+The HTTP API (`cauldron.content.api`) and Django Admin integration (`cauldron.admin.content`)
+are thin layers over `ContentOperationService`. A future AI Admin module will follow the same
+pattern.
+
 ## Deferred modules
 
-AI administration, LLM integration, Django-side content APIs beyond the
-`ContentRepository` protocol, SQL/Wagtail providers, media library, search,
-RAG/vector, imports, forms, deployment, billing, tenancy, and production
-operations are intentionally deferred.
+SQL/Wagtail providers, media library, search, RAG/vector, imports, forms,
+deployment, billing, tenancy, and production operations are intentionally deferred.

@@ -1,6 +1,7 @@
 """Routes content operations to the correct provider."""
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -90,20 +91,45 @@ class ContentRouter:
                 "Cannot route get_by_id without collection or default provider."
             )
         repo = self._get_repo(provider)
-        # Item 3: forward collection to collection-aware repositories so the
-        # search stays within op.collection. Fall back gracefully for older
-        # repositories.
+        # Item 14: capability-detect a ``collection`` kwarg rather than
+        # relying on ``TypeError`` fallback. If the repo does not accept
+        # ``collection``, scan the requested collection directly so the
+        # search never leaks results from other collections.
         try:
+            sig = inspect.signature(repo.get_by_id)
+        except (TypeError, ValueError):
+            sig = None
+        supports_collection = False
+        if sig is not None:
+            for name, param in sig.parameters.items():
+                if name == "collection":
+                    supports_collection = True
+                    break
+                if param.kind == inspect.Parameter.VAR_KEYWORD:
+                    supports_collection = True
+                    break
+        if supports_collection:
             return repo.get_by_id(
                 item_id, include_drafts=include_drafts, collection=collection,
             )
-        except TypeError:
-            item = repo.get_by_id(item_id, include_drafts=include_drafts)
-            # Item 3 fallback filter: if the repo does not accept a collection
-            # kwarg, drop items from the wrong collection.
-            if item is not None and collection and item.collection != collection:
-                return None
-            return item
+        # Fallback: enumerate only the requested collection so a same-id
+        # item in a different collection cannot pollute the result.
+        if collection:
+            items = repo.list_items(collection, include_drafts=True)
+            for it in items:
+                if it.id == item_id:
+                    if not include_drafts and getattr(it, "status", None) is not None:
+                        # ContentStatus enum; DRAFT filter.
+                        try:
+                            from .contracts import ContentStatus
+                            if it.status == ContentStatus.DRAFT and not include_drafts:
+                                return None
+                        except Exception:
+                            pass
+                    return it
+            return None
+        # No collection and no collection-aware repo: preserve legacy behaviour.
+        return repo.get_by_id(item_id, include_drafts=include_drafts)
 
     def get_by_slug(
         self,

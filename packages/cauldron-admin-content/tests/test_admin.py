@@ -196,8 +196,31 @@ def test_item11_admin_service_factory_bad_workspace(tmp_path):
 
 
 def test_item14_missing_content_root_raises(tmp_path):
+    """Item 15: content_root is only required when cauldron.cms.flatfile
+    is present. Providing the flatfile config without a content_root must
+    still raise; omitting the flatfile config entirely must NOT raise.
+    """
     from django.test import override_settings
     from django.core.exceptions import ImproperlyConfigured
+    from cauldron_admin_content.service_factory import get_service
+    # Case 1: flatfile module present but content_root missing → error.
+    with override_settings(
+        CAULDRON_MODULES={
+            "cauldron.content": {},
+            "cauldron.workspace.flatfile": {"workspace_root": str(tmp_path / "ws")},
+            "cauldron.cms.flatfile": {},
+            "cauldron.admin.content": {},
+        }
+    ):
+        with pytest.raises(ImproperlyConfigured):
+            get_service()
+
+
+def test_item15_non_flatfile_provider_needs_no_content_root(tmp_path):
+    """Item 15: with no cauldron.cms.flatfile module, get_service() must
+    succeed without requiring content_root.
+    """
+    from django.test import override_settings
     from cauldron_admin_content.service_factory import get_service
     with override_settings(
         CAULDRON_MODULES={
@@ -206,8 +229,8 @@ def test_item14_missing_content_root_raises(tmp_path):
             "cauldron.admin.content": {},
         }
     ):
-        with pytest.raises(ImproperlyConfigured):
-            get_service()
+        svc = get_service()
+    assert svc is not None
 
 
 def test_item14_ok_registration_replaces_stale_adapter(tmp_path):
@@ -239,6 +262,28 @@ def test_item14_ok_registration_replaces_stale_adapter(tmp_path):
 
 
 def test_item14_system_checks_report_missing_content_root(tmp_path):
+    """Item 15: when cauldron.cms.flatfile IS declared but content_root is
+    absent, E002 fires. Without the flatfile module, E002 must NOT fire.
+    """
+    from django.test import override_settings
+    from cauldron_admin_content.checks import check_admin_content_configuration
+    with override_settings(
+        CAULDRON_MODULES={
+            "cauldron.content": {},
+            "cauldron.workspace.flatfile": {"workspace_root": str(tmp_path / "ws")},
+            "cauldron.cms.flatfile": {},
+            "cauldron.admin.content": {},
+        }
+    ):
+        errors = check_admin_content_configuration(None)
+    ids = [e.id for e in errors]
+    assert "content_admin.E002" in ids
+
+
+def test_item15_no_flatfile_provider_skips_content_root_check(tmp_path):
+    """Item 15: check_admin_content_configuration does not require a
+    content_root when the flatfile CMS module is absent.
+    """
     from django.test import override_settings
     from cauldron_admin_content.checks import check_admin_content_configuration
     with override_settings(
@@ -250,7 +295,7 @@ def test_item14_system_checks_report_missing_content_root(tmp_path):
     ):
         errors = check_admin_content_configuration(None)
     ids = [e.id for e in errors]
-    assert "content_admin.E002" in ids
+    assert "content_admin.E002" not in ids
 
 
 # ---------------------------------------------------------------------------
@@ -329,3 +374,64 @@ def _make_test_user():
         username="item15adminuser", defaults={"is_staff": True, "is_superuser": True},
     )
     return user
+
+
+# ---------------------------------------------------------------------------
+# Item 10: admin lifecycle template — no nested <form>, formaction submits,
+# and action visibility is gated on both lifecycle state and permissions.
+# ---------------------------------------------------------------------------
+
+
+def test_item10_admin_template_has_no_nested_form_element():
+    """The lifecycle template must not open a nested <form> element."""
+    import cauldron_admin_content
+    from pathlib import Path
+    tpl_path = (
+        Path(cauldron_admin_content.__file__).parent
+        / "templates" / "admin" / "cauldron_content_operations"
+        / "contentchangerequest" / "change_form.html"
+    )
+    text = tpl_path.read_text(encoding="utf-8")
+    # Strip Django/Jinja `{# ... #}` and HTML `<!-- ... -->` comments before
+    # searching so tag names mentioned in docs don't count.
+    import re
+    stripped = re.sub(r"\{\#.*?\#\}", "", text, flags=re.DOTALL)
+    stripped = re.sub(r"<!--.*?-->", "", stripped, flags=re.DOTALL)
+    # No literal `<form ...>` or `</form>` tag remaining in the body.
+    assert not re.search(r"<\s*form[\s>]", stripped), (
+        "Template must not open a nested <form> element."
+    )
+    assert not re.search(r"</\s*form\s*>", stripped), (
+        "Template must not close a nested </form> element."
+    )
+    # Buttons submit via formaction+formmethod.
+    assert "formaction=" in text
+    assert 'formmethod="post"' in text
+    # Single hidden expected_version input.
+    assert 'name="expected_version"' in text
+
+
+def test_item10_template_gates_actions_on_permissions_and_state():
+    """The template must gate each lifecycle button on the matching
+    permission AND the current lifecycle state, so an unauthorised user
+    sees no action UI even in a valid state.
+    """
+    import cauldron_admin_content
+    from pathlib import Path
+    tpl_path = (
+        Path(cauldron_admin_content.__file__).parent
+        / "templates" / "admin" / "cauldron_content_operations"
+        / "contentchangerequest" / "change_form.html"
+    )
+    text = tpl_path.read_text(encoding="utf-8")
+    # Each of the four lifecycle actions is gated on a permission.
+    for perm in (
+        "validate_content_changes",
+        "approve_content_changes",
+        "reject_content_changes",
+        "apply_content_changes",
+    ):
+        assert perm in text, f"Missing permission gate: {perm}"
+    # Each of the five state branches is present.
+    for state in ("proposed", "validated", "approved", "applied"):
+        assert state in text, f"Missing state branch: {state}"

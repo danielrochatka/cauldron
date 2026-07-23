@@ -50,11 +50,17 @@ class NotFoundError(Exception):
     pass
 
 
-# Item 13: required protocol methods for a rollback-supporting adapter.
+# Item 2: strict protocol requirements for a v2 reversible adapter.
+# Providers advertising ``supports_rollback=True`` MUST implement every one
+# of these members. Adapters lacking any member are treated as unsupported
+# and get ``rollback.not_supported`` — we no longer fall back to legacy
+# call shapes.
 _REQUIRED_ADAPTER_METHODS = (
     "prepare",
     "record_applied",
+    "record_rolled_back",
     "rollback",
+    "has_rollback_artifact",
     "verify_applied_state",
     "verify_rolled_back_state",
     "inspect",
@@ -65,7 +71,7 @@ def _adapter_fully_supports_rollback(adapter: Any) -> bool:
     """Return True iff the adapter advertises rollback support and implements
     every required method.
 
-    Item 13: providers advertising ``supports_rollback=True`` must implement
+    Item 2: providers advertising ``supports_rollback=True`` must implement
     every protocol member. We fail closed if any method is missing.
     """
     if adapter is None:
@@ -76,6 +82,25 @@ def _adapter_fully_supports_rollback(adapter: Any) -> bool:
         if not callable(getattr(adapter, name, None)):
             return False
     return True
+
+
+def _is_valid_sha256_hex(value: Any) -> bool:
+    """Return True iff ``value`` is a 64-char lowercase-hex string."""
+    if not isinstance(value, str):
+        return False
+    if len(value) != 64:
+        return False
+    for ch in value:
+        if ch not in "0123456789abcdef":
+            return False
+    return True
+
+
+def _payload_hash_error() -> OperationError:
+    return OperationError(
+        "workspace.payload_integrity_unavailable",
+        "Persisted workspace payload hash is missing or invalid.",
+    )
 
 
 def _check_permission(user: Any, perm: str) -> None:
@@ -186,7 +211,15 @@ def _load_workspace_changeset_with_integrity(
     Returns (changeset, None) on success, or (None, error) on integrity failure
     or force-tampering. Any operation with force=True in the persisted payload
     is rejected because public proposals must never carry force through.
+
+    Item 1: ``expected_hash`` MUST be a valid SHA-256 hex string. Absence or
+    invalid form maps to ``workspace.payload_integrity_unavailable`` — we
+    fail closed rather than silently skipping the check.
     """
+    # Item 1: require a valid SHA-256 hex payload hash before any load.
+    if not _is_valid_sha256_hex(expected_hash):
+        return None, _payload_hash_error()
+
     # Prefer load_changeset_with_hash when the workspace supports it; fall back
     # to load_changeset + local canonical hashing otherwise. This keeps tests
     # that mock only load_changeset() working.
@@ -220,7 +253,7 @@ def _load_workspace_changeset_with_integrity(
                 "Persisted changeset contains a force=True operation; refusing.",
             )
 
-    if expected_hash and actual_hash and actual_hash != expected_hash:
+    if actual_hash != expected_hash:
         return None, OperationError(
             "workspace.payload_integrity_mismatch",
             "Persisted workspace payload does not match the recorded hash.",
@@ -482,6 +515,11 @@ class ContentOperationService:
                 ),
             )
 
+        # Item 13: validate collection and slug identifiers up-front, before
+        # any workspace or DB writes. Failures map to
+        # ``operations.invalid_collection`` / ``operations.invalid_slug``.
+        from ._identifiers import validate_identifier_segment as _vseg
+
         # Item 2: validate operation dict shape, resolve providers, and enforce
         # a single authoritative provider per proposal.
         providers_seen: set[str] = set()
@@ -494,6 +532,30 @@ class ContentOperationService:
                         f"Operation {i} must be a JSON object.",
                     ),
                 )
+            # Item 13: collection segment must be identifier-safe.
+            try:
+                _vseg(op_data.get("collection", ""), "collection")
+            except ValueError as exc:
+                return ChangeRequestResult(
+                    ok=False,
+                    error=OperationError(
+                        "operations.invalid_collection",
+                        f"Operation {i}: {exc}",
+                    ),
+                )
+            # Item 13: slug segment (when supplied) must also be safe.
+            _slug_val = op_data.get("slug", "")
+            if _slug_val:
+                try:
+                    _vseg(_slug_val, "slug")
+                except ValueError as exc:
+                    return ChangeRequestResult(
+                        ok=False,
+                        error=OperationError(
+                            "operations.invalid_slug",
+                            f"Operation {i}: {exc}",
+                        ),
+                    )
             try:
                 routed = self._router.resolve_provider(op_data.get("collection", ""))
             except Exception as exc:
@@ -1052,27 +1114,46 @@ class ContentOperationService:
                 correlation_id=correlation_id,
             )
 
-        # Item 14/16: mirror the workspace manifest state (advisory).
+        # Item 9: mirror the workspace manifest state (advisory for
+        # validation/rejection). On failure, record a bounded
+        # ``workspace_sync_failed`` metadata entry and emit a dedicated
+        # WORKSPACE_SYNC_FAILED audit event — NOT a duplicate
+        # VALIDATION_SUCCEEDED entry.
         try:
             from cauldron_workspace_flatfile.store import ChangeSetState as _WsState
             synced = _safe_workspace_transition(
                 self._workspace, cr.workspace_changeset_id, _WsState.VALIDATED,
             )
             if not synced:
-                # Item 16: advisory failure — audit but don't fail the request.
+                try:
+                    with transaction.atomic():
+                        cr_sync = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
+                        meta = dict(cr_sync.metadata or {})
+                        meta["workspace_sync_failed"] = {
+                            "target_state": "validated",
+                            "at_lifecycle_state": LifecycleState.VALIDATED.value,
+                        }
+                        cr_sync.metadata = meta
+                        cr_sync.save(update_fields=["metadata", "updated_at"])
+                except Exception:
+                    pass
                 try:
                     append_audit_event(
                         change_request=cr,
-                        event_type=AuditEventType.VALIDATION_SUCCEEDED,
+                        event_type=AuditEventType.WORKSPACE_SYNC_FAILED,
                         actor=user,
                         previous_state=LifecycleState.VALIDATED.value,
                         resulting_state=LifecycleState.VALIDATED.value,
                         provider=cr.provider_name,
                         correlation_id=correlation_id,
-                        detail={"workspace_sync_failed": True},
+                        detail={"target_state": "validated"},
                     )
                 except Exception:
-                    pass
+                    # Item 9: audit failure must not crash the request.
+                    logger.warning(
+                        "workspace_sync_failed audit event failed for %s",
+                        cr.request_id,
+                    )
         except Exception:
             pass
 
@@ -1112,28 +1193,69 @@ class ContentOperationService:
                     ),
                 )
 
-            # Item 1: verify persisted workspace proposal before touching
-            # lifecycle or self-approval logic. Any integrity failure is an
-            # ``approval-denied`` audit event; no state mutation.
-            if self._workspace is not None:
-                changeset, load_err = _load_workspace_changeset_with_integrity(
-                    self._workspace, cr.workspace_changeset_id, cr.payload_hash,
+            # Item 1: workspace is MANDATORY for approval. No workspace →
+            # workspace.unavailable, no state mutation.
+            if self._workspace is None:
+                append_audit_event(
+                    change_request=cr,
+                    event_type=AuditEventType.APPROVAL_DENIED,
+                    actor=user,
+                    previous_state=cr.lifecycle_state,
+                    resulting_state=cr.lifecycle_state,
+                    provider=cr.provider_name,
+                    correlation_id=correlation_id,
+                    detail={
+                        "error_code": "workspace.unavailable",
+                        "error_summary": "Workspace required for approval.",
+                    },
                 )
-                if load_err is not None:
-                    append_audit_event(
-                        change_request=cr,
-                        event_type=AuditEventType.APPROVAL_DENIED,
-                        actor=user,
-                        previous_state=cr.lifecycle_state,
-                        resulting_state=cr.lifecycle_state,
-                        provider=cr.provider_name,
-                        correlation_id=correlation_id,
-                        detail={
-                            "error_code": load_err.code,
-                            "error_summary": load_err.message[:200],
-                        },
-                    )
-                    return ChangeRequestResult(ok=False, error=load_err)
+                return ChangeRequestResult(
+                    ok=False,
+                    error=OperationError(
+                        "workspace.unavailable",
+                        "Workspace is required to approve a change request.",
+                    ),
+                )
+            # Item 1: integrity check on persisted proposal. Any integrity
+            # failure is an ``approval.denied`` audit event; no state mutation.
+            changeset, load_err = _load_workspace_changeset_with_integrity(
+                self._workspace, cr.workspace_changeset_id, cr.payload_hash,
+            )
+            if load_err is not None:
+                append_audit_event(
+                    change_request=cr,
+                    event_type=AuditEventType.APPROVAL_DENIED,
+                    actor=user,
+                    previous_state=cr.lifecycle_state,
+                    resulting_state=cr.lifecycle_state,
+                    provider=cr.provider_name,
+                    correlation_id=correlation_id,
+                    detail={
+                        "error_code": load_err.code,
+                        "error_summary": load_err.message[:200],
+                    },
+                )
+                return ChangeRequestResult(ok=False, error=load_err)
+
+            # Item 1: provider routing must still match at approval time.
+            route_err = _check_provider_routing(
+                self._router, changeset, cr.provider_name,
+            )
+            if route_err is not None:
+                append_audit_event(
+                    change_request=cr,
+                    event_type=AuditEventType.APPROVAL_DENIED,
+                    actor=user,
+                    previous_state=cr.lifecycle_state,
+                    resulting_state=cr.lifecycle_state,
+                    provider=cr.provider_name,
+                    correlation_id=correlation_id,
+                    detail={
+                        "error_code": route_err.code,
+                        "error_summary": route_err.message[:200],
+                    },
+                )
+                return ChangeRequestResult(ok=False, error=route_err)
 
             # Self-approval check
             if not cfg.allow_self_approval and hasattr(user, "pk") and cr.created_by_id == user.pk:
@@ -1218,12 +1340,43 @@ class ContentOperationService:
                 detail={"reason": reason[:500] if reason else ""},
             )
 
-        # Item 14/16: mirror rejection to the workspace manifest (advisory).
+        # Item 9: mirror rejection to the workspace manifest (advisory). On
+        # failure record ``workspace_sync_failed`` in metadata and emit a
+        # dedicated WORKSPACE_SYNC_FAILED audit event.
         try:
             from cauldron_workspace_flatfile.store import ChangeSetState as _WsState
-            _safe_workspace_transition(
+            synced = _safe_workspace_transition(
                 self._workspace, cr.workspace_changeset_id, _WsState.REJECTED,
             )
+            if not synced:
+                try:
+                    with transaction.atomic():
+                        cr_sync = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
+                        meta = dict(cr_sync.metadata or {})
+                        meta["workspace_sync_failed"] = {
+                            "target_state": "rejected",
+                            "at_lifecycle_state": LifecycleState.REJECTED.value,
+                        }
+                        cr_sync.metadata = meta
+                        cr_sync.save(update_fields=["metadata", "updated_at"])
+                except Exception:
+                    pass
+                try:
+                    append_audit_event(
+                        change_request=cr,
+                        event_type=AuditEventType.WORKSPACE_SYNC_FAILED,
+                        actor=user,
+                        previous_state=LifecycleState.REJECTED.value,
+                        resulting_state=LifecycleState.REJECTED.value,
+                        provider=cr.provider_name,
+                        correlation_id=correlation_id,
+                        detail={"target_state": "rejected"},
+                    )
+                except Exception:
+                    logger.warning(
+                        "workspace_sync_failed audit event failed for %s",
+                        cr.request_id,
+                    )
         except Exception:
             pass
 
@@ -1577,15 +1730,14 @@ class ContentOperationService:
 
         if adapter is not None and _adapter_fully_supports_rollback(adapter):
             try:
-                # Item 8: bind post-state to the artifact digest we recorded.
-                try:
-                    adapter.record_applied(
-                        cr.workspace_changeset_id,
-                        artifact_digest=prep_digest,
-                    )
-                except TypeError:
-                    # Legacy adapter without artifact_digest kwarg.
-                    adapter.record_applied(cr.workspace_changeset_id)
+                # Item 2/8: bind post-state to the artifact digest we
+                # recorded. Legacy adapters are already rejected upstream by
+                # ``_adapter_fully_supports_rollback``; we do NOT fall back
+                # to positional-only signatures.
+                adapter.record_applied(
+                    cr.workspace_changeset_id,
+                    artifact_digest=prep_digest,
+                )
             except Exception as exc:
                 _recon_needed = True
                 _recon_error = str(exc)[:500]
@@ -1653,14 +1805,52 @@ class ContentOperationService:
                 detail={"applied_count": _result_meta["applied_count"]},
             )
 
-        # Item 14/16: mirror apply success in workspace manifest (advisory).
+        # Item 9: mirror apply success in the workspace manifest. Failure to
+        # sync APPLIED post-mutation is escalated to reconciliation_required
+        # (the SQL row still carries ``application_completed`` and
+        # verification evidence, so reconciliation can safely finalize).
+        applied_sync_ok = True
         try:
             from cauldron_workspace_flatfile.store import ChangeSetState as _WsState
-            _safe_workspace_transition(
+            applied_sync_ok = _safe_workspace_transition(
                 self._workspace, cr.workspace_changeset_id, _WsState.APPLIED,
             )
         except Exception:
-            pass
+            applied_sync_ok = False
+
+        if not applied_sync_ok:
+            with transaction.atomic():
+                cr3 = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
+                cr3.lifecycle_state = LifecycleState.RECONCILIATION_REQUIRED.value
+                cr3.request_version += 1
+                cr3.last_error_code = "application.reconciliation_required"
+                cr3.last_error_summary = "Workspace APPLIED sync failed after apply."
+                cr3.save(update_fields=[
+                    "lifecycle_state", "request_version",
+                    "last_error_code", "last_error_summary", "updated_at",
+                ])
+                append_audit_event(
+                    change_request=cr3,
+                    event_type=AuditEventType.RECONCILIATION_FAILED,
+                    actor=user,
+                    previous_state=LifecycleState.APPLIED.value,
+                    resulting_state=LifecycleState.RECONCILIATION_REQUIRED.value,
+                    provider=cr.provider_name,
+                    correlation_id=correlation_id,
+                    detail={
+                        "error_code": "application.reconciliation_required",
+                        "error_summary": "workspace_applied_sync_failed",
+                    },
+                )
+            return ChangeRequestResult(
+                ok=False,
+                error=OperationError(
+                    "application.reconciliation_required",
+                    "Workspace APPLIED sync failed; reconciliation required.",
+                ),
+                request_id=request_id,
+                lifecycle_state=LifecycleState.RECONCILIATION_REQUIRED.value,
+            )
 
         return ChangeRequestResult(ok=True, request_id=request_id, lifecycle_state=LifecycleState.APPLIED.value, request_version=cr2.request_version)
 
@@ -1847,21 +2037,15 @@ class ContentOperationService:
         rollback_error_code = "rollback.failed"
         rollback_needs_recon = False
         try:
-            # Item 8: pass the trusted artifact digest from SQL to bind the
-            # rollback plan to the digest recorded at prepare().
-            try:
-                adapter.rollback(
-                    cr.workspace_changeset_id,
-                    force=force,
-                    is_superuser=bool(getattr(user, "is_superuser", False)),
-                    expected_artifact_digest=cr.rollback_artifact_digest or "",
-                )
-            except TypeError:
-                adapter.rollback(
-                    cr.workspace_changeset_id,
-                    force=force,
-                    is_superuser=bool(getattr(user, "is_superuser", False)),
-                )
+            # Item 2/8: pass the trusted artifact digest from SQL. We do not
+            # fall back to legacy call shapes — adapters advertising
+            # supports_rollback=True must implement the v2 signature.
+            adapter.rollback(
+                cr.workspace_changeset_id,
+                force=force,
+                is_superuser=bool(getattr(user, "is_superuser", False)),
+                expected_artifact_digest=cr.rollback_artifact_digest or "",
+            )
             rollback_ok = True
         except PermissionError as exc:
             rollback_error = str(exc)
@@ -1878,46 +2062,81 @@ class ContentOperationService:
                 rollback_error_code = "rollback.artifact_invalid"
             rollback_error = str(exc)[:500]
 
-        # Item 8/13: verify state, then persist result. Any failure after
-        # a successful rollback → reconciliation_required.
+        # Item 5: on successful canonical rollback + provider marker, the
+        # sequence is:
+        #   1. adapter.rollback() -> internally calls record_rolled_back()
+        #   2. adapter.verify_rolled_back_state() (evidence, may fail)
+        #   3. SQL: metadata["rollback_completed"] = True + evidence
+        #   4. workspace.save_rollback_result()
+        #   5. SQL: finalize rolled_back lifecycle state
+        # A failure at step 4 keeps rollback_completed in SQL and transitions
+        # to reconciliation_required. Reconciliation can then finalize from
+        # SQL evidence + verify_rolled_back_state alone.
         verification_failed = False
         verification_reason = ""
+        verification_status = ""
         persistence_failed = False
         persistence_reason = ""
+        entry_count_from_meta = int(
+            (cr.metadata or {}).get("rollback_artifact_entry_count") or 0
+        )
         if rollback_ok:
+            # Item 3: verify with trusted SQL evidence.
             try:
-                vr = adapter.verify_rolled_back_state(cr.workspace_changeset_id)
-                if getattr(vr, "status", "") != "verified":
+                vr = adapter.verify_rolled_back_state(
+                    cr.workspace_changeset_id,
+                    expected_artifact_digest=cr.rollback_artifact_digest or "",
+                    expected_entry_count=entry_count_from_meta,
+                )
+                verification_status = getattr(vr, "status", "") or ""
+                if verification_status != "verified":
                     verification_failed = True
                     verification_reason = getattr(vr, "reason", "") or "verification failed"
             except Exception as exc:
-                # Item 13: any exception from verify is fail-closed.
+                # Item 3: any exception from verify is fail-closed.
                 verification_failed = True
                 verification_reason = str(exc)[:200]
+                verification_status = "error"
 
-            if not verification_failed:
-                try:
-                    self._workspace.save_rollback_result(
-                        cr.workspace_changeset_id,
-                        {"correlation_id": correlation_id},
-                    )
-                except Exception as exc:
-                    persistence_failed = True
-                    persistence_reason = str(exc)[:200]
+            # Item 5 step 3: durable SQL rollback_completed marker (before
+            # workspace persistence) with bounded verification evidence.
+            # Item 7: clear application_completed so reconciliation does not
+            # see both markers simultaneously (which would be interpreted as
+            # contradictory evidence).
+            with transaction.atomic():
+                cr_mark = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
+                meta = dict(cr_mark.metadata or {})
+                meta["rollback_completed"] = True
+                meta.pop("application_completed", None)
+                meta["rollback_verification"] = {
+                    "status": verification_status[:64],
+                    "reason": verification_reason[:200],
+                }
+                cr_mark.metadata = meta
+                cr_mark.save(update_fields=["metadata", "updated_at"])
+
+            # Item 5 step 4: persist workspace rollback_result. Failure here
+            # must not undo the SQL rollback_completed marker — reconciliation
+            # can finalize from evidence alone.
+            try:
+                self._workspace.save_rollback_result(
+                    cr.workspace_changeset_id,
+                    {"correlation_id": correlation_id},
+                )
+            except Exception as exc:
+                persistence_failed = True
+                persistence_reason = str(exc)[:200]
 
         with transaction.atomic():
             cr2 = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
             if rollback_ok and not verification_failed and not persistence_failed:
-                # Item 10: also record a durable rollback marker.
-                meta = dict(cr2.metadata or {})
-                meta["rollback_completed"] = True
-                cr2.metadata = meta
+                # Item 5 step 6: finalize rolled_back lifecycle state.
                 cr2.lifecycle_state = LifecycleState.ROLLED_BACK.value
                 cr2.rolled_back_at = datetime.now(timezone.utc)
                 cr2.last_error_code = ""
                 cr2.last_error_summary = ""
                 cr2.request_version += 1
-                cr2.save(update_fields=["lifecycle_state", "rolled_back_at", "last_error_code", "last_error_summary", "request_version", "metadata", "updated_at"])
+                cr2.save(update_fields=["lifecycle_state", "rolled_back_at", "last_error_code", "last_error_summary", "request_version", "updated_at"])
                 append_audit_event(
                     change_request=cr2,
                     event_type=AuditEventType.ROLLBACK_SUCCEEDED,
@@ -1928,12 +2147,14 @@ class ContentOperationService:
                     correlation_id=correlation_id,
                 )
             elif rollback_ok and (verification_failed or persistence_failed):
-                # Post-mutation reconciliation branch (Item 9).
-                code = (
-                    "rollback.verification_failed" if verification_failed
-                    else "rollback.result_persistence_failed"
-                )
-                summary = verification_reason if verification_failed else persistence_reason
+                # Item 5: workspace/verify failure post-mutation → reconciliation.
+                # SQL rollback_completed remains set.
+                if persistence_failed:
+                    code = "application.reconciliation_required"
+                    summary = persistence_reason
+                else:
+                    code = "rollback.verification_failed"
+                    summary = verification_reason
                 cr2.lifecycle_state = LifecycleState.RECONCILIATION_REQUIRED.value
                 cr2.last_error_code = code
                 cr2.last_error_summary = summary
@@ -1950,12 +2171,34 @@ class ContentOperationService:
                     detail={"error_code": code, "error_summary": summary},
                 )
             elif rollback_needs_recon:
-                # Item 7: preflight passed but Phase 2 partially executed.
+                # Item 6: preflight passed but Phase 2 or provider marker
+                # failed. State is uncertain — attempt one round of provider
+                # verification, store bounded evidence in metadata, then
+                # transition to reconciliation_required. Never rollback_failed.
+                _rr_status = ""
+                _rr_reason = ""
+                try:
+                    _rr_vr = adapter.verify_rolled_back_state(
+                        cr.workspace_changeset_id,
+                        expected_artifact_digest=cr.rollback_artifact_digest or "",
+                        expected_entry_count=entry_count_from_meta,
+                    )
+                    _rr_status = getattr(_rr_vr, "status", "") or ""
+                    _rr_reason = getattr(_rr_vr, "reason", "") or ""
+                except Exception as _rr_exc:
+                    _rr_status = "error"
+                    _rr_reason = str(_rr_exc)[:200]
+                _rr_meta = dict(cr2.metadata or {})
+                _rr_meta["rollback_verification"] = {
+                    "status": _rr_status[:64],
+                    "reason": _rr_reason[:200],
+                }
+                cr2.metadata = _rr_meta
                 cr2.lifecycle_state = LifecycleState.RECONCILIATION_REQUIRED.value
                 cr2.last_error_code = rollback_error_code
                 cr2.last_error_summary = rollback_error
                 cr2.request_version += 1
-                cr2.save(update_fields=["lifecycle_state", "last_error_code", "last_error_summary", "request_version", "updated_at"])
+                cr2.save(update_fields=["lifecycle_state", "last_error_code", "last_error_summary", "request_version", "metadata", "updated_at"])
                 append_audit_event(
                     change_request=cr2,
                     event_type=AuditEventType.RECONCILIATION_FAILED,
@@ -1986,11 +2229,12 @@ class ContentOperationService:
         if rollback_ok and not verification_failed and not persistence_failed:
             return ChangeRequestResult(ok=True, request_id=request_id, lifecycle_state=LifecycleState.ROLLED_BACK.value, request_version=cr2.request_version)
         if rollback_ok and (verification_failed or persistence_failed):
-            code = (
-                "rollback.verification_failed" if verification_failed
-                else "rollback.result_persistence_failed"
-            )
-            summary = verification_reason if verification_failed else persistence_reason
+            if persistence_failed:
+                code = "application.reconciliation_required"
+                summary = persistence_reason
+            else:
+                code = "rollback.verification_failed"
+                summary = verification_reason
             return ChangeRequestResult(
                 ok=False,
                 error=OperationError(code, summary or code),
@@ -2124,7 +2368,13 @@ class ContentOperationService:
         user: Any,
         dry_run: bool = False,
     ) -> list[dict[str, Any]]:
-        """Inspect and optionally finalize interrupted change requests."""
+        """Inspect and optionally finalize interrupted change requests.
+
+        Item 8: mutating reconciliation acquires both a per-request and a
+        per-provider file lock. Timeouts map to ``operations.busy`` without
+        leaking lock paths. Dry-run uses the same decision engine but takes
+        no locks and notes that evidence may be transient.
+        """
         _check_permission(user, "apply_content_changes")
 
         transitional = list(
@@ -2150,24 +2400,43 @@ class ContentOperationService:
                 "applied": False,
             }
 
-            def _lock_ctx():
-                if locks_dir is not None:
-                    return request_lock(cr.request_id, locks_dir, timeout=timeout)
-                return nullcontext()
-
-            # Item 11: dry-run must use the same decision engine as mutating.
+            # Item 8: dry-run uses the same decision engine, acquires no
+            # locks, and notes evidence may be transient.
             if dry_run:
-                # Read-only inspection: no locks, no mutations.
                 self._reconcile_decide(cr, entry, mutate=False, user=user)
+                entry.setdefault("dry_run_evidence_notice",
+                                 "Evidence read without locks; may be transient.")
+                results.append(entry)
+                continue
+
+            # Item 8: mutating mode requires locks_dir.
+            if locks_dir is None:
+                entry["action"] = "leave_ambiguous"
+                entry["reason"] = "operations.busy: locks unavailable"
                 results.append(entry)
                 continue
 
             try:
-                with _lock_ctx():
-                    self._reconcile_decide(cr, entry, mutate=True, user=user)
+                with request_lock(cr.request_id, locks_dir, timeout=timeout):
+                    try:
+                        with provider_lock(cr.provider_name, locks_dir, timeout=timeout):
+                            # Item 8: re-read row with select_for_update
+                            # before deciding, to see the freshest evidence.
+                            try:
+                                with transaction.atomic():
+                                    fresh = ContentChangeRequest.objects.select_for_update().get(pk=cr.pk)
+                            except ContentChangeRequest.DoesNotExist:
+                                entry["action"] = "leave_ambiguous"
+                                entry["reason"] = "Row missing at lock time."
+                                results.append(entry)
+                                continue
+                            self._reconcile_decide(fresh, entry, mutate=True, user=user)
+                    except TimeoutError:
+                        entry["action"] = "leave_ambiguous"
+                        entry["reason"] = "operations.busy: provider lock timeout"
             except TimeoutError:
                 entry["action"] = "leave_ambiguous"
-                entry["reason"] = "Lock timeout during reconciliation."
+                entry["reason"] = "operations.busy: request lock timeout"
             results.append(entry)
 
         return results
@@ -2238,16 +2507,26 @@ class ContentOperationService:
         sql_applied_marker = bool(meta.get("application_completed"))
         sql_rollback_marker = bool(meta.get("rollback_completed"))
 
-        # Provider verification.
+        # Item 3: verification must use trusted SQL evidence.
+        expected_digest = cr.rollback_artifact_digest or ""
+        expected_count = int(meta.get("rollback_artifact_entry_count") or 0)
         try:
-            vapp = adapter.verify_applied_state(cr.workspace_changeset_id)
+            vapp = adapter.verify_applied_state(
+                cr.workspace_changeset_id,
+                expected_artifact_digest=expected_digest,
+                expected_entry_count=expected_count,
+            )
         except Exception as exc:
             vapp = None
             v_apply_err = str(exc)[:120]
         else:
             v_apply_err = ""
         try:
-            vrb = adapter.verify_rolled_back_state(cr.workspace_changeset_id)
+            vrb = adapter.verify_rolled_back_state(
+                cr.workspace_changeset_id,
+                expected_artifact_digest=expected_digest,
+                expected_entry_count=expected_count,
+            )
         except Exception as exc:
             vrb = None
             v_rb_err = str(exc)[:120]
@@ -2255,6 +2534,31 @@ class ContentOperationService:
             v_rb_err = ""
         vapp_verified = vapp is not None and getattr(vapp, "status", "") == "verified"
         vrb_verified = vrb is not None and getattr(vrb, "status", "") == "verified"
+
+        # Item 7: contradiction detection — both applied AND rolled-back
+        # evidence present makes any finalization unsafe.
+        contradictory_evidence = (
+            (vapp_verified and vrb_verified)
+            or (sql_applied_marker and sql_rollback_marker)
+            or (typed_applied and typed_rolled_back)
+        )
+        if contradictory_evidence:
+            if mutate:
+                _record_reconciliation_reason(
+                    cr,
+                    "reconciliation.contradictory_evidence",
+                    "Both applied and rolled-back evidence present.",
+                )
+                self._mark_reconciliation_required(
+                    cr, user,
+                    extra_reason={
+                        "code": "reconciliation.contradictory_evidence",
+                        "summary": "Both applied and rolled-back evidence present.",
+                    },
+                )
+            entry["action"] = "requires_manual_review"
+            entry["reason"] = "Contradictory apply/rollback evidence."
+            return
 
         # For rolling_back, never rewrite to applied even if provider says so.
         if state == LifecycleState.ROLLING_BACK.value:
@@ -2285,6 +2589,9 @@ class ContentOperationService:
             return
 
         if state == LifecycleState.APPLYING.value:
+            # Item 7: tampered payload can NEVER finalize as applied. The only
+            # bypass in this decision engine is a completed rollback with
+            # independent provider evidence.
             if not payload_ok:
                 if mutate:
                     _record_reconciliation_reason(cr, payload_err_code, payload_err_msg)
@@ -2315,13 +2622,28 @@ class ContentOperationService:
             return
 
         if state == LifecycleState.RECONCILIATION_REQUIRED.value:
-            # Attempt safe disambiguation using SQL markers + provider verification.
-            # Item 10: allow finalization from SQL evidence alone if provider verified.
-            if not payload_ok and not (vapp_verified or vrb_verified):
+            # Item 7: a tampered payload NEVER finalizes as applied. The only
+            # exception is a completed rollback proven by independent provider
+            # evidence (verify_rolled_back_state returns "verified" and we
+            # have a rollback marker or typed rollback result).
+            if not payload_ok:
+                can_finalize_rolled_back = (
+                    (typed_rolled_back or sql_rollback_marker) and vrb_verified
+                )
+                if not can_finalize_rolled_back:
+                    if mutate:
+                        _record_reconciliation_reason(cr, payload_err_code, payload_err_msg)
+                    entry["action"] = "requires_manual_review"
+                    entry["reason"] = f"payload_integrity: {payload_err_code}"
+                    return
+                # Fall through to the rolled_back finalize branch below.
                 if mutate:
-                    _record_reconciliation_reason(cr, payload_err_code, payload_err_msg)
-                entry["action"] = "requires_manual_review"
-                entry["reason"] = f"payload_integrity: {payload_err_code}"
+                    self._finalize_rolled_back(cr, user, rb_result or {})
+                    entry["applied"] = True
+                    entry["action"] = "finalize_rolled_back"
+                else:
+                    entry["action"] = "would_finalize_rolled_back"
+                    entry["reason"] = "Verified rolled-back state via provider."
                 return
             if (typed_applied or sql_applied_marker) and vapp_verified:
                 if mutate:

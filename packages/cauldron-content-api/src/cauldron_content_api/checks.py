@@ -62,8 +62,12 @@ def check_api_configuration(app_configs, **kwargs):
             "cauldron.workspace.flatfile.workspace_root is required.",
             id="content_api.E001",
         ))
-    cms_cfg = modules.get("cauldron.cms.flatfile") or {}
-    content_root = cms_cfg.get("content_root", "")
+    # Item 15: content_root and adapter checks only fire when the flatfile
+    # CMS module is configured. Non-flatfile providers don't need either.
+    cms_cfg = modules.get("cauldron.cms.flatfile")
+    if cms_cfg is None:
+        return errors
+    content_root = (cms_cfg or {}).get("content_root", "")
     if not content_root:
         errors.append(checks.Error(
             "cauldron.cms.flatfile.content_root is required for cauldron.content.api.",

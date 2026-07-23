@@ -183,3 +183,51 @@ def test_get_by_slug_routes_by_collection():
     router = ContentRouter(reg, RouterConfig(collections={"pages": "p"}))
     router.get_by_slug("pages", "home")
     assert repo.calls[0][:3] == ("get_by_slug", "pages", "home")
+
+
+class _CollectionAwareRepo(_RecordingRepo):
+    """Repo whose ``get_by_id`` accepts a ``collection`` kwarg."""
+
+    def get_by_id(self, item_id, *, include_drafts=False, collection=None):
+        self.calls.append(("get_by_id", item_id, include_drafts, collection))
+        for it in self._items:
+            if it.id == item_id and (collection is None or it.collection == collection):
+                return it
+        return None
+
+
+def test_item14_router_forwards_collection_when_supported():
+    """Item 14: capability-detect ``collection`` kwarg and forward it."""
+    reg = RepositoryRegistry()
+    items = [
+        _item(collection="pages", slug="home", id_="home"),
+        _item(collection="posts", slug="home", id_="home"),
+    ]
+    repo = _CollectionAwareRepo("p", items=items)
+    reg.register("p", repo)
+    router = ContentRouter(reg, RouterConfig(default_provider="p"))
+    got = router.get_by_id("home", collection="posts")
+    assert got is not None
+    assert got.collection == "posts"
+
+
+def test_item14_router_falls_back_to_list_items_when_no_collection_param():
+    """Item 14: repo without ``collection`` kwarg → fall back to list_items
+    scoped to the requested collection, not a naive ``get_by_id`` on any
+    collection (which could return a same-id item from a different one).
+    """
+    reg = RepositoryRegistry()
+    # _RecordingRepo.get_by_id has NO ``collection`` kwarg. Two items share
+    # the same ``id`` across different collections.
+    items = [
+        _item(collection="pages", slug="home", id_="home"),
+        _item(collection="posts", slug="home", id_="home"),
+    ]
+    repo = _RecordingRepo("p", items=items)
+    reg.register("p", repo)
+    router = ContentRouter(reg, RouterConfig(default_provider="p"))
+    got = router.get_by_id("home", collection="posts")
+    assert got is not None
+    assert got.collection == "posts"
+    # The router must have called list_items on the requested collection.
+    assert any(c[0] == "list_items" and c[1] == "posts" for c in repo.calls)

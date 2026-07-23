@@ -450,10 +450,14 @@ def test_item7_verify_applied_state_ok(tmp_path):
     f.write_text("v1", encoding="utf-8")
     ops = (_update_op("pages", "home", "home"),)
     changeset = ContentChangeSet(id="cs.item7.applied", operations=ops)
-    adapter.prepare("cs.item7.applied", changeset)
+    prep = adapter.prepare("cs.item7.applied", changeset)
     f.write_text("v2", encoding="utf-8")
-    adapter.record_applied("cs.item7.applied")
-    vr = adapter.verify_applied_state("cs.item7.applied")
+    adapter.record_applied("cs.item7.applied", artifact_digest=prep.artifact_digest)
+    vr = adapter.verify_applied_state(
+        "cs.item7.applied",
+        expected_artifact_digest=prep.artifact_digest,
+        expected_entry_count=prep.entry_count,
+    )
     assert vr.status == "verified"
 
 
@@ -464,16 +468,21 @@ def test_item7_verify_applied_state_mismatch(tmp_path):
     f.write_text("v1", encoding="utf-8")
     ops = (_update_op("pages", "home", "home"),)
     changeset = ContentChangeSet(id="cs.item7.mm", operations=ops)
-    adapter.prepare("cs.item7.mm", changeset)
+    prep = adapter.prepare("cs.item7.mm", changeset)
     f.write_text("v2", encoding="utf-8")
-    adapter.record_applied("cs.item7.mm")
+    adapter.record_applied("cs.item7.mm", artifact_digest=prep.artifact_digest)
     f.write_text("v3", encoding="utf-8")
-    vr = adapter.verify_applied_state("cs.item7.mm")
+    vr = adapter.verify_applied_state(
+        "cs.item7.mm",
+        expected_artifact_digest=prep.artifact_digest,
+        expected_entry_count=prep.entry_count,
+    )
     assert vr.status == "mismatch"
 
 
 def test_item7_verify_applied_state_missing(tmp_path):
     adapter, cfg, content = _make_adapter(tmp_path)
+    # Missing SQL evidence -> missing_evidence (never verified).
     vr = adapter.verify_applied_state("no-such-cs")
     assert vr.status == "missing_evidence"
 
@@ -485,11 +494,15 @@ def test_item7_verify_rolled_back_state_ok(tmp_path):
     f.write_text("v1", encoding="utf-8")
     ops = (_update_op("pages", "home", "home"),)
     changeset = ContentChangeSet(id="cs.item7.rbok", operations=ops)
-    adapter.prepare("cs.item7.rbok", changeset)
+    prep = adapter.prepare("cs.item7.rbok", changeset)
     f.write_text("v2", encoding="utf-8")
-    adapter.record_applied("cs.item7.rbok")
+    adapter.record_applied("cs.item7.rbok", artifact_digest=prep.artifact_digest)
     adapter.rollback("cs.item7.rbok")
-    vr = adapter.verify_rolled_back_state("cs.item7.rbok")
+    vr = adapter.verify_rolled_back_state(
+        "cs.item7.rbok",
+        expected_artifact_digest=prep.artifact_digest,
+        expected_entry_count=prep.entry_count,
+    )
     assert vr.status == "verified"
 
 
@@ -731,3 +744,71 @@ def test_item9_duplicate_targets_rejected_by_prepare(tmp_path):
     changeset = ContentChangeSet(id="cs.item9", operations=ops)
     with pytest.raises(DuplicateTargetError):
         adapter.prepare("cs.item9", changeset)
+
+
+# ---------------------------------------------------------------------------
+# Item 12: symlink escape hardening on discovered .md files
+# ---------------------------------------------------------------------------
+
+
+def test_item12_symlink_outside_content_root_rejected(tmp_path):
+    """A markdown symlink pointing outside content_root is skipped by
+    ``_find_file_for_item``, so we never read attacker-controlled files.
+    """
+    import os
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    # Legit page inside content_root.
+    (content / "pages" / "legit.md").write_text(
+        "---\nid: legit\n---\n\nOK\n", encoding="utf-8"
+    )
+    # Target outside content_root.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_target = outside / "secret.md"
+    outside_target.write_text(
+        "---\nid: pwn\n---\n\nsecret\n", encoding="utf-8"
+    )
+    try:
+        os.symlink(outside_target, content / "pages" / "pwn.md")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink not supported on this platform")
+    # Item 12: looking up id 'pwn' must fail — the symlink is discovered
+    # by glob() but rejected because it resolves outside content_root.
+    got = adapter._find_file_for_item("pages", "pwn")
+    assert got is None
+    # The legit file is still discoverable.
+    got_legit = adapter._find_file_for_item("pages", "legit")
+    assert got_legit is not None
+
+
+# ---------------------------------------------------------------------------
+# Item 13: identifier segment validation in the adapter
+# ---------------------------------------------------------------------------
+
+
+def test_item13_invalid_collection_returns_none(tmp_path):
+    """Unsafe collection segments must be rejected before any resolve."""
+    adapter, cfg, content = _make_adapter(tmp_path)
+    got = adapter._find_file_for_item("../etc", "passwd")
+    assert got is None
+
+
+def test_item13_invalid_slug_returns_none(tmp_path):
+    """Unsafe slug segments must be rejected before any resolve."""
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    from cauldron_content.contracts import ContentOperation, ContentOperationKind, ContentStatus
+    op = ContentOperation(
+        kind=ContentOperationKind.CREATE,
+        provider="flatfile",
+        collection="pages",
+        item_id="p1",
+        slug="../etc/passwd",
+        data={},
+        body="",
+        schema="",
+        status=ContentStatus.PUBLISHED,
+    )
+    got = adapter._canonical_path_for_op(op)
+    assert got is None

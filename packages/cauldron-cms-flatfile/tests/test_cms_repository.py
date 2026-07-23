@@ -408,3 +408,66 @@ def test_item4_collection_traversal_returns_empty(tmp_path: Path):
     repo = FlatFileRepository(FlatFileCMSConfig(site_root=site))
     assert repo.list_items("../../etc") == []
     assert repo.list_items("/etc") == []
+
+
+# ---------------------------------------------------------------------------
+# Item 12: symlink escape hardening on discovered .md files
+# ---------------------------------------------------------------------------
+
+
+def test_item12_symlink_outside_content_root_skipped(tmp_path: Path):
+    """A markdown symlink that resolves outside ``content_dir`` must be
+    skipped during collection load. The legit page remains visible.
+    """
+    import os
+    import shutil
+    site = tmp_path / "site"
+    (site / "content" / "pages").mkdir(parents=True)
+    (site / "schemas").mkdir(parents=True)
+    # Legit page
+    (site / "content" / "pages" / "legit.md").write_text(
+        "---\nid: page.legit\nslug: legit\nstatus: published\nschema: pages\n"
+        "title: Legit\ndescription: OK\n---\n\nBody\n",
+        encoding="utf-8",
+    )
+    # Minimal schema file so schema loading doesn't blow up.
+    (site / "schemas" / "pages.schema.json").write_text(
+        '{"type":"object","properties":{"title":{"type":"string"}},'
+        '"required":["title"]}',
+        encoding="utf-8",
+    )
+    # Target outside content_dir.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_target = outside / "secret.md"
+    outside_target.write_text(
+        "---\nid: page.pwn\nslug: pwn\n---\n\nsecret\n", encoding="utf-8"
+    )
+    try:
+        os.symlink(outside_target, site / "content" / "pages" / "pwn.md")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink not supported on this platform")
+    repo = FlatFileRepository(FlatFileCMSConfig(site_root=site))
+    items = repo.list_items("pages")
+    ids = {i.id for i in items}
+    # Legit page loaded, symlinked-escape page skipped.
+    assert "page.legit" in ids
+    assert "page.pwn" not in ids
+
+
+# ---------------------------------------------------------------------------
+# Item 13: identifier segment validation on collection names
+# ---------------------------------------------------------------------------
+
+
+def test_item13_invalid_collection_name_returns_empty(tmp_path: Path):
+    """Collections with path separators or Windows drive prefixes are
+    rejected without touching the filesystem.
+    """
+    site = tmp_path / "site"
+    (site / "content" / "pages").mkdir(parents=True)
+    (site / "schemas").mkdir(parents=True)
+    repo = FlatFileRepository(FlatFileCMSConfig(site_root=site))
+    # Slash / backslash / drive prefix / null control byte / dot special.
+    for bad in ("a/b", "a\\b", "C:pages", "\x00pages", ".", ".."):
+        assert repo.list_items(bad) == []

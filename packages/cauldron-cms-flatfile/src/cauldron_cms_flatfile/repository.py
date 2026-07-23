@@ -23,9 +23,31 @@ from cauldron_content.contracts import (
 )
 from cauldron_content.hashing import compute_content_hash, normalize_body
 
+from ._paths import PathEscapeError, _safe_resolve
 from .config import FlatFileCMSConfig
 from .parser import parse_content_file
 from .validator import SchemaError, load_schema, validate_item
+
+
+def _valid_identifier_segment(value: str) -> bool:
+    """Local identifier-segment guard (Item 13).
+
+    Mirrors :func:`cauldron_content_operations._identifiers.validate_identifier_segment`
+    without importing it, so cauldron-cms-flatfile stays independent.
+    """
+    if not isinstance(value, str) or value == "":
+        return False
+    if "/" in value or "\\" in value:
+        return False
+    if value.startswith(("/", "\\")):
+        return False
+    if value in (".", ".."):
+        return False
+    if any(ord(ch) < 0x20 for ch in value):
+        return False
+    if len(value) >= 2 and value[1] == ":" and value[0].isalpha():
+        return False
+    return True
 
 PROVIDER_NAME = "flatfile"
 
@@ -49,20 +71,38 @@ class FlatFileRepository:
         return sorted(p.name for p in content_dir.iterdir() if p.is_dir())
 
     def _load_collection(self, collection: str, include_drafts: bool) -> list[ContentItem]:
+        # Item 13: reject unsafe collection segments before any I/O.
+        if not _valid_identifier_segment(collection):
+            return []
         # Item 4: containment-safe collection resolution — reject traversal,
         # absolute names, path separators embedded in the collection segment,
         # and symlink escapes.
         try:
-            from cauldron_workspace_flatfile.paths import safe_resolve as _safe_resolve
             coll_dir = _safe_resolve(self._config.content_dir, collection)
         except Exception:
             return []
         if not coll_dir.exists():
             return []
+        # Item 12: harden each discovered markdown file against symlink escape,
+        # dangling links, and non-regular files (directories, FIFOs).
+        content_root = Path(self._config.content_dir).resolve()
         items: list[ContentItem] = []
         seen_ids: dict[str, Path] = {}
         seen_slugs: dict[str, Path] = {}
         for md_file in sorted(coll_dir.glob("*.md")):
+            try:
+                resolved = md_file.resolve(strict=True)
+            except (OSError, RuntimeError):
+                # Dangling symlink or resolution failure — skip.
+                continue
+            try:
+                resolved.relative_to(content_root)
+            except ValueError:
+                # Symlink whose target escapes content_root.
+                continue
+            if not resolved.is_file():
+                # Reject directories, FIFOs, sockets, etc.
+                continue
             item = parse_content_file(md_file, collection, PROVIDER_NAME)
             if item.id in seen_ids:
                 raise ValueError(
@@ -200,9 +240,18 @@ class FlatFileRepository:
         )
 
     def _stage_operation(self, op: ContentOperation):
+        # Item 13: reject unsafe collection segments before any I/O.
+        if not _valid_identifier_segment(op.collection):
+            return [
+                ValidationIssue(
+                    code="invalid_collection",
+                    message=f"Invalid collection segment: {op.collection!r}",
+                    collection=op.collection,
+                    item_id=op.item_id,
+                )
+            ]
         # Item 4: containment-safe collection resolution.
         try:
-            from cauldron_workspace_flatfile.paths import safe_resolve as _safe_resolve
             coll_dir = _safe_resolve(self._config.content_dir, op.collection)
         except Exception:
             return [
@@ -241,7 +290,7 @@ class FlatFileRepository:
 
         if op.kind == ContentOperationKind.CREATE:
             slug = op.slug
-            if not slug or "/" in slug or ".." in slug:
+            if not _valid_identifier_segment(slug):
                 return [
                     ValidationIssue(
                         code="invalid_slug",
@@ -324,7 +373,7 @@ class FlatFileRepository:
                 )
             new_slug = op.slug or existing.slug
             if op.slug and op.slug != existing.slug:
-                if "/" in op.slug or ".." in op.slug:
+                if not _valid_identifier_segment(op.slug):
                     return [
                         ValidationIssue(
                             code="invalid_slug",

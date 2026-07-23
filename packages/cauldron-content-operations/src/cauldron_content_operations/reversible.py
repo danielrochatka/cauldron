@@ -3,11 +3,42 @@
 Providers that support rollback register a :class:`ReversibleMutationAdapter`
 so that :class:`ContentOperationService` can safely roll back an applied
 change request without having to know provider-specific details.
+
+Adapter protocol versions
+=========================
+
+``REVERSIBLE_ADAPTER_VERSION = 2`` — current protocol.
+
+* Version 1 (legacy) required:
+    ``supports_rollback``, ``prepare``, ``record_applied`` (positional cs_id),
+    ``rollback``, ``has_rollback_artifact``, ``inspect``,
+    ``verify_applied_state(cs_id)``, ``verify_rolled_back_state(cs_id)``.
+    Version 1 adapters are no longer supported by the service.
+
+* Version 2 (current) additionally requires:
+    ``record_rolled_back(cs_id)`` — durable provider completion marker
+    written after canonical rollback mutations succeed.
+    ``record_applied(cs_id, *, artifact_digest)`` — post-state must be
+    bound to the trusted artifact digest recorded at prepare().
+    ``rollback(cs_id, *, force, is_superuser, expected_artifact_digest)``
+    — rollback must be bound to the trusted artifact digest.
+    ``verify_applied_state(cs_id, *, expected_artifact_digest,
+    expected_entry_count)`` and
+    ``verify_rolled_back_state(cs_id, *, expected_artifact_digest,
+    expected_entry_count)`` — verification is bound to trusted SQL evidence.
+
+Providers advertising ``supports_rollback = True`` MUST implement the
+current protocol; the service refuses to use adapters that only implement
+a subset of the required members (see
+``ContentOperationService._adapter_fully_supports_rollback``).
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
+
+
+REVERSIBLE_ADAPTER_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -32,19 +63,24 @@ class VerificationResult:
 
 @runtime_checkable
 class ReversibleMutationAdapter(Protocol):
-    """Protocol describing provider-specific rollback support."""
+    """Protocol describing provider-specific rollback support (version 2)."""
 
     @property
     def supports_rollback(self) -> bool: ...
 
-    def prepare(self, cs_id: str, changeset: Any) -> None:
-        """Called just before a mutation to snapshot pre-application state."""
+    def prepare(self, cs_id: str, changeset: Any) -> Any:
+        """Called just before a mutation to snapshot pre-application state.
 
-    def record_applied(self, cs_id: str) -> None:
-        """Persist post-application state by reading canonical files after mutation."""
+        Implementations should return a typed result object with at least
+        ``artifact_digest`` and ``entry_count`` attributes so the service can
+        bind post-state to a trusted digest.
+        """
+
+    def record_applied(self, cs_id: str, *, artifact_digest: str) -> None:
+        """Persist post-application state and bind it to ``artifact_digest``."""
 
     def record_rolled_back(self, cs_id: str) -> None:
-        """Persist that a rollback succeeded."""
+        """Persist that a rollback completed durably on the provider side."""
 
     def rollback(
         self,
@@ -52,8 +88,9 @@ class ReversibleMutationAdapter(Protocol):
         *,
         force: bool = False,
         is_superuser: bool = False,
+        expected_artifact_digest: str = "",
     ) -> None:
-        """Restore the pre-application state.
+        """Restore the pre-application state, bound to the trusted digest.
 
         Implementations should refuse to overwrite content that has diverged
         from the recorded post-application state unless ``force`` is True
@@ -69,11 +106,31 @@ class ReversibleMutationAdapter(Protocol):
 
     def get_post_application_hashes(self, cs_id: str) -> dict[str, str]: ...
 
-    def verify_applied_state(self, cs_id: str) -> "VerificationResult":
-        """Confirm on-disk state matches the recorded post-application state."""
+    def verify_applied_state(
+        self,
+        cs_id: str,
+        *,
+        expected_artifact_digest: str,
+        expected_entry_count: int,
+    ) -> "VerificationResult":
+        """Confirm on-disk state matches the recorded post-application state.
 
-    def verify_rolled_back_state(self, cs_id: str) -> "VerificationResult":
-        """Confirm on-disk state matches the recorded pre-application state."""
+        Both keyword arguments are trusted SQL evidence; without a digest or
+        entry count the adapter MUST return ``"missing_evidence"``.
+        """
+
+    def verify_rolled_back_state(
+        self,
+        cs_id: str,
+        *,
+        expected_artifact_digest: str,
+        expected_entry_count: int,
+    ) -> "VerificationResult":
+        """Confirm on-disk state matches the recorded pre-application state.
+
+        Both keyword arguments are trusted SQL evidence; without a digest or
+        entry count the adapter MUST return ``"missing_evidence"``.
+        """
 
 
 _registry: dict[str, ReversibleMutationAdapter] = {}

@@ -33,6 +33,9 @@ class AuditEventType:
     RECONCILIATION_FAILED = "reconciliation.failed"
     AUTHORIZATION_DENIED = "authorization.denied"
     CONTENT_VIEWED = "content.viewed"
+    # Item 9: workspace mirror-sync failure is a distinct, dedicated event so
+    # dashboards don't see it as a duplicate lifecycle-success audit entry.
+    WORKSPACE_SYNC_FAILED = "workspace.sync_failed"
 
 
 _MAX_RETRIES = 3

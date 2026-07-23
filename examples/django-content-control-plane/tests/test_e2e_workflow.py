@@ -474,7 +474,13 @@ def test_e2e_item9_duplicate_targets_rejected(e2e_env):
 
 
 def test_e2e_item4_malicious_collection_traversal_rejected(e2e_env):
-    """Item 4: apply of a traversal-collection proposal never escapes content_root."""
+    """Item 13: traversal collection identifiers are rejected at proposal time.
+
+    Item 4 defence-in-depth still holds: even if a malformed collection made
+    it past the proposal (it will not), the flat-file adapter refuses to
+    resolve outside ``content_dir``. The fail-fast rejection here proves the
+    identifier segment guard runs before any workspace/DB writes.
+    """
     service = e2e_env["service"]
     content_dir = e2e_env["content_dir"]
     proposer = _make_user("i4prop", perms=_superuser_perms())
@@ -487,27 +493,11 @@ def test_e2e_item4_malicious_collection_traversal_rejected(e2e_env):
         }],
         provider_name="flatfile",
     )
-    # Router permits proposal (default provider matches). Validation and apply
-    # must both refuse to write outside content_dir. Under our defaults, the
-    # traversal is caught at apply-time (never on disk).
-    assert result.ok  # proposal accepted; hardening runs at apply time
-    validator = _make_user("i4val", perms=_superuser_perms())
-    v = service.validate_change_request(result.request_id, user=validator, expected_version=1)
-    # Validation may pass since it uses safe path resolution too.
-    # The absolute guarantee we care about: NO file written outside content_dir.
-    approver = _make_user("i4appr", perms=_superuser_perms())
-    if v.ok:
-        a = service.approve_change_request(
-            result.request_id, user=approver, expected_version=v.request_version,
-        )
-        if a.ok:
-            applier = _make_user("i4apply", is_superuser=True, perms=_superuser_perms())
-            ap = service.apply_change_request(
-                result.request_id, user=applier, expected_version=a.request_version,
-            )
-            # If apply succeeded/failed, target file must live under content_dir.
-            # Confirm nothing was written under /etc.
-            assert not (content_dir / ".." / ".." / "etc" / "passwd.md").exists()
+    # Item 13: rejected at proposal time — before workspace or DB writes.
+    assert not result.ok
+    assert result.error.code == "operations.invalid_collection"
+    # Confirm nothing was written under /etc.
+    assert not (content_dir / ".." / ".." / "etc" / "passwd.md").exists()
 
 
 def test_e2e_item6_tampered_snap_name_rejected(e2e_env):
@@ -679,8 +669,11 @@ def test_e2e_item11_missing_adapter_verify_remains_recon(e2e_env):
     assert cr.lifecycle_state == "reconciliation_required"
 
 
-def test_e2e_item16_workspace_transition_failure_does_not_break_apply(e2e_env, monkeypatch):
-    """Item 16: workspace state-sync failures are logged but do not fail apply."""
+def test_e2e_workspace_applied_sync_failure(e2e_env, monkeypatch):
+    """Item 9: workspace APPLIED sync failure post-mutation escalates to
+    ``reconciliation_required`` while preserving SQL ``application_completed``
+    so reconciliation can safely finalize once the workspace recovers.
+    """
     service = e2e_env["service"]
     ws = e2e_env["ws"]
     rid, aver = _propose_and_approve(service, e2e_env)
@@ -693,13 +686,22 @@ def test_e2e_item16_workspace_transition_failure_does_not_break_apply(e2e_env, m
     monkeypatch.setattr(ws, "transition", _boom)
     applier = _make_user("i16apply", is_superuser=True, perms=_superuser_perms())
     ap = service.apply_change_request(rid, user=applier, expected_version=aver)
-    # Apply must still succeed even though workspace APPLIED transition failed.
-    assert ap.ok
-    assert ap.lifecycle_state == "applied"
+    # Item 9: apply escalates to reconciliation_required when the workspace
+    # APPLIED transition fails after the canonical mutation has committed.
+    assert not ap.ok
+    assert ap.error.code == "application.reconciliation_required"
+    assert ap.lifecycle_state == "reconciliation_required"
+    # SQL application_completed marker is preserved for reconciliation.
+    from cauldron_content_operations.models import ContentChangeRequest
+    cr = ContentChangeRequest.objects.get(request_id=rid)
+    assert (cr.metadata or {}).get("application_completed") is True
 
 
 def test_e2e_item19_rollback_result_persistence_failure_finalizes_via_recon(e2e_env, monkeypatch):
-    """Item 19: workspace rollback_result write failure → reconciliation completes."""
+    """Item 5: workspace rollback_result write failure → reconciliation completes
+    from SQL ``rollback_completed=True`` + ``verify_rolled_back_state``, WITHOUT
+    a manually written ``rollback_result.json``.
+    """
     service = e2e_env["service"]
     ws = e2e_env["ws"]
     rid, aver = _propose_and_approve(service, e2e_env)
@@ -709,7 +711,6 @@ def test_e2e_item19_rollback_result_persistence_failure_finalizes_via_recon(e2e_
     from cauldron_content_operations.models import ContentChangeRequest
     cr = ContentChangeRequest.objects.get(request_id=rid)
 
-    original_save = ws.save_rollback_result
     def _boom(cs_id, result):
         raise IOError("simulated rollback save failure")
     monkeypatch.setattr(ws, "save_rollback_result", _boom)
@@ -718,11 +719,12 @@ def test_e2e_item19_rollback_result_persistence_failure_finalizes_via_recon(e2e_
     )
     assert not rb.ok
     assert rb.lifecycle_state == "reconciliation_required"
-    monkeypatch.setattr(ws, "save_rollback_result", original_save)
-    # After the "failure", the on-disk rollback already succeeded. Reconciliation
-    # only needs the workspace result and verified state.
-    cr = ContentChangeRequest.objects.get(request_id=rid)
-    ws.save_rollback_result(cr.workspace_changeset_id, {"correlation_id": "cx"})
+
+    # Item 5: the SQL row now holds ``rollback_completed=True``. Reconciliation
+    # must finalize as ``rolled_back`` from SQL evidence + provider
+    # verification, WITHOUT ever writing ``rollback_result.json`` manually.
+    cr.refresh_from_db()
+    assert (cr.metadata or {}).get("rollback_completed") is True
     results = service.reconcile(user=applier, dry_run=False)
     matched = [r for r in results if r["request_id"] == rid]
     assert matched

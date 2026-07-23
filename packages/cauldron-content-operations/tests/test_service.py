@@ -635,7 +635,7 @@ def test_adapter_prepare_failure_prevents_mutation(tmp_path):
     """prepare() failure → apply_failed; router.apply is never called."""
     from unittest.mock import MagicMock
     from cauldron_content.contracts import ApplyResult, ContentChangeSet, ContentOperation, ContentOperationKind, ContentStatus
-    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.service import ContentOperationService, _compute_canonical_changeset_hash
     from cauldron_content_operations.config import ContentOperationsConfig
     from cauldron_content_operations.reversible import register_adapter, unregister_adapter
     from cauldron_content_operations.models import ContentChangeRequest
@@ -654,6 +654,7 @@ def test_adapter_prepare_failure_prevents_mutation(tmp_path):
         cs_id = str(uuid.uuid4())
         op = ContentOperation(kind=ContentOperationKind.CREATE, provider="flatfile", collection="pages", item_id="p1", slug="p1", data={}, body="", schema="", status=ContentStatus.DRAFT, force=False)
         cs = ContentChangeSet(id=cs_id, operations=(op,))
+        payload_hash = _compute_canonical_changeset_hash(cs)
 
         router = MagicMock()
         router.resolve_provider.return_value = "flatfile"
@@ -673,6 +674,7 @@ def test_adapter_prepare_failure_prevents_mutation(tmp_path):
             provider_name="flatfile",
             lifecycle_state="approved",
             request_version=1,
+            payload_hash=payload_hash,
             created_by=user,
         )
 
@@ -692,7 +694,7 @@ def test_result_persistence_failure_enters_reconciliation_required(tmp_path):
     """record_applied() failure after successful mutation → reconciliation_required."""
     from unittest.mock import MagicMock
     from cauldron_content.contracts import ApplyResult, ContentChangeSet, ContentOperation, ContentOperationKind, ContentStatus
-    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.service import ContentOperationService, _compute_canonical_changeset_hash
     from cauldron_content_operations.config import ContentOperationsConfig
     from cauldron_content_operations.reversible import register_adapter, unregister_adapter
     from cauldron_content_operations.models import ContentChangeRequest
@@ -712,6 +714,7 @@ def test_result_persistence_failure_enters_reconciliation_required(tmp_path):
         cs_id = str(uuid.uuid4())
         op = ContentOperation(kind=ContentOperationKind.CREATE, provider="flatfile", collection="pages", item_id="p1", slug="p1", data={}, body="", schema="", status=ContentStatus.DRAFT, force=False)
         cs = ContentChangeSet(id=cs_id, operations=(op,))
+        payload_hash = _compute_canonical_changeset_hash(cs)
 
         router = MagicMock()
         router.resolve_provider.return_value = "flatfile"
@@ -731,6 +734,7 @@ def test_result_persistence_failure_enters_reconciliation_required(tmp_path):
             provider_name="flatfile",
             lifecycle_state="approved",
             request_version=1,
+            payload_hash=payload_hash,
             created_by=user,
         )
 
@@ -1526,3 +1530,154 @@ def test_item14_reject_transitions_workspace_state(tmp_path):
     assert rej.ok
     cs_id = _get_ws_cs_id(r.request_id)
     assert ws.get_state(cs_id) == ChangeSetState.REJECTED
+
+
+# ---------------------------------------------------------------------------
+# Item 1: approval must require workspace + valid payload hash
+# ---------------------------------------------------------------------------
+
+
+def test_item1_approval_without_workspace_denied(tmp_path):
+    """Approval must fail closed when the workspace is not configured."""
+    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.config import ContentOperationsConfig
+    from cauldron_content_operations.models import ContentChangeRequest, ContentAuditEvent
+    from cauldron_content_operations.audit import AuditEventType
+
+    user = _make_user(is_superuser=True, username="item1_appr_noworkspace")
+    router = MagicMock()
+    router.resolve_provider.return_value = "flatfile"
+    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=True, max_operations_per_change_set=10)
+    service = ContentOperationService(router=router, workspace=None, config=cfg)
+
+    cr = ContentChangeRequest.objects.create(
+        workspace_changeset_id="cs-noworkspace-appr",
+        provider_name="flatfile",
+        lifecycle_state="validated",
+        request_version=1,
+        payload_hash="a" * 64,
+        created_by=user,
+    )
+    ap = service.approve_change_request(cr.request_id, user=user, expected_version=1)
+    assert not ap.ok
+    assert ap.error.code == "workspace.unavailable"
+    # Lifecycle unchanged.
+    cr.refresh_from_db()
+    assert cr.lifecycle_state == "validated"
+    assert cr.request_version == 1
+    # Bounded approval-denied audit event.
+    denied = ContentAuditEvent.objects.filter(
+        change_request=cr,
+        event_type=AuditEventType.APPROVAL_DENIED,
+    ).order_by("-sequence").first()
+    assert denied is not None
+    assert denied.detail.get("error_code") == "workspace.unavailable"
+
+
+def test_item1_approval_missing_payload_hash_denied(tmp_path):
+    """Empty/invalid payload_hash → workspace.payload_integrity_unavailable."""
+    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.config import ContentOperationsConfig
+    from cauldron_content_operations.models import ContentChangeRequest
+    from cauldron_workspace_flatfile.config import WorkspaceConfig
+    from cauldron_workspace_flatfile.store import ChangeSetStore
+
+    user = _make_user(is_superuser=True, username="item1_appr_nohash")
+    ws = ChangeSetStore(WorkspaceConfig(workspace_root=tmp_path / "ws"))
+    router = MagicMock()
+    router.resolve_provider.return_value = "flatfile"
+    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=True, max_operations_per_change_set=10)
+    service = ContentOperationService(router=router, workspace=ws, config=cfg)
+
+    cr = ContentChangeRequest.objects.create(
+        workspace_changeset_id="cs-nohash-appr",
+        provider_name="flatfile",
+        lifecycle_state="validated",
+        request_version=1,
+        payload_hash="",  # missing
+        created_by=user,
+    )
+    ap = service.approve_change_request(cr.request_id, user=user, expected_version=1)
+    assert not ap.ok
+    assert ap.error.code == "workspace.payload_integrity_unavailable"
+    cr.refresh_from_db()
+    assert cr.lifecycle_state == "validated"
+
+
+def test_item1_approval_invalid_payload_hash_denied(tmp_path):
+    """Non-hex or wrong-length payload_hash → workspace.payload_integrity_unavailable."""
+    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.config import ContentOperationsConfig
+    from cauldron_content_operations.models import ContentChangeRequest
+    from cauldron_workspace_flatfile.config import WorkspaceConfig
+    from cauldron_workspace_flatfile.store import ChangeSetStore
+
+    user = _make_user(is_superuser=True, username="item1_appr_badhash")
+    ws = ChangeSetStore(WorkspaceConfig(workspace_root=tmp_path / "ws"))
+    router = MagicMock()
+    router.resolve_provider.return_value = "flatfile"
+    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=True, max_operations_per_change_set=10)
+    service = ContentOperationService(router=router, workspace=ws, config=cfg)
+
+    cr = ContentChangeRequest.objects.create(
+        workspace_changeset_id="cs-badhash-appr",
+        provider_name="flatfile",
+        lifecycle_state="validated",
+        request_version=1,
+        payload_hash="notavalidhex",
+        created_by=user,
+    )
+    ap = service.approve_change_request(cr.request_id, user=user, expected_version=1)
+    assert not ap.ok
+    assert ap.error.code == "workspace.payload_integrity_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Item 13: identifier segment validation at proposal time
+# ---------------------------------------------------------------------------
+
+
+def test_item13_traversal_collection_rejected_at_proposal():
+    """Collections containing traversal sequences are rejected before any I/O."""
+    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.config import ContentOperationsConfig
+    from cauldron_content_operations.models import ContentChangeRequest
+
+    user = _make_user(is_superuser=True, username="item13_col")
+    workspace = MagicMock()
+    router = MagicMock()
+    router.resolve_provider.return_value = "flatfile"
+    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=True, max_operations_per_change_set=10)
+    service = ContentOperationService(router=router, workspace=workspace, config=cfg)
+
+    cr_before = ContentChangeRequest.objects.count()
+    r = service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "../etc", "item_id": "p1", "slug": "p1", "data": {}}],
+        provider_name="flatfile",
+    )
+    assert not r.ok
+    assert r.error.code == "operations.invalid_collection"
+    # Nothing persisted.
+    assert ContentChangeRequest.objects.count() == cr_before
+
+
+def test_item13_absolute_slug_rejected_at_proposal():
+    """Slugs that look like absolute paths are rejected before any I/O."""
+    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.config import ContentOperationsConfig
+
+    user = _make_user(is_superuser=True, username="item13_slug")
+    workspace = MagicMock()
+    router = MagicMock()
+    router.resolve_provider.return_value = "flatfile"
+    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=True, max_operations_per_change_set=10)
+    service = ContentOperationService(router=router, workspace=workspace, config=cfg)
+
+    r = service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "/etc/passwd", "data": {}}],
+        provider_name="flatfile",
+    )
+    assert not r.ok
+    assert r.error.code == "operations.invalid_slug"

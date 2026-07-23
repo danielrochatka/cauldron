@@ -1,6 +1,8 @@
 {% extends "admin/change_form.html" %}
 {% load i18n admin_urls %}
-{# Item 15: real POST forms with CSRF + hidden expected_version #}
+{# Item 10: no nested <form> — the outer Django Admin form already provides
+   CSRF and POST. Buttons submit to lifecycle endpoints via formaction+
+   formmethod. A single hidden expected_version input pins the version. #}
 
 {% block after_field_sets %}
 {{ block.super }}
@@ -11,51 +13,66 @@
     <strong>{% trans "Current version" %}:</strong> {{ original.request_version }} —
     <strong>{% trans "State" %}:</strong> {{ original.lifecycle_state }}
   </p>
-  {% if original.lifecycle_state == "proposed" %}
-    <div class="cauldron-action" style="padding: 6px 12px;">
-      <form method="post" action="{% url 'admin:cauldron_content_operations_contentchangerequest_validate' original.request_id %}" style="display:inline-block">
-        {% csrf_token %}
-        <input type="hidden" name="expected_version" value="{{ original.request_version }}">
-        <button type="submit">{% trans "Validate" %}</button>
-      </form>
-      <form method="post" action="{% url 'admin:cauldron_content_operations_contentchangerequest_reject' original.request_id %}" style="display:inline-block; margin-left: 8px">
-        {% csrf_token %}
-        <input type="hidden" name="expected_version" value="{{ original.request_version }}">
-        <label>{% trans "Reason:" %} <input type="text" name="reason" maxlength="500"></label>
-        <button type="submit">{% trans "Reject" %}</button>
-      </form>
-    </div>
-  {% elif original.lifecycle_state == "validated" %}
-    <div class="cauldron-action" style="padding: 6px 12px;">
-      <form method="post" action="{% url 'admin:cauldron_content_operations_contentchangerequest_approve' original.request_id %}" style="display:inline-block">
-        {% csrf_token %}
-        <input type="hidden" name="expected_version" value="{{ original.request_version }}">
-        <button type="submit">{% trans "Approve" %}</button>
-      </form>
-      <form method="post" action="{% url 'admin:cauldron_content_operations_contentchangerequest_reject' original.request_id %}" style="display:inline-block; margin-left: 8px">
-        {% csrf_token %}
-        <input type="hidden" name="expected_version" value="{{ original.request_version }}">
-        <label>{% trans "Reason:" %} <input type="text" name="reason" maxlength="500"></label>
-        <button type="submit">{% trans "Reject" %}</button>
-      </form>
-    </div>
-  {% elif original.lifecycle_state == "approved" %}
-    <div class="cauldron-action" style="padding: 6px 12px;">
-      <form method="post" action="{% url 'admin:cauldron_content_operations_contentchangerequest_apply' original.request_id %}" style="display:inline-block">
-        {% csrf_token %}
-        <input type="hidden" name="expected_version" value="{{ original.request_version }}">
-        <button type="submit">{% trans "Apply" %}</button>
-      </form>
-    </div>
-  {% elif original.lifecycle_state == "applied" %}
-    <div class="cauldron-action" style="padding: 6px 12px;">
-      <form method="post" action="{% url 'admin:cauldron_content_operations_contentchangerequest_rollback' original.request_id %}" style="display:inline-block">
-        {% csrf_token %}
-        <input type="hidden" name="expected_version" value="{{ original.request_version }}">
-        <button type="submit">{% trans "Rollback" %}</button>
-      </form>
-    </div>
-  {% endif %}
+  {# Item 10: single hidden expected_version input, submitted with any of
+     the lifecycle-action buttons via their formaction. #}
+  <input type="hidden" name="expected_version" value="{{ original.request_version }}">
+  <div class="cauldron-action" style="padding: 6px 12px;">
+    {% if original.lifecycle_state == "proposed" %}
+      {% if perms.cauldron_content_operations.validate_content_changes %}
+        <button type="submit"
+                formaction="{% url 'admin:cauldron_content_operations_contentchangerequest_validate' original.request_id %}"
+                formmethod="post">
+          {% trans "Validate" %}
+        </button>
+      {% endif %}
+      {% if perms.cauldron_content_operations.reject_content_changes %}
+        <label style="margin-left: 8px;">
+          {% trans "Reason:" %}
+          <input type="text" name="reason" maxlength="500">
+        </label>
+        <button type="submit"
+                formaction="{% url 'admin:cauldron_content_operations_contentchangerequest_reject' original.request_id %}"
+                formmethod="post">
+          {% trans "Reject" %}
+        </button>
+      {% endif %}
+    {% elif original.lifecycle_state == "validated" %}
+      {% if perms.cauldron_content_operations.approve_content_changes %}
+        <button type="submit"
+                formaction="{% url 'admin:cauldron_content_operations_contentchangerequest_approve' original.request_id %}"
+                formmethod="post">
+          {% trans "Approve" %}
+        </button>
+      {% endif %}
+      {% if perms.cauldron_content_operations.reject_content_changes %}
+        <label style="margin-left: 8px;">
+          {% trans "Reason:" %}
+          <input type="text" name="reason" maxlength="500">
+        </label>
+        <button type="submit"
+                formaction="{% url 'admin:cauldron_content_operations_contentchangerequest_reject' original.request_id %}"
+                formmethod="post">
+          {% trans "Reject" %}
+        </button>
+      {% endif %}
+    {% elif original.lifecycle_state == "approved" %}
+      {% if perms.cauldron_content_operations.apply_content_changes %}
+        <button type="submit"
+                formaction="{% url 'admin:cauldron_content_operations_contentchangerequest_apply' original.request_id %}"
+                formmethod="post">
+          {% trans "Apply" %}
+        </button>
+      {% endif %}
+    {% elif original.lifecycle_state == "applied" %}
+      {% if perms.cauldron_content_operations.apply_content_changes %}
+        <button type="submit"
+                formaction="{% url 'admin:cauldron_content_operations_contentchangerequest_rollback' original.request_id %}"
+                formmethod="post">
+          {% trans "Rollback" %}
+        </button>
+      {% endif %}
+    {% endif %}
+  </div>
 </div>
 {% endif %}
 {% endblock %}

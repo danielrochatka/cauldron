@@ -615,19 +615,46 @@ class FlatFileReversibleMutationAdapter:
                 f"Rollback Phase 2 failed after partial execution: {exc}"
             ) from exc
 
-        self.record_rolled_back(cs_id)
+        # Item 5/6: canonical mutation has completed. If the provider
+        # completion marker fails to persist we cannot signal "rollback
+        # failed" — the file mutation already succeeded, so the caller must
+        # treat this as ``reconciliation_required`` and use verify_rolled_
+        # back_state to disambiguate.
+        try:
+            self.record_rolled_back(cs_id)
+        except Exception as exc:
+            raise RollbackReconciliationRequired(
+                f"Rollback completed but provider marker failed: {exc}"
+            ) from exc
 
-    def verify_applied_state(self, cs_id: str) -> VerificationResult:
+    def verify_applied_state(
+        self,
+        cs_id: str,
+        *,
+        expected_artifact_digest: str = "",
+        expected_entry_count: int = 0,
+    ) -> VerificationResult:
         """Verify that on-disk state matches the recorded post-application state.
 
         Uses the provider-owned ``post_application_state.json`` record set so
         the check operates in the raw-file hash domain (not the semantic
         ContentItem domain).
 
-        Item 8: enforces strict binding to the artifact digest, matched entry
-        count and consistent kinds; contradictory or empty evidence never
-        returns "verified".
+        Item 3: verification is bound to trusted SQL evidence
+        (``expected_artifact_digest`` and ``expected_entry_count``). Missing
+        evidence returns ``"missing_evidence"``, never ``"verified"``.
+
+        Item 4: post-application state is strict: every field must be present
+        and typed correctly; ``expected_present`` must be a real ``bool``;
+        ``sha256`` must be 64 hex chars when the file is expected present.
         """
+        # Item 3: no trusted SQL evidence means we cannot verify.
+        if not expected_artifact_digest or not expected_entry_count:
+            return VerificationResult(
+                status="missing_evidence",
+                reason="No trusted SQL digest available",
+            )
+
         state_path = self._post_state_path(cs_id)
         if not state_path.exists():
             return VerificationResult(
@@ -663,17 +690,43 @@ class FlatFileReversibleMutationAdapter:
                     f"entry count {len(files)}"
                 ),
             )
-        # Ensure digest binding when present.
+
+        # Item 3: digest and count binding.
         actual_digest = self._artifact_digest(art_path)
+        if actual_digest != expected_artifact_digest:
+            return VerificationResult(
+                status="corrupt_evidence",
+                reason="Artifact digest does not match SQL evidence.",
+            )
+        if len(files) != int(expected_entry_count):
+            return VerificationResult(
+                status="corrupt_evidence",
+                reason=(
+                    f"Artifact entry count {len(files)} != expected "
+                    f"{expected_entry_count}"
+                ),
+            )
         state_digest = state_doc.get("artifact_digest", "")
-        if state_digest and state_digest != actual_digest:
+        if not state_digest or state_digest != actual_digest:
             return VerificationResult(
                 status="corrupt_evidence",
                 reason="Post-state artifact digest does not match artifact.",
             )
-        # Compare records to artifact entries by op_index.
-        art_by_index = {int(e["op_index"]): e for e in files if isinstance(e, dict)}
-        details: dict = {"checked": len(records), "issues": []}
+        state_cs_id = state_doc.get("cs_id", "")
+        if state_cs_id and state_cs_id != cs_id:
+            return VerificationResult(
+                status="corrupt_evidence",
+                reason="Post-state cs_id does not match request cs_id.",
+            )
+        state_version = state_doc.get("version")
+        if state_version is not None and state_version not in (POST_STATE_VERSION, 1):
+            return VerificationResult(
+                status="corrupt_evidence",
+                reason=f"Unsupported post-state version {state_version!r}",
+            )
+
+        # Item 4: unique contiguous op indexes.
+        indexes = []
         for r in records:
             if not isinstance(r, dict):
                 return VerificationResult(
@@ -681,23 +734,112 @@ class FlatFileReversibleMutationAdapter:
                     reason="Non-dict record in post-state.",
                 )
             oi = r.get("op_index")
-            if not isinstance(oi, int) or oi not in art_by_index:
+            if not isinstance(oi, int) or isinstance(oi, bool) or oi < 0:
+                return VerificationResult(
+                    status="corrupt_evidence",
+                    reason=f"Bad op_index {oi!r} in post-state",
+                )
+            indexes.append(oi)
+        if sorted(indexes) != list(range(len(records))):
+            return VerificationResult(
+                status="corrupt_evidence",
+                reason="Post-state op indexes are not contiguous/unique.",
+            )
+
+        # Compare records to artifact entries by op_index.
+        art_by_index = {int(e["op_index"]): e for e in files if isinstance(e, dict)}
+        art_cs_id = artifact.get("cs_id", "")
+        if art_cs_id and art_cs_id != cs_id:
+            return VerificationResult(
+                status="corrupt_evidence",
+                reason="Artifact cs_id does not match request cs_id.",
+            )
+        art_version = artifact.get("version")
+        if art_version is not None and art_version not in (ROLLBACK_ARTIFACT_VERSION, 1):
+            return VerificationResult(
+                status="corrupt_evidence",
+                reason=f"Unsupported artifact version {art_version!r}",
+            )
+
+        details: dict = {"checked": len(records), "issues": []}
+        for r in records:
+            oi = r["op_index"]
+            if oi not in art_by_index:
                 return VerificationResult(
                     status="corrupt_evidence",
                     reason=f"post-state op_index {oi!r} not in artifact",
                 )
             art_entry = art_by_index[oi]
+            # Item 4: strict types on every field.
+            for field_name in ("collection", "item_id", "kind", "rel_path"):
+                if not isinstance(r.get(field_name), str):
+                    return VerificationResult(
+                        status="corrupt_evidence",
+                        reason=f"Bad {field_name} at op_index {oi}",
+                    )
+            if r.get("kind") not in SUPPORTED_KINDS:
+                return VerificationResult(
+                    status="corrupt_evidence",
+                    reason=f"Unsupported kind {r.get('kind')!r} at op_index {oi}",
+                )
+            # Every artifact field must match the post-state record.
             if art_entry.get("kind") != r.get("kind"):
                 return VerificationResult(
                     status="corrupt_evidence",
                     reason=f"kind mismatch at op_index {oi}",
                 )
-            if art_entry.get("rel_path") not in (r.get("rel_path"), None):
+            if (
+                art_entry.get("rel_path") is not None
+                and art_entry.get("rel_path") != r.get("rel_path")
+            ):
                 return VerificationResult(
                     status="corrupt_evidence",
                     reason=f"rel_path mismatch at op_index {oi}",
                 )
-            rel = r.get("rel_path", "")
+            if (
+                art_entry.get("collection") is not None
+                and art_entry.get("collection") != r.get("collection")
+            ):
+                return VerificationResult(
+                    status="corrupt_evidence",
+                    reason=f"collection mismatch at op_index {oi}",
+                )
+            if (
+                art_entry.get("item_id") is not None
+                and art_entry.get("item_id") != r.get("item_id")
+            ):
+                return VerificationResult(
+                    status="corrupt_evidence",
+                    reason=f"item_id mismatch at op_index {oi}",
+                )
+            # Item 4: expected_present must be a real bool.
+            expected_present_val = r.get("expected_present")
+            if expected_present_val is not True and expected_present_val is not False:
+                return VerificationResult(
+                    status="corrupt_evidence",
+                    reason=f"expected_present at op_index {oi} is not a bool",
+                )
+            expected_sha = r.get("sha256", "")
+            if not isinstance(expected_sha, str):
+                return VerificationResult(
+                    status="corrupt_evidence",
+                    reason=f"sha256 at op_index {oi} is not a string",
+                )
+            # Item 4: contradiction check — create must have expected_present.
+            if r["kind"] in ("create", "update") and expected_present_val is False:
+                return VerificationResult(
+                    status="corrupt_evidence",
+                    reason=(
+                        f"kind={r['kind']} but expected_present=False at "
+                        f"op_index {oi}"
+                    ),
+                )
+            if r["kind"] == "delete" and expected_present_val is True:
+                return VerificationResult(
+                    status="corrupt_evidence",
+                    reason=f"kind=delete but expected_present=True at op_index {oi}",
+                )
+            rel = r["rel_path"]
             try:
                 canonical = self._safe_resolve_content(rel)
             except Exception as exc:
@@ -706,9 +848,14 @@ class FlatFileReversibleMutationAdapter:
                     reason=f"rel_path {rel!r} is unsafe: {exc}",
                     details=details,
                 )
-            expected_present = bool(r.get("expected_present"))
-            expected_sha = r.get("sha256", "")
-            if expected_present:
+            if expected_present_val is True:
+                if len(expected_sha) != 64 or any(
+                    ch not in "0123456789abcdef" for ch in expected_sha
+                ):
+                    return VerificationResult(
+                        status="corrupt_evidence",
+                        reason=f"sha256 at op_index {oi} not a 64-char hex string",
+                    )
                 if not canonical.exists():
                     details["issues"].append({"rel_path": rel, "reason": "missing"})
                     return VerificationResult(
@@ -725,6 +872,14 @@ class FlatFileReversibleMutationAdapter:
                         details=details,
                     )
             else:
+                if expected_sha != "":
+                    return VerificationResult(
+                        status="corrupt_evidence",
+                        reason=(
+                            f"sha256 at op_index {oi} must be empty when "
+                            "expected_present is False"
+                        ),
+                    )
                 if canonical.exists():
                     details["issues"].append({"rel_path": rel, "reason": "unexpected_present"})
                     return VerificationResult(
@@ -734,15 +889,28 @@ class FlatFileReversibleMutationAdapter:
                     )
         return VerificationResult(status="verified", details=details)
 
-    def verify_rolled_back_state(self, cs_id: str) -> VerificationResult:
+    def verify_rolled_back_state(
+        self,
+        cs_id: str,
+        *,
+        expected_artifact_digest: str = "",
+        expected_entry_count: int = 0,
+    ) -> VerificationResult:
         """Verify that on-disk state matches the recorded pre-application state.
 
         Files whose pre-state was "did not exist" must be absent after rollback.
         Files whose pre-state was "existed" must match ``pre_hash`` after rollback.
 
-        Item 8: rejects empty artifacts and enforces the same digest and
-        entry-count binding when a post-state is present.
+        Item 3: verification is bound to trusted SQL evidence
+        (``expected_artifact_digest`` and ``expected_entry_count``). Missing
+        evidence returns ``"missing_evidence"``, never ``"verified"``.
         """
+        # Item 3: require trusted SQL evidence.
+        if not expected_artifact_digest or not expected_entry_count:
+            return VerificationResult(
+                status="missing_evidence",
+                reason="No trusted SQL digest available",
+            )
         art_path = self._art_path(cs_id)
         if not art_path.exists():
             return VerificationResult(
@@ -761,6 +929,33 @@ class FlatFileReversibleMutationAdapter:
             return VerificationResult(
                 status="corrupt_evidence",
                 reason="Empty artifact files list",
+            )
+        # Item 3: digest and count binding.
+        actual_digest = self._artifact_digest(art_path)
+        if actual_digest != expected_artifact_digest:
+            return VerificationResult(
+                status="corrupt_evidence",
+                reason="Artifact digest does not match SQL evidence.",
+            )
+        if len(files) != int(expected_entry_count):
+            return VerificationResult(
+                status="corrupt_evidence",
+                reason=(
+                    f"Artifact entry count {len(files)} != expected "
+                    f"{expected_entry_count}"
+                ),
+            )
+        art_cs_id = artifact.get("cs_id", "")
+        if art_cs_id and art_cs_id != cs_id:
+            return VerificationResult(
+                status="corrupt_evidence",
+                reason="Artifact cs_id does not match request cs_id.",
+            )
+        art_version = artifact.get("version")
+        if art_version is not None and art_version not in (ROLLBACK_ARTIFACT_VERSION, 1):
+            return VerificationResult(
+                status="corrupt_evidence",
+                reason=f"Unsupported artifact version {art_version!r}",
             )
         details: dict = {"checked": len(files), "issues": []}
         for entry in files:
@@ -854,6 +1049,8 @@ class FlatFileReversibleMutationAdapter:
             "has_application_result": self.has_application_result(cs_id),
             "has_rollback_result": self._rollback_result_path(cs_id).exists(),
         }
+        # Inspect is a diagnostic view — call verify without trusted SQL evidence,
+        # so both statuses will typically be "missing_evidence" in the raw view.
         try:
             info["applied_state"] = self.verify_applied_state(cs_id).to_dict()
         except Exception as exc:
@@ -896,12 +1093,20 @@ class FlatFileReversibleMutationAdapter:
         Item 4: collection segment is validated through ``safe_resolve``
         against ``content_root`` so pathological collection names cannot
         cause writes outside the content root.
+
+        Item 13: collection and slug segments are validated through
+        :func:`_identifiers.validate_identifier_segment` before any I/O.
         """
         try:
             from cauldron_content.contracts import ContentOperationKind
         except Exception:  # pragma: no cover - contract package must be available
             ContentOperationKind = None  # type: ignore[assignment]
 
+        try:
+            from ._identifiers import validate_identifier_segment
+            validate_identifier_segment(op.collection, "collection")
+        except Exception:
+            return None
         try:
             coll_dir = safe_resolve(self._content_root, op.collection)
         except Exception:
@@ -917,6 +1122,10 @@ class FlatFileReversibleMutationAdapter:
             if not slug:
                 return None
             try:
+                validate_identifier_segment(slug, "slug")
+            except Exception:
+                return None
+            try:
                 return safe_resolve(coll_dir, f"{slug}.md")
             except Exception:
                 return None
@@ -928,12 +1137,22 @@ class FlatFileReversibleMutationAdapter:
             if not slug:
                 return None
             try:
+                validate_identifier_segment(slug, "slug")
+            except Exception:
+                return None
+            try:
                 return safe_resolve(coll_dir, f"{slug}.md")
             except Exception:
                 return None
         return None
 
     def _find_file_for_item(self, collection: str, item_id: str) -> Path | None:
+        # Item 13: validate collection segment before any I/O.
+        try:
+            from ._identifiers import validate_identifier_segment
+            validate_identifier_segment(collection, "collection")
+        except Exception:
+            return None
         try:
             coll_dir = safe_resolve(self._content_root, collection)
         except Exception:
@@ -944,8 +1163,20 @@ class FlatFileReversibleMutationAdapter:
             import yaml  # type: ignore
         except Exception:
             return None
+        content_root = self._content_root
         try:
             for f in coll_dir.glob("*.md"):
+                # Item 12: harden against symlink escape and non-regular files.
+                try:
+                    resolved = f.resolve(strict=True)
+                except (OSError, RuntimeError):
+                    continue
+                try:
+                    resolved.relative_to(content_root)
+                except ValueError:
+                    continue
+                if not resolved.is_file():
+                    continue
                 text = f.read_text(encoding="utf-8")
                 if text.startswith("---"):
                     try:

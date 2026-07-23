@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from cauldron_content_operations.reversible import PreparationResult
+
 from .config import WorkspaceConfig
 from .paths import PathEscapeError, safe_resolve
 from .store import _atomic_write_json, _read_json
@@ -32,6 +34,343 @@ ROLLBACK_ARTIFACT_VERSION = 2
 POST_STATE_VERSION = 2
 
 SUPPORTED_KINDS = frozenset({"create", "update", "delete"})
+
+
+class EvidenceValidationError(Exception):
+    """Raised when a rollback artifact or post-state document fails strict
+    v2 validation.
+
+    Callers that hold trusted SQL evidence catch this exception and translate
+    it into ``rollback.artifact_invalid`` or ``VerificationResult(status=
+    "mismatch"/"corrupt_evidence", ...)`` depending on the call site.
+    """
+
+
+@dataclass(frozen=True)
+class RollbackEntry:
+    """One validated entry in a v2 rollback artifact."""
+
+    op_index: int
+    collection: str
+    item_id: str
+    kind: str
+    rel_path: str
+    snap_name: str
+    existed: bool
+    pre_hash: str
+    snap_sha256: str
+
+
+@dataclass(frozen=True)
+class PostStateRecord:
+    """One validated record in a v2 post-application state document."""
+
+    op_index: int
+    collection: str
+    item_id: str
+    kind: str
+    rel_path: str
+    expected_present: bool
+    sha256: str
+
+
+def _is_hex64(value: Any) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    return all(ch in "0123456789abcdef" for ch in value)
+
+
+def _is_positive_int(value: Any) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value > 0
+    )
+
+
+def parse_rollback_artifact(
+    raw: dict,
+    *,
+    cs_id: str,
+    trusted_digest: str,
+    trusted_entry_count: int,
+) -> list[RollbackEntry]:
+    """Parse and fully validate a v2 rollback artifact.
+
+    Enforces schema, digest binding, contiguous op-indexes, per-entry kinds,
+    typed ``existed`` booleans, and per-branch hash requirements. Raises
+    :class:`EvidenceValidationError` on any deviation.
+
+    The parser is pure (no I/O) — the caller supplies the raw parsed JSON.
+    """
+    if not isinstance(raw, dict):
+        raise EvidenceValidationError("rollback artifact is not an object")
+    if not _is_hex64(trusted_digest):
+        raise EvidenceValidationError("trusted_digest is missing or invalid")
+    if not _is_positive_int(trusted_entry_count):
+        raise EvidenceValidationError(
+            "trusted_entry_count is missing or non-positive"
+        )
+    if "version" not in raw:
+        raise EvidenceValidationError("artifact missing 'version'")
+    version = raw["version"]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise EvidenceValidationError(f"artifact version is not int: {version!r}")
+    if version != ROLLBACK_ARTIFACT_VERSION:
+        raise EvidenceValidationError(
+            f"artifact version {version!r} is not {ROLLBACK_ARTIFACT_VERSION}"
+        )
+    if "cs_id" not in raw:
+        raise EvidenceValidationError("artifact missing 'cs_id'")
+    if raw.get("cs_id") != cs_id:
+        raise EvidenceValidationError("artifact cs_id does not match request cs_id")
+
+    files = raw.get("files")
+    if not isinstance(files, list) or not files:
+        raise EvidenceValidationError("artifact 'files' is missing or empty")
+    if len(files) != trusted_entry_count:
+        raise EvidenceValidationError(
+            f"artifact entry count {len(files)} != trusted {trusted_entry_count}"
+        )
+
+    # Op-index contiguity check.
+    indexes: list[int] = []
+    for e in files:
+        if not isinstance(e, dict):
+            raise EvidenceValidationError("artifact entry is not an object")
+        oi = e.get("op_index")
+        if isinstance(oi, bool) or not isinstance(oi, int) or oi < 0:
+            raise EvidenceValidationError(
+                f"artifact op_index {oi!r} is not a non-negative int"
+            )
+        indexes.append(oi)
+    if sorted(indexes) != list(range(len(files))):
+        raise EvidenceValidationError(
+            "artifact op_indexes are not contiguous unique 0-based"
+        )
+
+    entries: list[RollbackEntry] = []
+    for entry in files:
+        op_index = entry["op_index"]
+        collection = entry.get("collection")
+        if not isinstance(collection, str) or not collection:
+            raise EvidenceValidationError(
+                f"artifact collection missing/empty at op_index {op_index}"
+            )
+        item_id = entry.get("item_id")
+        if not isinstance(item_id, str) or not item_id:
+            raise EvidenceValidationError(
+                f"artifact item_id missing/empty at op_index {op_index}"
+            )
+        kind = entry.get("kind")
+        if kind not in SUPPORTED_KINDS:
+            raise EvidenceValidationError(
+                f"artifact kind {kind!r} unsupported at op_index {op_index}"
+            )
+        rel_path = entry.get("rel_path")
+        if not isinstance(rel_path, str) or not rel_path:
+            raise EvidenceValidationError(
+                f"artifact rel_path missing/empty at op_index {op_index}"
+            )
+        # Reject absolute paths and traversal at the parser level.
+        rp = Path(rel_path)
+        if rp.is_absolute():
+            raise EvidenceValidationError(
+                f"artifact rel_path is absolute at op_index {op_index}"
+            )
+        if any(part == ".." for part in rp.parts):
+            raise EvidenceValidationError(
+                f"artifact rel_path contains '..' at op_index {op_index}"
+            )
+        snap_name = entry.get("snap_name")
+        expected_snap_name = f"snap_{op_index}.bin"
+        if snap_name != expected_snap_name:
+            raise EvidenceValidationError(
+                f"artifact snap_name {snap_name!r} does not match "
+                f"{expected_snap_name!r} at op_index {op_index}"
+            )
+        existed = entry.get("existed")
+        if existed is not True and existed is not False:
+            raise EvidenceValidationError(
+                f"artifact existed is not a bool at op_index {op_index}"
+            )
+        pre_hash = entry.get("pre_hash")
+        snap_sha256 = entry.get("snap_sha256")
+        if existed is True:
+            if not _is_hex64(pre_hash):
+                raise EvidenceValidationError(
+                    f"artifact pre_hash is not 64-char hex at op_index {op_index}"
+                )
+            if not _is_hex64(snap_sha256):
+                raise EvidenceValidationError(
+                    f"artifact snap_sha256 is not 64-char hex at op_index {op_index}"
+                )
+        else:
+            if pre_hash != "":
+                raise EvidenceValidationError(
+                    f"artifact pre_hash must be '' when existed=False at op_index {op_index}"
+                )
+            if snap_sha256 != "":
+                raise EvidenceValidationError(
+                    f"artifact snap_sha256 must be '' when existed=False at op_index {op_index}"
+                )
+        entries.append(
+            RollbackEntry(
+                op_index=op_index,
+                collection=collection,
+                item_id=item_id,
+                kind=kind,
+                rel_path=rel_path,
+                snap_name=snap_name,
+                existed=existed,
+                pre_hash=pre_hash,
+                snap_sha256=snap_sha256,
+            )
+        )
+    # Sort by op_index so callers can index by position.
+    entries.sort(key=lambda e: e.op_index)
+    return entries
+
+
+def parse_post_state(
+    raw: dict,
+    *,
+    cs_id: str,
+    trusted_digest: str,
+    rollback_entries: list[RollbackEntry],
+) -> list[PostStateRecord]:
+    """Parse and fully validate a v2 post-application state document.
+
+    Enforces schema, digest binding, per-record types, and exact per-index
+    parity with the corresponding :class:`RollbackEntry`. Raises
+    :class:`EvidenceValidationError` on any deviation.
+    """
+    if not isinstance(raw, dict):
+        raise EvidenceValidationError("post-state is not an object")
+    if not _is_hex64(trusted_digest):
+        raise EvidenceValidationError("trusted_digest is missing or invalid")
+    if not isinstance(rollback_entries, list) or not rollback_entries:
+        raise EvidenceValidationError("rollback_entries empty for post-state parse")
+
+    if "version" not in raw:
+        raise EvidenceValidationError("post-state missing 'version'")
+    version = raw["version"]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise EvidenceValidationError(
+            f"post-state version is not int: {version!r}"
+        )
+    if version != POST_STATE_VERSION:
+        raise EvidenceValidationError(
+            f"post-state version {version!r} is not {POST_STATE_VERSION}"
+        )
+    if "cs_id" not in raw:
+        raise EvidenceValidationError("post-state missing 'cs_id'")
+    if raw.get("cs_id") != cs_id:
+        raise EvidenceValidationError("post-state cs_id does not match request cs_id")
+
+    if "artifact_digest" not in raw:
+        raise EvidenceValidationError("post-state missing 'artifact_digest'")
+    art_digest = raw["artifact_digest"]
+    if art_digest != trusted_digest:
+        raise EvidenceValidationError(
+            "post-state artifact_digest does not match trusted digest"
+        )
+
+    records_raw = raw.get("records")
+    if not isinstance(records_raw, list):
+        raise EvidenceValidationError("post-state 'records' missing or not a list")
+    if len(records_raw) != len(rollback_entries):
+        raise EvidenceValidationError(
+            f"post-state record count {len(records_raw)} != "
+            f"{len(rollback_entries)} entries"
+        )
+
+    # Op-index contiguity.
+    indexes: list[int] = []
+    for r in records_raw:
+        if not isinstance(r, dict):
+            raise EvidenceValidationError("post-state record is not an object")
+        oi = r.get("op_index")
+        if isinstance(oi, bool) or not isinstance(oi, int) or oi < 0:
+            raise EvidenceValidationError(
+                f"post-state op_index {oi!r} is not a non-negative int"
+            )
+        indexes.append(oi)
+    if sorted(indexes) != list(range(len(records_raw))):
+        raise EvidenceValidationError(
+            "post-state op_indexes are not contiguous unique 0-based"
+        )
+
+    entries_by_idx = {e.op_index: e for e in rollback_entries}
+    records: list[PostStateRecord] = []
+    for r in records_raw:
+        op_index = r["op_index"]
+        art_entry = entries_by_idx.get(op_index)
+        if art_entry is None:
+            raise EvidenceValidationError(
+                f"post-state op_index {op_index} has no matching artifact entry"
+            )
+        collection = r.get("collection")
+        if not isinstance(collection, str) or collection != art_entry.collection:
+            raise EvidenceValidationError(
+                f"post-state collection mismatch at op_index {op_index}"
+            )
+        item_id = r.get("item_id")
+        if not isinstance(item_id, str) or item_id != art_entry.item_id:
+            raise EvidenceValidationError(
+                f"post-state item_id mismatch at op_index {op_index}"
+            )
+        kind = r.get("kind")
+        if kind not in SUPPORTED_KINDS or kind != art_entry.kind:
+            raise EvidenceValidationError(
+                f"post-state kind mismatch at op_index {op_index}"
+            )
+        rel_path = r.get("rel_path")
+        if not isinstance(rel_path, str) or rel_path != art_entry.rel_path:
+            raise EvidenceValidationError(
+                f"post-state rel_path mismatch at op_index {op_index}"
+            )
+        expected_present = r.get("expected_present")
+        if expected_present is not True and expected_present is not False:
+            raise EvidenceValidationError(
+                f"post-state expected_present is not a bool at op_index {op_index}"
+            )
+        sha256 = r.get("sha256", "")
+        if not isinstance(sha256, str):
+            raise EvidenceValidationError(
+                f"post-state sha256 is not a string at op_index {op_index}"
+            )
+        if kind in ("create", "update"):
+            if expected_present is not True:
+                raise EvidenceValidationError(
+                    f"post-state {kind} requires expected_present=True at op_index {op_index}"
+                )
+            if not _is_hex64(sha256):
+                raise EvidenceValidationError(
+                    f"post-state sha256 is not 64-char hex at op_index {op_index}"
+                )
+        else:  # delete
+            if expected_present is not False:
+                raise EvidenceValidationError(
+                    f"post-state delete requires expected_present=False at op_index {op_index}"
+                )
+            if sha256 != "":
+                raise EvidenceValidationError(
+                    f"post-state sha256 must be '' for delete at op_index {op_index}"
+                )
+        records.append(
+            PostStateRecord(
+                op_index=op_index,
+                collection=collection,
+                item_id=item_id,
+                kind=kind,
+                rel_path=rel_path,
+                expected_present=expected_present,
+                sha256=sha256,
+            )
+        )
+    records.sort(key=lambda r: r.op_index)
+    return records
 
 
 class RollbackConflict(Exception):
@@ -88,21 +427,6 @@ class VerificationResult:
 
     def to_dict(self) -> dict:
         return {"status": self.status, "reason": self.reason, "details": dict(self.details)}
-
-
-@dataclass(frozen=True)
-class PreparationResult:
-    """Typed result of :meth:`FlatFileReversibleMutationAdapter.prepare`.
-
-    Fields:
-      * ``artifact_digest`` — SHA-256 hex digest of the written
-        ``rollback_artifact.json`` bytes (used as trusted evidence when
-        cross-referenced from SQL metadata).
-      * ``entry_count`` — total number of entries recorded in the artifact.
-    """
-
-    artifact_digest: str
-    entry_count: int
 
 
 class FlatFileReversibleMutationAdapter:
@@ -225,7 +549,7 @@ class FlatFileReversibleMutationAdapter:
                 )
             seen_rels[rel] = i
 
-            snap_name = f"{i:04d}_{canonical.name}"
+            snap_name = f"snap_{i}.bin"
             kind_value = op.kind.value if hasattr(op.kind, "value") else str(op.kind)
             existed = canonical.exists()
             entry: dict = {
@@ -235,7 +559,7 @@ class FlatFileReversibleMutationAdapter:
                 "collection": op.collection,
                 "item_id": op.item_id,
                 "kind": kind_value,
-                "existed": existed,
+                "existed": bool(existed),
                 "pre_hash": self._file_hash(canonical) if existed else "",
                 "snap_sha256": "",
             }
@@ -272,64 +596,62 @@ class FlatFileReversibleMutationAdapter:
         Item 8: unknown operation kinds are rejected as errors rather than
         recorded as informational entries — post-state must be authoritative.
         """
-        artifact = _read_json(self._art_path(cs_id))
-        files = artifact.get("files", [])
+        art_path = self._art_path(cs_id)
+        artifact = _read_json(art_path)
         # Compute the artifact digest so we can bind post-state to the artifact.
-        computed_digest = self._artifact_digest(self._art_path(cs_id))
+        computed_digest = self._artifact_digest(art_path)
         if artifact_digest and artifact_digest != computed_digest:
             raise RollbackPostStateUnavailable(
                 f"artifact digest mismatch for {cs_id!r}."
             )
+        # Item 3: parse the artifact strictly through the shared v2 parser.
+        try:
+            files_meta = artifact.get("files") or []
+            entries = parse_rollback_artifact(
+                artifact,
+                cs_id=cs_id,
+                trusted_digest=computed_digest,
+                trusted_entry_count=len(files_meta),
+            )
+        except EvidenceValidationError as exc:
+            raise RollbackPostStateUnavailable(
+                f"Rollback artifact for {cs_id!r} failed v2 validation: {exc}"
+            ) from exc
+
         records: list[dict] = []
         legacy_hashes: dict[str, str] = {}
-        for entry in files:
-            rel_path = entry.get("rel_path")
-            if rel_path is None:
-                # Backward compat: older artifacts stored only canonical_path.
-                canonical_str = entry.get("canonical_path", "")
-                if not canonical_str:
-                    raise RollbackPostStateUnavailable(
-                        f"Rollback artifact for {cs_id!r} is missing rel_path."
-                    )
-                rel_path = self._legacy_rel_from_canonical(canonical_str)
-            canonical = self._safe_resolve_content(rel_path)
-            kind = entry.get("kind", "")
-            if kind not in SUPPORTED_KINDS:
-                raise RollbackPostStateUnavailable(
-                    f"Unsupported op kind {kind!r} in artifact for {cs_id!r}."
-                )
-            item_id = entry.get("item_id", "")
-            collection = entry.get("collection", "")
-            op_index = entry.get("op_index", 0)
+        for entry in entries:
+            canonical = self._safe_resolve_content(entry.rel_path)
             file_present = canonical.exists()
-            if kind in ("create", "update"):
+            if entry.kind in ("create", "update"):
                 if not file_present:
                     raise RuntimeError(
-                        f"Post-application contradiction: {kind!r} target "
-                        f"{rel_path!r} does not exist on disk."
+                        f"Post-application contradiction: {entry.kind!r} target "
+                        f"{entry.rel_path!r} does not exist on disk."
                     )
                 sha = self._file_hash(canonical)
                 records.append({
-                    "op_index": op_index,
-                    "collection": collection,
-                    "item_id": item_id,
-                    "rel_path": rel_path,
-                    "kind": kind,
+                    "op_index": entry.op_index,
+                    "collection": entry.collection,
+                    "item_id": entry.item_id,
+                    "rel_path": entry.rel_path,
+                    "kind": entry.kind,
                     "expected_present": True,
                     "sha256": sha,
                 })
-                legacy_hashes[item_id] = sha
-            elif kind == "delete":
+                legacy_hashes[entry.item_id] = sha
+            elif entry.kind == "delete":
                 records.append({
-                    "op_index": op_index,
-                    "collection": collection,
-                    "item_id": item_id,
-                    "rel_path": rel_path,
-                    "kind": kind,
+                    "op_index": entry.op_index,
+                    "collection": entry.collection,
+                    "item_id": entry.item_id,
+                    "rel_path": entry.rel_path,
+                    "kind": entry.kind,
                     "expected_present": False,
                     "sha256": "",
                 })
-                legacy_hashes[item_id] = ""
+                legacy_hashes[entry.item_id] = ""
+
         # Post-state binds itself to the artifact via the digest.
         post_state = {
             "version": POST_STATE_VERSION,
@@ -337,6 +659,19 @@ class FlatFileReversibleMutationAdapter:
             "artifact_digest": computed_digest,
             "records": records,
         }
+        # Item 3: validate the post-state we just built through the same parser
+        # so authors of record_applied cannot accidentally emit an invalid doc.
+        try:
+            parse_post_state(
+                post_state,
+                cs_id=cs_id,
+                trusted_digest=computed_digest,
+                rollback_entries=entries,
+            )
+        except EvidenceValidationError as exc:  # pragma: no cover - internal invariant
+            raise RollbackPostStateUnavailable(
+                f"Refusing to write invalid post-state for {cs_id!r}: {exc}"
+            ) from exc
         _atomic_write_json(self._post_state_path(cs_id), post_state)
         _atomic_write_json(self._post_hashes_path(cs_id), legacy_hashes)
 
@@ -346,33 +681,48 @@ class FlatFileReversibleMutationAdapter:
         The marker binds to the artifact digest and entry count so
         reconciliation can trust it as independent evidence that canonical
         rollback completed. Callers pass ``cs_id`` only — the marker is
-        derived from the artifact itself.
+        derived from the artifact itself and validated through the shared
+        parser before it is written.
         """
         art_path = self._art_path(cs_id)
+        digest = ""
+        entry_count = 0
         if art_path.exists():
             try:
                 artifact = _read_json(art_path)
-                files = artifact.get("files") or []
-                entry_count = len(files)
             except Exception:
-                entry_count = 0
-            try:
-                digest = self._artifact_digest(art_path)
-            except Exception:
-                digest = ""
-        else:
-            entry_count = 0
-            digest = ""
-        _atomic_write_json(
-            self._rollback_result_path(cs_id),
-            {
-                "result_type": "rolled_back",
-                "cs_id": cs_id,
-                "artifact_digest": digest,
-                "entry_count": entry_count,
-                "adapter_version": self.reversible_adapter_version,
-            },
-        )
+                artifact = None
+            if isinstance(artifact, dict):
+                try:
+                    digest = self._artifact_digest(art_path)
+                except Exception:
+                    digest = ""
+                files = artifact.get("files")
+                entry_count = len(files) if isinstance(files, list) else 0
+                # Item 3: strictly validate through the shared parser; a
+                # tampered artifact is never used to derive a completion
+                # marker.
+                if digest and entry_count:
+                    try:
+                        parse_rollback_artifact(
+                            artifact,
+                            cs_id=cs_id,
+                            trusted_digest=digest,
+                            trusted_entry_count=entry_count,
+                        )
+                    except EvidenceValidationError:
+                        # Marker still records what we know but rejects
+                        # obviously bad evidence up front.
+                        digest = ""
+                        entry_count = 0
+        marker = {
+            "result_type": "rolled_back",
+            "cs_id": cs_id,
+            "artifact_digest": digest,
+            "entry_count": entry_count,
+            "adapter_version": self.reversible_adapter_version,
+        }
+        _atomic_write_json(self._rollback_result_path(cs_id), marker)
 
     def load_rollback_completion(self, cs_id: str) -> dict | None:
         """Load the provider rollback-completion marker (Item 7).
@@ -396,10 +746,10 @@ class FlatFileReversibleMutationAdapter:
         if data.get("cs_id") != cs_id:
             return None
         digest = data.get("artifact_digest")
-        if not isinstance(digest, str) or len(digest) != 64:
+        if not _is_hex64(digest):
             return None
         entry_count = data.get("entry_count")
-        if not isinstance(entry_count, int) or isinstance(entry_count, bool) or entry_count <= 0:
+        if not _is_positive_int(entry_count):
             return None
         adapter_version = data.get("adapter_version")
         if adapter_version != self.reversible_adapter_version:
@@ -415,14 +765,20 @@ class FlatFileReversibleMutationAdapter:
         cs_id: str,
         *,
         force: bool,
-        expected_artifact_digest: str = "",
-        expected_entry_count: int = 0,
+        expected_artifact_digest: str,
+        expected_entry_count: int,
     ) -> list[dict]:
         """Validate the entire rollback plan before any mutation.
 
         Returns an immutable-per-entry plan list on success. Raises
-        :class:`RollbackArtifactInvalid`, :class:`PathEscapeError`, or
-        :class:`RollbackPostStateUnavailable` on failure.
+        :class:`RollbackArtifactInvalid`, :class:`PathEscapeError`,
+        :class:`RollbackNotSupported`, or :class:`RollbackPostStateUnavailable`
+        on failure.
+
+        Item 3: uses the shared :func:`parse_rollback_artifact` and
+        :func:`parse_post_state` parsers. Trusted digest and entry count are
+        mandatory keyword arguments — the adapter rejects missing evidence
+        directly (adapter callers cannot silently opt out).
         """
         art_path = self._art_path(cs_id)
         if not art_path.exists():
@@ -436,83 +792,45 @@ class FlatFileReversibleMutationAdapter:
                 f"Cannot read rollback artifact for {cs_id!r}: {exc}"
             ) from exc
 
-        # Item 8: schema/version validation.
-        version = artifact.get("version")
-        if version is not None and version not in (
-            ROLLBACK_ARTIFACT_VERSION, 1,
-        ):
-            raise RollbackArtifactInvalid(
-                f"Unsupported artifact version {version!r} for {cs_id!r}"
-            )
-        if artifact.get("cs_id") not in (cs_id, None):
-            raise RollbackArtifactInvalid(
-                f"Artifact cs_id mismatch for {cs_id!r}"
-            )
-        files = artifact.get("files", [])
-        if not isinstance(files, list) or not files:
-            raise RollbackArtifactInvalid(
-                f"Rollback artifact for {cs_id!r} has no entries."
-            )
-
-        # Item 8: bind to trusted digest if provided (from SQL metadata).
+        # Item 3: adapter callers MUST supply trusted evidence; without it we
+        # cannot bind the artifact to SQL truth.
         actual_digest = self._artifact_digest(art_path)
-        if expected_artifact_digest and expected_artifact_digest != actual_digest:
+        if not _is_hex64(expected_artifact_digest):
+            raise RollbackArtifactInvalid(
+                f"expected_artifact_digest missing or invalid for {cs_id!r}"
+            )
+        if actual_digest != expected_artifact_digest:
             raise RollbackArtifactInvalid(
                 f"Artifact digest mismatch for {cs_id!r}"
             )
-        # Item 4: bind to SQL-recorded entry count when provided.
-        if expected_entry_count and len(files) != int(expected_entry_count):
+        if not _is_positive_int(expected_entry_count):
             raise RollbackArtifactInvalid(
-                f"Artifact entry count {len(files)} != expected "
-                f"{expected_entry_count} for {cs_id!r}"
+                f"expected_entry_count missing or non-positive for {cs_id!r}"
             )
-
-        # Item 8: op index integrity — contiguous, unique, starting at 0.
-        indexes = []
-        for e in files:
-            if not isinstance(e, dict):
-                raise RollbackArtifactInvalid(
-                    f"Non-dict entry in artifact for {cs_id!r}"
-                )
-            oi = e.get("op_index")
-            if not isinstance(oi, int) or oi < 0:
-                raise RollbackArtifactInvalid(
-                    f"Bad op_index in artifact for {cs_id!r}"
-                )
-            indexes.append(oi)
-        if sorted(indexes) != list(range(len(files))):
+        try:
+            entries = parse_rollback_artifact(
+                artifact,
+                cs_id=cs_id,
+                trusted_digest=actual_digest,
+                trusted_entry_count=int(expected_entry_count),
+            )
+        except EvidenceValidationError as exc:
             raise RollbackArtifactInvalid(
-                f"Op indexes not contiguous/unique for {cs_id!r}"
-            )
+                f"Rollback artifact invalid for {cs_id!r}: {exc}"
+            ) from exc
 
-        # Item 8: kind validation — only supported kinds.
-        for e in files:
-            k = e.get("kind", "")
-            if k not in SUPPORTED_KINDS:
+        # Item 9: duplicate canonical targets across entries.
+        seen_rels: dict[str, int] = {}
+        for e in entries:
+            if e.rel_path in seen_rels:
                 raise RollbackArtifactInvalid(
-                    f"Unsupported op kind {k!r} in artifact for {cs_id!r}"
+                    f"Duplicate canonical target {e.rel_path!r} in artifact for {cs_id!r}"
                 )
-
-        # Item 9: duplicate canonical targets.
-        seen: dict[str, int] = {}
-        for e in files:
-            rel = e.get("rel_path")
-            if rel is None:
-                canonical_str = e.get("canonical_path", "")
-                if not canonical_str:
-                    raise RollbackArtifactInvalid(
-                        f"Entry missing rel_path in artifact for {cs_id!r}"
-                    )
-                rel = self._legacy_rel_from_canonical(canonical_str)
-            if rel in seen:
-                raise RollbackArtifactInvalid(
-                    f"Duplicate canonical target {rel!r} in artifact for {cs_id!r}"
-                )
-            seen[rel] = int(e["op_index"])
+            seen_rels[e.rel_path] = e.op_index
 
         # For non-forced rollback we require a matching post-application state
         # bound to the same artifact digest and covering every entry.
-        state_by_index: dict[int, dict] = {}
+        state_by_index: dict[int, PostStateRecord] = {}
         if not force:
             state_path = self._post_state_path(cs_id)
             if not state_path.exists():
@@ -526,53 +844,29 @@ class FlatFileReversibleMutationAdapter:
                 raise RollbackPostStateUnavailable(
                     f"Post-application state for {cs_id!r} is unreadable: {exc}"
                 ) from exc
-            state_digest = state_doc.get("artifact_digest", "")
-            if state_digest and state_digest != actual_digest:
-                raise RollbackPostStateUnavailable(
-                    f"Post-state artifact digest mismatch for {cs_id!r}."
+            try:
+                records = parse_post_state(
+                    state_doc,
+                    cs_id=cs_id,
+                    trusted_digest=actual_digest,
+                    rollback_entries=entries,
                 )
-            records = state_doc.get("records") or []
-            if not isinstance(records, list) or not records:
+            except EvidenceValidationError as exc:
                 raise RollbackPostStateUnavailable(
-                    f"Post-application state for {cs_id!r} has no records."
-                )
-            for r in records:
-                if not isinstance(r, dict) or "op_index" not in r:
-                    raise RollbackPostStateUnavailable(
-                        f"Bad record in post-state for {cs_id!r}"
-                    )
-                state_by_index[int(r["op_index"])] = r
-            if len(state_by_index) != len(files):
-                raise RollbackPostStateUnavailable(
-                    f"Post-application state for {cs_id!r} is incomplete: "
-                    f"expected {len(files)} records, got {len(state_by_index)}."
-                )
+                    f"Post-application state invalid for {cs_id!r}: {exc}"
+                ) from exc
+            state_by_index = {r.op_index: r for r in records}
 
         snap_dir = self._snap_dir(cs_id)
         plan: list[dict] = []
-        for entry in files:
-            op_index = int(entry["op_index"])
-            rel_path = entry.get("rel_path")
-            if rel_path is None:
-                canonical_str = entry.get("canonical_path", "")
-                if not canonical_str:
-                    raise RollbackArtifactInvalid(
-                        f"Rollback entry for {cs_id!r} missing rel_path."
-                    )
-                rel_path = self._legacy_rel_from_canonical(canonical_str)
+        for entry in entries:
+            op_index = entry.op_index
+            rel_path = entry.rel_path
             # Item 4: validate rel_path through safe_resolve BEFORE any I/O.
             canonical = self._safe_resolve_content(rel_path)
-            kind = entry.get("kind", "")
-            existed = bool(entry.get("existed"))
-            snap_name = entry.get("snap_name") or ""
-            # Item 6: prefer deriving the expected snap name from the op index;
-            # a mismatched persisted snap_name is a hard error.
-            expected_snap_name = f"{op_index:04d}_{Path(rel_path).name}"
-            if snap_name and snap_name != expected_snap_name:
-                raise RollbackArtifactInvalid(
-                    f"snap_name mismatch for op_index {op_index} in {cs_id!r}"
-                )
-            snap_name = snap_name or expected_snap_name
+            kind = entry.kind
+            existed = entry.existed
+            snap_name = entry.snap_name
             snap_path = None
             if existed:
                 # Item 6: validate snap path, verify digest against prepare().
@@ -581,27 +875,17 @@ class FlatFileReversibleMutationAdapter:
                     raise RollbackArtifactInvalid(
                         f"Snapshot file missing for op_index {op_index} in {cs_id!r}"
                     )
-                recorded_snap_hash = entry.get("snap_sha256", "") or ""
-                if recorded_snap_hash:
-                    actual_snap_hash = self._file_hash(snap_path)
-                    if actual_snap_hash != recorded_snap_hash:
-                        raise RollbackArtifactInvalid(
-                            f"Snapshot digest mismatch for op_index {op_index}"
-                            f" in {cs_id!r}"
-                        )
+                actual_snap_hash = self._file_hash(snap_path)
+                if actual_snap_hash != entry.snap_sha256:
+                    raise RollbackArtifactInvalid(
+                        f"Snapshot digest mismatch for op_index {op_index}"
+                        f" in {cs_id!r}"
+                    )
             # Non-forced rollback: cross-check post-state.
             if not force:
                 record = state_by_index[op_index]
-                if record.get("rel_path") != rel_path:
-                    raise RollbackPostStateUnavailable(
-                        f"post-state rel_path mismatch for op_index {op_index}"
-                    )
-                if record.get("kind") != kind:
-                    raise RollbackPostStateUnavailable(
-                        f"post-state kind mismatch for op_index {op_index}"
-                    )
-                expected_present = bool(record.get("expected_present"))
-                expected_sha = record.get("sha256", "")
+                expected_present = record.expected_present
+                expected_sha = record.sha256
                 file_exists_now = canonical.exists()
                 if not expected_present:
                     if file_exists_now:
@@ -719,11 +1003,9 @@ class FlatFileReversibleMutationAdapter:
 
         Item 3: verification is bound to trusted SQL evidence
         (``expected_artifact_digest`` and ``expected_entry_count``). Missing
-        evidence returns ``"missing_evidence"``, never ``"verified"``.
-
-        Item 4: post-application state is strict: every field must be present
-        and typed correctly; ``expected_present`` must be a real ``bool``;
-        ``sha256`` must be 64 hex chars when the file is expected present.
+        evidence returns ``"missing_evidence"``, never ``"verified"``. Any
+        :class:`EvidenceValidationError` from the shared parsers is surfaced
+        as ``"mismatch"``.
         """
         # Item 3: no trusted SQL evidence means we cannot verify.
         if not expected_artifact_digest or not expected_entry_count:
@@ -731,7 +1013,11 @@ class FlatFileReversibleMutationAdapter:
                 status="missing_evidence",
                 reason="No trusted SQL digest available",
             )
-
+        if not _is_hex64(expected_artifact_digest) or not _is_positive_int(expected_entry_count):
+            return VerificationResult(
+                status="missing_evidence",
+                reason="Trusted evidence is malformed",
+            )
         state_path = self._post_state_path(cs_id)
         if not state_path.exists():
             return VerificationResult(
@@ -746,177 +1032,41 @@ class FlatFileReversibleMutationAdapter:
             )
         try:
             state_doc = _read_json(state_path)
-            records = state_doc.get("records") or []
             artifact = _read_json(art_path)
-            files = artifact.get("files") or []
         except Exception as exc:
             return VerificationResult(
                 status="corrupt_evidence",
-                reason=f"Cannot read post_application_state.json: {exc}",
+                reason=f"Cannot read state or artifact: {exc}",
             )
-        if not records or not files:
-            return VerificationResult(
-                status="corrupt_evidence",
-                reason="Empty records or files list",
-            )
-        if len(records) != len(files):
-            return VerificationResult(
-                status="corrupt_evidence",
-                reason=(
-                    f"Record count {len(records)} does not match artifact "
-                    f"entry count {len(files)}"
-                ),
-            )
-
-        # Item 3: digest and count binding.
         actual_digest = self._artifact_digest(art_path)
         if actual_digest != expected_artifact_digest:
             return VerificationResult(
                 status="corrupt_evidence",
                 reason="Artifact digest does not match SQL evidence.",
             )
-        if len(files) != int(expected_entry_count):
-            return VerificationResult(
-                status="corrupt_evidence",
-                reason=(
-                    f"Artifact entry count {len(files)} != expected "
-                    f"{expected_entry_count}"
-                ),
+        # Item 3: parse both documents through the shared parser.
+        try:
+            entries = parse_rollback_artifact(
+                artifact,
+                cs_id=cs_id,
+                trusted_digest=actual_digest,
+                trusted_entry_count=int(expected_entry_count),
             )
-        state_digest = state_doc.get("artifact_digest", "")
-        if not state_digest or state_digest != actual_digest:
-            return VerificationResult(
-                status="corrupt_evidence",
-                reason="Post-state artifact digest does not match artifact.",
+            records = parse_post_state(
+                state_doc,
+                cs_id=cs_id,
+                trusted_digest=actual_digest,
+                rollback_entries=entries,
             )
-        state_cs_id = state_doc.get("cs_id", "")
-        if state_cs_id and state_cs_id != cs_id:
+        except EvidenceValidationError as exc:
             return VerificationResult(
-                status="corrupt_evidence",
-                reason="Post-state cs_id does not match request cs_id.",
-            )
-        state_version = state_doc.get("version")
-        if state_version is not None and state_version not in (POST_STATE_VERSION, 1):
-            return VerificationResult(
-                status="corrupt_evidence",
-                reason=f"Unsupported post-state version {state_version!r}",
-            )
-
-        # Item 4: unique contiguous op indexes.
-        indexes = []
-        for r in records:
-            if not isinstance(r, dict):
-                return VerificationResult(
-                    status="corrupt_evidence",
-                    reason="Non-dict record in post-state.",
-                )
-            oi = r.get("op_index")
-            if not isinstance(oi, int) or isinstance(oi, bool) or oi < 0:
-                return VerificationResult(
-                    status="corrupt_evidence",
-                    reason=f"Bad op_index {oi!r} in post-state",
-                )
-            indexes.append(oi)
-        if sorted(indexes) != list(range(len(records))):
-            return VerificationResult(
-                status="corrupt_evidence",
-                reason="Post-state op indexes are not contiguous/unique.",
-            )
-
-        # Compare records to artifact entries by op_index.
-        art_by_index = {int(e["op_index"]): e for e in files if isinstance(e, dict)}
-        art_cs_id = artifact.get("cs_id", "")
-        if art_cs_id and art_cs_id != cs_id:
-            return VerificationResult(
-                status="corrupt_evidence",
-                reason="Artifact cs_id does not match request cs_id.",
-            )
-        art_version = artifact.get("version")
-        if art_version is not None and art_version not in (ROLLBACK_ARTIFACT_VERSION, 1):
-            return VerificationResult(
-                status="corrupt_evidence",
-                reason=f"Unsupported artifact version {art_version!r}",
+                status="mismatch",
+                reason=str(exc)[:200],
             )
 
         details: dict = {"checked": len(records), "issues": []}
-        for r in records:
-            oi = r["op_index"]
-            if oi not in art_by_index:
-                return VerificationResult(
-                    status="corrupt_evidence",
-                    reason=f"post-state op_index {oi!r} not in artifact",
-                )
-            art_entry = art_by_index[oi]
-            # Item 4: strict types on every field.
-            for field_name in ("collection", "item_id", "kind", "rel_path"):
-                if not isinstance(r.get(field_name), str):
-                    return VerificationResult(
-                        status="corrupt_evidence",
-                        reason=f"Bad {field_name} at op_index {oi}",
-                    )
-            if r.get("kind") not in SUPPORTED_KINDS:
-                return VerificationResult(
-                    status="corrupt_evidence",
-                    reason=f"Unsupported kind {r.get('kind')!r} at op_index {oi}",
-                )
-            # Every artifact field must match the post-state record.
-            if art_entry.get("kind") != r.get("kind"):
-                return VerificationResult(
-                    status="corrupt_evidence",
-                    reason=f"kind mismatch at op_index {oi}",
-                )
-            if (
-                art_entry.get("rel_path") is not None
-                and art_entry.get("rel_path") != r.get("rel_path")
-            ):
-                return VerificationResult(
-                    status="corrupt_evidence",
-                    reason=f"rel_path mismatch at op_index {oi}",
-                )
-            if (
-                art_entry.get("collection") is not None
-                and art_entry.get("collection") != r.get("collection")
-            ):
-                return VerificationResult(
-                    status="corrupt_evidence",
-                    reason=f"collection mismatch at op_index {oi}",
-                )
-            if (
-                art_entry.get("item_id") is not None
-                and art_entry.get("item_id") != r.get("item_id")
-            ):
-                return VerificationResult(
-                    status="corrupt_evidence",
-                    reason=f"item_id mismatch at op_index {oi}",
-                )
-            # Item 4: expected_present must be a real bool.
-            expected_present_val = r.get("expected_present")
-            if expected_present_val is not True and expected_present_val is not False:
-                return VerificationResult(
-                    status="corrupt_evidence",
-                    reason=f"expected_present at op_index {oi} is not a bool",
-                )
-            expected_sha = r.get("sha256", "")
-            if not isinstance(expected_sha, str):
-                return VerificationResult(
-                    status="corrupt_evidence",
-                    reason=f"sha256 at op_index {oi} is not a string",
-                )
-            # Item 4: contradiction check — create must have expected_present.
-            if r["kind"] in ("create", "update") and expected_present_val is False:
-                return VerificationResult(
-                    status="corrupt_evidence",
-                    reason=(
-                        f"kind={r['kind']} but expected_present=False at "
-                        f"op_index {oi}"
-                    ),
-                )
-            if r["kind"] == "delete" and expected_present_val is True:
-                return VerificationResult(
-                    status="corrupt_evidence",
-                    reason=f"kind=delete but expected_present=True at op_index {oi}",
-                )
-            rel = r["rel_path"]
+        for record in records:
+            rel = record.rel_path
             try:
                 canonical = self._safe_resolve_content(rel)
             except Exception as exc:
@@ -925,14 +1075,7 @@ class FlatFileReversibleMutationAdapter:
                     reason=f"rel_path {rel!r} is unsafe: {exc}",
                     details=details,
                 )
-            if expected_present_val is True:
-                if len(expected_sha) != 64 or any(
-                    ch not in "0123456789abcdef" for ch in expected_sha
-                ):
-                    return VerificationResult(
-                        status="corrupt_evidence",
-                        reason=f"sha256 at op_index {oi} not a 64-char hex string",
-                    )
+            if record.expected_present:
                 if not canonical.exists():
                     details["issues"].append({"rel_path": rel, "reason": "missing"})
                     return VerificationResult(
@@ -941,7 +1084,7 @@ class FlatFileReversibleMutationAdapter:
                         details=details,
                     )
                 actual = self._file_hash(canonical)
-                if actual != expected_sha:
+                if actual != record.sha256:
                     details["issues"].append({"rel_path": rel, "reason": "hash_mismatch"})
                     return VerificationResult(
                         status="mismatch",
@@ -949,14 +1092,6 @@ class FlatFileReversibleMutationAdapter:
                         details=details,
                     )
             else:
-                if expected_sha != "":
-                    return VerificationResult(
-                        status="corrupt_evidence",
-                        reason=(
-                            f"sha256 at op_index {oi} must be empty when "
-                            "expected_present is False"
-                        ),
-                    )
                 if canonical.exists():
                     details["issues"].append({"rel_path": rel, "reason": "unexpected_present"})
                     return VerificationResult(
@@ -980,13 +1115,20 @@ class FlatFileReversibleMutationAdapter:
 
         Item 3: verification is bound to trusted SQL evidence
         (``expected_artifact_digest`` and ``expected_entry_count``). Missing
-        evidence returns ``"missing_evidence"``, never ``"verified"``.
+        evidence returns ``"missing_evidence"``, never ``"verified"``. Any
+        :class:`EvidenceValidationError` from the shared parser surfaces as
+        ``"mismatch"``.
         """
         # Item 3: require trusted SQL evidence.
         if not expected_artifact_digest or not expected_entry_count:
             return VerificationResult(
                 status="missing_evidence",
                 reason="No trusted SQL digest available",
+            )
+        if not _is_hex64(expected_artifact_digest) or not _is_positive_int(expected_entry_count):
+            return VerificationResult(
+                status="missing_evidence",
+                reason="Trusted evidence is malformed",
             )
         art_path = self._art_path(cs_id)
         if not art_path.exists():
@@ -996,63 +1138,32 @@ class FlatFileReversibleMutationAdapter:
             )
         try:
             artifact = _read_json(art_path)
-            files = artifact.get("files", [])
         except Exception as exc:
             return VerificationResult(
                 status="corrupt_evidence",
                 reason=f"Cannot read rollback_artifact.json: {exc}",
             )
-        if not files:
-            return VerificationResult(
-                status="corrupt_evidence",
-                reason="Empty artifact files list",
-            )
-        # Item 3: digest and count binding.
         actual_digest = self._artifact_digest(art_path)
         if actual_digest != expected_artifact_digest:
             return VerificationResult(
                 status="corrupt_evidence",
                 reason="Artifact digest does not match SQL evidence.",
             )
-        if len(files) != int(expected_entry_count):
-            return VerificationResult(
-                status="corrupt_evidence",
-                reason=(
-                    f"Artifact entry count {len(files)} != expected "
-                    f"{expected_entry_count}"
-                ),
+        try:
+            entries = parse_rollback_artifact(
+                artifact,
+                cs_id=cs_id,
+                trusted_digest=actual_digest,
+                trusted_entry_count=int(expected_entry_count),
             )
-        art_cs_id = artifact.get("cs_id", "")
-        if art_cs_id and art_cs_id != cs_id:
+        except EvidenceValidationError as exc:
             return VerificationResult(
-                status="corrupt_evidence",
-                reason="Artifact cs_id does not match request cs_id.",
+                status="mismatch",
+                reason=str(exc)[:200],
             )
-        art_version = artifact.get("version")
-        if art_version is not None and art_version not in (ROLLBACK_ARTIFACT_VERSION, 1):
-            return VerificationResult(
-                status="corrupt_evidence",
-                reason=f"Unsupported artifact version {art_version!r}",
-            )
-        details: dict = {"checked": len(files), "issues": []}
-        for entry in files:
-            rel = entry.get("rel_path")
-            if rel is None:
-                canonical_str = entry.get("canonical_path", "")
-                if not canonical_str:
-                    return VerificationResult(
-                        status="corrupt_evidence",
-                        reason="artifact entry missing rel_path",
-                        details=details,
-                    )
-                try:
-                    rel = self._legacy_rel_from_canonical(canonical_str)
-                except Exception as exc:
-                    return VerificationResult(
-                        status="corrupt_evidence",
-                        reason=f"canonical_path unsafe: {exc}",
-                        details=details,
-                    )
+        details: dict = {"checked": len(entries), "issues": []}
+        for entry in entries:
+            rel = entry.rel_path
             try:
                 canonical = self._safe_resolve_content(rel)
             except Exception as exc:
@@ -1061,9 +1172,7 @@ class FlatFileReversibleMutationAdapter:
                     reason=f"rel_path unsafe: {exc}",
                     details=details,
                 )
-            existed = bool(entry.get("existed"))
-            pre_hash = entry.get("pre_hash", "")
-            if not existed:
+            if not entry.existed:
                 if canonical.exists():
                     details["issues"].append({"rel_path": rel, "reason": "unexpected_present"})
                     return VerificationResult(
@@ -1080,7 +1189,7 @@ class FlatFileReversibleMutationAdapter:
                         details=details,
                     )
                 actual = self._file_hash(canonical)
-                if actual != pre_hash:
+                if actual != entry.pre_hash:
                     details["issues"].append({"rel_path": rel, "reason": "hash_mismatch"})
                     return VerificationResult(
                         status="mismatch",
@@ -1141,28 +1250,6 @@ class FlatFileReversibleMutationAdapter:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
-    def _legacy_rel_from_canonical(self, canonical_str: str) -> str:
-        """Convert a legacy artifact's ``canonical_path`` to a safe rel_path.
-
-        Item 5: legacy artifacts stored absolute paths. We accept them only
-        after proving containment inside ``content_root`` — the absolute
-        path is never trusted for I/O.
-        """
-        p = Path(canonical_str)
-        if not p.is_absolute():
-            # Legacy code always wrote absolute paths, but be forgiving if a
-            # relative one leaked in: still resolve/validate.
-            candidate = (self._content_root / p).resolve()
-        else:
-            candidate = p.resolve()
-        try:
-            rel = candidate.relative_to(self._content_root)
-        except ValueError as exc:
-            raise PathEscapeError(
-                f"Legacy canonical_path escapes content_root: {canonical_str}"
-            ) from exc
-        return str(rel)
 
     def _canonical_path_for_op(self, op: Any) -> Path | None:
         """Best-effort resolution of the on-disk path for an operation.

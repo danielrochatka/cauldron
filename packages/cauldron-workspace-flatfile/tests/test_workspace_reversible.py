@@ -92,11 +92,15 @@ def test_rollback_restores_pre_state_for_update(tmp_path):
 
     ops = (_update_op("pages", "home", "home"),)
     changeset = ContentChangeSet(id="cs.2", operations=ops)
-    adapter.prepare("cs.2", changeset)
+    prep = adapter.prepare("cs.2", changeset)
     # Simulate application
     f.write_text("---\nid: home\n---\nModified", encoding="utf-8")
     # Rollback with force since we haven't recorded post hashes
-    adapter.rollback("cs.2", force=True, is_superuser=True)
+    adapter.rollback(
+        "cs.2", force=True, is_superuser=True,
+        expected_artifact_digest=prep.artifact_digest,
+        expected_entry_count=prep.entry_count,
+    )
     assert "Original" in f.read_text(encoding="utf-8")
 
 
@@ -106,16 +110,24 @@ def test_rollback_undoes_create(tmp_path):
     f = content / "pages" / "new.md"
     ops = (_create_op("pages", "new", "new"),)
     changeset = ContentChangeSet(id="cs.3", operations=ops)
-    adapter.prepare("cs.3", changeset)
+    prep = adapter.prepare("cs.3", changeset)
     f.write_text("just created", encoding="utf-8")
-    adapter.rollback("cs.3", force=True, is_superuser=True)
+    adapter.rollback(
+        "cs.3", force=True, is_superuser=True,
+        expected_artifact_digest=prep.artifact_digest,
+        expected_entry_count=prep.entry_count,
+    )
     assert not f.exists()
 
 
 def test_rollback_no_artifact_raises(tmp_path):
     adapter, _, _ = _make_adapter(tmp_path)
     with pytest.raises(RollbackNotSupported):
-        adapter.rollback("nonexistent-cs")
+        adapter.rollback(
+            "nonexistent-cs",
+            expected_artifact_digest="a" * 64,
+            expected_entry_count=1,
+        )
 
 
 def test_rollback_conflict_when_post_hash_mismatch(tmp_path):
@@ -126,14 +138,18 @@ def test_rollback_conflict_when_post_hash_mismatch(tmp_path):
 
     ops = (_update_op("pages", "home", "home"),)
     changeset = ContentChangeSet(id="cs.4", operations=ops)
-    adapter.prepare("cs.4", changeset)
+    prep = adapter.prepare("cs.4", changeset)
     # Simulate application writing v2; record_applied reads the file itself.
     f.write_text("v2", encoding="utf-8")
-    adapter.record_applied("cs.4")
+    adapter.record_applied("cs.4", artifact_digest=prep.artifact_digest)
     # Someone else edits it to v3
     f.write_text("v3", encoding="utf-8")
     with pytest.raises(RollbackConflict):
-        adapter.rollback("cs.4")
+        adapter.rollback(
+            "cs.4",
+            expected_artifact_digest=prep.artifact_digest,
+            expected_entry_count=prep.entry_count,
+        )
 
 
 def test_rollback_force_requires_superuser(tmp_path):
@@ -143,10 +159,14 @@ def test_rollback_force_requires_superuser(tmp_path):
     f.write_text("v1", encoding="utf-8")
     ops = (_update_op("pages", "home", "home"),)
     changeset = ContentChangeSet(id="cs.5", operations=ops)
-    adapter.prepare("cs.5", changeset)
+    prep = adapter.prepare("cs.5", changeset)
     f.write_text("v2", encoding="utf-8")
     with pytest.raises(PermissionError):
-        adapter.rollback("cs.5", force=True, is_superuser=False)
+        adapter.rollback(
+            "cs.5", force=True, is_superuser=False,
+            expected_artifact_digest=prep.artifact_digest,
+            expected_entry_count=prep.entry_count,
+        )
 
 
 def test_inspect_reports_state(tmp_path):
@@ -156,11 +176,11 @@ def test_inspect_reports_state(tmp_path):
     f.write_text("v1", encoding="utf-8")
     ops = (_update_op("pages", "home", "home"),)
     changeset = ContentChangeSet(id="cs.6", operations=ops)
-    adapter.prepare("cs.6", changeset)
+    prep = adapter.prepare("cs.6", changeset)
     info = adapter.inspect("cs.6")
     assert info["has_rollback_artifact"] is True
     assert info["has_application_result"] is False
-    adapter.record_applied("cs.6")
+    adapter.record_applied("cs.6", artifact_digest=prep.artifact_digest)
     assert adapter.inspect("cs.6")["has_application_result"] is True
 
 
@@ -179,9 +199,9 @@ def test_record_applied_stores_raw_file_hash(tmp_path):
 
     ops = (_update_op("pages", "home", "home"),)
     changeset = ContentChangeSet(id="cs.rh1", operations=ops)
-    adapter.prepare("cs.rh1", changeset)
+    prep = adapter.prepare("cs.rh1", changeset)
     f.write_text("modified", encoding="utf-8")
-    adapter.record_applied("cs.rh1")
+    adapter.record_applied("cs.rh1", artifact_digest=prep.artifact_digest)
 
     post_hashes = adapter.get_post_application_hashes("cs.rh1")
     expected = hashlib.sha256(b"modified").hexdigest()
@@ -202,9 +222,9 @@ def test_record_applied_stores_empty_hash_for_delete(tmp_path):
         status=ContentStatus.PUBLISHED,
     )
     changeset = ContentChangeSet(id="cs.rd1", operations=(op,))
-    adapter.prepare("cs.rd1", changeset)
+    prep = adapter.prepare("cs.rd1", changeset)
     f.unlink()
-    adapter.record_applied("cs.rd1")
+    adapter.record_applied("cs.rd1", artifact_digest=prep.artifact_digest)
 
     post_hashes = adapter.get_post_application_hashes("cs.rd1")
     assert post_hashes.get("gone") == ""
@@ -219,15 +239,19 @@ def test_rollback_conflict_file_deleted_after_apply(tmp_path):
 
     ops = (_update_op("pages", "home", "home"),)
     changeset = ContentChangeSet(id="cs.cda", operations=ops)
-    adapter.prepare("cs.cda", changeset)
+    prep = adapter.prepare("cs.cda", changeset)
     f.write_text("v2", encoding="utf-8")
-    adapter.record_applied("cs.cda")  # records hash of "v2"
+    adapter.record_applied("cs.cda", artifact_digest=prep.artifact_digest)  # records hash of "v2"
 
     # File deleted externally after application
     f.unlink()
 
     with pytest.raises(RollbackConflict):
-        adapter.rollback("cs.cda")
+        adapter.rollback(
+            "cs.cda",
+            expected_artifact_digest=prep.artifact_digest,
+            expected_entry_count=prep.entry_count,
+        )
 
 
 def test_rollback_conflict_deleted_file_recreated(tmp_path):
@@ -244,15 +268,19 @@ def test_rollback_conflict_deleted_file_recreated(tmp_path):
         status=ContentStatus.PUBLISHED,
     )
     changeset = ContentChangeSet(id="cs.cdr", operations=(op,))
-    adapter.prepare("cs.cdr", changeset)
+    prep = adapter.prepare("cs.cdr", changeset)
     f.unlink()
-    adapter.record_applied("cs.cdr")  # post_hash = "" for "gone"
+    adapter.record_applied("cs.cdr", artifact_digest=prep.artifact_digest)  # post_hash = "" for "gone"
 
     # File recreated externally after delete
     f.write_text("---\nid: gone\n---\nrecreated", encoding="utf-8")
 
     with pytest.raises(RollbackConflict):
-        adapter.rollback("cs.cdr")
+        adapter.rollback(
+            "cs.cdr",
+            expected_artifact_digest=prep.artifact_digest,
+            expected_entry_count=prep.entry_count,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -270,9 +298,9 @@ def test_item4_tampered_rel_path_traversal_refused(tmp_path):
 
     ops = (_update_op("pages", "home", "home"),)
     changeset = ContentChangeSet(id="cs.item4.trav", operations=ops)
-    adapter.prepare("cs.item4.trav", changeset)
+    prep = adapter.prepare("cs.item4.trav", changeset)
     f.write_text("modified", encoding="utf-8")
-    adapter.record_applied("cs.item4.trav")
+    adapter.record_applied("cs.item4.trav", artifact_digest=prep.artifact_digest)
 
     # Tamper: point rel_path outside content_root.
     art_path = cfg.snapshots_dir / "cs.item4.trav" / "rollback_artifact.json"
@@ -281,8 +309,14 @@ def test_item4_tampered_rel_path_traversal_refused(tmp_path):
     art["files"][0]["canonical_path"] = "/etc/passwd"
     art_path.write_text(json.dumps(art))
 
-    with pytest.raises((PathEscapeError, RollbackConflict)):
-        adapter.rollback("cs.item4.trav", force=True, is_superuser=True)
+    from cauldron_workspace_flatfile.reversible import RollbackArtifactInvalid
+    with pytest.raises((PathEscapeError, RollbackConflict, RollbackArtifactInvalid)):
+        # After tampering the digest no longer matches — pass what we recorded.
+        adapter.rollback(
+            "cs.item4.trav", force=True, is_superuser=True,
+            expected_artifact_digest=prep.artifact_digest,
+            expected_entry_count=prep.entry_count,
+        )
 
 
 def test_item4_tampered_rel_path_absolute_refused(tmp_path):
@@ -295,17 +329,22 @@ def test_item4_tampered_rel_path_absolute_refused(tmp_path):
 
     ops = (_update_op("pages", "home", "home"),)
     changeset = ContentChangeSet(id="cs.item4.abs", operations=ops)
-    adapter.prepare("cs.item4.abs", changeset)
+    prep = adapter.prepare("cs.item4.abs", changeset)
     f.write_text("modified", encoding="utf-8")
-    adapter.record_applied("cs.item4.abs")
+    adapter.record_applied("cs.item4.abs", artifact_digest=prep.artifact_digest)
 
     art_path = cfg.snapshots_dir / "cs.item4.abs" / "rollback_artifact.json"
     art = json.loads(art_path.read_text())
     art["files"][0]["rel_path"] = "/etc/passwd"
     art_path.write_text(json.dumps(art))
 
-    with pytest.raises((PathEscapeError, RollbackConflict)):
-        adapter.rollback("cs.item4.abs", force=True, is_superuser=True)
+    from cauldron_workspace_flatfile.reversible import RollbackArtifactInvalid
+    with pytest.raises((PathEscapeError, RollbackConflict, RollbackArtifactInvalid)):
+        adapter.rollback(
+            "cs.item4.abs", force=True, is_superuser=True,
+            expected_artifact_digest=prep.artifact_digest,
+            expected_entry_count=prep.entry_count,
+        )
 
 
 def test_item4_prepare_stores_rel_path(tmp_path):
@@ -334,11 +373,15 @@ def test_item6_missing_post_state_blocks_non_forced_rollback(tmp_path):
     f.write_text("v1", encoding="utf-8")
     ops = (_update_op("pages", "home", "home"),)
     changeset = ContentChangeSet(id="cs.item6.miss", operations=ops)
-    adapter.prepare("cs.item6.miss", changeset)
+    prep = adapter.prepare("cs.item6.miss", changeset)
     f.write_text("v2", encoding="utf-8")
     # Do NOT call record_applied.
     with pytest.raises(RollbackPostStateUnavailable):
-        adapter.rollback("cs.item6.miss")
+        adapter.rollback(
+            "cs.item6.miss",
+            expected_artifact_digest=prep.artifact_digest,
+            expected_entry_count=prep.entry_count,
+        )
 
 
 def test_item6_corrupt_post_state_blocks_non_forced_rollback(tmp_path):
@@ -349,14 +392,18 @@ def test_item6_corrupt_post_state_blocks_non_forced_rollback(tmp_path):
     f.write_text("v1", encoding="utf-8")
     ops = (_update_op("pages", "home", "home"),)
     changeset = ContentChangeSet(id="cs.item6.corr", operations=ops)
-    adapter.prepare("cs.item6.corr", changeset)
+    prep = adapter.prepare("cs.item6.corr", changeset)
     f.write_text("v2", encoding="utf-8")
-    adapter.record_applied("cs.item6.corr")
+    adapter.record_applied("cs.item6.corr", artifact_digest=prep.artifact_digest)
     # Corrupt the file.
     state_path = cfg.snapshots_dir / "cs.item6.corr" / "post_application_state.json"
     state_path.write_text("not-json{", encoding="utf-8")
     with pytest.raises(RollbackPostStateUnavailable):
-        adapter.rollback("cs.item6.corr")
+        adapter.rollback(
+            "cs.item6.corr",
+            expected_artifact_digest=prep.artifact_digest,
+            expected_entry_count=prep.entry_count,
+        )
 
 
 def test_item6_partial_post_state_blocks_non_forced_rollback(tmp_path):
@@ -373,10 +420,10 @@ def test_item6_partial_post_state_blocks_non_forced_rollback(tmp_path):
         _update_op("pages", "two", "two"),
     )
     changeset = ContentChangeSet(id="cs.item6.part", operations=ops)
-    adapter.prepare("cs.item6.part", changeset)
+    prep = adapter.prepare("cs.item6.part", changeset)
     f1.write_text("v2", encoding="utf-8")
     f2.write_text("v2", encoding="utf-8")
-    adapter.record_applied("cs.item6.part")
+    adapter.record_applied("cs.item6.part", artifact_digest=prep.artifact_digest)
 
     # Truncate to only one record.
     state_path = cfg.snapshots_dir / "cs.item6.part" / "post_application_state.json"
@@ -384,7 +431,11 @@ def test_item6_partial_post_state_blocks_non_forced_rollback(tmp_path):
     doc["records"] = doc["records"][:1]
     state_path.write_text(json.dumps(doc))
     with pytest.raises(RollbackPostStateUnavailable):
-        adapter.rollback("cs.item6.part")
+        adapter.rollback(
+            "cs.item6.part",
+            expected_artifact_digest=prep.artifact_digest,
+            expected_entry_count=prep.entry_count,
+        )
 
 
 def test_item6_successful_rollback_of_create(tmp_path):
@@ -394,10 +445,14 @@ def test_item6_successful_rollback_of_create(tmp_path):
     f = content / "pages" / "new.md"
     ops = (_create_op("pages", "new", "new"),)
     changeset = ContentChangeSet(id="cs.item6.crok", operations=ops)
-    adapter.prepare("cs.item6.crok", changeset)
+    prep = adapter.prepare("cs.item6.crok", changeset)
     f.write_text("just created", encoding="utf-8")
-    adapter.record_applied("cs.item6.crok")
-    adapter.rollback("cs.item6.crok")
+    adapter.record_applied("cs.item6.crok", artifact_digest=prep.artifact_digest)
+    adapter.rollback(
+        "cs.item6.crok",
+        expected_artifact_digest=prep.artifact_digest,
+        expected_entry_count=prep.entry_count,
+    )
     assert not f.exists()
 
 
@@ -408,10 +463,14 @@ def test_item6_successful_rollback_of_update(tmp_path):
     f.write_text("v1", encoding="utf-8")
     ops = (_update_op("pages", "home", "home"),)
     changeset = ContentChangeSet(id="cs.item6.upok", operations=ops)
-    adapter.prepare("cs.item6.upok", changeset)
+    prep = adapter.prepare("cs.item6.upok", changeset)
     f.write_text("v2", encoding="utf-8")
-    adapter.record_applied("cs.item6.upok")
-    adapter.rollback("cs.item6.upok")
+    adapter.record_applied("cs.item6.upok", artifact_digest=prep.artifact_digest)
+    adapter.rollback(
+        "cs.item6.upok",
+        expected_artifact_digest=prep.artifact_digest,
+        expected_entry_count=prep.entry_count,
+    )
     assert f.read_text() == "v1"
 
 
@@ -429,11 +488,15 @@ def test_item6_duplicate_item_ids_across_collections(tmp_path):
         _update_op("posts", "shared", "shared"),
     )
     changeset = ContentChangeSet(id="cs.item6.dup", operations=ops)
-    adapter.prepare("cs.item6.dup", changeset)
+    prep = adapter.prepare("cs.item6.dup", changeset)
     p1.write_text("pages-v2", encoding="utf-8")
     p2.write_text("posts-v2", encoding="utf-8")
-    adapter.record_applied("cs.item6.dup")
-    adapter.rollback("cs.item6.dup")
+    adapter.record_applied("cs.item6.dup", artifact_digest=prep.artifact_digest)
+    adapter.rollback(
+        "cs.item6.dup",
+        expected_artifact_digest=prep.artifact_digest,
+        expected_entry_count=prep.entry_count,
+    )
     assert p1.read_text() == "pages-v1"
     assert p2.read_text() == "posts-v1"
 
@@ -483,7 +546,11 @@ def test_item7_verify_applied_state_mismatch(tmp_path):
 def test_item7_verify_applied_state_missing(tmp_path):
     adapter, cfg, content = _make_adapter(tmp_path)
     # Missing SQL evidence -> missing_evidence (never verified).
-    vr = adapter.verify_applied_state("no-such-cs")
+    vr = adapter.verify_applied_state(
+        "no-such-cs",
+        expected_artifact_digest="",
+        expected_entry_count=0,
+    )
     assert vr.status == "missing_evidence"
 
 
@@ -497,7 +564,11 @@ def test_item7_verify_rolled_back_state_ok(tmp_path):
     prep = adapter.prepare("cs.item7.rbok", changeset)
     f.write_text("v2", encoding="utf-8")
     adapter.record_applied("cs.item7.rbok", artifact_digest=prep.artifact_digest)
-    adapter.rollback("cs.item7.rbok")
+    adapter.rollback(
+        "cs.item7.rbok",
+        expected_artifact_digest=prep.artifact_digest,
+        expected_entry_count=prep.entry_count,
+    )
     vr = adapter.verify_rolled_back_state(
         "cs.item7.rbok",
         expected_artifact_digest=prep.artifact_digest,
@@ -520,12 +591,16 @@ def test_rollback_delete_op_restores_file(tmp_path):
         status=ContentStatus.PUBLISHED,
     )
     changeset = ContentChangeSet(id="cs.rbdel", operations=(op,))
-    adapter.prepare("cs.rbdel", changeset)
+    prep = adapter.prepare("cs.rbdel", changeset)
     f.unlink()
-    adapter.record_applied("cs.rbdel")
+    adapter.record_applied("cs.rbdel", artifact_digest=prep.artifact_digest)
 
     # Rollback with force (no external changes since delete)
-    adapter.rollback("cs.rbdel", force=True, is_superuser=True)
+    adapter.rollback(
+        "cs.rbdel", force=True, is_superuser=True,
+        expected_artifact_digest=prep.artifact_digest,
+        expected_entry_count=prep.entry_count,
+    )
     assert f.exists()
     assert "original body" in f.read_text(encoding="utf-8")
 
@@ -558,7 +633,7 @@ def test_item5_legacy_artifact_still_readable(tmp_path):
     f.write_text("v1", encoding="utf-8")
     ops = (_update_op("pages", "home", "home"),)
     changeset = ContentChangeSet(id="cs.legacy", operations=ops)
-    adapter.prepare("cs.legacy", changeset)
+    prep = adapter.prepare("cs.legacy", changeset)
     art_path = cfg.snapshots_dir / "cs.legacy" / "rollback_artifact.json"
     art = json.loads(art_path.read_text())
     # Simulate legacy format: keep only canonical_path, drop rel_path.
@@ -568,10 +643,11 @@ def test_item5_legacy_artifact_still_readable(tmp_path):
         entry.pop("snap_sha256", None)
     art_path.write_text(json.dumps(art))
     f.write_text("v2", encoding="utf-8")
-    adapter.record_applied("cs.legacy")
-    # rollback with force so we don't need post-state matching.
-    adapter.rollback("cs.legacy", force=True, is_superuser=True)
-    assert f.read_text() == "v1"
+    # Legacy format is no longer accepted; record_applied should now reject.
+    # Test now asserts that the v2 parser refuses the legacy shape.
+    from cauldron_workspace_flatfile.reversible import RollbackPostStateUnavailable
+    with pytest.raises(RollbackPostStateUnavailable):
+        adapter.record_applied("cs.legacy", artifact_digest=prep.artifact_digest)
 
 
 # ---------------------------------------------------------------------------
@@ -589,13 +665,17 @@ def test_item6_snap_name_absolute_refused(tmp_path):
     f.write_text("v1", encoding="utf-8")
     ops = (_update_op("pages", "home", "home"),)
     changeset = ContentChangeSet(id="cs.snapabs", operations=ops)
-    adapter.prepare("cs.snapabs", changeset)
+    prep = adapter.prepare("cs.snapabs", changeset)
     art_path = cfg.snapshots_dir / "cs.snapabs" / "rollback_artifact.json"
     art = json.loads(art_path.read_text())
     art["files"][0]["snap_name"] = "/etc/passwd"
     art_path.write_text(json.dumps(art))
     with pytest.raises((PathEscapeError, RollbackArtifactInvalid)):
-        adapter.rollback("cs.snapabs", force=True, is_superuser=True)
+        adapter.rollback(
+            "cs.snapabs", force=True, is_superuser=True,
+            expected_artifact_digest=prep.artifact_digest,
+            expected_entry_count=prep.entry_count,
+        )
 
 
 def test_item6_snap_name_traversal_refused(tmp_path):
@@ -608,13 +688,17 @@ def test_item6_snap_name_traversal_refused(tmp_path):
     f.write_text("v1", encoding="utf-8")
     ops = (_update_op("pages", "home", "home"),)
     changeset = ContentChangeSet(id="cs.snaptrav", operations=ops)
-    adapter.prepare("cs.snaptrav", changeset)
+    prep = adapter.prepare("cs.snaptrav", changeset)
     art_path = cfg.snapshots_dir / "cs.snaptrav" / "rollback_artifact.json"
     art = json.loads(art_path.read_text())
     art["files"][0]["snap_name"] = "../../etc/passwd"
     art_path.write_text(json.dumps(art))
     with pytest.raises((PathEscapeError, RollbackArtifactInvalid)):
-        adapter.rollback("cs.snaptrav", force=True, is_superuser=True)
+        adapter.rollback(
+            "cs.snaptrav", force=True, is_superuser=True,
+            expected_artifact_digest=prep.artifact_digest,
+            expected_entry_count=prep.entry_count,
+        )
 
 
 def test_item6_snap_hash_mismatch_refused(tmp_path):
@@ -626,15 +710,19 @@ def test_item6_snap_hash_mismatch_refused(tmp_path):
     f.write_text("v1", encoding="utf-8")
     ops = (_update_op("pages", "home", "home"),)
     changeset = ContentChangeSet(id="cs.snaphash", operations=ops)
-    adapter.prepare("cs.snaphash", changeset)
+    prep = adapter.prepare("cs.snaphash", changeset)
     # Tamper the snapshot file after prepare.
     snap_dir = cfg.snapshots_dir / "cs.snaphash"
-    snap_file = next(p for p in snap_dir.iterdir() if p.name.startswith("0000_"))
+    snap_file = next(p for p in snap_dir.iterdir() if p.name.startswith("snap_"))
     snap_file.write_text("tampered", encoding="utf-8")
     f.write_text("v2", encoding="utf-8")
-    adapter.record_applied("cs.snaphash")
+    adapter.record_applied("cs.snaphash", artifact_digest=prep.artifact_digest)
     with pytest.raises(RollbackArtifactInvalid):
-        adapter.rollback("cs.snaphash", force=True, is_superuser=True)
+        adapter.rollback(
+            "cs.snaphash", force=True, is_superuser=True,
+            expected_artifact_digest=prep.artifact_digest,
+            expected_entry_count=prep.entry_count,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -657,10 +745,10 @@ def test_item7_preflight_fails_when_second_entry_invalid(tmp_path):
         _update_op("pages", "two", "two"),
     )
     changeset = ContentChangeSet(id="cs.preflight", operations=ops)
-    adapter.prepare("cs.preflight", changeset)
+    prep = adapter.prepare("cs.preflight", changeset)
     f1.write_text("v2-one", encoding="utf-8")
     f2.write_text("v2-two", encoding="utf-8")
-    adapter.record_applied("cs.preflight")
+    adapter.record_applied("cs.preflight", artifact_digest=prep.artifact_digest)
     # Tamper the second entry to have a bad rel_path.
     art_path = cfg.snapshots_dir / "cs.preflight" / "rollback_artifact.json"
     art = json.loads(art_path.read_text())
@@ -668,7 +756,11 @@ def test_item7_preflight_fails_when_second_entry_invalid(tmp_path):
     art_path.write_text(json.dumps(art))
     # v2 remains on both files. Rollback must not touch f1 or f2.
     with pytest.raises((PathEscapeError, RollbackArtifactInvalid)):
-        adapter.rollback("cs.preflight", force=True, is_superuser=True)
+        adapter.rollback(
+            "cs.preflight", force=True, is_superuser=True,
+            expected_artifact_digest=prep.artifact_digest,
+            expected_entry_count=prep.entry_count,
+        )
     assert f1.read_text() == "v2-one"
     assert f2.read_text() == "v2-two"
 
@@ -700,14 +792,14 @@ def test_item8_unknown_kind_rejected_by_record_applied(tmp_path):
     (content / "pages" / "home.md").write_text("hi", encoding="utf-8")
     ops = (_update_op("pages", "home", "home"),)
     changeset = ContentChangeSet(id="cs.unkkind", operations=ops)
-    adapter.prepare("cs.unkkind", changeset)
+    prep = adapter.prepare("cs.unkkind", changeset)
     # Corrupt the artifact to introduce an unknown kind.
     art_path = cfg.snapshots_dir / "cs.unkkind" / "rollback_artifact.json"
     art = json.loads(art_path.read_text())
     art["files"][0]["kind"] = "bogus"
     art_path.write_text(json.dumps(art))
     with pytest.raises(RollbackPostStateUnavailable):
-        adapter.record_applied("cs.unkkind")
+        adapter.record_applied("cs.unkkind", artifact_digest=prep.artifact_digest)
 
 
 def test_item8_empty_artifact_verify_rejects(tmp_path):
@@ -717,13 +809,19 @@ def test_item8_empty_artifact_verify_rejects(tmp_path):
     (content / "pages" / "home.md").write_text("hi", encoding="utf-8")
     ops = (_update_op("pages", "home", "home"),)
     changeset = ContentChangeSet(id="cs.empty", operations=ops)
-    adapter.prepare("cs.empty", changeset)
+    prep = adapter.prepare("cs.empty", changeset)
     # Empty the artifact files list.
     art_path = cfg.snapshots_dir / "cs.empty" / "rollback_artifact.json"
     art = json.loads(art_path.read_text())
     art["files"] = []
     art_path.write_text(json.dumps(art))
-    vr = adapter.verify_rolled_back_state("cs.empty")
+    # Digest changes when we edited the artifact — verification is bound to
+    # the trusted (pre-tamper) digest, so status will not be "verified".
+    vr = adapter.verify_rolled_back_state(
+        "cs.empty",
+        expected_artifact_digest=prep.artifact_digest,
+        expected_entry_count=prep.entry_count,
+    )
     assert vr.status != "verified"
 
 

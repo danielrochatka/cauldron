@@ -244,6 +244,7 @@ def test_item14_ok_registration_replaces_stale_adapter(tmp_path):
     stale = MagicMock()
     stale._content_root = "/some/stale/path"
     stale.reversible_adapter_version = 2
+    stale.supports_rollback = True
     register_adapter("flatfile", stale)
     try:
         (tmp_path / "content").mkdir()

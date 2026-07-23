@@ -15,6 +15,26 @@ def _is_api_active() -> bool:
         return False
 
 
+def _resolve_routing(settings) -> dict:
+    override = getattr(settings, "CAULDRON_CONTENT_ROUTING", None)
+    if isinstance(override, dict):
+        return override
+    modules = getattr(settings, "CAULDRON_MODULES", {}) or {}
+    content_cfg = modules.get("cauldron.content") or {}
+    routing = content_cfg.get("routing") or {}
+    return routing if isinstance(routing, dict) else {}
+
+
+def _flatfile_is_routed(settings) -> bool:
+    routing = _resolve_routing(settings)
+    default = routing.get("default_provider", "") or ""
+    collections = routing.get("collections", {}) or {}
+    providers: set[str] = {default} if default else set()
+    if isinstance(collections, dict):
+        providers.update(v for v in collections.values() if isinstance(v, str))
+    return "flatfile" in providers
+
+
 @checks.register(checks.Tags.compatibility)
 def check_api_dependencies(app_configs, **kwargs):
     if not _is_api_active():
@@ -116,4 +136,77 @@ def check_api_configuration(app_configs, **kwargs):
             "Adapter/configuration mismatch: cannot verify content_root.",
             id="content_api.E006",
         ))
+    return errors
+
+
+@checks.register(checks.Tags.compatibility)
+def check_api_flatfile_routing(app_configs, **kwargs):
+    """Routing-aware flatfile checks (Item 4 of the frozen contract pass).
+
+    Emits:
+      * content_api.E020 — flatfile routed but flatfile module missing
+      * content_api.E021 — flatfile routed but content_root missing/empty
+      * content_api.E022 — flatfile routed but repository not registered
+      * content_api.E023 — flatfile routed but adapter contract fails
+    """
+    if not _is_api_active():
+        return []
+    from django.conf import settings
+    if not _flatfile_is_routed(settings):
+        return []
+
+    errors = []
+    modules = getattr(settings, "CAULDRON_MODULES", {}) or {}
+    cms_cfg = modules.get("cauldron.cms.flatfile")
+    if cms_cfg is None:
+        errors.append(checks.Error(
+            "Routing selects 'flatfile' but CAULDRON_MODULES["
+            "'cauldron.cms.flatfile'] is not configured.",
+            id="content_api.E020",
+        ))
+        return errors
+    content_root = (cms_cfg or {}).get("content_root", "")
+    if not content_root:
+        errors.append(checks.Error(
+            "Routing selects 'flatfile' but 'content_root' is missing.",
+            id="content_api.E021",
+        ))
+        return errors
+
+    installed = list(getattr(settings, "INSTALLED_APPS", []))
+    if "cauldron_cms_flatfile" not in installed:
+        errors.append(checks.Error(
+            "Routing selects 'flatfile' but 'cauldron_cms_flatfile' is not "
+            "in INSTALLED_APPS.",
+            id="content_api.E022",
+        ))
+
+    try:
+        from cauldron_workspace_flatfile.config import WorkspaceConfig
+        from cauldron_workspace_flatfile.reversible import (
+            FlatFileReversibleMutationAdapter,
+        )
+        from cauldron_content_operations.reversible import (
+            validate_adapter_contract,
+        )
+        ws_cfg = modules.get("cauldron.workspace.flatfile") or {}
+        wp = ws_cfg.get("workspace_root", "")
+        if wp:
+            adapter = FlatFileReversibleMutationAdapter(
+                WorkspaceConfig(workspace_root=wp), content_root,
+            )
+            violations = validate_adapter_contract(adapter)
+            if violations:
+                errors.append(checks.Error(
+                    "Flatfile adapter does not satisfy the v2 rollback "
+                    f"contract: {'; '.join(violations)[:200]}",
+                    id="content_api.E023",
+                ))
+    except Exception as exc:
+        errors.append(checks.Error(
+            f"Failed to validate flatfile adapter contract: "
+            f"{type(exc).__name__}",
+            id="content_api.E023",
+        ))
+
     return errors

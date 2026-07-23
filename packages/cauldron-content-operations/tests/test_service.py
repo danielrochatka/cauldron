@@ -697,7 +697,9 @@ def test_result_persistence_failure_enters_reconciliation_required(tmp_path):
     from cauldron_content.contracts import ApplyResult, ContentChangeSet, ContentOperation, ContentOperationKind, ContentStatus
     from cauldron_content_operations.service import ContentOperationService, _compute_canonical_changeset_hash
     from cauldron_content_operations.config import ContentOperationsConfig
-    from cauldron_content_operations.reversible import register_adapter, unregister_adapter
+    from cauldron_content_operations.reversible import (
+        PreparationResult, register_adapter, unregister_adapter,
+    )
     from cauldron_content_operations.models import ContentChangeRequest
     import uuid
 
@@ -709,10 +711,9 @@ def test_result_persistence_failure_enters_reconciliation_required(tmp_path):
     mock_adapter.supports_rollback = True
     mock_adapter.reversible_adapter_version = 2
     # Return realistic prep evidence so service.py Item 3 validation passes.
-    class _P:
-        artifact_digest = "a" * 64
-        entry_count = 1
-    mock_adapter.prepare.return_value = _P()
+    mock_adapter.prepare.return_value = PreparationResult(
+        artifact_digest="a" * 64, entry_count=1,
+    )
     mock_adapter.record_applied.side_effect = OSError("storage error")
 
     register_adapter("flatfile", mock_adapter)

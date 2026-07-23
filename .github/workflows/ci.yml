@@ -143,6 +143,9 @@ jobs:
         working-directory: examples/django-content-control-plane
         run: python -m pytest tests/ -v
 
+      - name: Clean-wheel CMS test
+        run: bash scripts/test_cms_flatfile_wheel.sh
+
       - name: Install core wheel in clean environment
         run: |
           python -m venv .venv-wheel

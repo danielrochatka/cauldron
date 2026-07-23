@@ -26,7 +26,12 @@ from .results import (
     OperationError,
     OperationPreview,
 )
-from .reversible import REVERSIBLE_ADAPTER_VERSION, get_adapter
+from .reversible import (
+    PreparationResult,
+    REVERSIBLE_ADAPTER_VERSION,
+    get_adapter,
+    validate_adapter_contract,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -50,43 +55,13 @@ class NotFoundError(Exception):
     pass
 
 
-# Item 2: strict protocol requirements for a v2 reversible adapter.
-# Providers advertising ``supports_rollback=True`` MUST implement every one
-# of these members. Adapters lacking any member are treated as unsupported
-# and get ``rollback.not_supported`` — we no longer fall back to legacy
-# call shapes.
-_REQUIRED_ADAPTER_METHODS = (
-    "prepare",
-    "record_applied",
-    "record_rolled_back",
-    "rollback",
-    "has_rollback_artifact",
-    "verify_applied_state",
-    "verify_rolled_back_state",
-    "inspect",
-)
-
-
 def _adapter_fully_supports_rollback(adapter: Any) -> bool:
-    """Return True iff the adapter advertises rollback support and implements
-    every required method with the correct protocol version.
+    """Return True iff the adapter satisfies the shared v2 contract.
 
-    Item 2: providers advertising ``supports_rollback=True`` must implement
-    every protocol member AND declare
-    ``reversible_adapter_version == REVERSIBLE_ADAPTER_VERSION``. We fail
-    closed if the version is wrong or any method is missing.
+    Delegates to :func:`validate_adapter_contract`; anything with contract
+    violations is treated as unsupported.
     """
-    if adapter is None:
-        return False
-    if not bool(getattr(adapter, "supports_rollback", False)):
-        return False
-    version = getattr(adapter, "reversible_adapter_version", None)
-    if version != REVERSIBLE_ADAPTER_VERSION:
-        return False
-    for name in _REQUIRED_ADAPTER_METHODS:
-        if not callable(getattr(adapter, name, None)):
-            return False
-    return True
+    return not validate_adapter_contract(adapter)
 
 
 def _is_valid_sha256_hex(value: Any) -> bool:
@@ -413,12 +388,17 @@ class ContentOperationService:
         snapshots: Any = None,  # Legacy SnapshotService (retained for compat, unused by new code)
         config: Optional[ContentOperationsConfig] = None,
         locks_dir: Optional[Path] = None,
+        required_reversible_providers: frozenset[str] = frozenset(),
     ) -> None:
         self._router = router
         self._workspace = workspace
         self._snapshots = snapshots
         self._config = config or get_operations_config()
         self._locks_dir = Path(locks_dir) if locks_dir is not None else None
+        # Item 1: providers listed here MUST have a compatible v2 adapter
+        # registered before an apply is allowed. Service factories pass this
+        # in when they enable a rollback-required provider (e.g. flatfile).
+        self._required_reversible_providers = frozenset(required_reversible_providers)
 
     # -------------------------------------------------------------------------
     # Locks
@@ -1601,30 +1581,73 @@ class ContentOperationService:
             # Row lock released here — no mutation yet.
 
         # Step 2: Prepare rollback artifact BEFORE marking applying and BEFORE mutation.
+        # Item 1: fail closed on incompatible adapter registration or missing
+        # required-provider adapter. State/version are NOT mutated.
         adapter = get_adapter(provider_name)
+        adapter_violations: list[str] = []
+        if adapter is not None:
+            adapter_violations = validate_adapter_contract(adapter)
+        adapter_incompatible = False
+        adapter_reason = ""
+        if adapter is not None and adapter_violations:
+            adapter_incompatible = True
+            adapter_reason = (
+                f"Registered adapter for {provider_name!r} does not satisfy "
+                f"v{REVERSIBLE_ADAPTER_VERSION} contract: "
+                f"{'; '.join(adapter_violations)}"
+            )
+        elif adapter is None and provider_name in self._required_reversible_providers:
+            adapter_incompatible = True
+            adapter_reason = (
+                f"Provider {provider_name!r} requires a v"
+                f"{REVERSIBLE_ADAPTER_VERSION} rollback adapter but none is "
+                "registered."
+            )
+        if adapter_incompatible:
+            return ChangeRequestResult(
+                ok=False,
+                error=OperationError(
+                    "application.rollback_adapter_incompatible",
+                    adapter_reason[:500],
+                ),
+                request_id=request_id,
+                lifecycle_state=cr.lifecycle_state,
+            )
+
         prep_digest = ""
         prep_entry_count = 0
         _prep_validation_error: str = ""
-        if adapter is not None and _adapter_fully_supports_rollback(adapter):
+        if adapter is not None and not adapter_violations:
             try:
                 prep_result = adapter.prepare(cr.workspace_changeset_id, changeset)
-                # Support both typed and untyped adapter implementations.
-                prep_digest = getattr(prep_result, "artifact_digest", "") or ""
-                prep_entry_count = getattr(prep_result, "entry_count", 0) or 0
-                # Item 3: validate preparation evidence before any mutation.
-                if not _is_valid_sha256_hex(prep_digest):
+                # Item 2: application MUST receive a real PreparationResult;
+                # dicts and duck-typed clones are rejected outright.
+                if not isinstance(prep_result, PreparationResult):
+                    _prep_validation_error = (
+                        f"prepare must return PreparationResult, got "
+                        f"{type(prep_result).__name__!r}."
+                    )
+                    prep_digest = ""
+                    prep_entry_count = 0
+                else:
+                    prep_digest = prep_result.artifact_digest
+                    prep_entry_count = prep_result.entry_count
+                if not _prep_validation_error and not _is_valid_sha256_hex(prep_digest):
                     _prep_validation_error = (
                         "prepare returned invalid or missing artifact_digest."
                     )
-                elif isinstance(prep_entry_count, bool) or not isinstance(prep_entry_count, int):
+                elif not _prep_validation_error and (
+                    isinstance(prep_entry_count, bool)
+                    or not isinstance(prep_entry_count, int)
+                ):
                     _prep_validation_error = (
                         "prepare returned non-int entry_count."
                     )
-                elif prep_entry_count <= 0:
+                elif not _prep_validation_error and prep_entry_count <= 0:
                     _prep_validation_error = (
                         "prepare returned non-positive entry_count."
                     )
-                elif prep_entry_count != len(changeset.operations):
+                elif not _prep_validation_error and prep_entry_count != len(changeset.operations):
                     _prep_validation_error = (
                         f"prepare entry_count {prep_entry_count} does not match "
                         f"{len(changeset.operations)} operations."
@@ -1818,12 +1841,12 @@ class ContentOperationService:
         _recon_needed = False
         _recon_error = ""
 
-        if adapter is not None and _adapter_fully_supports_rollback(adapter):
+        if adapter is not None and not adapter_violations:
             try:
                 # Item 2/8: bind post-state to the artifact digest we
-                # recorded. Legacy adapters are already rejected upstream by
-                # ``_adapter_fully_supports_rollback``; we do NOT fall back
-                # to positional-only signatures.
+                # recorded. Adapters that fail contract validation are
+                # rejected upstream — we do NOT fall back to positional-only
+                # signatures or TypeError-retry paths.
                 adapter.record_applied(
                     cr.workspace_changeset_id,
                     artifact_digest=prep_digest,

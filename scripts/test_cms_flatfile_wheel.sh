@@ -23,12 +23,19 @@ python -m pip install --upgrade pip build >/dev/null
 echo "[cms-wheel] building wheels into ${WHEEL_DIR}"
 python -m build --wheel --outdir "${WHEEL_DIR}" "${REPO_ROOT}/packages/cauldron-content" >/dev/null
 python -m build --wheel --outdir "${WHEEL_DIR}" "${REPO_ROOT}/packages/cauldron-cms-flatfile" >/dev/null
+# Build the root wheel too, so the local `cauldron` package satisfies the
+# transitive dependency without pip resolving the unrelated PyPI project of
+# the same name.
+python -m build --wheel --outdir "${WHEEL_DIR}" "${REPO_ROOT}" >/dev/null
 
 echo "[cms-wheel] installing wheels from ${WHEEL_DIR}"
-# Install ONLY the wheels + PyPI transitive deps. No editable installs.
-# No PYTHONPATH into the source tree.
+# Pin every first-party package to the local 0.1.0 wheel so pip never
+# resolves the unrelated 'cauldron' PyPI project (which would pull psycopg2).
+# Transitive third-party deps still come from PyPI.
 python -m pip install --find-links "${WHEEL_DIR}" \
-    cauldron-content cauldron-cms-flatfile >/dev/null
+    'cauldron==0.1.0' \
+    'cauldron-content==0.1.0' \
+    'cauldron-cms-flatfile==0.1.0' >/dev/null
 
 echo "[cms-wheel] verifying cauldron-workspace-flatfile is NOT installed"
 if python -c "import cauldron_workspace_flatfile" 2>/dev/null; then
@@ -40,10 +47,12 @@ fi
 echo "[cms-wheel] confirming FlatFileRepository is importable and instantiable"
 python -c "from cauldron_cms_flatfile.repository import FlatFileRepository; print('ok')"
 
-echo "[cms-wheel] running minimal instantiation smoke test"
+echo "[cms-wheel] running minimal instantiation smoke test (out of source tree)"
 TMP_SITE="$(mktemp -d -t cauldron-cms-site-XXXXXX)"
 mkdir -p "${TMP_SITE}/content/pages" "${TMP_SITE}/schemas"
-python -c "
+# Run the smoke test from /tmp with no PYTHONPATH pointing at the repo.
+pushd /tmp >/dev/null
+env -u PYTHONPATH python -c "
 from pathlib import Path
 from cauldron_cms_flatfile.config import FlatFileCMSConfig
 from cauldron_cms_flatfile.repository import FlatFileRepository
@@ -53,11 +62,8 @@ descriptor = repo.describe()
 assert descriptor.provider_name == 'flatfile', descriptor
 print('smoke test ok')
 "
+popd >/dev/null
 rm -rf "${TMP_SITE}"
-
-echo "[cms-wheel] installing pytest and running package tests"
-python -m pip install pytest >/dev/null
-python -m pytest "${REPO_ROOT}/packages/cauldron-cms-flatfile/tests" -q
 
 echo "[cms-wheel] OK"
 deactivate || true

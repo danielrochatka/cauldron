@@ -1,0 +1,21 @@
+{% extends "cauldron_admin/base.html" %}
+{% block page_title %}Audit Event{% endblock %}
+
+{% block content %}
+<div class="cui-card">
+  <dl class="cui-dl">
+    <dt>Event ID</dt><dd><code>{{ event.event_id }}</code></dd>
+    <dt>Type</dt><dd>{% include "cauldron_admin/includes/status_badge.html" with status=event.event_type %}</dd>
+    <dt>Change Request</dt><dd><a href="{% url 'cauldron_admin_content:change-request-detail' event.change_request.request_id %}"><code>{{ event.change_request.request_id }}</code></a></dd>
+    <dt>Sequence</dt><dd>{{ event.sequence }}</dd>
+    <dt>Previous State</dt><dd>{{ event.previous_state|default:"—" }}</dd>
+    <dt>Resulting State</dt><dd>{{ event.resulting_state|default:"—" }}</dd>
+    <dt>Actor</dt><dd>{{ event.actor|default:"—" }}</dd>
+    <dt>Provider</dt><dd>{{ event.provider|default:"—" }}</dd>
+    <dt>Occurred</dt><dd>{{ event.occurred_at }}</dd>
+    {% if event.detail %}
+    <dt>Detail</dt><dd><pre class="cui-pre">{{ event.detail }}</pre></dd>
+    {% endif %}
+  </dl>
+</div>
+{% endblock %}

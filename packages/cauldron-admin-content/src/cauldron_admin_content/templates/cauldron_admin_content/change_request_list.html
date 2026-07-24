@@ -1,0 +1,35 @@
+{% extends "cauldron_admin/base.html" %}
+{% block page_title %}Change Requests{% endblock %}
+
+{% block page_actions %}
+<a href="{% url 'cauldron_admin_content:content-proposal' %}" class="cui-button">New Proposal</a>
+{% endblock %}
+
+{% block content %}
+{% if change_requests %}
+<div class="cui-table-container">
+  <table class="cui-table">
+    <thead>
+      <tr>
+        <th>Request ID</th>
+        <th>Status</th>
+        <th>Provider</th>
+        <th>Created</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for cr in change_requests %}
+      <tr>
+        <td><a href="{% url 'cauldron_admin_content:change-request-detail' cr.request_id %}"><code>{{ cr.request_id|slice:":8" }}…</code></a></td>
+        <td>{% include "cauldron_admin/includes/status_badge.html" with status=cr.lifecycle_state %}</td>
+        <td>{{ cr.provider_name }}</td>
+        <td class="cui-text-sm cui-text-muted">{{ cr.created_at }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+{% include "cauldron_admin/includes/empty_state.html" %}
+{% endif %}
+{% endblock %}

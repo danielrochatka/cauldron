@@ -32,6 +32,7 @@ def _make_user(*, username, perms=()):
 
 def _make_proposal(**kwargs):
     from cauldron_ai_admin.models import UIStyleChangeRequest
+    from django.utils import timezone
     defaults = dict(
         scope="admin",
         target_path="admin/custom.css",
@@ -40,6 +41,12 @@ def _make_proposal(**kwargs):
         status="proposed",
     )
     defaults.update(kwargs)
+    # Satisfy DB constraints: reviewed_at required for approved/rejected/conflicted
+    if defaults.get("status") in ("approved", "rejected", "conflicted") and "reviewed_at" not in defaults:
+        defaults["reviewed_at"] = timezone.now()
+    # Satisfy DB constraint: applied_at required for applied status
+    if defaults.get("status") == "applied" and "applied_at" not in defaults:
+        defaults["applied_at"] = timezone.now()
     return UIStyleChangeRequest.objects.create(**defaults)
 
 

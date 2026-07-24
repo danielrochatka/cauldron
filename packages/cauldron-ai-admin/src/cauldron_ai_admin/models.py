@@ -221,6 +221,10 @@ UI_STYLE_STATUS_CHOICES = [
     ("conflicted", "conflicted"),
 ]
 
+_UI_STYLE_STATUS_VALUES = [v for v, _ in UI_STYLE_STATUS_CHOICES]
+
+_SHA256_RE = r"^[0-9a-f]{64}$"
+
 
 class UIStyleChangeRequest(models.Model):
     """Durable record of an AI-proposed CSS style change."""
@@ -232,6 +236,38 @@ class UIStyleChangeRequest(models.Model):
             models.Index(fields=["status"], name="uiscr_status_idx"),
             models.Index(fields=["scope"], name="uiscr_scope_idx"),
             models.Index(fields=["created_at"], name="uiscr_created_idx"),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(status__in=_UI_STYLE_STATUS_VALUES),
+                name="uiscr_status_valid",
+            ),
+            models.CheckConstraint(
+                condition=Q(scope__in=["admin", "pages"]),
+                name="uiscr_scope_valid",
+            ),
+            models.CheckConstraint(
+                condition=Q(proposed_hash="") | Q(proposed_hash__regex=_SHA256_RE),
+                name="uiscr_proposed_hash_format",
+            ),
+            models.CheckConstraint(
+                condition=Q(base_hash="") | Q(base_hash__regex=_SHA256_RE),
+                name="uiscr_base_hash_format",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~Q(status__in=["approved", "rejected", "conflicted"])
+                    | Q(reviewed_at__isnull=False)
+                ),
+                name="uiscr_reviewed_at_when_terminal",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~Q(status="applied")
+                    | Q(applied_at__isnull=False)
+                ),
+                name="uiscr_applied_at_when_applied",
+            ),
         ]
         permissions = [
             ("view_ui_styles", "Can view UI style overrides"),
@@ -279,6 +315,8 @@ UI_STYLE_EVENT_TYPES = [
     ("failed", "failed"),
 ]
 
+_UI_STYLE_EVENT_TYPES = [v for v, _ in UI_STYLE_EVENT_TYPES]
+
 
 class UIStyleAuditEvent(models.Model):
     """Append-only audit log for UI style change request actions."""
@@ -290,6 +328,10 @@ class UIStyleAuditEvent(models.Model):
             models.UniqueConstraint(
                 fields=["change_request", "sequence"],
                 name="uisae_unique_request_sequence",
+            ),
+            models.CheckConstraint(
+                condition=Q(event_type__in=_UI_STYLE_EVENT_TYPES),
+                name="uisae_event_type_valid",
             ),
         ]
 

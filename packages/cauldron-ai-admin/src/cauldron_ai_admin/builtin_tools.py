@@ -857,9 +857,10 @@ def _handle_list_files(context: AdminAIToolContext, **kwargs) -> Any:
 _READ_FILE_SCHEMA: dict = {
     "type": "object",
     "properties": {
+        "scope": {"type": "string", "enum": ["admin", "pages"]},
         "path": {"type": "string"},
     },
-    "required": ["path"],
+    "required": ["scope", "path"],
 }
 
 
@@ -867,16 +868,17 @@ def _handle_read_file(context: AdminAIToolContext, **kwargs) -> Any:
     deadline_err = _check_deadline("ui.styles.read_file", context)
     if deadline_err is not None:
         return deadline_err
+    scope = kwargs.get("scope", "")
     path = kwargs.get("path")
     try:
         store = _get_override_store()
-        content = store.read_file(path)
-        file_hash = store.calculate_hash(path)
+        content = store.read_file(scope, path)
+        file_hash = store.calculate_hash(scope, path)
     except FileNotFoundError:
         return AdminAIToolError(
             tool_name="ui.styles.read_file",
             error_code="ui.styles.file_not_found",
-            message=f"File not found: {path!r}",
+            message=f"File not found: {path!r} in scope {scope!r}",
         )
     except Exception as exc:
         return AdminAIToolError(
@@ -908,30 +910,22 @@ def _handle_ui_create_proposal(context: AdminAIToolContext, **kwargs) -> Any:
     deadline_err = _check_deadline("ui.styles.create_proposal", context)
     if deadline_err is not None:
         return deadline_err
-    from .models import UIStyleChangeRequest, UIStyleAuditEvent
+    from .style_service import get_style_service
     scope = kwargs.get("scope", "")
     target_path = kwargs.get("target_path", "")
     proposed_content = kwargs.get("proposed_content", "")
-    base_hash = kwargs.get("base_hash", "") or ""
     description = kwargs.get("description", "")
+    actor = context.actor if context.actor and context.actor.pk else None
     try:
-        proposal = UIStyleChangeRequest.objects.create(
+        service = get_style_service()
+        proposal = service.create_proposal(
             scope=scope,
             target_path=target_path,
             proposed_content=proposed_content,
-            base_hash=base_hash,
             description=description,
-            created_by=context.actor if context.actor and context.actor.pk else None,
-            status="proposed",
+            created_by=actor,
         )
-        UIStyleAuditEvent.objects.create(
-            change_request=proposal,
-            sequence=1,
-            event_type="proposed",
-            actor=context.actor if context.actor and context.actor.pk else None,
-            detail={"scope": scope, "target_path": target_path},
-        )
-    except Exception as exc:
+    except (ValueError, Exception) as exc:
         return AdminAIToolError(
             tool_name="ui.styles.create_proposal",
             error_code="ui.styles.create_proposal_failed",

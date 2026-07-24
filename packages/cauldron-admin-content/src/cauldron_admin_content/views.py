@@ -6,12 +6,12 @@ import json
 from typing import Any
 
 from django.contrib import messages
-from django.contrib.admin.views.decorators import staff_member_required
+from django.contrib.auth.decorators import login_required, permission_required
 from django.http import HttpRequest, HttpResponseRedirect
 from django.shortcuts import render
 from django.urls import reverse
 from django.views import View
-from django.contrib.auth.decorators import login_required
+from django.views.generic import RedirectView
 from django.utils.decorators import method_decorator
 
 from .forms import ContentProposalForm
@@ -32,7 +32,10 @@ def _handle_config_error(request):
     )
 
 
-@method_decorator([login_required, staff_member_required], name="dispatch")
+@method_decorator([
+    login_required,
+    permission_required("cauldron_content_operations.view_published_content", raise_exception=True),
+], name="dispatch")
 class ContentBrowserView(View):
     """Browse published and draft content via ContentOperationService."""
 
@@ -79,7 +82,16 @@ class ContentBrowserView(View):
         })
 
 
-@method_decorator([login_required, staff_member_required], name="dispatch")
+class ContentBrowserRedirectView(RedirectView):
+    """Permanent redirect from legacy content-browser/ to canonical content/ route."""
+    permanent = True
+    pattern_name = "cauldron_admin_content:content-browser"
+
+
+@method_decorator([
+    login_required,
+    permission_required("cauldron_content_operations.propose_content_changes", raise_exception=True),
+], name="dispatch")
 class ContentProposalView(View):
     """Create a content proposal via ContentOperationService."""
 
@@ -121,7 +133,10 @@ class ContentProposalView(View):
         return render(request, self.template_name, {"form": form})
 
 
-@method_decorator([login_required, staff_member_required], name="dispatch")
+@method_decorator([
+    login_required,
+    permission_required("cauldron_content_operations.view_content_change_requests", raise_exception=True),
+], name="dispatch")
 class ChangeRequestListView(View):
     template_name = "cauldron_admin_content/change_request_list.html"
 
@@ -137,7 +152,10 @@ class ChangeRequestListView(View):
         })
 
 
-@method_decorator([login_required, staff_member_required], name="dispatch")
+@method_decorator([
+    login_required,
+    permission_required("cauldron_content_operations.view_content_change_requests", raise_exception=True),
+], name="dispatch")
 class ChangeRequestDetailView(View):
     template_name = "cauldron_admin_content/change_request_detail.html"
 
@@ -157,7 +175,10 @@ class ChangeRequestDetailView(View):
         })
 
 
-@method_decorator([login_required, staff_member_required], name="dispatch")
+@method_decorator([
+    login_required,
+    permission_required("cauldron_content_operations.view_content_audit", raise_exception=True),
+], name="dispatch")
 class AuditListView(View):
     template_name = "cauldron_admin_content/audit_list.html"
 
@@ -173,7 +194,10 @@ class AuditListView(View):
         })
 
 
-@method_decorator([login_required, staff_member_required], name="dispatch")
+@method_decorator([
+    login_required,
+    permission_required("cauldron_content_operations.view_content_audit", raise_exception=True),
+], name="dispatch")
 class AuditDetailView(View):
     template_name = "cauldron_admin_content/audit_detail.html"
 

@@ -5,7 +5,8 @@ from . import views
 app_name = "cauldron_admin_content"
 
 urlpatterns = [
-    path("content-browser/", views.ContentBrowserView.as_view(), name="content-browser"),
+    path("content/", views.ContentBrowserView.as_view(), name="content-browser"),  # canonical
+    path("content-browser/", views.ContentBrowserRedirectView.as_view()),  # compat redirect
     path("content-proposal/", views.ContentProposalView.as_view(), name="content-proposal"),
     path("content/change-requests/", views.ChangeRequestListView.as_view(), name="change-request-list"),
     path("content/change-requests/<str:request_id>/", views.ChangeRequestDetailView.as_view(), name="change-request-detail"),

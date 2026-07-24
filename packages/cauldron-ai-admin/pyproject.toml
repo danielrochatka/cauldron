@@ -9,6 +9,7 @@ requires-python = ">=3.11"
 dependencies = [
     "cauldron>=0.1.0",
     "cauldron-ai>=0.1.0",
+    "cauldron-django-admin>=0.1.0",
     "cauldron-content-operations>=0.1.0",
     "cauldron-admin-content>=0.1.0",
     "django>=4.2",

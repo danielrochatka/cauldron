@@ -8,10 +8,9 @@
       <ul class="cui-sidebar__items" role="list">
         {% for item in group.items %}
         <li class="cui-sidebar__item">
-          {% url item.url_name as nav_item_url %}
-          <a href="{{ nav_item_url|default:'#' }}"
-             class="cui-sidebar__link{% if item.url_prefix and request.path|slice:item.url_prefix|length == item.url_prefix %} is-active{% endif %}"
-             {% if item.url_prefix and request.path == item.url_prefix %}aria-current="page"{% endif %}>
+          <a href="{{ item.url }}"
+             class="cui-sidebar__link{% if item.is_active %} cui-nav__item--active{% endif %}"
+             {% if item.is_active %}aria-current="page"{% endif %}>
             {{ item.label }}
             {% if item.badge_count %}<span class="cui-badge" aria-label="{{ item.badge_count }} items">{{ item.badge_count }}</span>{% endif %}
           </a>

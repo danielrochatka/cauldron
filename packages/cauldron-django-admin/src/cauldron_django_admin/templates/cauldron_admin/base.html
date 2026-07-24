@@ -1,4 +1,4 @@
-{% load static %}<!DOCTYPE html>
+{% load static cauldron_admin_tags %}<!DOCTYPE html>
 <html lang="en" class="{% block body_classes %}{% endblock %}">
 <head>
   <meta charset="utf-8">
@@ -13,6 +13,10 @@
   <link rel="stylesheet" href="{% static 'cauldron_admin/css/tables.css' %}">
   <link rel="stylesheet" href="{% static 'cauldron_admin/css/utilities.css' %}">
   <link rel="stylesheet" href="{% static 'cauldron_admin/css/responsive.css' %}">
+  {% get_override_css_urls "admin" as override_css_urls %}
+  {% for css_url in override_css_urls %}
+  <link rel="stylesheet" href="{{ css_url }}">
+  {% endfor %}
   {% block extra_css %}{% endblock %}
   {% block extra_head %}{% endblock %}
 </head>

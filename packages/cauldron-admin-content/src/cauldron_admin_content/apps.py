@@ -30,7 +30,7 @@ class CauldronAdminContentConfig(AppConfig):
                 section="content",
                 order=10,
                 permission="cauldron_content_operations.view_published_content",
-                url_prefix="/cauldron/content-browser/",
+                url_prefix="/cauldron/content/",
                 description="Browse published and draft content",
             ))
             registry.register_item(AdminNavigationItem(

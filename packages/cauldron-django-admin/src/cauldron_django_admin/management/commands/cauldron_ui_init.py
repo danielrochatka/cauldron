@@ -18,10 +18,7 @@ _DEFAULT_PAGES_FILES = {
     "90-site.css": "/* Site-wide public page CSS customizations */\n",
 }
 
-_GITIGNORE_CONTENT = (
-    "# Do not commit generated or site-specific CSS\n"
-    "# Only commit files you intentionally maintain\n"
-)
+_GITIGNORE_CONTENT = "*\n!.gitignore\n"
 
 
 class Command(BaseCommand):
@@ -88,21 +85,49 @@ class Command(BaseCommand):
         self.stdout.write(f"  Written: {path.name}")
 
     def _run_check(self, root: Path) -> None:
+        from cauldron_django_admin.override_store import UIOverrideStore, _MAX_FILE_BYTES, _MAX_TOTAL_BYTES
+
         issues = []
+
         if not root.exists():
-            issues.append("Override root does not exist")
+            issues.append("Override root does not exist. Run cauldron_ui_init to create it.")
         elif not root.is_dir():
-            issues.append("Override root is not a directory")
+            issues.append("Override root path exists but is not a directory.")
         else:
             for scope in ("admin", "pages"):
                 scope_dir = root / scope
                 if not scope_dir.is_dir():
                     issues.append(f"Missing scope directory: {scope}/")
+                    continue
+
+                store = UIOverrideStore(root)
+                try:
+                    files = store.list_files(scope)
+                except Exception as exc:
+                    issues.append(f"Cannot list files in scope {scope!r}: {type(exc).__name__}")
+                    continue
+
+                total = 0
+                for rel_path in files:
+                    try:
+                        content = store.read_file(scope, rel_path)
+                        size = len(content.encode("utf-8"))
+                        if size > _MAX_FILE_BYTES:
+                            issues.append(
+                                f"File exceeds size limit: scope={scope!r}, path={rel_path!r} ({size} bytes)"
+                            )
+                        total += size
+                    except Exception as exc:
+                        issues.append(f"Cannot read {scope!r}/{rel_path!r}: {type(exc).__name__}")
+
+                if total > _MAX_TOTAL_BYTES:
+                    issues.append(f"Total size in scope {scope!r} exceeds limit ({total} bytes).")
+
         if issues:
             for issue in issues:
                 self.stderr.write(self.style.WARNING(f"  [WARN] {issue}"))
-            self.stdout.write(
-                self.style.WARNING("Override directory has issues. Run cauldron_ui_init to fix.")
+            self.stderr.write(
+                self.style.WARNING("Override directory has validation issues. Run cauldron_ui_init to fix.")
             )
         else:
             self.stdout.write(self.style.SUCCESS("Override directory is valid."))

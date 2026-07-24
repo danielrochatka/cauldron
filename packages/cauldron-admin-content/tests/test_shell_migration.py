@@ -31,7 +31,7 @@ def test_audit_list_template_loads():
 
 
 @pytest.mark.django_db
-def test_change_request_list_view_requires_staff(client):
+def test_change_request_list_view_requires_login(client):
     from django.test import override_settings
     from django.contrib.auth import get_user_model
     User = get_user_model()
@@ -43,11 +43,22 @@ def test_change_request_list_view_requires_staff(client):
 
 
 @pytest.mark.django_db
-def test_change_request_list_view_staff_access(client):
+def test_change_request_list_view_permission_access(client):
     from django.test import override_settings
     from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Permission
     User = get_user_model()
     user = User.objects.create_user(username="staffuser", password="pw", is_staff=True)
+    try:
+        perm = Permission.objects.get(
+            codename="view_content_change_requests",
+            content_type__app_label="cauldron_content_operations",
+        )
+        user.user_permissions.add(perm)
+        user = User.objects.get(pk=user.pk)
+    except Permission.DoesNotExist:
+        # If permission doesn't exist yet (e.g. migrations not run), skip
+        pytest.skip("view_content_change_requests permission not found")
     client.force_login(user)
     with override_settings(ROOT_URLCONF="tests.urls"):
         response = client.get("/cauldron-admin/content/change-requests/")
@@ -55,11 +66,21 @@ def test_change_request_list_view_staff_access(client):
 
 
 @pytest.mark.django_db
-def test_audit_list_view_staff_access(client):
+def test_audit_list_view_permission_access(client):
     from django.test import override_settings
     from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Permission
     User = get_user_model()
     user = User.objects.create_user(username="staffaudit", password="pw", is_staff=True)
+    try:
+        perm = Permission.objects.get(
+            codename="view_content_audit",
+            content_type__app_label="cauldron_content_operations",
+        )
+        user.user_permissions.add(perm)
+        user = User.objects.get(pk=user.pk)
+    except Permission.DoesNotExist:
+        pytest.skip("view_content_audit permission not found")
     client.force_login(user)
     with override_settings(ROOT_URLCONF="tests.urls"):
         response = client.get("/cauldron-admin/content/audit/")

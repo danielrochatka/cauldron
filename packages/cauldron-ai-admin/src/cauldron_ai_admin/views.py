@@ -15,6 +15,7 @@ from django.utils.decorators import method_decorator
 from django.views import View
 
 from .models import AdminAIRun
+from .style_service import get_style_service
 
 
 logger = logging.getLogger(__name__)
@@ -187,91 +188,63 @@ class UIStyleChangeDetailView(View):
         })
 
     def post(self, request, request_id):
-        """Handle approve/reject actions."""
+        """Handle approve/reject/apply actions."""
         from django.shortcuts import get_object_or_404, redirect
-        from django.utils import timezone
-        from .models import UIStyleChangeRequest, UIStyleAuditEvent
+        from .models import UIStyleChangeRequest
+        from cauldron_django_admin.override_store import HashConflictError, OverrideStoreError
         if not request.user.has_perm("cauldron_ai_admin.approve_ui_style_changes"):
             raise PermissionDenied
         proposal = get_object_or_404(UIStyleChangeRequest, request_id=request_id)
         action = request.POST.get("action", "")
-        if action == "approve" and proposal.status == "proposed":
-            proposal.status = "approved"
-            proposal.reviewed_by = request.user
-            proposal.reviewed_at = timezone.now()
-            proposal.save(update_fields=["status", "reviewed_by", "reviewed_at"])
-            seq = proposal.audit_events.count() + 1
-            UIStyleAuditEvent.objects.create(
-                change_request=proposal, sequence=seq, event_type="approved",
-                actor=request.user, detail={"action": "approved"},
-            )
-            messages.success(request, "Proposal approved.")
-        elif action == "reject" and proposal.status == "proposed":
-            proposal.status = "rejected"
-            proposal.reviewed_by = request.user
-            proposal.reviewed_at = timezone.now()
-            proposal.save(update_fields=["status", "reviewed_by", "reviewed_at"])
-            seq = proposal.audit_events.count() + 1
-            UIStyleAuditEvent.objects.create(
-                change_request=proposal, sequence=seq, event_type="rejected",
-                actor=request.user, detail={"action": "rejected"},
-            )
-            messages.success(request, "Proposal rejected.")
-        elif action == "apply" and proposal.status == "approved":
-            self._apply_proposal(request, proposal)
+        service = get_style_service()
+        try:
+            if action == "approve" and proposal.status == "proposed":
+                service.approve(proposal, reviewed_by=request.user)
+                messages.success(request, "Proposal approved.")
+            elif action == "reject" and proposal.status == "proposed":
+                service.reject(proposal, reviewed_by=request.user)
+                messages.success(request, "Proposal rejected.")
+            elif action == "apply" and proposal.status == "approved":
+                try:
+                    service.apply(proposal, applied_by=request.user)
+                    messages.success(request, "Style change applied successfully.")
+                except HashConflictError:
+                    messages.error(
+                        request,
+                        "Conflict: the target file was modified. Proposal marked as conflicted.",
+                    )
+                except OverrideStoreError:
+                    messages.error(request, "Failed to apply style change. See audit for details.")
+        except ValueError as exc:
+            messages.error(request, str(exc))
         return redirect("cauldron_ai_admin:style-detail", request_id=request_id)
 
-    def _apply_proposal(self, request, proposal):
-        from django.utils import timezone
-        from .models import UIStyleAuditEvent
-        from cauldron_django_admin.override_store import UIOverrideStore, HashConflictError, OverrideStoreError
-        from pathlib import Path
-        from django.conf import settings
-        override_dir = getattr(settings, "CAULDRON_UI_OVERRIDES_DIR", None)
-        if override_dir is None:
-            base_dir = getattr(settings, "BASE_DIR", None)
-            override_dir = Path(base_dir) / "cauldron-overrides" if base_dir else None
-        if override_dir is None:
-            messages.error(request, "Override directory not configured.")
-            return
-        store = UIOverrideStore(Path(override_dir))
-        try:
-            new_hash = store.write_file_atomic(
-                proposal.target_path,
-                proposal.proposed_content,
-                expected_hash=proposal.base_hash or None,
-            )
-            proposal.status = "applied"
-            proposal.applied_at = timezone.now()
-            proposal.proposed_hash = new_hash
-            proposal.save(update_fields=["status", "applied_at", "proposed_hash"])
-            seq = proposal.audit_events.count() + 1
-            UIStyleAuditEvent.objects.create(
-                change_request=proposal, sequence=seq, event_type="applied",
-                actor=request.user, detail={"new_hash": new_hash},
-            )
-            messages.success(request, "Style change applied successfully.")
-        except HashConflictError:
-            proposal.status = "conflicted"
-            proposal.error_code = "HASH_CONFLICT"
-            proposal.error_summary = "File was modified since the proposal was created."
-            proposal.save(update_fields=["status", "error_code", "error_summary"])
-            seq = proposal.audit_events.count() + 1
-            UIStyleAuditEvent.objects.create(
-                change_request=proposal, sequence=seq, event_type="conflict",
-                actor=request.user, detail={"error": "hash_conflict"},
-            )
-            messages.error(request, "Conflict: the target file was modified. Proposal marked as conflicted.")
-        except OverrideStoreError as exc:
-            proposal.error_code = "STORE_ERROR"
-            proposal.error_summary = str(exc)[:200]
-            proposal.save(update_fields=["error_code", "error_summary"])
-            seq = proposal.audit_events.count() + 1
-            UIStyleAuditEvent.objects.create(
-                change_request=proposal, sequence=seq, event_type="failed",
-                actor=request.user, detail={"error": str(exc)[:200]},
-            )
-            messages.error(request, "Failed to apply style change. See audit for details.")
+
+@method_decorator([
+    login_required,
+    permission_required("cauldron_ai_admin.view_admin_ai_audit", raise_exception=True),
+], name="dispatch")
+class AdminAIInvocationDetailView(View):
+    template_name = "cauldron_ai_admin/invocation_detail.html"
+
+    def get(self, request, run_id, invocation_id):
+        from django.shortcuts import get_object_or_404
+        from .models import AdminAIToolInvocation
+        inv = get_object_or_404(
+            AdminAIToolInvocation,
+            invocation_id=invocation_id,
+            run__run_id=run_id,
+        )
+        return render(request, self.template_name, {
+            "invocation": inv,
+            "run": inv.run,
+            "breadcrumbs": [
+                {"label": "Admin AI", "url": reverse("cauldron_ai_admin:ai-page")},
+                {"label": "Runs", "url": reverse("cauldron_ai_admin:run-list")},
+                {"label": str(run_id)[:8] + "…", "url": reverse("cauldron_ai_admin:run-detail", kwargs={"run_id": run_id})},
+                {"label": str(invocation_id)[:8] + "…", "url": ""},
+            ],
+        })
 
 
 def _parse_json_body(request: HttpRequest) -> dict[str, Any]:

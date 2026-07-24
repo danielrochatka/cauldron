@@ -1,4 +1,4 @@
-"""Tests for UIOverrideStore."""
+"""Tests for UIOverrideStore (scope-aware API)."""
 import os
 import tempfile
 from pathlib import Path
@@ -6,10 +6,13 @@ from pathlib import Path
 import pytest
 
 from cauldron_django_admin.override_store import (
+    ABSENT,
     EncodingError,
     FileSizeError,
     HashConflictError,
     InvalidFileError,
+    InvalidScopeError,
+    MissingExpectedHashError,
     TraversalError,
     UIOverrideStore,
 )
@@ -27,25 +30,25 @@ def test_list_files_empty(store, tmp_path):
 
 
 def test_write_and_read(store):
-    store.write_file_atomic("admin/test.css", "body { color: red; }")
-    content = store.read_file("admin/test.css")
+    store.write_file_atomic("admin", "test.css", "body { color: red; }", expected_hash=ABSENT)
+    content = store.read_file("admin", "test.css")
     assert "color: red" in content
 
 
 def test_list_files_after_write(store):
-    store.write_file_atomic("admin/test.css", "/* hello */")
+    store.write_file_atomic("admin", "test.css", "/* hello */", expected_hash=ABSENT)
     files = store.list_files("admin")
-    assert "admin/test.css" in files
+    assert "test.css" in files
 
 
 def test_traversal_rejected(store):
     with pytest.raises((TraversalError, InvalidFileError, FileNotFoundError)):
-        store.read_file("../escape.css")
+        store.read_file("admin", "../escape.css")
 
 
 def test_traversal_in_write_rejected(store):
     with pytest.raises((TraversalError, InvalidFileError)):
-        store.write_file_atomic("../escape.css", "body {}")
+        store.write_file_atomic("admin", "../escape.css", "body {}", expected_hash=ABSENT)
 
 
 def test_symlink_escape_rejected(store, tmp_path):
@@ -61,45 +64,71 @@ def test_symlink_escape_rejected(store, tmp_path):
     symlink.symlink_to(target_file)
 
     with pytest.raises(TraversalError):
-        store.read_file("admin/symlink.css")
+        store.read_file("admin", "symlink.css")
 
 
 def test_non_css_rejected(store):
     with pytest.raises(InvalidFileError):
-        store.read_file("admin/file.txt")
+        store.read_file("admin", "file.txt")
 
     with pytest.raises(InvalidFileError):
-        store.write_file_atomic("admin/file.txt", "body {}")
+        store.write_file_atomic("admin", "file.txt", "body {}", expected_hash=ABSENT)
+
+
+def test_invalid_scope_rejected(store):
+    with pytest.raises(InvalidScopeError):
+        store.read_file("badscope", "test.css")
+
+    with pytest.raises(InvalidScopeError):
+        store.list_files("badscope")
+
+
+def test_missing_expected_hash_raises(store):
+    with pytest.raises(MissingExpectedHashError):
+        store.write_file_atomic("admin", "test.css", "body {}", expected_hash=None)
+
+
+def test_absent_sentinel_for_new_files(store):
+    # ABSENT expected → new file must not exist
+    store.write_file_atomic("admin", "test.css", "body { color: blue; }", expected_hash=ABSENT)
+    content = store.read_file("admin", "test.css")
+    assert "blue" in content
+
+
+def test_absent_raises_if_file_exists(store):
+    store.write_file_atomic("admin", "test.css", "body { color: blue; }", expected_hash=ABSENT)
+    with pytest.raises(HashConflictError):
+        store.write_file_atomic("admin", "test.css", "body { color: red; }", expected_hash=ABSENT)
 
 
 def test_hash_conflict(store):
-    store.write_file_atomic("admin/test.css", "body { color: blue; }")
+    store.write_file_atomic("admin", "test.css", "body { color: blue; }", expected_hash=ABSENT)
     wrong_hash = "a" * 64
     with pytest.raises(HashConflictError):
-        store.write_file_atomic("admin/test.css", "body { color: red; }", expected_hash=wrong_hash)
+        store.write_file_atomic("admin", "test.css", "body { color: red; }", expected_hash=wrong_hash)
 
 
 def test_correct_hash_allows_write(store):
-    store.write_file_atomic("admin/test.css", "body { color: blue; }")
-    correct_hash = store.calculate_hash("admin/test.css")
-    new_hash = store.write_file_atomic("admin/test.css", "body { color: green; }", expected_hash=correct_hash)
-    content = store.read_file("admin/test.css")
+    store.write_file_atomic("admin", "test.css", "body { color: blue; }", expected_hash=ABSENT)
+    correct_hash = store.calculate_hash("admin", "test.css")
+    new_hash = store.write_file_atomic("admin", "test.css", "body { color: green; }", expected_hash=correct_hash)
+    content = store.read_file("admin", "test.css")
     assert "green" in content
     assert len(new_hash) == 64  # SHA-256 hex
 
 
 def test_delete_file(store):
-    store.write_file_atomic("admin/test.css", "body {}")
-    file_hash = store.calculate_hash("admin/test.css")
-    store.delete_file_atomic("admin/test.css", file_hash)
+    store.write_file_atomic("admin", "test.css", "body {}", expected_hash=ABSENT)
+    file_hash = store.calculate_hash("admin", "test.css")
+    store.delete_file_atomic("admin", "test.css", file_hash)
     with pytest.raises(FileNotFoundError):
-        store.read_file("admin/test.css")
+        store.read_file("admin", "test.css")
 
 
 def test_delete_with_wrong_hash(store):
-    store.write_file_atomic("admin/test.css", "body {}")
+    store.write_file_atomic("admin", "test.css", "body {}", expected_hash=ABSENT)
     with pytest.raises(HashConflictError):
-        store.delete_file_atomic("admin/test.css", "wrong" * 12 + "1234")
+        store.delete_file_atomic("admin", "test.css", "wrong" * 12 + "1234")
 
 
 def test_utf8_enforced(store, tmp_path):
@@ -110,18 +139,27 @@ def test_utf8_enforced(store, tmp_path):
     bad_file.write_bytes(b"\xff\xfe body {}")
 
     with pytest.raises(EncodingError):
-        store.read_file("admin/bad.css")
+        store.read_file("admin", "bad.css")
 
 
 def test_file_not_found(store):
     with pytest.raises(FileNotFoundError):
-        store.read_file("admin/nonexistent.css")
+        store.read_file("admin", "nonexistent.css")
 
 
 def test_calculate_hash_consistent(store):
     content = "body { color: red; }"
-    store.write_file_atomic("admin/test.css", content)
-    hash1 = store.calculate_hash("admin/test.css")
-    hash2 = store.calculate_hash("admin/test.css")
+    store.write_file_atomic("admin", "test.css", content, expected_hash=ABSENT)
+    hash1 = store.calculate_hash("admin", "test.css")
+    hash2 = store.calculate_hash("admin", "test.css")
     assert hash1 == hash2
     assert len(hash1) == 64
+
+
+def test_pages_scope_isolated_from_admin(store):
+    store.write_file_atomic("admin", "test.css", "/* admin */", expected_hash=ABSENT)
+    store.write_file_atomic("pages", "test.css", "/* pages */", expected_hash=ABSENT)
+    admin_content = store.read_file("admin", "test.css")
+    pages_content = store.read_file("pages", "test.css")
+    assert "admin" in admin_content
+    assert "pages" in pages_content

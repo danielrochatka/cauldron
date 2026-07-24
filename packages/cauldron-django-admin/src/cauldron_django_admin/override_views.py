@@ -7,8 +7,6 @@ from pathlib import Path
 from django.http import HttpRequest, HttpResponse
 from django.views import View
 
-_MAX_FILE_BYTES = 256 * 1024
-
 
 def _get_override_root() -> Path | None:
     from django.conf import settings
@@ -22,23 +20,29 @@ def _get_override_root() -> Path | None:
 
 
 class CSSOverrideView(View):
-    """Serve a site CSS override file safely."""
+    """Serve a site CSS override file safely.
 
-    def get(self, request: HttpRequest, scope: str, filename: str) -> HttpResponse:
-        from .override_store import UIOverrideStore, TraversalError, InvalidFileError, FileSizeError
+    URL pattern: ``cauldron-overrides/<str:scope>/<path:rel_path>``
+    The ``<path:rel_path>`` captures nested paths like ``subdir/file.css``.
+    """
+
+    def get(self, request: HttpRequest, scope: str, rel_path: str) -> HttpResponse:
+        from .override_store import (
+            UIOverrideStore,
+            TraversalError, InvalidFileError, InvalidScopeError, FileSizeError,
+        )
 
         root = _get_override_root()
-        if root is None:
+        if root is None or not root.is_dir():
             return HttpResponse(b"", content_type="text/css; charset=utf-8", status=200)
 
         store = UIOverrideStore(root)
-        rel_path = f"{scope}/{filename}"
 
         try:
-            content = store.read_file(rel_path)
+            content = store.read_file(scope, rel_path)
         except FileNotFoundError:
             return HttpResponse(b"", content_type="text/css; charset=utf-8", status=200)
-        except (TraversalError, InvalidFileError, FileSizeError):
+        except (TraversalError, InvalidFileError, InvalidScopeError, FileSizeError):
             return HttpResponse(b"", content_type="text/css; charset=utf-8", status=403)
 
         encoded = content.encode("utf-8")

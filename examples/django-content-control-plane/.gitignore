@@ -1,5 +1,6 @@
 db.sqlite3
 site/.cauldron/workspace/
+cauldron-overrides/
 *.pyc
 __pycache__/
 .env

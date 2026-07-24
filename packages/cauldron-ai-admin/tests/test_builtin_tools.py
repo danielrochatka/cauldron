@@ -246,6 +246,7 @@ def test_module_status_no_secrets_or_paths():
         assert set(m.keys()) == {
             "name", "capabilities", "dependencies",
             "status", "version", "health",
+            "capability_providers", "dependency_health", "errors",
         }
 
 

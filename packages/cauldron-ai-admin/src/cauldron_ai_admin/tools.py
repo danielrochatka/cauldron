@@ -228,19 +228,18 @@ class AdminAIToolContext:
 
 @dataclass(frozen=True)
 class AdminAIToolResult:
-    """Success shape returned by a tool handler."""
+    """Success shape returned by a tool handler.
+
+    Full contract validation (tool_name / success / message / data
+    JSON-compat) happens in the service on return so that a mis-shaped
+    result is deterministically recorded as ``tool.bad_return_type``
+    rather than surfacing as a handler exception during construction.
+    """
 
     tool_name: str
     success: bool = True
     data: Any = None                 # JSON-serialisable
     message: str = ""
-
-    def __post_init__(self) -> None:
-        # Validate JSON compatibility of the data payload (if any); a
-        # non-``None`` value that isn't strict-JSON safe is a bug in the
-        # tool handler.
-        if self.data is not None:
-            _assert_json_compatible(self.data)
 
 
 @dataclass(frozen=True)
@@ -255,12 +254,20 @@ class AdminAIToolError:
 AdminAIToolHandler = Callable[..., "AdminAIToolResult | AdminAIToolError"]
 
 
-def _validate_handler_signature(handler: Callable[..., Any]) -> None:
+def _validate_handler_signature(
+    handler: Callable[..., Any],
+    definition: "AdminAIToolDefinition | None" = None,
+) -> None:
     """Raise ``ValueError`` when *handler* cannot receive ``(context, **kwargs)``.
 
     A tool handler must take a positional context argument first and any
     additional arguments must be keyword-friendly (either
     positional-or-keyword, keyword-only, or captured by ``**kwargs``).
+
+    When *definition* is provided the argument-schema and handler kwargs
+    must be bidirectionally compatible: unless the handler accepts
+    ``**kwargs``, every schema property must be a kwarg the handler
+    accepts, and every handler-required kwarg must appear in the schema.
     """
     try:
         sig = inspect.signature(handler)
@@ -282,11 +289,59 @@ def _validate_handler_signature(handler: Callable[..., Any]) -> None:
             "Tool handler's first parameter must be positional (context); "
             f"got {first.kind.name}"
         )
-    for extra in params[1:]:
-        if extra.kind == inspect.Parameter.VAR_POSITIONAL:
+
+    remaining = {
+        name: p for name, p in sig.parameters.items() if name != first.name
+    }
+    has_var_keyword = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in remaining.values()
+    )
+    has_var_positional = any(
+        p.kind == inspect.Parameter.VAR_POSITIONAL for p in remaining.values()
+    )
+
+    if has_var_positional:
+        raise ValueError("Handler must not have *args")
+
+    for name, p in remaining.items():
+        if p.kind == inspect.Parameter.POSITIONAL_ONLY:
             raise ValueError(
-                "Tool handler must not accept *args after context"
+                f"Handler param {name!r} must not be positional-only"
             )
+
+    if definition is None:
+        return
+
+    schema_props = set(definition.argument_schema.get("properties", {}).keys())
+    if has_var_keyword:
+        # Handler accepts arbitrary kwargs; no need to compare specific names.
+        return
+
+    handler_kw = {
+        name for name, p in remaining.items()
+        if p.kind in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    }
+    handler_required = {
+        name for name, p in remaining.items()
+        if p.default is inspect.Parameter.empty
+        and p.kind in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    }
+    unsupported = schema_props - handler_kw
+    if unsupported:
+        raise ValueError(
+            f"Schema properties not in handler: {sorted(unsupported)}"
+        )
+    missing = handler_required - schema_props
+    if missing:
+        raise ValueError(
+            f"Handler requires params not in schema: {sorted(missing)}"
+        )
 
 
 class AdminAIToolRegistry:
@@ -316,8 +371,10 @@ class AdminAIToolRegistry:
             raise TypeError("handler must be callable")
 
         # Handler signature: must accept a positional context and only
-        # keyword-friendly params after that.
-        _validate_handler_signature(handler)
+        # keyword-friendly params after that. When a definition is
+        # provided the handler kwargs and argument_schema must also be
+        # bidirectionally compatible.
+        _validate_handler_signature(handler, definition)
 
         # Reserved namespace: server.* is only for the Admin AI server package.
         if definition.name.startswith(SERVER_NAMESPACE) and (

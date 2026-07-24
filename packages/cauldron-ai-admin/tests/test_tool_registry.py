@@ -182,6 +182,101 @@ def test_register_accepts_kw_only_after_context():
     r.register(_defn("a.b"), ok_handler)
 
 
+# ---------------------------- ITEM 2: handler/schema signature compatibility
+
+
+def _schema_defn(name: str, schema: dict) -> AdminAIToolDefinition:
+    return AdminAIToolDefinition(
+        name=name, version="1.0", description="",
+        argument_schema=schema,
+        risk_level=RiskLevel.READ_ONLY,
+        required_permission="p.q",
+        owning_module="cauldron.test",
+    )
+
+
+def test_register_rejects_handler_with_star_args_after_context():
+    r = AdminAIToolRegistry()
+
+    def bad_handler(ctx, *args, **kwargs):  # pragma: no cover
+        return None
+
+    with pytest.raises(ValueError):
+        r.register(_schema_defn("a.b", {"type": "object"}), bad_handler)
+
+
+def test_register_rejects_positional_only_second_param():
+    r = AdminAIToolRegistry()
+    # Build a handler with a positional-only second param via exec — the
+    # syntax uses PEP 570 ``/``.
+    ns: dict = {}
+    exec(
+        "def bad_handler(ctx, foo, /, **kw):\n    return None\n",
+        ns,
+    )
+    bad_handler = ns["bad_handler"]
+    with pytest.raises(ValueError):
+        r.register(_schema_defn("a.b", {"type": "object"}), bad_handler)
+
+
+def test_register_rejects_handler_required_kwarg_not_in_schema():
+    r = AdminAIToolRegistry()
+
+    def bad_handler(ctx, *, foo):  # required kwarg 'foo', schema has none
+        return AdminAIToolResult(tool_name="a.b", success=True)
+
+    schema = {"type": "object", "properties": {}, "additionalProperties": False}
+    with pytest.raises(ValueError):
+        r.register(_schema_defn("a.b", schema), bad_handler)
+
+
+def test_register_accepts_handler_with_var_kwargs_and_any_schema():
+    r = AdminAIToolRegistry()
+
+    def any_handler(ctx, **kwargs):
+        return AdminAIToolResult(tool_name="a.b", success=True)
+
+    schema = {
+        "type": "object",
+        "properties": {"anything": {"type": "string"}},
+    }
+    r.register(_schema_defn("a.b", schema), any_handler)
+
+
+def test_register_accepts_exact_schema_match():
+    r = AdminAIToolRegistry()
+
+    def ok_handler(ctx, *, collection, limit=None):
+        return AdminAIToolResult(tool_name="a.b", success=True)
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "collection": {"type": "string"},
+            "limit": {"type": "integer"},
+        },
+        "required": ["collection"],
+    }
+    r.register(_schema_defn("a.b", schema), ok_handler)
+
+
+def test_register_rejects_schema_property_missing_from_handler():
+    r = AdminAIToolRegistry()
+
+    def narrow_handler(ctx, *, collection=None):
+        return AdminAIToolResult(tool_name="a.b", success=True)
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "collection": {"type": "string"},
+            "unexpected": {"type": "string"},
+        },
+    }
+    with pytest.raises(ValueError):
+        r.register(_schema_defn("a.b", schema), narrow_handler)
+
+
 # ---------------------------------------------------------- builtin protection
 
 

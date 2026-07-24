@@ -125,6 +125,9 @@ def _handle_list_collections(context: AdminAIToolContext, **kwargs) -> Any:
     svc = _content_service_or_error("content.list_collections", context)
     if isinstance(svc, AdminAIToolError):
         return svc
+    deadline_err = _check_deadline("content.list_collections", context)
+    if deadline_err is not None:
+        return deadline_err
     try:
         names = svc.list_collections(user=context.actor)
     except Exception as exc:
@@ -179,6 +182,9 @@ def _handle_list_items(context: AdminAIToolContext, **kwargs) -> Any:
     svc = _content_service_or_error("content.list_items", context)
     if isinstance(svc, AdminAIToolError):
         return svc
+    deadline_err = _check_deadline("content.list_items", context)
+    if deadline_err is not None:
+        return deadline_err
     try:
         items = svc.list_items(
             collection, user=context.actor, include_drafts=include_drafts,
@@ -238,6 +244,9 @@ def _handle_get_item(context: AdminAIToolContext, **kwargs) -> Any:
     svc = _content_service_or_error("content.get_item", context)
     if isinstance(svc, AdminAIToolError):
         return svc
+    deadline_err = _check_deadline("content.get_item", context)
+    if deadline_err is not None:
+        return deadline_err
     try:
         item = svc.get_item(
             item_id, collection, user=context.actor, include_drafts=include_drafts,
@@ -413,6 +422,9 @@ def _handle_preview_change_request(context: AdminAIToolContext, **kwargs) -> Any
             error_code="content.service_unsupported",
             message="Service does not expose get_preview.",
         )
+    deadline_err = _check_deadline("content.preview_change_request", context)
+    if deadline_err is not None:
+        return deadline_err
     try:
         preview = svc.get_preview(cs_id, user=context.actor)
     except Exception as exc:
@@ -492,6 +504,9 @@ def _handle_django_checks(context: AdminAIToolContext, **kwargs) -> Any:
     # Use Python API — never a subprocess.
     from django.core.checks.registry import registry as check_registry
     filtered = list(tags) if tags else []
+    deadline_err = _check_deadline("system.django_checks", context)
+    if deadline_err is not None:
+        return deadline_err
     try:
         raw = check_registry.run_checks(tags=filtered) if filtered \
             else check_registry.run_checks()
@@ -544,6 +559,95 @@ _MODULE_STATUS_SCHEMA: dict = {
 }
 
 
+_MAX_MODULE_STATUS_ERROR_STRING_BYTES = 400
+_MAX_MODULE_STATUS_ERRORS = 20
+
+
+def _bound_error_string(text: str) -> str:
+    """Truncate an error surface string to a bounded UTF-8 length."""
+    if not isinstance(text, str):
+        text = str(text)
+    encoded = text.encode("utf-8")
+    if len(encoded) <= _MAX_MODULE_STATUS_ERROR_STRING_BYTES:
+        return text
+    return encoded[:_MAX_MODULE_STATUS_ERROR_STRING_BYTES].decode(
+        "utf-8", "ignore",
+    )
+
+
+def _capability_provider_overrides() -> dict[str, str]:
+    """Read ``CAULDRON_CAPABILITY_PROVIDERS`` from Django settings."""
+    try:
+        from django.conf import settings
+    except Exception:
+        return {}
+    raw = getattr(settings, "CAULDRON_CAPABILITY_PROVIDERS", None) or {}
+    if not isinstance(raw, dict):
+        return {}
+    overrides: dict[str, str] = {}
+    for k, v in raw.items():
+        if isinstance(k, str) and isinstance(v, str) and k and v:
+            overrides[k] = v
+    return overrides
+
+
+def _ai_provider_names() -> list[str]:
+    """Return the sorted list of registered AI-model provider names, or []."""
+    try:
+        from cauldron_ai.providers import provider_names
+        return sorted(provider_names())
+    except Exception:
+        return []
+
+
+def _resolve_capability(
+    capability: str,
+    providers: list[str],
+    overrides: dict[str, str],
+) -> tuple[str | None, bool, list[str]]:
+    """Resolve (selected, ambiguous, errors) for a single capability."""
+    if not providers:
+        # No providers registered for the capability. Not ambiguous, but a
+        # missing provider is a resolution error the caller can bubble up.
+        return None, False, []
+    if len(providers) == 1:
+        return providers[0], False, []
+    override = overrides.get(capability)
+    if override and override in providers:
+        return override, False, []
+    return (
+        None,
+        True,
+        [_bound_error_string(
+            f"Capability {capability!r} has multiple providers "
+            f"{providers!r}; set CAULDRON_CAPABILITY_PROVIDERS to select."
+        )],
+    )
+
+
+def _dependency_health(dep_slug: str, active_slugs: set[str]) -> str:
+    """Return 'ok', 'missing', or 'unknown' for a declared dependency."""
+    if not dep_slug:
+        return "unknown"
+    # First look for the slug in the active module set.
+    if dep_slug in active_slugs:
+        return "ok"
+    # Then look up whether it's the app-label of a Django installed app.
+    try:
+        from django.conf import settings
+        installed = list(getattr(settings, "INSTALLED_APPS", []) or [])
+    except Exception:
+        return "unknown"
+    # Match slug directly or by dotted last segment (app_label).
+    for entry in installed:
+        if entry == dep_slug:
+            return "ok"
+        # e.g. dep "django.state" and INSTALLED_APPS has "cauldron_django_state"
+        if entry.endswith(dep_slug.replace(".", "_")):
+            return "ok"
+    return "missing"
+
+
 def _handle_module_status(context: AdminAIToolContext, **kwargs) -> Any:
     deadline_err = _check_deadline("system.module_status", context)
     if deadline_err is not None:
@@ -562,18 +666,49 @@ def _handle_module_status(context: AdminAIToolContext, **kwargs) -> Any:
             error_code="system.module_registry_unavailable",
             message=redact_exception(exc, max_bytes=200),
         )
+
+    # Deadline check immediately before touching the registry — the graph
+    # walk can be non-trivial on large installs.
+    deadline_err = _check_deadline("system.module_status", context)
+    if deadline_err is not None:
+        return deadline_err
+
     graph = module_registry.graph_info() or []
-    lifecycle_errors_by_slug: dict[str, int] = {}
+    lifecycle_errors_by_slug: dict[str, list[str]] = {}
     try:
         for lifecycle_error in module_registry.lifecycle_errors():
             slug = getattr(lifecycle_error, "module_slug", "")
             if isinstance(slug, str) and slug:
-                lifecycle_errors_by_slug[slug] = (
-                    lifecycle_errors_by_slug.get(slug, 0) + 1
-                )
+                # We don't surface raw exception text — just a bounded
+                # class-name summary consistent with redact_exception.
+                exc = getattr(lifecycle_error, "exception", None)
+                if exc is not None:
+                    err_str = redact_exception(exc, max_bytes=200)
+                else:
+                    err_str = "LifecycleError: [details omitted]"
+                lifecycle_errors_by_slug.setdefault(slug, []).append(err_str)
     except Exception:
         # Older registries may not expose lifecycle_errors — treat as none.
         lifecycle_errors_by_slug = {}
+
+    # Registry-level capability provider mapping (module system).
+    try:
+        capability_map = module_registry.capabilities()
+        if not isinstance(capability_map, dict):
+            capability_map = {}
+    except Exception:
+        capability_map = {}
+
+    # Overrides from Django settings (module system + AI provider system).
+    overrides = _capability_provider_overrides()
+
+    # Registered AI providers (a separate registry from the module system).
+    ai_provider_names = _ai_provider_names()
+
+    active_slugs = {
+        entry.get("slug", "") for entry in graph if entry.get("active")
+    }
+
     modules = []
     for entry in graph:
         slug = entry.get("slug", "") or ""
@@ -583,27 +718,65 @@ def _handle_module_status(context: AdminAIToolContext, **kwargs) -> Any:
             dep_slug = req.get("slug") if isinstance(req, dict) else None
             if isinstance(dep_slug, str) and dep_slug and dep_slug not in deps:
                 deps.append(dep_slug)
-        for dep_slug in entry.get("deps", []) or []:
-            if isinstance(dep_slug, str) and dep_slug and dep_slug not in deps:
-                deps.append(dep_slug)
+        capabilities_provided = list(entry.get("provides", []) or [])
         active = bool(entry.get("active"))
-        # Status: derived from active flag.
+        entry_errors: list[str] = []
+
+        # Status: derived from active flag + lifecycle errors.
         if lifecycle_errors_by_slug.get(slug):
             status = "error"
             health: str = "degraded"
+            entry_errors.extend(lifecycle_errors_by_slug[slug])
         elif active:
             status = "active"
             health = "unknown"  # true health signal is not fabricated.
         else:
             status = "inactive"
             health = "unknown"
+
+        # Capability providers this module provides.
+        capability_providers: dict[str, dict[str, Any]] = {}
+        resolution_errors: list[str] = []
+        for cap in sorted(set(capabilities_provided)):
+            if cap == "ai.model.providers":
+                cap_providers = list(ai_provider_names)
+            else:
+                cap_providers = sorted(capability_map.get(cap, []) or [])
+            selected, ambiguous, errors = _resolve_capability(
+                cap, cap_providers, overrides,
+            )
+            if errors:
+                resolution_errors.extend(errors)
+                entry_errors.extend(errors)
+            capability_providers[cap] = {
+                "providers": cap_providers,
+                "selected": selected,
+                "ambiguous": ambiguous,
+                "resolution_errors": errors,
+            }
+
+        # Dependency health for declared requires.
+        dependency_health: dict[str, str] = {}
+        for dep_slug in sorted(deps):
+            dependency_health[dep_slug] = _dependency_health(
+                dep_slug, active_slugs,
+            )
+
+        # Bound the surfaced entry-level error list.
+        bounded_errors = [
+            _bound_error_string(s) for s in entry_errors
+        ][:_MAX_MODULE_STATUS_ERRORS]
+
         modules.append({
             "name": slug,
-            "capabilities": list(entry.get("provides", []) or []),
+            "version": entry.get("version", ""),
+            "capabilities": capabilities_provided,
             "dependencies": sorted(deps),
             "status": status,
-            "version": entry.get("version", ""),
             "health": health,
+            "capability_providers": capability_providers,
+            "dependency_health": dependency_health,
+            "errors": bounded_errors,
         })
     return AdminAIToolResult(
         tool_name="system.module_status",

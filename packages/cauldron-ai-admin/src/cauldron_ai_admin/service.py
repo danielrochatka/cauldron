@@ -48,6 +48,7 @@ from cauldron_ai.contracts import (
     AIModelResponse,
     AIModelToolCall,
     AIModelToolDefinition,
+    _assert_json_compatible,
 )
 from cauldron_ai.providers import AIModelProvider
 
@@ -180,15 +181,21 @@ class AdminAIService:
         # sensitive key/value fragments never enter the durable audit row.
         bounded_request = redact(request_text, max_bytes=self._max_argument_bytes)
 
-        # Caller-supplied correlation_id: truncate at 128 UTF-8 bytes.
-        safe_correlation_id = bound_utf8(correlation_id or "", 128)
+        # Caller-supplied correlation_id: truncate at MAX_CORRELATION_ID_BYTES
+        # UTF-8 bytes. This single bounded value is threaded through every
+        # downstream location — the persisted run row, the provider request,
+        # the tool context, and every per-invocation row — so the bounded
+        # form is authoritative.
+        bounded_correlation_id = bound_utf8(
+            correlation_id or "", MAX_CORRELATION_ID_BYTES,
+        )
 
         run = AdminAIRun.objects.create(
             actor=actor,
             status="created",
             provider_name=getattr(self._provider, "name", "") or "unknown",
             user_request=bounded_request,
-            correlation_id=safe_correlation_id,
+            correlation_id=bounded_correlation_id,
         )
         run.started_at = django_timezone.now()
         run.status = "running"
@@ -199,7 +206,9 @@ class AdminAIService:
         )
 
         try:
-            self._execute_loop(run, actor, request_text, correlation_id, deadline)
+            self._execute_loop(
+                run, actor, request_text, bounded_correlation_id, deadline,
+            )
         except PermissionDenied:
             raise
         except Exception as exc:  # pragma: no cover - defensive
@@ -500,9 +509,11 @@ class AdminAIService:
                 call.id, "restricted", "Restricted tool.",
             )
 
-        # Deadline check before execution.
+        # Deadline check before execution: refuse if less than the minimum
+        # meaningful budget remains. Persist the full requested → authorized
+        # → timed_out transition so the audit row reflects reality.
         remaining = (deadline - datetime.now(tz=timezone.utc)).total_seconds()
-        if remaining <= 0:
+        if remaining < _DEADLINE_EPSILON:
             invocation = self._new_invocation_row(
                 run, call, definition, status="requested",
                 correlation_id=correlation_id,
@@ -616,12 +627,19 @@ class AdminAIService:
             # Tool-name mismatch on an error return is a handler contract
             # violation — record as bad_return_type and fail the run so an
             # operator can trace the mis-behaving handler.
-            if outcome.tool_name != definition.name:
-                invocation.status = "failed"
-                invocation.error_code = "tool.bad_return_type"
+            violation = _validate_error_contract(outcome, definition.name)
+            if violation is not None:
+                return self._fail_bad_return_type(
+                    run, invocation, call, violation,
+                )
+            # Handler-signalled timeout: record as timed_out rather than
+            # failed so operators see the right invocation-level status,
+            # but the run still fails and the model does not see success.
+            if outcome.error_code == "tool.timeout":
+                invocation.status = "timed_out"
+                invocation.error_code = "tool.timeout"
                 invocation.result_summary = redact(
-                    "Handler returned AdminAIToolError with mismatched tool_name.",
-                    max_bytes=1024,
+                    outcome.message, max_bytes=1024,
                 )
                 invocation.save(update_fields=[
                     "status", "error_code", "result_summary",
@@ -630,12 +648,12 @@ class AdminAIService:
                 run.tool_call_count = run.tool_call_count + 1
                 run.save(update_fields=["tool_call_count"])
                 self._finalize_error(
-                    run, "tool.bad_return_type",
-                    "Handler returned AdminAIToolError with mismatched tool_name.",
+                    run, "tool.timeout",
+                    outcome.message or "Tool timed out.",
                 )
                 return _tool_error_message(
-                    call.id, "tool.bad_return_type",
-                    "Tool returned mismatched tool_name.",
+                    call.id, "tool.timeout",
+                    outcome.message or "Tool timed out.",
                 )
             invocation.status = "failed"
             invocation.error_code = bound_utf8(outcome.error_code, 128)
@@ -650,71 +668,22 @@ class AdminAIService:
 
         # Success.
         if not isinstance(outcome, AdminAIToolResult):
-            invocation.status = "failed"
-            invocation.error_code = "tool.bad_return_type"
-            invocation.result_summary = f"{type(outcome).__name__}"[:1024]
-            invocation.save(update_fields=[
-                "status", "error_code", "result_summary",
-                "duration_ms", "completed_at",
-            ])
-            run.tool_call_count = run.tool_call_count + 1
-            run.save(update_fields=["tool_call_count"])
-            return _tool_error_message(
-                call.id, "tool.bad_return_type",
-                "Tool returned unsupported type.",
+            return self._fail_bad_return_type(
+                run, invocation, call,
+                f"Tool returned unsupported type: {type(outcome).__name__}",
             )
 
-        # tool_name mismatch
-        if outcome.tool_name != definition.name:
-            invocation.status = "failed"
-            invocation.error_code = "tool.bad_return_type"
-            invocation.result_summary = "Handler returned mismatched tool_name."
-            invocation.save(update_fields=[
-                "status", "error_code", "result_summary",
-                "duration_ms", "completed_at",
-            ])
-            run.tool_call_count = run.tool_call_count + 1
-            run.save(update_fields=["tool_call_count"])
-            return _tool_error_message(
-                call.id, "tool.bad_return_type",
-                "Tool returned mismatched tool_name.",
-            )
-
-        # success flag must be True
-        if outcome.success is not True:
-            invocation.status = "failed"
-            invocation.error_code = "tool.bad_return_type"
-            invocation.result_summary = "Handler returned AdminAIToolResult with success=False."
-            invocation.save(update_fields=[
-                "status", "error_code", "result_summary",
-                "duration_ms", "completed_at",
-            ])
-            run.tool_call_count = run.tool_call_count + 1
-            run.save(update_fields=["tool_call_count"])
-            return _tool_error_message(
-                call.id, "tool.bad_return_type",
-                "Tool returned unexpected success flag.",
-            )
-
-        # JSON-serialisability check (no default=str).
-        try:
-            data_encoded = json.dumps(outcome.data, sort_keys=True, ensure_ascii=False, allow_nan=False)
-        except (TypeError, ValueError):
-            invocation.status = "failed"
-            invocation.error_code = "tool.bad_return_type"
-            invocation.result_summary = "Tool result is not JSON-serialisable."
-            invocation.save(update_fields=[
-                "status", "error_code", "result_summary",
-                "duration_ms", "completed_at",
-            ])
-            run.tool_call_count = run.tool_call_count + 1
-            run.save(update_fields=["tool_call_count"])
-            return _tool_error_message(
-                call.id, "tool.bad_return_type",
-                "Tool result is not JSON-serialisable.",
+        # Full AdminAIToolResult contract validation. Any violation is a
+        # tool.bad_return_type — the result is never returned to the model.
+        violation = _validate_result_contract(outcome, definition.name)
+        if violation is not None:
+            return self._fail_bad_return_type(
+                run, invocation, call, violation,
             )
 
         # Compose the full tool result payload to send back to the model.
+        # Serialisation is fail-closed: any failure is tool.result_not_serializable,
+        # no encoding fallback.
         payload = {
             "tool_name": outcome.tool_name,
             "success": True,
@@ -722,9 +691,33 @@ class AdminAIService:
             "message": outcome.message,
         }
         try:
-            payload_encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, allow_nan=False)
-        except (TypeError, ValueError):  # pragma: no cover - covered by earlier check
-            payload_encoded = data_encoded
+            payload_encoded = json.dumps(
+                _to_plain_json(payload),
+                sort_keys=True,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError):
+            invocation.status = "failed"
+            invocation.error_code = "tool.result_not_serializable"
+            invocation.result_summary = redact(
+                "Tool result envelope failed JSON serialization.",
+                max_bytes=1024,
+            )
+            invocation.save(update_fields=[
+                "status", "error_code", "result_summary",
+                "duration_ms", "completed_at",
+            ])
+            run.tool_call_count = run.tool_call_count + 1
+            run.save(update_fields=["tool_call_count"])
+            self._finalize_error(
+                run, "tool.result_not_serializable",
+                "Tool result envelope failed JSON serialization.",
+            )
+            return _tool_error_message(
+                call.id, "tool.result_not_serializable",
+                "Tool result envelope failed JSON serialization.",
+            )
         payload_bytes = len(payload_encoded.encode("utf-8"))
         if payload_bytes > effective_max_bytes:
             invocation.status = "failed"
@@ -754,6 +747,36 @@ class AdminAIService:
             role="tool",
             content=bound_utf8(payload_encoded, effective_max_bytes),
             tool_call_id=call.id,
+        )
+
+    def _fail_bad_return_type(
+        self,
+        run: AdminAIRun,
+        invocation: AdminAIToolInvocation,
+        call: AIModelToolCall,
+        summary: str,
+    ) -> AIModelMessage:
+        """Persist ``tool.bad_return_type``, fail the run, and return the
+        stub tool-error message that goes back to the model channel.
+
+        Never returns the offending handler result. Caller must supply a
+        bounded, already-redacted summary. ``duration_ms`` and
+        ``completed_at`` are assumed to be already set on *invocation*.
+        """
+        invocation.status = "failed"
+        invocation.error_code = "tool.bad_return_type"
+        invocation.result_summary = redact(summary, max_bytes=1024)
+        invocation.save(update_fields=[
+            "status", "error_code", "result_summary",
+            "duration_ms", "completed_at",
+        ])
+        run.tool_call_count = run.tool_call_count + 1
+        run.save(update_fields=["tool_call_count"])
+        self._finalize_error(
+            run, "tool.bad_return_type", summary,
+        )
+        return _tool_error_message(
+            call.id, "tool.bad_return_type", summary,
         )
 
     # -------------------------------------------------------------- finalizers
@@ -927,6 +950,64 @@ def _tool_error_message(call_id: str, code: str, message: str) -> AIModelMessage
         "message": message,
     }, sort_keys=True, ensure_ascii=False, allow_nan=False)
     return AIModelMessage(role="tool", content=payload, tool_call_id=call_id)
+
+
+_MAX_ERROR_CODE_BYTES = 128
+_MAX_ERROR_MESSAGE_BYTES = 1024
+
+
+def _validate_result_contract(
+    outcome: AdminAIToolResult, expected_name: str,
+) -> str | None:
+    """Return a bounded violation string, or None if the result is valid.
+
+    Full contract:
+    * ``tool_name`` is a non-empty str matching ``expected_name`` exactly.
+    * ``success`` is exactly ``True`` (not truthy).
+    * ``message`` is a str (any length, including empty).
+    * ``data`` passes ``_assert_json_compatible`` when not None.
+    """
+    if not isinstance(outcome.tool_name, str) or not outcome.tool_name:
+        return "AdminAIToolResult.tool_name must be a non-empty string."
+    if outcome.tool_name != expected_name:
+        return "AdminAIToolResult.tool_name does not match invoked tool."
+    if outcome.success is not True:
+        return "AdminAIToolResult.success must be exactly True."
+    if not isinstance(outcome.message, str):
+        return "AdminAIToolResult.message must be a string."
+    if outcome.data is not None:
+        try:
+            _assert_json_compatible(outcome.data)
+        except (TypeError, ValueError):
+            return "AdminAIToolResult.data is not JSON-compatible."
+    return None
+
+
+def _validate_error_contract(
+    outcome: AdminAIToolError, expected_name: str,
+) -> str | None:
+    """Return a bounded violation string, or None if the error is valid.
+
+    Full contract:
+    * ``tool_name`` is a non-empty str matching ``expected_name`` exactly.
+    * ``error_code`` is a non-empty str, at most ``_MAX_ERROR_CODE_BYTES``
+      UTF-8 bytes.
+    * ``message`` is a str, at most ``_MAX_ERROR_MESSAGE_BYTES`` UTF-8
+      bytes.
+    """
+    if not isinstance(outcome.tool_name, str) or not outcome.tool_name:
+        return "AdminAIToolError.tool_name must be a non-empty string."
+    if outcome.tool_name != expected_name:
+        return "AdminAIToolError.tool_name does not match invoked tool."
+    if not isinstance(outcome.error_code, str) or not outcome.error_code:
+        return "AdminAIToolError.error_code must be a non-empty string."
+    if len(outcome.error_code.encode("utf-8")) > _MAX_ERROR_CODE_BYTES:
+        return "AdminAIToolError.error_code exceeds byte limit."
+    if not isinstance(outcome.message, str):
+        return "AdminAIToolError.message must be a string."
+    if len(outcome.message.encode("utf-8")) > _MAX_ERROR_MESSAGE_BYTES:
+        return "AdminAIToolError.message exceeds byte limit."
+    return None
 
 
 def _payload_bytes(payload: Any) -> int:

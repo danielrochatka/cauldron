@@ -1,0 +1,178 @@
+"""Django settings for the Cauldron self-hosted instance."""
+import os
+import secrets
+import sys
+from pathlib import Path
+
+# Base directory is the cauldron-app/ directory (parent of this file's package)
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Content and workspace paths
+CONTENT_DIR = BASE_DIR / "content"
+SCHEMAS_DIR = BASE_DIR / "schemas"
+WORKSPACE_DIR = BASE_DIR / "data" / "workspace"
+
+# ---------------------------------------------------------------------------
+# Security
+# ---------------------------------------------------------------------------
+
+_secret = os.environ.get("SECRET_KEY")
+if not _secret:
+    if sys.argv[1:2] in [["runserver"], ["start"]]:
+        print(
+            "WARNING: SECRET_KEY is not set. Set it in config.env for production.",
+            file=sys.stderr,
+        )
+    _secret = secrets.token_hex(32)
+SECRET_KEY = _secret
+
+DEBUG = os.environ.get("CAULDRON_DEBUG", "false").lower() == "true"
+
+_allowed_host = os.environ.get("CAULDRON_HOST", "")
+ALLOWED_HOSTS = (
+    [h.strip() for h in _allowed_host.split(",") if h.strip()]
+    if _allowed_host
+    else ["localhost", "127.0.0.1"]
+)
+
+# ---------------------------------------------------------------------------
+# Cauldron modules
+# ---------------------------------------------------------------------------
+
+CAULDRON_MODULES = {
+    "cauldron.content": {
+        "routing": {
+            "default_provider": "flatfile",
+            "collections": {},
+        },
+    },
+    "cauldron.workspace.flatfile": {
+        "workspace_root": str(WORKSPACE_DIR),
+    },
+    "cauldron.cms.flatfile": {
+        "content_root": str(CONTENT_DIR),
+        "schemas_root": str(SCHEMAS_DIR),
+    },
+    "cauldron.django.state": {},
+    "cauldron.django.auth": {},
+    "cauldron.django.admin": {},
+    "cauldron.content.operations": {
+        "require_approval": True,
+        "allow_self_approval": False,
+        "max_operations_per_change_set": 100,
+    },
+    "cauldron.content.api": {},
+    "cauldron.admin.content": {},
+    "cauldron.ai": {},
+    # Admin AI: uses the deterministic FakeAIModelProvider that
+    # cauldron_site.admin_ai_bootstrap registers in AppConfig.ready().
+    # Real deployments configure a vendor provider package instead.
+    "cauldron.ai.admin": {
+        "provider": "fake",
+        "max_model_turns": 3,
+        "max_tool_calls": 5,
+        "tool_timeout_seconds": 10,
+        "run_timeout_seconds": 30,
+        "max_argument_bytes": 4096,
+        "max_result_bytes": 8192,
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Django application composition
+# ---------------------------------------------------------------------------
+
+from cauldron.django.compose import compose_django_settings
+
+_plan = compose_django_settings(
+    installed_apps=[
+        "django.contrib.contenttypes",
+        "cauldron",
+        # Registers the FakeAIModelProvider used by cauldron.ai.admin.
+        "cauldron_site.admin_ai_bootstrap.AdminAIBootstrapConfig",
+        # Admin AI models/migrations/checks.
+        "cauldron_ai_admin",
+    ],
+    middleware=[
+        "django.middleware.security.SecurityMiddleware",
+        "django.middleware.common.CommonMiddleware",
+        "django.middleware.csrf.CsrfViewMiddleware",
+        "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    ],
+    context_processors=[
+        "django.template.context_processors.debug",
+        "django.template.context_processors.request",
+    ],
+    module_settings=CAULDRON_MODULES,
+)
+
+INSTALLED_APPS = list(_plan.installed_apps)
+MIDDLEWARE = list(_plan.middleware)
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": BASE_DIR / "data" / "cauldron.db",
+    }
+}
+
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+AUTH_USER_MODEL = "auth.User"
+
+# ---------------------------------------------------------------------------
+# URLs and WSGI
+# ---------------------------------------------------------------------------
+
+ROOT_URLCONF = "cauldron_site.urls"
+WSGI_APPLICATION = "cauldron_site.wsgi.application"
+
+# ---------------------------------------------------------------------------
+# Templates
+# ---------------------------------------------------------------------------
+
+TEMPLATES = [
+    {
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [BASE_DIR / "templates"],
+        "APP_DIRS": True,
+        "OPTIONS": {
+            "context_processors": list(_plan.context_processors),
+        },
+    },
+]
+
+# ---------------------------------------------------------------------------
+# Static and media files
+# ---------------------------------------------------------------------------
+
+STATIC_URL = "/static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
+MEDIA_URL = "/media/"
+MEDIA_ROOT = BASE_DIR / "data" / "media"
+
+# ---------------------------------------------------------------------------
+# Cauldron UI override directory
+# ---------------------------------------------------------------------------
+
+CAULDRON_UI_OVERRIDES_DIR = str(BASE_DIR / "overrides")
+
+# ---------------------------------------------------------------------------
+# Internationalisation
+# ---------------------------------------------------------------------------
+
+LANGUAGE_CODE = "en-us"
+TIME_ZONE = "UTC"
+USE_I18N = True
+USE_TZ = True
+
+# ---------------------------------------------------------------------------
+# Auth redirects
+# ---------------------------------------------------------------------------
+
+LOGIN_URL = "/accounts/login/"
+LOGIN_REDIRECT_URL = "/cauldron/"
+LOGOUT_REDIRECT_URL = "/accounts/login/"

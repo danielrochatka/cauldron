@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+CAULDRON_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(dirname "$CAULDRON_DIR")"
+VENV="$CAULDRON_DIR/.venv"
+
+echo "==> Cauldron Update"
+echo ""
+
+# 1. Stop server if running
+if [ -f "$CAULDRON_DIR/data/cauldron.pid" ]; then
+  echo "--> Stopping server..."
+  "$CAULDRON_DIR/stop" || true
+fi
+
+# 2. Backup the database
+DB="$CAULDRON_DIR/data/cauldron.db"
+if [ -f "$DB" ]; then
+  BACKUP="$CAULDRON_DIR/data/cauldron.db.bak-$(date +%Y%m%d-%H%M%S)"
+  cp "$DB" "$BACKUP"
+  echo "--> Database backed up to $(basename "$BACKUP")"
+fi
+
+# 3. Pull latest code
+echo "--> Pulling latest Cauldron..."
+cd "$REPO_DIR"
+git pull --ff-only
+
+# 4. Upgrade dependencies
+echo "--> Upgrading dependencies..."
+source "$VENV/bin/activate"
+pip install -q -r "$CAULDRON_DIR/requirements.txt"
+for pkg in "$REPO_DIR"/packages/*/; do
+  pip install -q --no-deps -e "$pkg"
+done
+
+# 5. Run migrations
+echo "--> Applying database migrations..."
+cd "$CAULDRON_DIR"
+python manage.py migrate --no-input
+
+# 6. Collect static assets
+echo "--> Collecting static assets..."
+python manage.py collectstatic --no-input --clear -v 0
+
+# 7. Restart server
+echo "--> Starting server..."
+"$CAULDRON_DIR/start"
+
+echo ""
+echo "==> Cauldron updated successfully."

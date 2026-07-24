@@ -1,0 +1,12 @@
+.venv/
+data/*.db
+data/*.db.bak*
+data/cauldron.pid
+data/media/
+data/workspace/
+logs/*.log
+staticfiles/
+__pycache__/
+*.pyc
+*.pyo
+.env

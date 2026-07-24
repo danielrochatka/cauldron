@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CAULDRON_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# 1. Check Python 3.11+
+PYTHON_VERSION=$(python3 --version 2>&1 | awk '{print $2}')
+PYTHON_MAJOR=$(echo "$PYTHON_VERSION" | cut -d. -f1)
+PYTHON_MINOR=$(echo "$PYTHON_VERSION" | cut -d. -f2)
+
+if [ -z "$PYTHON_VERSION" ] || [ "$PYTHON_MAJOR" -lt 3 ] || { [ "$PYTHON_MAJOR" -eq 3 ] && [ "$PYTHON_MINOR" -lt 11 ]; }; then
+  echo "ERROR: Python 3.11 or newer is required. Found: ${PYTHON_VERSION:-none}"
+  echo "Please install Python 3.11+ from https://www.python.org/downloads/"
+  exit 1
+fi
+
+# 2. Create virtualenv if it doesn't exist
+if [ ! -d "$CAULDRON_DIR/.venv" ]; then
+  echo "--> Creating virtual environment..."
+  python3 -m venv "$CAULDRON_DIR/.venv"
+fi
+
+# 3. Activate virtualenv
+source "$CAULDRON_DIR/.venv/bin/activate"
+
+# 4. Install/upgrade dependencies
+echo "--> Installing dependencies..."
+pip install -q -r "$CAULDRON_DIR/requirements.txt"
+
+REPO_DIR="$(dirname "$CAULDRON_DIR")"
+for pkg in "$REPO_DIR"/packages/*/; do
+  pip install -q --no-deps -e "$pkg"
+done
+
+# 5. Load config.env if it exists
+if [ -f "$CAULDRON_DIR/config.env" ]; then
+  set -a
+  source "$CAULDRON_DIR/config.env"
+  set +a
+fi
+
+cd "$CAULDRON_DIR"
+
+# 6. Run migrations
+echo "--> Running database migrations..."
+python manage.py migrate --no-input
+
+# 7. Collect static assets
+echo "--> Collecting static files..."
+python manage.py collectstatic --no-input --clear -v 0
+
+# 8. Initialize override directory
+python manage.py cauldron_ui_init 2>/dev/null || true
+
+# 9. Start the server
+PORT="${CAULDRON_PORT:-8000}"
+PID_FILE="$CAULDRON_DIR/data/cauldron.pid"
+
+if command -v gunicorn &>/dev/null; then
+  gunicorn \
+    --bind "0.0.0.0:$PORT" \
+    --workers "${CAULDRON_WORKERS:-2}" \
+    --pid "$PID_FILE" \
+    --access-logfile "$CAULDRON_DIR/logs/access.log" \
+    --error-logfile "$CAULDRON_DIR/logs/error.log" \
+    --daemon \
+    cauldron_site.wsgi:application
+  echo "Cauldron started on http://localhost:$PORT (gunicorn)"
+else
+  echo "Cauldron starting on http://localhost:$PORT (press Ctrl+C to stop)"
+  python manage.py runserver "0.0.0.0:$PORT"
+fi

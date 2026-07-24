@@ -55,3 +55,24 @@ def test_descriptor_name_must_match_provider_name():
                 name="different", display_name="", version="",
             ),
         )
+
+
+def test_mismatched_descriptor_leaves_registry_unchanged():
+    """A ValueError on register() must not leave the provider half-registered."""
+    r = AIModelProviderRegistry()
+    with pytest.raises(ValueError):
+        r.register(
+            _DummyProvider("p1"),
+            descriptor=AIModelProviderDescriptor(
+                name="different", display_name="", version="",
+            ),
+        )
+    # Neither provider nor descriptor should be stored.
+    assert r.names() == []
+    with pytest.raises(ProviderRegistryError):
+        r.get("p1")
+    with pytest.raises(ProviderRegistryError):
+        r.descriptor_for("p1")
+    # And the "different" name obviously must not exist either.
+    with pytest.raises(ProviderRegistryError):
+        r.get("different")

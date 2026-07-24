@@ -2,14 +2,16 @@
 
 These types are provider-neutral. Concrete provider adapters translate
 between these contracts and the wire format used by the model vendor.
-Everything is immutable — dicts are copied defensively on construction
-so callers cannot mutate what a consumer already observed.
+Everything is immutable — dicts are deep-frozen at construction so callers
+cannot mutate what a consumer already observed, and every payload is
+strictly checked for JSON compatibility (no NaN/Infinity, no non-string
+keys, no non-primitive leaves).
 """
 from __future__ import annotations
 
-import copy
 import json
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Mapping
 
 
@@ -17,22 +19,76 @@ _ALLOWED_ROLES = frozenset({"system", "user", "assistant", "tool"})
 _ALLOWED_STOP_REASONS = frozenset({"", "end_turn", "tool_use", "max_tokens", "timeout"})
 
 
-def _deep_freeze_json_value(value: Any) -> Any:
-    """Return a deep-copied version of ``value`` after asserting JSON-compat.
+def _check_keys(value: Any) -> None:
+    """Recursively verify every mapping key is a plain string."""
+    if isinstance(value, Mapping):
+        for k, v in value.items():
+            if not isinstance(k, str):
+                raise ValueError(f"Non-string mapping key: {k!r}")
+            _check_keys(v)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            _check_keys(v)
 
-    We *only* accept JSON-serialisable primitives, dicts (with string keys),
-    and lists/tuples of the same. This keeps schemas and tool arguments
-    hashable-in-effect at rest, and makes downstream serialisation safe.
+
+def _to_plain_for_check(value: Any) -> Any:
+    """Return a plain ``dict``/``list`` projection for JSON-serialisation.
+
+    ``json.dumps`` does not accept :class:`types.MappingProxyType` (which
+    is what our deep-freeze produces). This helper walks the input and
+    substitutes plain concrete types so the strict JSON check can run
+    against both fresh and already-frozen values.
+    """
+    if isinstance(value, Mapping):
+        return {str(k): _to_plain_for_check(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_plain_for_check(v) for v in value]
+    return value
+
+
+def _assert_json_compatible(value: Any) -> None:
+    """Raise ``ValueError`` for values that are not strict-JSON safe.
+
+    Rejects ``NaN`` / ``Infinity`` / ``-Infinity`` (via ``allow_nan=False``),
+    non-string mapping keys, and any leaf that ``json.dumps`` cannot encode
+    without a ``default`` fallback. This is called both at construction of
+    the immutable contract types and again at argument-validation time so
+    that non-JSON values can never enter the audit trail.
+    """
+    # Walk once for non-string keys BEFORE hitting json.dumps so the error
+    # message is stable regardless of whether the key or the value fails
+    # first.
+    _check_keys(value)
+    plain = _to_plain_for_check(value)
+    try:
+        json.dumps(plain, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Value is not JSON-compatible: {exc}") from exc
+
+
+def _deep_freeze(value: Any) -> Any:
+    """Return a deeply-immutable view of *value* after JSON validation.
+
+    * ``dict`` → :class:`types.MappingProxyType` wrapping frozen children
+    * ``list`` / ``tuple`` → ``tuple`` of frozen children
+    * primitives → returned as-is
     """
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, Mapping):
-        return {str(k): _deep_freeze_json_value(v) for k, v in value.items()}
+        return MappingProxyType({
+            str(k): _deep_freeze(v) for k, v in value.items()
+        })
     if isinstance(value, (list, tuple)):
-        return [_deep_freeze_json_value(v) for v in value]
+        return tuple(_deep_freeze(v) for v in value)
     raise TypeError(
         f"Value of type {type(value).__name__!r} is not JSON-serialisable."
     )
+
+
+def _deep_freeze_json_value(value: Any) -> Any:
+    """Legacy alias kept for backwards compatibility."""
+    return _deep_freeze(value)
 
 
 @dataclass(frozen=True)
@@ -41,7 +97,7 @@ class AIModelToolCall:
 
     id: str  # unique per request; model-supplied
     name: str
-    arguments: dict  # JSON-decoded arguments
+    arguments: Mapping[str, Any]  # JSON-decoded arguments (deep-frozen)
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not self.id:
@@ -50,10 +106,11 @@ class AIModelToolCall:
             raise ValueError("AIModelToolCall.name must be a non-empty string")
         if not isinstance(self.arguments, Mapping):
             raise TypeError("AIModelToolCall.arguments must be a mapping")
-        # Deep defensive copy so callers can't mutate the record after
-        # construction, and the whole nested tree is isolated from any
-        # mutation of the source dict.
-        object.__setattr__(self, "arguments", copy.deepcopy(dict(self.arguments)))
+        # Strict JSON compatibility first (rejects NaN/Infinity/non-string
+        # keys/non-primitive leaves before anything is exposed).
+        _assert_json_compatible(dict(self.arguments))
+        # Deep freeze so callers can't mutate the record after construction.
+        object.__setattr__(self, "arguments", _deep_freeze(dict(self.arguments)))
 
 
 @dataclass(frozen=True)
@@ -115,7 +172,7 @@ class AIModelToolDefinition:
 
     name: str
     description: str
-    parameters: dict  # JSON Schema object — deep-frozen at construction time
+    parameters: Mapping[str, Any]  # JSON Schema object — deep-frozen
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
@@ -124,9 +181,10 @@ class AIModelToolDefinition:
             raise TypeError("AIModelToolDefinition.description must be a string")
         if not isinstance(self.parameters, Mapping):
             raise TypeError("AIModelToolDefinition.parameters must be a mapping")
-        # Deep copy so nested schema mutations don't leak in.
+        _assert_json_compatible(dict(self.parameters))
+        # Deep freeze so nested schema mutations don't leak in.
         object.__setattr__(
-            self, "parameters", copy.deepcopy(dict(self.parameters))
+            self, "parameters", _deep_freeze(dict(self.parameters))
         )
 
 
@@ -206,9 +264,13 @@ class AIModelResponse:
 
 def is_json_serialisable(value: Any) -> bool:
     """Return True iff ``value`` round-trips through :func:`json.dumps`
-    with no ``default`` fallback."""
+    with no ``default`` fallback.
+
+    Accepts our deep-frozen views (MappingProxyType/tuple) by projecting
+    them onto their concrete counterparts before serialisation.
+    """
     try:
-        json.dumps(value)
+        json.dumps(_to_plain_for_check(value))
     except (TypeError, ValueError):
         return False
     return True

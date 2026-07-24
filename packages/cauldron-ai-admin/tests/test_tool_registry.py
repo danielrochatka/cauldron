@@ -138,3 +138,82 @@ def test_definition_rejects_bad_risk_level():
 def test_unregister_missing_is_silent():
     r = AdminAIToolRegistry()
     r.unregister("no-such-tool")  # no exception
+
+
+# ---------------------------------------------------------- signature validation
+
+
+def test_register_rejects_handler_with_no_params():
+    r = AdminAIToolRegistry()
+
+    def bad_handler():  # pragma: no cover - never invoked
+        return None
+
+    with pytest.raises(ValueError):
+        r.register(_defn("a.b"), bad_handler)
+
+
+def test_register_rejects_handler_with_star_args_first():
+    r = AdminAIToolRegistry()
+
+    def bad_handler(*args, **kwargs):  # pragma: no cover - never invoked
+        return None
+
+    with pytest.raises(ValueError):
+        r.register(_defn("a.b"), bad_handler)
+
+
+def test_register_rejects_var_positional_after_context():
+    r = AdminAIToolRegistry()
+
+    def bad_handler(ctx, *args, **kwargs):  # pragma: no cover - never invoked
+        return None
+
+    with pytest.raises(ValueError):
+        r.register(_defn("a.b"), bad_handler)
+
+
+def test_register_accepts_kw_only_after_context():
+    r = AdminAIToolRegistry()
+
+    def ok_handler(ctx, *, k=1):
+        return AdminAIToolResult(tool_name="x", success=True)
+
+    r.register(_defn("a.b"), ok_handler)
+
+
+# ---------------------------------------------------------- builtin protection
+
+
+def test_builtin_registration_cannot_overwrite_child_module_tool():
+    """Once a child module has registered a tool at a given name, the
+    subsequent builtin startup MUST NOT silently replace it."""
+    from cauldron_ai_admin.builtin_tools import register_builtin_tools
+    from cauldron_ai_admin.tools import (
+        AdminAIToolDefinition, RiskLevel, get_tool_registry,
+        register_tool, unregister_tool,
+    )
+
+    reg = get_tool_registry()
+    # Pre-register something at the builtin name with a distinct definition.
+    child_defn = AdminAIToolDefinition(
+        name="content.list_collections",
+        version="0.9",  # different version -> different definition
+        description="child-owned",
+        argument_schema={"type": "object"},
+        risk_level=RiskLevel.READ_ONLY,
+        required_permission="cauldron_content_operations.view_published_content",
+        owning_module="child.module",
+    )
+
+    def child_handler(ctx, **kw):
+        return AdminAIToolResult(tool_name="content.list_collections")
+
+    # First: get a clean slate on this tool name
+    unregister_tool("content.list_collections")
+    register_tool(child_defn, child_handler)
+    try:
+        with pytest.raises(ValueError):
+            register_builtin_tools()
+    finally:
+        unregister_tool("content.list_collections")

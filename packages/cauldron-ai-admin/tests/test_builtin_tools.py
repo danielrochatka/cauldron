@@ -241,8 +241,63 @@ def test_module_status_no_secrets_or_paths():
     serialised = json.dumps(result.data)
     assert "/home" not in serialised
     assert "SECRET_KEY" not in serialised
+    # Per the module_status contract each entry surfaces exactly these keys.
     for m in modules:
-        assert set(m.keys()) == {"name", "capabilities", "status", "version"}
+        assert set(m.keys()) == {
+            "name", "capabilities", "dependencies",
+            "status", "version", "health",
+        }
+
+
+def test_module_status_health_is_unknown_not_ok_for_active_modules():
+    """Absent an explicit health signal the tool must NOT fabricate
+    ``ok`` — the value has to be ``unknown``."""
+    from unittest.mock import patch
+    ctx, _ = _ctx()
+    fake_registry = MagicMock()
+    fake_registry.graph_info.return_value = [{
+        "slug": "cauldron.example",
+        "provides": ["ex.cap"],
+        "requires": [],
+        "deps": [],
+        "active": True,
+        "version": "1.0.0",
+    }]
+    fake_registry.lifecycle_errors.return_value = []
+    with patch(
+        "cauldron.modules.registry.registry", fake_registry,
+    ):
+        result = _handle_module_status(ctx)
+    assert isinstance(result, AdminAIToolResult)
+    assert result.data["modules"][0]["health"] == "unknown"
+    assert result.data["modules"][0]["status"] == "active"
+
+
+def test_module_status_reports_error_status_for_lifecycle_failures():
+    """Modules with recorded lifecycle errors must surface ``status='error'``
+    and ``health='degraded'``."""
+    from unittest.mock import patch
+    ctx, _ = _ctx()
+    fake_registry = MagicMock()
+    fake_registry.graph_info.return_value = [{
+        "slug": "cauldron.broken",
+        "provides": [],
+        "requires": [],
+        "deps": [],
+        "active": True,
+        "version": "1.0.0",
+    }]
+    fake_error = MagicMock()
+    fake_error.module_slug = "cauldron.broken"
+    fake_registry.lifecycle_errors.return_value = [fake_error]
+    with patch(
+        "cauldron.modules.registry.registry", fake_registry,
+    ):
+        result = _handle_module_status(ctx)
+    assert isinstance(result, AdminAIToolResult)
+    entry = result.data["modules"][0]
+    assert entry["status"] == "error"
+    assert entry["health"] == "degraded"
 
 
 def test_module_status_rejects_extra_args():

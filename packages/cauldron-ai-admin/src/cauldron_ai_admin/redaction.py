@@ -76,10 +76,15 @@ def redact(value: Any, *, max_bytes: int = 512) -> str:
     bytes (never mid-codepoint). Sensitive dict keys — matched case-
     insensitively against :data:`REDACTED_KEYS` — have their values
     replaced with the literal marker ``[REDACTED]`` before serialisation.
+
+    Strings that parse as JSON are inspected as their decoded structure
+    so a request body like ``'{"api_key": "sk-..."}'`` also has the
+    embedded secret scrubbed before persistence.
     """
     if max_bytes < 0:
         raise ValueError("max_bytes must be non-negative")
-    if isinstance(value, (dict, list, tuple)):
+    from collections.abc import Mapping as _M
+    if isinstance(value, _M) or isinstance(value, (list, tuple)):
         cleaned = _redact_tree(value)
         try:
             text = json.dumps(cleaned, sort_keys=True, ensure_ascii=False)
@@ -87,7 +92,26 @@ def redact(value: Any, *, max_bytes: int = 512) -> str:
             text = str(cleaned)
     elif value is None:
         text = ""
-    elif isinstance(value, (str, int, float, bool)):
+    elif isinstance(value, str):
+        # If the string decodes cleanly as JSON, redact sensitive keys in
+        # the decoded structure. Otherwise treat as opaque prose.
+        stripped = value.strip()
+        if stripped.startswith(("{", "[")) and stripped.endswith(("}", "]")):
+            try:
+                decoded = json.loads(stripped)
+            except (TypeError, ValueError):
+                text = value
+            else:
+                cleaned = _redact_tree(decoded)
+                try:
+                    text = json.dumps(
+                        cleaned, sort_keys=True, ensure_ascii=False,
+                    )
+                except (TypeError, ValueError):  # pragma: no cover
+                    text = value
+        else:
+            text = value
+    elif isinstance(value, (int, float, bool)):
         text = str(value)
     else:
         text = str(value)

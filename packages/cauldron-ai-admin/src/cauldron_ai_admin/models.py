@@ -61,16 +61,35 @@ class AdminAIRun(models.Model):
         ]
         constraints = [
             models.CheckConstraint(
-                check=~Q(provider_name=""),
+                condition=~Q(provider_name=""),
                 name="adminairun_provider_name_nonempty",
             ),
             models.CheckConstraint(
-                check=Q(version__gt=0),
+                condition=Q(version__gt=0),
                 name="adminairun_version_positive",
             ),
             models.CheckConstraint(
-                check=Q(status__in=_RUN_STATUS_VALUES),
+                condition=Q(status__in=_RUN_STATUS_VALUES),
                 name="adminairun_status_valid",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~Q(status__in=["created", "running"])
+                    | Q(completed_at__isnull=True)
+                ),
+                name="adminairun_no_completed_at_when_active",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~Q(status__in=[
+                        "waiting_for_approval",
+                        "completed",
+                        "failed",
+                        "cancelled",
+                    ])
+                    | Q(completed_at__isnull=False)
+                ),
+                name="adminairun_completed_at_when_terminal",
             ),
         ]
         permissions = [
@@ -125,13 +144,35 @@ class AdminAIToolInvocation(models.Model):
         ]
         constraints = [
             models.CheckConstraint(
-                check=~Q(tool_name=""),
+                condition=~Q(tool_name=""),
                 name="adminaitoolinvocation_tool_name_nonempty",
             ),
             models.UniqueConstraint(
                 fields=["run", "tool_call_id"],
                 condition=~Q(tool_call_id=""),
                 name="adminaitoolinvocation_tool_call_id_unique",
+            ),
+            models.CheckConstraint(
+                condition=Q(status__in=_INVOCATION_STATUS_VALUES),
+                name="adminaitoolinvocation_status_valid",
+            ),
+            models.CheckConstraint(
+                condition=Q(risk_level__in=[v for v, _ in RISK_LEVEL_CHOICES]),
+                name="adminaitoolinvocation_risk_level_valid",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~Q(status__in=["requested", "authorized", "running"])
+                    | Q(completed_at__isnull=True)
+                ),
+                name="adminaitoolinvocation_no_completed_at_when_active",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~Q(status__in=["completed", "denied", "failed", "timed_out"])
+                    | Q(completed_at__isnull=False)
+                ),
+                name="adminaitoolinvocation_completed_at_when_terminal",
             ),
         ]
 

@@ -18,10 +18,22 @@ from cauldron_ai_admin.builtin_tools import (
 from cauldron_ai_admin.tools import AdminAIToolContext, AdminAIToolError, AdminAIToolResult
 
 
-def _ctx(content_service=None, deadline=None):
+def _ctx(content_service=None, deadline=None, with_perms=()):
     from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Permission
     User = get_user_model()
     user, _ = User.objects.get_or_create(username="ctxuser")
+    for spec in with_perms:
+        app_label, codename = spec.split(".", 1)
+        try:
+            perm = Permission.objects.get(
+                codename=codename, content_type__app_label=app_label,
+            )
+        except Permission.DoesNotExist:
+            continue
+        user.user_permissions.add(perm)
+    if with_perms:
+        user = User.objects.get(pk=user.pk)  # refresh perm cache
     return AdminAIToolContext(
         actor=user,
         run_id="r",
@@ -80,7 +92,10 @@ def test_preview_change_request_calls_get_preview_and_never_mutates():
     preview.operations = (op,)
     fake_service.get_preview.return_value = preview
 
-    ctx = _ctx(content_service=fake_service)
+    ctx = _ctx(
+        content_service=fake_service,
+        with_perms=("cauldron_content_operations.view_draft_content",),
+    )
     result = _handle_preview_change_request(ctx, cs_id="cs-42")
     assert isinstance(result, AdminAIToolResult)
     assert result.data["cs_id"] == "cs-42"
@@ -94,14 +109,34 @@ def test_preview_change_request_calls_get_preview_and_never_mutates():
 def test_preview_change_request_not_found():
     fake_service = MagicMock(spec=["get_preview"])
     fake_service.get_preview.return_value = None
-    ctx = _ctx(content_service=fake_service)
+    ctx = _ctx(
+        content_service=fake_service,
+        with_perms=("cauldron_content_operations.view_draft_content",),
+    )
     result = _handle_preview_change_request(ctx, cs_id="missing")
     assert isinstance(result, AdminAIToolResult)
     assert result.data == {"found": False}
 
 
 def test_preview_service_unavailable():
-    ctx = _ctx(content_service=None)
+    ctx = _ctx(
+        content_service=None,
+        with_perms=("cauldron_content_operations.view_draft_content",),
+    )
     result = _handle_preview_change_request(ctx, cs_id="whatever")
     assert isinstance(result, AdminAIToolError)
     assert result.error_code == "tool.service_unavailable"
+
+
+def test_preview_requires_view_draft_content_permission():
+    """content.preview_change_request requires BOTH view_content_change_requests
+    (declared as tool-level required_permission) AND view_draft_content
+    (checked in the handler)."""
+    fake_service = MagicMock(spec=["get_preview"])
+    fake_service.get_preview.return_value = None
+    # Actor has NO view_draft_content permission.
+    ctx = _ctx(content_service=fake_service)
+    result = _handle_preview_change_request(ctx, cs_id="cs-1")
+    assert isinstance(result, AdminAIToolError)
+    assert result.error_code == "tool.permission_denied"
+    fake_service.get_preview.assert_not_called()

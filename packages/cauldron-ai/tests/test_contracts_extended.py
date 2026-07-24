@@ -86,7 +86,9 @@ def test_tool_call_arguments_deep_copy():
     # Mutating the source dict must not affect the record.
     nested["outer"]["inner"].append(999)
     nested["outer"]["extra"] = "sneaky"
-    assert call.arguments == {"outer": {"inner": [1, 2, 3]}}
+    # The stored record uses deep-frozen views (mappingproxy + tuple).
+    assert call.arguments["outer"]["inner"] == (1, 2, 3)
+    assert "extra" not in call.arguments["outer"]
 
 
 def test_tool_definition_parameters_deep_copy():
@@ -99,7 +101,8 @@ def test_tool_definition_parameters_deep_copy():
     schema["properties"]["a"]["type"] = "mutated"
     schema["required"].append("b")
     assert defn.parameters["properties"]["a"]["type"] == "string"
-    assert defn.parameters["required"] == ["a"]
+    # Lists become tuples after deep freeze.
+    assert defn.parameters["required"] == ("a",)
 
 
 # --------------------------------------------------------------------- deadline
@@ -145,3 +148,93 @@ def test_is_json_serialisable_false_for_non_json():
 
     assert not is_json_serialisable({"o": Custom()})
     assert not is_json_serialisable({1, 2, 3})
+
+
+# --------------------------------------------------------------------- immutability + strict JSON rejection
+
+
+def test_tool_call_arguments_returned_dict_is_read_only():
+    """The exposed ``arguments`` mapping must not be mutable at any depth."""
+    call = AIModelToolCall(
+        id="c1", name="t.x",
+        arguments={"outer": {"inner": [1, 2]}},
+    )
+    with pytest.raises(TypeError):
+        call.arguments["new"] = "sneaky"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        call.arguments["outer"]["extra"] = "sneaky"  # type: ignore[index]
+    # Tuples are the deep-frozen sequence type.
+    assert call.arguments["outer"]["inner"] == (1, 2)
+
+
+def test_tool_definition_parameters_returned_dict_is_read_only():
+    defn = AIModelToolDefinition(
+        name="t.x", description="",
+        parameters={"type": "object", "properties": {"a": {"type": "string"}}},
+    )
+    with pytest.raises(TypeError):
+        defn.parameters["extra"] = "sneaky"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        defn.parameters["properties"]["a"]["type"] = "mutated"  # type: ignore[index]
+
+
+def test_tool_call_rejects_nan():
+    with pytest.raises(ValueError):
+        AIModelToolCall(id="c1", name="t.x", arguments={"v": float("nan")})
+
+
+def test_tool_call_rejects_infinity():
+    with pytest.raises(ValueError):
+        AIModelToolCall(id="c1", name="t.x", arguments={"v": float("inf")})
+    with pytest.raises(ValueError):
+        AIModelToolCall(id="c1", name="t.x", arguments={"v": float("-inf")})
+
+
+def test_tool_call_rejects_non_string_keys():
+    with pytest.raises(ValueError):
+        AIModelToolCall(id="c1", name="t.x", arguments={1: "v"})  # type: ignore[dict-item]
+
+
+def test_tool_call_rejects_arbitrary_object():
+    from datetime import datetime as _dt
+    with pytest.raises((ValueError, TypeError)):
+        AIModelToolCall(
+            id="c1", name="t.x", arguments={"when": _dt(2026, 1, 1)},
+        )
+
+
+def test_tool_definition_rejects_nan_in_schema():
+    with pytest.raises(ValueError):
+        AIModelToolDefinition(
+            name="t.x", description="",
+            parameters={"const": float("nan")},
+        )
+
+
+def test_tool_definition_rejects_non_string_keys():
+    with pytest.raises(ValueError):
+        AIModelToolDefinition(
+            name="t.x", description="",
+            parameters={1: "v"},  # type: ignore[dict-item]
+        )
+
+
+def test_tool_call_valid_nested_structure_is_deep_frozen():
+    call = AIModelToolCall(
+        id="c1", name="t.x",
+        arguments={
+            "outer": {
+                "list": [1, {"inner": True}, 3],
+                "meta": {"count": 4},
+            },
+        },
+    )
+    # Every mapping is a MappingProxyType (immutable view).
+    from types import MappingProxyType
+    assert isinstance(call.arguments, MappingProxyType)
+    assert isinstance(call.arguments["outer"], MappingProxyType)
+    assert isinstance(call.arguments["outer"]["meta"], MappingProxyType)
+    # Sequences are tuples.
+    assert isinstance(call.arguments["outer"]["list"], tuple)
+    # Innermost mapping still frozen.
+    assert isinstance(call.arguments["outer"]["list"][1], MappingProxyType)

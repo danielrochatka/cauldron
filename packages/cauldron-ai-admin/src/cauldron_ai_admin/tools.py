@@ -43,15 +43,20 @@ Registration invariants
 """
 from __future__ import annotations
 
-import copy
+import inspect
 import re
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable
+from types import MappingProxyType
+from typing import Any, Callable, Mapping
 
-from cauldron_ai.contracts import is_json_serialisable
+from cauldron_ai.contracts import (
+    _assert_json_compatible,
+    _deep_freeze,
+    is_json_serialisable,
+)
 
 
 # -------------------------------------------------------------- validators
@@ -86,6 +91,19 @@ def _check_schema(schema: dict) -> None:
     except ImportError as exc:  # pragma: no cover - jsonschema is a dep
         raise RuntimeError("jsonschema is required for AdminAI tools") from exc
     Draft7Validator.check_schema(schema)
+
+
+def _to_plain(value: Any) -> Any:
+    """Return a plain-``dict``/``list`` tree from any Mapping/Sequence view.
+
+    Used so downstream libraries that don't accept ``MappingProxyType`` or
+    ``tuple`` receive their expected concrete types.
+    """
+    if isinstance(value, Mapping):
+        return {str(k): _to_plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_plain(v) for v in value]
+    return value
 
 
 @dataclass(frozen=True)
@@ -129,15 +147,19 @@ class AdminAIToolDefinition:
         if not isinstance(self.description, str):
             raise TypeError("AdminAIToolDefinition.description must be a string")
         # ----- argument_schema
-        if not isinstance(self.argument_schema, dict):
-            raise TypeError("AdminAIToolDefinition.argument_schema must be a dict")
-        # Deep copy so mutation of the caller's dict doesn't leak in.
-        frozen_schema = copy.deepcopy(self.argument_schema)
-        # Schema validity is enforced by the registry at register() time as
-        # well; we run it here too so mis-shaped definitions fail fast even
-        # when constructed outside the registry.
-        _check_schema(frozen_schema)
-        object.__setattr__(self, "argument_schema", frozen_schema)
+        if not isinstance(self.argument_schema, Mapping):
+            raise TypeError("AdminAIToolDefinition.argument_schema must be a mapping")
+        # Reject non-JSON compatible values (NaN, Infinity, non-string keys,
+        # unknown types) before we even validate as JSON Schema.
+        _assert_json_compatible(dict(self.argument_schema))
+        # JSON Schema Draft-07 validity check runs against the raw dict
+        # form; jsonschema doesn't accept MappingProxyType directly.
+        raw_schema = {str(k): _to_plain(v) for k, v in self.argument_schema.items()}
+        _check_schema(raw_schema)
+        # Deep freeze so callers cannot mutate the exposed schema.
+        object.__setattr__(
+            self, "argument_schema", _deep_freeze(raw_schema),
+        )
         # ----- risk_level
         if not isinstance(self.risk_level, RiskLevel):
             raise TypeError("AdminAIToolDefinition.risk_level must be a RiskLevel")
@@ -213,6 +235,13 @@ class AdminAIToolResult:
     data: Any = None                 # JSON-serialisable
     message: str = ""
 
+    def __post_init__(self) -> None:
+        # Validate JSON compatibility of the data payload (if any); a
+        # non-``None`` value that isn't strict-JSON safe is a bug in the
+        # tool handler.
+        if self.data is not None:
+            _assert_json_compatible(self.data)
+
 
 @dataclass(frozen=True)
 class AdminAIToolError:
@@ -224,6 +253,40 @@ class AdminAIToolError:
 
 
 AdminAIToolHandler = Callable[..., "AdminAIToolResult | AdminAIToolError"]
+
+
+def _validate_handler_signature(handler: Callable[..., Any]) -> None:
+    """Raise ``ValueError`` when *handler* cannot receive ``(context, **kwargs)``.
+
+    A tool handler must take a positional context argument first and any
+    additional arguments must be keyword-friendly (either
+    positional-or-keyword, keyword-only, or captured by ``**kwargs``).
+    """
+    try:
+        sig = inspect.signature(handler)
+    except (TypeError, ValueError):
+        # Objects whose signature can't be introspected (e.g. some C
+        # builtins) can't be validated; refuse rather than accept blindly.
+        raise ValueError("Tool handler signature could not be introspected")
+    params = list(sig.parameters.values())
+    if not params:
+        raise ValueError(
+            "Tool handler must accept at least one positional argument (context)"
+        )
+    first = params[0]
+    if first.kind not in (
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    ):
+        raise ValueError(
+            "Tool handler's first parameter must be positional (context); "
+            f"got {first.kind.name}"
+        )
+    for extra in params[1:]:
+        if extra.kind == inspect.Parameter.VAR_POSITIONAL:
+            raise ValueError(
+                "Tool handler must not accept *args after context"
+            )
 
 
 class AdminAIToolRegistry:
@@ -251,6 +314,10 @@ class AdminAIToolRegistry:
             raise TypeError("definition must be an AdminAIToolDefinition")
         if not callable(handler):
             raise TypeError("handler must be callable")
+
+        # Handler signature: must accept a positional context and only
+        # keyword-friendly params after that.
+        _validate_handler_signature(handler)
 
         # Reserved namespace: server.* is only for the Admin AI server package.
         if definition.name.startswith(SERVER_NAMESPACE) and (
@@ -367,25 +434,41 @@ class ToolArgumentValidationError(ValueError):
         self.stable_message = message
 
 
-def validate_tool_arguments(schema: dict, arguments: Any) -> None:
+def validate_tool_arguments(schema: Any, arguments: Any) -> None:
     """Validate *arguments* against *schema*.
 
     Raises :class:`ToolArgumentValidationError` with a bounded, stable
     message on failure. The schema itself is not re-validated here (that
     is done at registration time).
+
+    Strict JSON compatibility is enforced first — ``NaN``, ``Infinity``,
+    non-string mapping keys, and non-primitive leaves are rejected before
+    the schema check runs so that non-JSON values can never enter the
+    audit trail.
     """
     try:
         from jsonschema import Draft7Validator
     except ImportError as exc:  # pragma: no cover - jsonschema is a dep
         raise RuntimeError("jsonschema is required for AdminAI tools") from exc
 
+    try:
+        _assert_json_compatible(arguments)
+    except ValueError:
+        raise ToolArgumentValidationError(
+            "Tool arguments must be JSON-compatible (no NaN/Infinity/non-string keys)."
+        )
+
     if not is_json_serialisable(arguments):
         raise ToolArgumentValidationError(
             "Tool arguments must be JSON-serialisable."
         )
 
-    validator = Draft7Validator(schema)
-    errors = sorted(validator.iter_errors(arguments), key=lambda e: e.path)
+    # jsonschema does not accept MappingProxyType/tuple views, so we pass
+    # a plain-dict/list projection through the validator.
+    plain_schema = _to_plain(schema)
+    plain_arguments = _to_plain(arguments)
+    validator = Draft7Validator(plain_schema)
+    errors = sorted(validator.iter_errors(plain_arguments), key=lambda e: e.path)
     if not errors:
         return
 

@@ -221,3 +221,89 @@ def check_tool_zero_timeouts(app_configs, **kwargs):
         f"Admin AI tools with non-positive timeout_seconds: {zeroed!r}",
         id="admin_ai.W001",
     )]
+
+
+@checks.register(checks.Tags.compatibility)
+def check_required_capabilities_present(app_configs, **kwargs):
+    """admin_ai.E008: every capability required by the Admin AI module must
+    be provided by some active Cauldron module.
+    """
+    if not _is_admin_ai_active():
+        return []
+    try:
+        from cauldron.modules.registry import registry as module_registry
+        from cauldron_ai_admin.module import module as admin_ai_module
+    except Exception:
+        # Module system or admin-ai module not importable — nothing to
+        # verify. Never crash the system check runner.
+        return []
+    if not module_registry.is_populated:
+        # Under some test configurations the registry is empty; in that
+        # case there is nothing meaningful to compare against.
+        return []
+    provided = set()
+    try:
+        provided = set(module_registry.capabilities().keys())
+    except Exception:
+        return []
+    required = {
+        r.slug for r in admin_ai_module.manifest.requires if r.kind == "capability"
+    }
+    missing = sorted(required - provided)
+    if not missing:
+        return []
+    return [checks.Error(
+        "Admin AI required capabilities are not provided by any active "
+        f"Cauldron module: {missing!r}",
+        id="admin_ai.E008",
+    )]
+
+
+@checks.register(checks.Tags.compatibility)
+def check_registered_tool_contracts(app_configs, **kwargs):
+    """admin_ai.E009: a registered tool has a contract violation.
+
+    Re-runs the tool-level invariants (name pattern, version pattern,
+    permission format, schema validity) so a corrupted or partially
+    upgraded registry surface fails ``manage.py check`` rather than at
+    request time.
+    """
+    if not _is_admin_ai_active():
+        return []
+    try:
+        from .tools import (
+            _NAME_RE, _VERSION_RE, _OWNING_MODULE_RE, _PERMISSION_RE,
+            _check_schema, _to_plain, get_tool_registry,
+        )
+    except Exception:
+        return []
+    offenders: list[str] = []
+    try:
+        for defn in get_tool_registry().all_definitions():
+            if not _NAME_RE.match(defn.name or ""):
+                offenders.append(f"{defn.name!r} name")
+                continue
+            if not _VERSION_RE.match(defn.version or ""):
+                offenders.append(f"{defn.name!r} version")
+                continue
+            if not _OWNING_MODULE_RE.match(defn.owning_module or ""):
+                offenders.append(f"{defn.name!r} owning_module")
+                continue
+            if not _PERMISSION_RE.match(defn.required_permission or ""):
+                offenders.append(f"{defn.name!r} required_permission")
+                continue
+            try:
+                # jsonschema wants plain dict/list containers, so we
+                # project the deep-frozen schema back before validation.
+                _check_schema(_to_plain(defn.argument_schema))
+            except Exception:
+                offenders.append(f"{defn.name!r} argument_schema")
+                continue
+    except Exception:
+        return []
+    if not offenders:
+        return []
+    return [checks.Error(
+        f"Admin AI tools with contract violations: {offenders!r}",
+        id="admin_ai.E009",
+    )]

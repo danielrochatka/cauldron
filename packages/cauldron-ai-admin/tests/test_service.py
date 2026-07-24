@@ -401,6 +401,29 @@ def test_service_requires_non_empty_request():
         svc.run(user, "")
 
 
+def test_service_admin_ai_tool_error_with_mismatched_tool_name_fails_run():
+    """Handler returning AdminAIToolError with a mismatched tool_name is
+    treated as a contract violation and fails the run."""
+    reg = AdminAIToolRegistry()
+    reg.register(
+        _defn("t.read"),
+        lambda ctx, **kw: AdminAIToolError(
+            tool_name="t.other", error_code="whatever", message="oops",
+        ),
+    )
+    fake = FakeAIModelProvider()
+    fake.queue_response(AIModelResponse(
+        provider_request_id="r1",
+        tool_calls=(AIModelToolCall(id="c1", name="t.read", arguments={}),),
+        stop_reason="tool_use",
+    ))
+    svc = _service(fake, reg)
+    user = _make_user()
+    run = svc.run(user, "Bad handler.")
+    assert run.status == "failed"
+    assert run.error_code == "tool.bad_return_type"
+
+
 def test_service_stores_provider_request_id():
     reg = AdminAIToolRegistry()
     fake = FakeAIModelProvider()

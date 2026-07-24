@@ -30,21 +30,21 @@ class Migration(migrations.Migration):
         migrations.AddConstraint(
             model_name="adminairun",
             constraint=models.CheckConstraint(
-                check=~Q(provider_name=""),
+                condition=~Q(provider_name=""),
                 name="adminairun_provider_name_nonempty",
             ),
         ),
         migrations.AddConstraint(
             model_name="adminairun",
             constraint=models.CheckConstraint(
-                check=Q(version__gt=0),
+                condition=Q(version__gt=0),
                 name="adminairun_version_positive",
             ),
         ),
         migrations.AddConstraint(
             model_name="adminairun",
             constraint=models.CheckConstraint(
-                check=Q(status__in=[
+                condition=Q(status__in=[
                     "created",
                     "running",
                     "waiting_for_approval",
@@ -58,7 +58,7 @@ class Migration(migrations.Migration):
         migrations.AddConstraint(
             model_name="adminaitoolinvocation",
             constraint=models.CheckConstraint(
-                check=~Q(tool_name=""),
+                condition=~Q(tool_name=""),
                 name="adminaitoolinvocation_tool_name_nonempty",
             ),
         ),

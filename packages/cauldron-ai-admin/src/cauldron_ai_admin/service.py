@@ -86,6 +86,15 @@ ADMIN_AI_PERMISSION = "cauldron_ai_admin.use_admin_ai"
 # Minimum meaningful remaining-deadline before a mutation is allowed.
 _DEADLINE_EPSILON = 0.1
 
+# Hard caps on model-supplied identifiers. Anything longer is refused
+# outright (never truncated) — a runaway ID is almost always a bug in the
+# provider adapter or a hostile response.
+MAX_TOOL_CALL_ID_BYTES = 256
+MAX_TOOL_NAME_BYTES = 128
+# Caller-supplied correlation IDs are truncated (never rejected) since
+# they originate from local trusted callers.
+MAX_CORRELATION_ID_BYTES = 128
+
 
 class AdminAIService:
     def __init__(
@@ -167,15 +176,19 @@ class AdminAIService:
         if not isinstance(request_text, str) or not request_text.strip():
             raise ValueError("request_text must be a non-empty string.")
 
-        # Redact and truncate the user request before persisting.
-        bounded_request = bound_utf8(request_text, self._max_argument_bytes)
+        # Redact and truncate the user request before persisting so any
+        # sensitive key/value fragments never enter the durable audit row.
+        bounded_request = redact(request_text, max_bytes=self._max_argument_bytes)
+
+        # Caller-supplied correlation_id: truncate at 128 UTF-8 bytes.
+        safe_correlation_id = bound_utf8(correlation_id or "", 128)
 
         run = AdminAIRun.objects.create(
             actor=actor,
             status="created",
             provider_name=getattr(self._provider, "name", "") or "unknown",
             user_request=bounded_request,
-            correlation_id=(correlation_id or "")[:128],
+            correlation_id=safe_correlation_id,
         )
         run.started_at = django_timezone.now()
         run.status = "running"
@@ -246,6 +259,29 @@ class AdminAIService:
                 )
                 return
 
+            # Enforce hard caps on model-supplied tool-call IDs and tool
+            # names BEFORE any per-invocation row is created. Oversized or
+            # empty values are always refusals — never silently truncated.
+            for tc in response.tool_calls:
+                if not tc.id:
+                    self._finalize_error(
+                        run, "provider.invalid_response",
+                        "Empty tool-call ID from provider.",
+                    )
+                    return
+                if len(tc.id.encode("utf-8")) > MAX_TOOL_CALL_ID_BYTES:
+                    self._finalize_error(
+                        run, "provider.invalid_response",
+                        f"Tool-call ID exceeds {MAX_TOOL_CALL_ID_BYTES} bytes.",
+                    )
+                    return
+                if len(tc.name.encode("utf-8")) > MAX_TOOL_NAME_BYTES:
+                    self._finalize_error(
+                        run, "tool.unknown",
+                        f"Tool name exceeds {MAX_TOOL_NAME_BYTES} bytes.",
+                    )
+                    return
+
             # Persist provider request id on the run once we have it.
             if response.provider_request_id and not run.provider_request_id:
                 run.provider_request_id = bound_utf8(response.provider_request_id, 256)
@@ -259,7 +295,11 @@ class AdminAIService:
                         "Final response must have stop_reason 'end_turn'.",
                     )
                     return
-                bounded = bound_utf8(response.content or "", self._max_result_bytes)
+                # Redact before persisting: models can echo back sensitive
+                # tokens from the conversation history.
+                bounded = redact(
+                    response.content or "", max_bytes=self._max_result_bytes,
+                )
                 self._finalize_success(run, bounded)
                 return
 
@@ -288,7 +328,7 @@ class AdminAIService:
                         run,
                         AIModelToolCall(
                             id=call.id, name=call.name,
-                            arguments=dict(call.arguments),
+                            arguments=_to_plain_json(call.arguments),
                         ),
                         risk_level=RiskLevel.READ_ONLY,
                         error_code="tool.duplicate_call_id",
@@ -343,7 +383,10 @@ class AdminAIService:
             return "provider.response_too_large"
         for tc in response.tool_calls:
             try:
-                enc = json.dumps(tc.arguments, ensure_ascii=False).encode("utf-8")
+                enc = json.dumps(
+                    _to_plain_json(tc.arguments), ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
             except (TypeError, ValueError):
                 return "provider.invalid_response"
             if len(enc) > self._max_result_bytes:
@@ -521,7 +564,7 @@ class AdminAIService:
 
         t0 = time.monotonic()
         try:
-            outcome = handler(context, **dict(call.arguments))
+            outcome = handler(context, **_to_plain_json(call.arguments))
         except Exception as exc:
             duration_ms = int((time.monotonic() - t0) * 1000)
             invocation.status = "failed"
@@ -544,7 +587,56 @@ class AdminAIService:
         invocation.duration_ms = duration_ms
         invocation.completed_at = django_timezone.now()
 
+        # Post-handler deadline check: if the handler ran past the
+        # effective deadline, refuse to treat its result as authoritative
+        # — record as timed_out and fail the run.
+        now_after = datetime.now(tz=timezone.utc)
+        if now_after > effective_deadline:
+            invocation.status = "timed_out"
+            invocation.error_code = "tool.timeout"
+            invocation.result_summary = redact(
+                "Tool ran past run deadline.", max_bytes=1024,
+            )
+            invocation.save(update_fields=[
+                "status", "error_code", "result_summary",
+                "duration_ms", "completed_at",
+            ])
+            run.tool_call_count = run.tool_call_count + 1
+            run.save(update_fields=["tool_call_count"])
+            self._finalize_error(
+                run, "tool.timeout",
+                "Tool ran past the run deadline.",
+            )
+            return _tool_error_message(
+                call.id, "tool.timeout",
+                "Tool execution deadline exceeded.",
+            )
+
         if isinstance(outcome, AdminAIToolError):
+            # Tool-name mismatch on an error return is a handler contract
+            # violation — record as bad_return_type and fail the run so an
+            # operator can trace the mis-behaving handler.
+            if outcome.tool_name != definition.name:
+                invocation.status = "failed"
+                invocation.error_code = "tool.bad_return_type"
+                invocation.result_summary = redact(
+                    "Handler returned AdminAIToolError with mismatched tool_name.",
+                    max_bytes=1024,
+                )
+                invocation.save(update_fields=[
+                    "status", "error_code", "result_summary",
+                    "duration_ms", "completed_at",
+                ])
+                run.tool_call_count = run.tool_call_count + 1
+                run.save(update_fields=["tool_call_count"])
+                self._finalize_error(
+                    run, "tool.bad_return_type",
+                    "Handler returned AdminAIToolError with mismatched tool_name.",
+                )
+                return _tool_error_message(
+                    call.id, "tool.bad_return_type",
+                    "Tool returned mismatched tool_name.",
+                )
             invocation.status = "failed"
             invocation.error_code = bound_utf8(outcome.error_code, 128)
             invocation.result_summary = redact(outcome.message, max_bytes=1024)
@@ -606,7 +698,7 @@ class AdminAIService:
 
         # JSON-serialisability check (no default=str).
         try:
-            data_encoded = json.dumps(outcome.data, sort_keys=True, ensure_ascii=False)
+            data_encoded = json.dumps(outcome.data, sort_keys=True, ensure_ascii=False, allow_nan=False)
         except (TypeError, ValueError):
             invocation.status = "failed"
             invocation.error_code = "tool.bad_return_type"
@@ -630,7 +722,7 @@ class AdminAIService:
             "message": outcome.message,
         }
         try:
-            payload_encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+            payload_encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, allow_nan=False)
         except (TypeError, ValueError):  # pragma: no cover - covered by earlier check
             payload_encoded = data_encoded
         payload_bytes = len(payload_encoded.encode("utf-8"))
@@ -720,8 +812,10 @@ class AdminAIService:
             "error_summary": redact(error_summary, max_bytes=512),
         }
         if final_response is not None:
-            updates["final_response"] = bound_utf8(
-                final_response, self._max_result_bytes,
+            # Redact the final response before persistence — the model may
+            # echo sensitive substrings from the conversation history.
+            updates["final_response"] = redact(
+                final_response, max_bytes=self._max_result_bytes,
             )
 
         with transaction.atomic():
@@ -803,11 +897,26 @@ class AdminAIService:
 # ---------------------------------------------------------------------- helpers
 
 
+def _to_plain_json(value: Any) -> Any:
+    """Convert deep-frozen MappingProxy/tuple views back to plain dict/list.
+
+    Needed so :func:`json.dumps` (and anything else that special-cases
+    ``dict``) sees the expected concrete types after
+    :func:`cauldron_ai.contracts._deep_freeze` has been applied.
+    """
+    from collections.abc import Mapping as _M
+    if isinstance(value, _M):
+        return {str(k): _to_plain_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_plain_json(v) for v in value]
+    return value
+
+
 def _to_model_tool_definition(defn: AdminAIToolDefinition) -> AIModelToolDefinition:
     return AIModelToolDefinition(
         name=defn.name,
         description=defn.description,
-        parameters=dict(defn.argument_schema),
+        parameters=_to_plain_json(defn.argument_schema),
     )
 
 
@@ -816,14 +925,17 @@ def _tool_error_message(call_id: str, code: str, message: str) -> AIModelMessage
         "success": False,
         "error_code": code,
         "message": message,
-    }, sort_keys=True, ensure_ascii=False)
+    }, sort_keys=True, ensure_ascii=False, allow_nan=False)
     return AIModelMessage(role="tool", content=payload, tool_call_id=call_id)
 
 
 def _payload_bytes(payload: Any) -> int:
     try:
         return len(
-            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            json.dumps(
+                _to_plain_json(payload), sort_keys=True, ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
         )
     except (TypeError, ValueError):
         return len(str(payload).encode("utf-8"))
@@ -832,7 +944,8 @@ def _payload_bytes(payload: Any) -> int:
 def _hash_arguments(arguments: Any) -> str:
     try:
         serialised = json.dumps(
-            arguments, sort_keys=True, ensure_ascii=False,
+            _to_plain_json(arguments), sort_keys=True, ensure_ascii=False,
+            allow_nan=False,
         )
     except (TypeError, ValueError):
         serialised = repr(arguments)

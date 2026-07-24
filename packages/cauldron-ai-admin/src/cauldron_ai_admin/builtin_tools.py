@@ -26,7 +26,6 @@ from .tools import (
     AdminAIToolResult,
     RiskLevel,
     get_tool_registry,
-    unregister_tool,
 )
 
 
@@ -114,6 +113,9 @@ _LIST_COLLECTIONS_SCHEMA: dict = {
 
 
 def _handle_list_collections(context: AdminAIToolContext, **kwargs) -> Any:
+    deadline_err = _check_deadline("content.list_collections", context)
+    if deadline_err is not None:
+        return deadline_err
     if kwargs:
         return AdminAIToolError(
             tool_name="content.list_collections",
@@ -157,6 +159,9 @@ _LIST_ITEMS_SCHEMA: dict = {
 
 
 def _handle_list_items(context: AdminAIToolContext, **kwargs) -> Any:
+    deadline_err = _check_deadline("content.list_items", context)
+    if deadline_err is not None:
+        return deadline_err
     collection = kwargs.get("collection")
     limit = int(kwargs.get("limit", 20))
     offset = int(kwargs.get("offset", 0))
@@ -214,6 +219,9 @@ _GET_ITEM_SCHEMA: dict = {
 
 
 def _handle_get_item(context: AdminAIToolContext, **kwargs) -> Any:
+    deadline_err = _check_deadline("content.get_item", context)
+    if deadline_err is not None:
+        return deadline_err
     collection = kwargs.get("collection")
     item_id = kwargs.get("item_id")
     include_drafts = bool(kwargs.get("include_drafts", False))
@@ -299,6 +307,9 @@ PROPOSAL_ALLOWED_METHODS: frozenset[str] = frozenset({"create_change_request"})
 
 
 def _handle_create_proposal(context: AdminAIToolContext, **kwargs) -> Any:
+    deadline_err = _check_deadline("content.create_proposal", context)
+    if deadline_err is not None:
+        return deadline_err
     operations = kwargs.get("operations")
     if not isinstance(operations, list) or not operations:
         return AdminAIToolError(
@@ -377,7 +388,22 @@ _PREVIEW_CHANGE_REQUEST_SCHEMA: dict = {
 
 
 def _handle_preview_change_request(context: AdminAIToolContext, **kwargs) -> Any:
+    deadline_err = _check_deadline("content.preview_change_request", context)
+    if deadline_err is not None:
+        return deadline_err
     cs_id = kwargs.get("cs_id")
+    # ITEM 8: content.preview_change_request requires BOTH the declared
+    # view_content_change_requests permission AND view_draft_content — the
+    # tool-level gate covers the former, we enforce the latter here.
+    actor = getattr(context, "actor", None)
+    if actor is None or not actor.has_perm(
+        "cauldron_content_operations.view_draft_content"
+    ):
+        return AdminAIToolError(
+            tool_name="content.preview_change_request",
+            error_code="tool.permission_denied",
+            message="Actor lacks view_draft_content permission.",
+        )
     svc = _content_service_or_error("content.preview_change_request", context)
     if isinstance(svc, AdminAIToolError):
         return svc
@@ -446,6 +472,9 @@ MAX_CHECK_FINDINGS = 50
 
 
 def _handle_django_checks(context: AdminAIToolContext, **kwargs) -> Any:
+    deadline_err = _check_deadline("system.django_checks", context)
+    if deadline_err is not None:
+        return deadline_err
     tags = kwargs.get("tags") or []
     if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
         return AdminAIToolError(
@@ -516,6 +545,9 @@ _MODULE_STATUS_SCHEMA: dict = {
 
 
 def _handle_module_status(context: AdminAIToolContext, **kwargs) -> Any:
+    deadline_err = _check_deadline("system.module_status", context)
+    if deadline_err is not None:
+        return deadline_err
     if kwargs:
         return AdminAIToolError(
             tool_name="system.module_status",
@@ -531,25 +563,47 @@ def _handle_module_status(context: AdminAIToolContext, **kwargs) -> Any:
             message=redact_exception(exc, max_bytes=200),
         )
     graph = module_registry.graph_info() or []
+    lifecycle_errors_by_slug: dict[str, int] = {}
+    try:
+        for lifecycle_error in module_registry.lifecycle_errors():
+            slug = getattr(lifecycle_error, "module_slug", "")
+            if isinstance(slug, str) and slug:
+                lifecycle_errors_by_slug[slug] = (
+                    lifecycle_errors_by_slug.get(slug, 0) + 1
+                )
+    except Exception:
+        # Older registries may not expose lifecycle_errors — treat as none.
+        lifecycle_errors_by_slug = {}
     modules = []
     for entry in graph:
-        # Determine dependencies as a plain list of slugs (deduped).
+        slug = entry.get("slug", "") or ""
+        # Dependencies: unique, deterministically ordered slugs.
         deps: list[str] = []
         for req in entry.get("requires", []) or []:
-            slug = req.get("slug") if isinstance(req, dict) else None
-            if isinstance(slug, str) and slug and slug not in deps:
-                deps.append(slug)
-        for slug in entry.get("deps", []) or []:
-            if isinstance(slug, str) and slug and slug not in deps:
-                deps.append(slug)
+            dep_slug = req.get("slug") if isinstance(req, dict) else None
+            if isinstance(dep_slug, str) and dep_slug and dep_slug not in deps:
+                deps.append(dep_slug)
+        for dep_slug in entry.get("deps", []) or []:
+            if isinstance(dep_slug, str) and dep_slug and dep_slug not in deps:
+                deps.append(dep_slug)
         active = bool(entry.get("active"))
+        # Status: derived from active flag.
+        if lifecycle_errors_by_slug.get(slug):
+            status = "error"
+            health: str = "degraded"
+        elif active:
+            status = "active"
+            health = "unknown"  # true health signal is not fabricated.
+        else:
+            status = "inactive"
+            health = "unknown"
         modules.append({
-            "name": entry.get("slug", ""),
+            "name": slug,
             "capabilities": list(entry.get("provides", []) or []),
             "dependencies": sorted(deps),
-            "status": "active" if active else "inactive",
+            "status": status,
             "version": entry.get("version", ""),
-            "health": "ok" if active else "degraded",
+            "health": health,
         })
     return AdminAIToolResult(
         tool_name="system.module_status",
@@ -628,7 +682,12 @@ def _builtin_definitions() -> tuple[tuple[AdminAIToolDefinition, Any], ...]:
                 ),
                 argument_schema=_PREVIEW_CHANGE_REQUEST_SCHEMA,
                 risk_level=RiskLevel.READ_ONLY,
-                required_permission="cauldron_content_operations.view_draft_content",
+                # The tool-level gate. Handler ALSO checks
+                # view_draft_content at execution time so both
+                # permissions are required.
+                required_permission=(
+                    "cauldron_content_operations.view_content_change_requests"
+                ),
                 owning_module=OWNING_MODULE,
             ),
             _handle_preview_change_request,
@@ -670,14 +729,14 @@ def _builtin_definitions() -> tuple[tuple[AdminAIToolDefinition, Any], ...]:
 def register_builtin_tools() -> None:
     """Register every built-in tool with the singleton registry.
 
-    Idempotent: if a tool is already registered under the same name (for
-    example after a Django autoreload), we replace the entry with the
-    fresh handler rather than raising.
+    Idempotent when the same ``(definition, handler)`` pair is re-registered
+    (e.g. a Django autoreload), but never replaces a distinct existing
+    entry — a child-module registration must not be silently overwritten.
     """
     reg = get_tool_registry()
     for definition, handler in _builtin_definitions():
-        existing = reg.get(definition.name)
-        if existing is not None:
-            # Replace to avoid stale handlers surviving a reload.
-            unregister_tool(definition.name)
+        # The registry itself enforces "same defn + same handler is a
+        # no-op; anything else raises". We deliberately do not unregister
+        # here — that would let a stale built-in silently overwrite a
+        # child-module tool registered earlier in the process lifetime.
         reg.register(definition, handler)

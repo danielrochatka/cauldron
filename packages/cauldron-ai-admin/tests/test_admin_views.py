@@ -109,12 +109,14 @@ def test_admin_ai_post_calls_service():
     client = Client()
     client.force_login(user)
     from cauldron_ai_admin.models import AdminAIRun
+    from django.utils import timezone as _tz
     fake_run = AdminAIRun.objects.create(
         actor=user,
         status="completed",
         provider_name="fake",
         user_request="hello",
         final_response="hi back",
+        completed_at=_tz.now(),
     )
     fake_service = MagicMock()
     fake_service.run.return_value = fake_run

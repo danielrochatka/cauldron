@@ -146,3 +146,26 @@ def test_checks_skip_when_admin_ai_inactive():
         assert check_required_dependencies(None) == []
         assert check_reserved_namespace_violation(None) == []
         assert check_tool_zero_timeouts(None) == []
+
+
+# ---------------------------------------------------------------------------
+# admin_ai.E008 / E009
+# ---------------------------------------------------------------------------
+
+
+def test_e008_silent_when_all_capabilities_provided():
+    """When the module registry has been populated with every capability
+    the Admin AI module requires, E008 must be silent."""
+    from cauldron_ai_admin.checks import check_required_capabilities_present
+    # The default test project either has all deps or an empty registry;
+    # in either case E008 must not fire.
+    assert check_required_capabilities_present(None) == []
+
+
+def test_e009_silent_for_healthy_builtin_registry():
+    """The built-in tools must all satisfy the tool contract invariants."""
+    from cauldron_ai_admin.checks import check_registered_tool_contracts
+    from cauldron_ai_admin.builtin_tools import register_builtin_tools
+    register_builtin_tools()
+    errors = check_registered_tool_contracts(None)
+    assert errors == []

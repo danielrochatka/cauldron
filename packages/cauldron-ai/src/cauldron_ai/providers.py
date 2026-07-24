@@ -71,28 +71,34 @@ class AIModelProviderRegistry:
         *,
         descriptor: AIModelProviderDescriptor | None = None,
     ) -> None:
-        if not isinstance(getattr(provider, "name", None), str) or not provider.name:
+        # Validate EVERYTHING before touching either dict so a bad
+        # descriptor cannot leave the registry in a half-registered state.
+        name = getattr(provider, "name", None)
+        if not isinstance(name, str) or not name:
             raise ValueError("Provider must expose a non-empty string 'name' attribute")
         if not callable(getattr(provider, "complete", None)):
             raise TypeError("Provider must implement complete(request)")
+        if descriptor is not None and descriptor.name != name:
+            raise ValueError(
+                f"AIModelProviderDescriptor.name {descriptor.name!r} "
+                f"does not match provider.name {name!r}"
+            )
+        # Materialise the descriptor before touching the dictionaries so
+        # any construction failure aborts before we mutate state.
+        effective_descriptor = descriptor or AIModelProviderDescriptor(
+            name=name,
+            display_name=getattr(provider, "display_name", "") or name,
+            version=getattr(provider, "version", "") or "",
+        )
+
         with self._lock:
-            existing = self._providers.get(provider.name)
+            existing = self._providers.get(name)
             if existing is not None and existing is not provider:
                 raise ProviderRegistryError(
-                    f"AI provider {provider.name!r} is already registered"
+                    f"AI provider {name!r} is already registered"
                 )
-            self._providers[provider.name] = provider
-            if descriptor is None:
-                descriptor = AIModelProviderDescriptor(
-                    name=provider.name,
-                    display_name=getattr(provider, "display_name", "") or provider.name,
-                    version=getattr(provider, "version", "") or "",
-                )
-            elif descriptor.name != provider.name:
-                raise ValueError(
-                    "AIModelProviderDescriptor.name must match provider.name"
-                )
-            self._descriptors[provider.name] = descriptor
+            self._providers[name] = provider
+            self._descriptors[name] = effective_descriptor
 
     def unregister(self, name: str) -> None:
         """Remove a provider. Silent no-op if it isn't registered."""

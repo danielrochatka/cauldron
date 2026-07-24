@@ -1,0 +1,16 @@
+.cui-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0,0,0,0);
+  white-space: nowrap;
+  border: 0;
+}
+.cui-text-muted { color: var(--cui-color-text-muted); }
+.cui-text-sm { font-size: var(--cui-font-size-sm); }
+.cui-mt-0 { margin-top: 0; }
+.cui-mb-0 { margin-bottom: 0; }
+.cui-pre { white-space: pre-wrap; word-break: break-word; }

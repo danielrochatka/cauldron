@@ -1,0 +1,11 @@
+/* Bridge: apply Cauldron tokens to Django admin interface */
+#header {
+  background: var(--cui-color-primary, #0d6efd) !important;
+}
+a:link, a:visited { color: var(--cui-color-link, #0d6efd); }
+.cauldron-admin-back-link {
+  margin-top: 1rem;
+  padding: 0.5rem;
+  text-align: center;
+  font-size: 0.875rem;
+}

@@ -107,11 +107,34 @@ jobs:
       - name: Test (cauldron-admin-content)
         run: pytest packages/cauldron-admin-content/tests/ -v
 
+      - name: Install Admin AI modules
+        run: |
+          pip install -e packages/cauldron-ai
+          pip install -e packages/cauldron-ai-admin
+
+      - name: Test (cauldron-ai)
+        run: pytest packages/cauldron-ai/tests/ -v
+
+      - name: Test (cauldron-ai-admin)
+        run: pytest packages/cauldron-ai-admin/tests/ -v
+
       - name: Build content operations wheels
         run: |
           python -m build packages/cauldron-content-operations
           python -m build packages/cauldron-content-api
           python -m build packages/cauldron-admin-content
+
+      - name: Build Admin AI wheels
+        run: |
+          python -m build packages/cauldron-ai
+          python -m build packages/cauldron-ai-admin
+
+      - name: Clean-wheel cauldron-ai
+        run: |
+          python -m venv /tmp/cauldron_ai_wheel_test
+          /tmp/cauldron_ai_wheel_test/bin/pip install --upgrade pip
+          /tmp/cauldron_ai_wheel_test/bin/pip install packages/cauldron-ai/dist/cauldron_ai-*.whl
+          /tmp/cauldron_ai_wheel_test/bin/python -c "from cauldron_ai.contracts import AIModelRequest; print('ok')"
 
       - name: Content control plane example: migrate
         working-directory: examples/django-content-control-plane
@@ -166,6 +189,8 @@ jobs:
           .venv-wheel/bin/pip install packages/cauldron-content-operations/dist/cauldron_content_operations-*.whl
           .venv-wheel/bin/pip install packages/cauldron-content-api/dist/cauldron_content_api-*.whl
           .venv-wheel/bin/pip install packages/cauldron-admin-content/dist/cauldron_admin_content-*.whl
+          .venv-wheel/bin/pip install packages/cauldron-ai/dist/cauldron_ai-*.whl
+          .venv-wheel/bin/pip install packages/cauldron-ai-admin/dist/cauldron_ai_admin-*.whl
           .venv-wheel/bin/pip install pytest pytest-django
 
       - name: Content control plane example: migrate (wheel)

@@ -1,5 +1,12 @@
-"""Django system checks for cauldron.ai.admin."""
+"""Django system checks for cauldron.ai.admin.
+
+The checks are registered here and re-registered from
+``CauldronAIAdminConfig.ready()`` — importing this module is enough to
+put the checks into the process-wide registry.
+"""
 from __future__ import annotations
+
+from typing import Any
 
 from django.core import checks
 
@@ -20,54 +27,76 @@ def _admin_ai_config() -> dict:
     return cfg if isinstance(cfg, dict) else {}
 
 
+def _resolve_provider(cfg: dict, names: list[str]) -> tuple[Any | None, str | None]:
+    """Return (provider, error_id_or_none).
+
+    The behaviour mirrors ``service_factory.get_admin_ai_service``:
+
+    * If ``cfg["provider"]`` is set → look it up by name (E002 on miss).
+    * Otherwise fall back to the single registered provider (E003 when
+      ambiguous, E001 when empty).
+    """
+    from cauldron_ai.providers import get_provider, get_default_provider
+
+    configured = cfg.get("provider")
+    if configured:
+        try:
+            return get_provider(configured), None
+        except Exception:
+            return None, "admin_ai.E002"
+    if not names:
+        return None, "admin_ai.E001"
+    if len(names) > 1:
+        return None, "admin_ai.E003"
+    try:
+        return get_default_provider(), None
+    except Exception:  # pragma: no cover - defensive
+        return None, "admin_ai.E003"
+
+
 @checks.register(checks.Tags.compatibility)
 def check_ai_provider_registered(app_configs, **kwargs):
-    """admin_ai.E001 / E002: an AI provider must be registered.
-
-    We don't force sites to pin a provider name at import time — a
-    consuming app registers one at ``AppConfig.ready()``. The check
-    fires when Admin AI is active but the registry is empty; if the
-    site opts into a specific provider via ``preferred_provider`` in
-    ``CAULDRON_MODULES['cauldron.ai.admin']`` and the name is missing
-    we surface E002.
-    """
+    """admin_ai.E001/E002/E003: an AI provider must resolve deterministically."""
     if not _is_admin_ai_active():
         return []
     errors: list = []
     try:
-        from cauldron_ai.providers import provider_names, get_provider
+        from cauldron_ai.providers import provider_names
     except Exception as exc:  # pragma: no cover - defensive
-        errors.append(checks.Error(
+        return [checks.Error(
             f"cauldron.ai package is unavailable: {type(exc).__name__}",
             id="admin_ai.E001",
-        ))
-        return errors
+        )]
 
+    cfg = _admin_ai_config()
     names = provider_names()
-    if not names:
+    _, err_id = _resolve_provider(cfg, names)
+    if err_id == "admin_ai.E001":
         errors.append(checks.Error(
             "No AI provider is registered. Install a Cauldron AI provider "
             "package and register it at Django startup.",
             id="admin_ai.E001",
         ))
-        return errors
-
-    preferred = _admin_ai_config().get("preferred_provider")
-    if preferred:
-        try:
-            get_provider(preferred)
-        except Exception:
-            errors.append(checks.Error(
-                f"Preferred AI provider {preferred!r} is not registered. "
-                f"Registered providers: {names!r}.",
-                id="admin_ai.E002",
-            ))
+    elif err_id == "admin_ai.E002":
+        configured = cfg.get("provider", "")
+        errors.append(checks.Error(
+            f"Configured AI provider {configured!r} is not registered. "
+            f"Registered providers: {names!r}.",
+            id="admin_ai.E002",
+        ))
+    elif err_id == "admin_ai.E003":
+        errors.append(checks.Error(
+            "Multiple AI providers are registered without an explicit "
+            "cauldron.ai.admin 'provider' selection. Registered: "
+            f"{names!r}.",
+            id="admin_ai.E003",
+        ))
     return errors
 
 
 @checks.register(checks.Tags.compatibility)
 def check_limits_are_positive(app_configs, **kwargs):
-    """admin_ai.E003: numeric limits must all be positive integers/floats."""
+    """admin_ai.E004: numeric limits must all be positive integers/floats."""
     if not _is_admin_ai_active():
         return []
     cfg = _admin_ai_config()
@@ -89,7 +118,7 @@ def check_limits_are_positive(app_configs, **kwargs):
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             errors.append(checks.Error(
                 f"cauldron.ai.admin config {key!r} must be a positive integer.",
-                id="admin_ai.E003",
+                id="admin_ai.E004",
             ))
     for key in positive_float_keys:
         if key not in cfg:
@@ -98,41 +127,17 @@ def check_limits_are_positive(app_configs, **kwargs):
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
             errors.append(checks.Error(
                 f"cauldron.ai.admin config {key!r} must be a positive number.",
-                id="admin_ai.E003",
+                id="admin_ai.E004",
             ))
     return errors
 
 
 @checks.register(checks.Tags.compatibility)
-def check_no_duplicate_tool_names(app_configs, **kwargs):
-    """admin_ai.E004: the tool registry never holds duplicate names.
-
-    The registry's ``register()`` refuses duplicates, so this check is
-    a belt-and-braces observation for operators who inspect the graph.
-    """
-    if not _is_admin_ai_active():
-        return []
-    try:
-        from .tools import get_tool_registry
-        duplicates = get_tool_registry().duplicate_names()
-    except Exception:
-        return []
-    if not duplicates:
-        return []
-    return [checks.Error(
-        f"Duplicate tool names in Admin AI registry: {sorted(duplicates)!r}",
-        id="admin_ai.E004",
-    )]
-
-
-@checks.register(checks.Tags.compatibility)
 def check_required_dependencies(app_configs, **kwargs):
-    """admin_ai.E005: dependent modules must be installed and active.
+    """admin_ai.E005: dependent Django apps must be installed.
 
     Admin AI's proposals go through ``cauldron.content.operations``, so
-    the Django app must be present. We don't require the Cauldron module
-    itself to be enabled in ``CAULDRON_MODULES`` — but if it isn't,
-    proposals will fail at runtime and we surface a warning.
+    the Django app must be present.
     """
     if not _is_admin_ai_active():
         return []
@@ -151,3 +156,68 @@ def check_required_dependencies(app_configs, **kwargs):
             id="admin_ai.E005",
         ))
     return errors
+
+
+@checks.register(checks.Tags.compatibility)
+def check_no_duplicate_tool_names(app_configs, **kwargs):
+    """admin_ai.E006: the tool registry never holds duplicate names."""
+    if not _is_admin_ai_active():
+        return []
+    try:
+        from .tools import get_tool_registry
+        duplicates = get_tool_registry().duplicate_names()
+    except Exception:
+        return []
+    if not duplicates:
+        return []
+    return [checks.Error(
+        f"Duplicate tool names in Admin AI registry: {sorted(duplicates)!r}",
+        id="admin_ai.E006",
+    )]
+
+
+@checks.register(checks.Tags.compatibility)
+def check_reserved_namespace_violation(app_configs, **kwargs):
+    """admin_ai.E007: no non-server module may register a ``server.*`` tool."""
+    if not _is_admin_ai_active():
+        return []
+    try:
+        from .tools import get_tool_registry, SERVER_NAMESPACE, SERVER_OWNING_MODULE
+        registry = get_tool_registry()
+        offenders = []
+        for defn in registry.all_definitions():
+            if defn.name.startswith(SERVER_NAMESPACE) and (
+                defn.owning_module != SERVER_OWNING_MODULE
+            ):
+                offenders.append((defn.name, defn.owning_module))
+    except Exception:
+        return []
+    if not offenders:
+        return []
+    return [checks.Error(
+        "Reserved namespace 'server.*' has non-server registrations: "
+        f"{offenders!r}",
+        id="admin_ai.E007",
+    )]
+
+
+@checks.register(checks.Tags.compatibility)
+def check_tool_zero_timeouts(app_configs, **kwargs):
+    """admin_ai.W001: a registered tool has zero-ish timeout — likely a bug."""
+    if not _is_admin_ai_active():
+        return []
+    try:
+        from .tools import get_tool_registry
+        registry = get_tool_registry()
+        zeroed = [
+            defn.name for defn in registry.all_definitions()
+            if defn.timeout_seconds <= 0
+        ]
+    except Exception:
+        return []
+    if not zeroed:
+        return []
+    return [checks.Warning(
+        f"Admin AI tools with non-positive timeout_seconds: {zeroed!r}",
+        id="admin_ai.W001",
+    )]

@@ -8,8 +8,9 @@ _manifest = ModuleManifest(
     cauldron_version=">=0.1.0",
     django_apps=(),
     provides=(
-        "ai.contracts",
-        "ai.providers",
+        "ai.model.contracts",
+        "ai.model.providers",
+        "ai.toolcalling",
     ),
 )
 

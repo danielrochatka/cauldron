@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from django.contrib.auth.decorators import login_required, permission_required
+from django.core.exceptions import PermissionDenied
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import render
 from django.utils.decorators import method_decorator
@@ -92,7 +93,7 @@ class AdminAIPageView(View):
             )
         try:
             run = service.run(request.user, request_text, correlation_id=correlation_id)
-        except PermissionError as exc:
+        except (PermissionDenied, PermissionError) as exc:
             return JsonResponse({"error": str(exc)}, status=403)
         except ValueError as exc:
             return JsonResponse({"error": str(exc)}, status=400)

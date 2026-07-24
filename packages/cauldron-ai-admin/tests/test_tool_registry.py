@@ -37,10 +37,15 @@ def test_register_and_get():
 
 
 def test_register_duplicate_raises():
+    """Registering the same name with a different handler must fail."""
     r = AdminAIToolRegistry()
     r.register(_defn("a.b"), _handler)
+
+    def _other_handler(ctx, **kw):  # pragma: no cover - not invoked
+        return AdminAIToolResult(tool_name="x")
+
     with pytest.raises(ValueError):
-        r.register(_defn("a.b"), _handler)
+        r.register(_defn("a.b"), _other_handler)
 
 
 def test_register_idempotent_when_same_args():
@@ -62,8 +67,8 @@ def test_all_definitions_sorted():
 
 def test_list_for_actor_filters_by_permission():
     r = AdminAIToolRegistry()
-    r.register(_defn("read", "app.view_x"), _handler)
-    r.register(_defn("write", "app.edit_x"), _handler)
+    r.register(_defn("t.read", "app.view_x"), _handler)
+    r.register(_defn("t.write", "app.edit_x"), _handler)
 
     class Actor:
         is_active = True
@@ -72,19 +77,19 @@ def test_list_for_actor_filters_by_permission():
 
     only_read = Actor(["app.view_x"])
     all_perms = Actor(["app.view_x", "app.edit_x"])
-    assert [d.name for d in r.list_for_actor(only_read)] == ["read"]
-    assert [d.name for d in r.list_for_actor(all_perms)] == ["read", "write"]
+    assert [d.name for d in r.list_for_actor(only_read)] == ["t.read"]
+    assert [d.name for d in r.list_for_actor(all_perms)] == ["t.read", "t.write"]
 
 
 def test_list_for_actor_none_returns_empty():
     r = AdminAIToolRegistry()
-    r.register(_defn("read"), _handler)
+    r.register(_defn("t.read"), _handler)
     assert r.list_for_actor(None) == []
 
 
 def test_list_for_actor_inactive_returns_empty():
     r = AdminAIToolRegistry()
-    r.register(_defn("read"), _handler)
+    r.register(_defn("t.read"), _handler)
 
     class Actor:
         is_active = False
@@ -102,31 +107,31 @@ def test_register_bad_definition_raises():
 def test_register_bad_handler_raises():
     r = AdminAIToolRegistry()
     with pytest.raises(TypeError):
-        r.register(_defn("a"), "not callable")  # type: ignore[arg-type]
+        r.register(_defn("a.b"), "not callable")  # type: ignore[arg-type]
 
 
 def test_definition_defensive_copy():
-    schema = {"type": "object"}
-    d = _defn("a")
+    schema = {"type": "object", "properties": {}}
     d = AdminAIToolDefinition(
-        name="x",
-        version="1",
+        name="a.x",
+        version="1.0",
         description="",
         argument_schema=schema,
         risk_level=RiskLevel.READ_ONLY,
         required_permission="p.q",
-        owning_module="m",
+        owning_module="cauldron.m",
     )
     schema["type"] = "mutated"
-    assert d.argument_schema == {"type": "object"}
+    assert d.argument_schema == {"type": "object", "properties": {}}
 
 
 def test_definition_rejects_bad_risk_level():
     with pytest.raises(TypeError):
         AdminAIToolDefinition(
-            name="x", version="1", description="", argument_schema={},
+            name="a.x", version="1.0", description="",
+            argument_schema={"type": "object"},
             risk_level="READ_ONLY",  # type: ignore[arg-type]
-            required_permission="p.q", owning_module="m",
+            required_permission="p.q", owning_module="cauldron.m",
         )
 
 

@@ -63,8 +63,14 @@ class AIModelProviderRegistry:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._providers: dict[str, AIModelProvider] = {}
+        self._descriptors: dict[str, AIModelProviderDescriptor] = {}
 
-    def register(self, provider: AIModelProvider) -> None:
+    def register(
+        self,
+        provider: AIModelProvider,
+        *,
+        descriptor: AIModelProviderDescriptor | None = None,
+    ) -> None:
         if not isinstance(getattr(provider, "name", None), str) or not provider.name:
             raise ValueError("Provider must expose a non-empty string 'name' attribute")
         if not callable(getattr(provider, "complete", None)):
@@ -76,11 +82,23 @@ class AIModelProviderRegistry:
                     f"AI provider {provider.name!r} is already registered"
                 )
             self._providers[provider.name] = provider
+            if descriptor is None:
+                descriptor = AIModelProviderDescriptor(
+                    name=provider.name,
+                    display_name=getattr(provider, "display_name", "") or provider.name,
+                    version=getattr(provider, "version", "") or "",
+                )
+            elif descriptor.name != provider.name:
+                raise ValueError(
+                    "AIModelProviderDescriptor.name must match provider.name"
+                )
+            self._descriptors[provider.name] = descriptor
 
     def unregister(self, name: str) -> None:
         """Remove a provider. Silent no-op if it isn't registered."""
         with self._lock:
             self._providers.pop(name, None)
+            self._descriptors.pop(name, None)
 
     def get(self, name: str) -> AIModelProvider:
         with self._lock:
@@ -90,6 +108,15 @@ class AIModelProviderRegistry:
                 f"No AI provider registered with name {name!r}"
             )
         return provider
+
+    def descriptor_for(self, name: str) -> AIModelProviderDescriptor:
+        with self._lock:
+            descriptor = self._descriptors.get(name)
+        if descriptor is None:
+            raise ProviderRegistryError(
+                f"No AI provider registered with name {name!r}"
+            )
+        return descriptor
 
     def names(self) -> list[str]:
         with self._lock:
@@ -117,14 +144,19 @@ class AIModelProviderRegistry:
         """Test helper: remove every registered provider."""
         with self._lock:
             self._providers.clear()
+            self._descriptors.clear()
 
 
 # Module-level singleton used by consumers and tests.
 _registry = AIModelProviderRegistry()
 
 
-def register_provider(provider: AIModelProvider) -> None:
-    _registry.register(provider)
+def register_provider(
+    provider: AIModelProvider,
+    *,
+    descriptor: AIModelProviderDescriptor | None = None,
+) -> None:
+    _registry.register(provider, descriptor=descriptor)
 
 
 def unregister_provider(name: str) -> None:
@@ -133,6 +165,10 @@ def unregister_provider(name: str) -> None:
 
 def get_provider(name: str) -> AIModelProvider:
     return _registry.get(name)
+
+
+def descriptor_for(name: str) -> AIModelProviderDescriptor:
+    return _registry.descriptor_for(name)
 
 
 def get_default_provider() -> AIModelProvider:

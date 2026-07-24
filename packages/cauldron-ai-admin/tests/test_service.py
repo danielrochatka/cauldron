@@ -43,13 +43,16 @@ def _service(provider, registry) -> AdminAIService:
     )
 
 
-def _make_user(username="ai-user", perms=("auth.view_user",)):
+def _make_user(username="ai-user", perms=("auth.view_user",), *, include_ai=True):
     from django.contrib.auth import get_user_model
     from django.contrib.auth.models import Permission
     User = get_user_model()
     user, _ = User.objects.get_or_create(username=username)
     # Assign perms by codename by parsing app.codename.
-    for spec in perms:
+    all_perms = list(perms)
+    if include_ai:
+        all_perms.append("cauldron_ai_admin.use_admin_ai")
+    for spec in all_perms:
         app_label, codename = spec.split(".", 1)
         try:
             perm = Permission.objects.get(
@@ -221,7 +224,7 @@ def test_service_oversized_arguments_rejected():
 def test_service_permission_denied():
     reg = AdminAIToolRegistry()
     reg.register(
-        _defn("t.read", perm="does.not.exist"),
+        _defn("t.read", perm="auth.change_user"),
         lambda ctx, **kw: AdminAIToolResult(tool_name="t.read"),
     )
     fake = FakeAIModelProvider()
@@ -286,6 +289,8 @@ def test_service_max_tool_calls_exceeded():
 
 
 def test_service_duplicate_call_id_rejected():
+    """Duplicate ids inside a single response are rejected at the provider
+    validation layer (``provider.invalid_response``)."""
     reg = AdminAIToolRegistry()
     reg.register(_defn("t.read"), lambda ctx, **kw: AdminAIToolResult(
         tool_name="t.read", success=True, data={},
@@ -297,6 +302,31 @@ def test_service_duplicate_call_id_rejected():
             AIModelToolCall(id="dup", name="t.read", arguments={}),
             AIModelToolCall(id="dup", name="t.read", arguments={}),
         ),
+        stop_reason="tool_use",
+    ))
+    svc = _service(fake, reg)
+    user = _make_user()
+    run = svc.run(user, "Dupe.")
+    assert run.status == "failed"
+    assert run.error_code == "provider.invalid_response"
+
+
+def test_service_duplicate_call_id_across_turns_rejected():
+    """Same tool-call id reused across separate turns is a
+    ``tool.duplicate_call_id`` audit error."""
+    reg = AdminAIToolRegistry()
+    reg.register(_defn("t.read"), lambda ctx, **kw: AdminAIToolResult(
+        tool_name="t.read", success=True, data={},
+    ))
+    fake = FakeAIModelProvider()
+    fake.queue_response(AIModelResponse(
+        provider_request_id="r1",
+        tool_calls=(AIModelToolCall(id="dup", name="t.read", arguments={}),),
+        stop_reason="tool_use",
+    ))
+    fake.queue_response(AIModelResponse(
+        provider_request_id="r2",
+        tool_calls=(AIModelToolCall(id="dup", name="t.read", arguments={}),),
         stop_reason="tool_use",
     ))
     svc = _service(fake, reg)
@@ -354,10 +384,11 @@ def test_service_records_denied_invocation_for_denials():
 
 
 def test_service_requires_active_actor():
+    from django.core.exceptions import PermissionDenied
     reg = AdminAIToolRegistry()
     fake = FakeAIModelProvider()
     svc = _service(fake, reg)
-    with pytest.raises(PermissionError):
+    with pytest.raises(PermissionDenied):
         svc.run(None, "Hello.")
 
 

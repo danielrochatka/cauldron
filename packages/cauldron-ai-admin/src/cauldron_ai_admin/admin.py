@@ -1,4 +1,13 @@
-"""Read-only Django Admin registrations for Admin AI audit records."""
+"""Read-only Django Admin registrations for Admin AI audit records.
+
+Access is gated by custom permissions:
+
+* ``cauldron_ai_admin.view_admin_ai_runs`` — see the run list/detail.
+* ``cauldron_ai_admin.view_admin_ai_audit`` — see the invocation list/detail.
+
+Callers with only ``use_admin_ai`` cannot see either page — that is the
+right to invoke, not the right to audit.
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -7,6 +16,20 @@ from django.contrib import admin
 from django.http import HttpRequest
 
 from .models import AdminAIRun, AdminAIToolInvocation
+
+
+VIEW_RUNS_PERM = "cauldron_ai_admin.view_admin_ai_runs"
+VIEW_AUDIT_PERM = "cauldron_ai_admin.view_admin_ai_audit"
+
+
+def _user_has_perm(request: HttpRequest, perm: str) -> bool:
+    user = getattr(request, "user", None)
+    if user is None:
+        return False
+    try:
+        return bool(user.has_perm(perm))
+    except Exception:  # pragma: no cover - defensive
+        return False
 
 
 @admin.register(AdminAIRun)
@@ -41,6 +64,12 @@ class AdminAIRunAdmin(admin.ModelAdmin):
         "version",
     ]
 
+    def has_module_permission(self, request: HttpRequest) -> bool:
+        return _user_has_perm(request, VIEW_RUNS_PERM)
+
+    def has_view_permission(self, request: HttpRequest, obj: Any = None) -> bool:
+        return _user_has_perm(request, VIEW_RUNS_PERM)
+
     def has_add_permission(self, request: HttpRequest) -> bool:
         return False
 
@@ -72,6 +101,8 @@ class AdminAIToolInvocationAdmin(admin.ModelAdmin):
         "tool_name",
         "tool_version",
         "owning_module",
+        "required_permission",
+        "correlation_id",
         "risk_level",
         "status",
         "arguments_hash",
@@ -83,6 +114,12 @@ class AdminAIToolInvocationAdmin(admin.ModelAdmin):
         "started_at",
         "completed_at",
     ]
+
+    def has_module_permission(self, request: HttpRequest) -> bool:
+        return _user_has_perm(request, VIEW_AUDIT_PERM)
+
+    def has_view_permission(self, request: HttpRequest, obj: Any = None) -> bool:
+        return _user_has_perm(request, VIEW_AUDIT_PERM)
 
     def has_add_permission(self, request: HttpRequest) -> bool:
         return False

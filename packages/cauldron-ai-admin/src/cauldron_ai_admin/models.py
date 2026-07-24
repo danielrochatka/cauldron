@@ -5,6 +5,7 @@ import uuid
 
 from django.conf import settings
 from django.db import models
+from django.db.models import Q
 
 
 RUN_STATUS_CHOICES = [
@@ -33,6 +34,14 @@ RISK_LEVEL_CHOICES = [
     ("PRIVILEGED", "PRIVILEGED"),
 ]
 
+_RUN_STATUS_VALUES = [v for v, _ in RUN_STATUS_CHOICES]
+_INVOCATION_STATUS_VALUES = [v for v, _ in INVOCATION_STATUS_CHOICES]
+
+
+class ConcurrentModificationError(RuntimeError):
+    """Raised when an optimistic-concurrency finalize fails because the row
+    was updated under our feet."""
+
 
 class AdminAIRun(models.Model):
     """One end-to-end natural-language admin request.
@@ -49,6 +58,20 @@ class AdminAIRun(models.Model):
             models.Index(fields=["status"], name="aair_status_idx"),
             models.Index(fields=["correlation_id"], name="aair_corr_idx"),
             models.Index(fields=["created_at"], name="aair_created_idx"),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                check=~Q(provider_name=""),
+                name="adminairun_provider_name_nonempty",
+            ),
+            models.CheckConstraint(
+                check=Q(version__gt=0),
+                name="adminairun_version_positive",
+            ),
+            models.CheckConstraint(
+                check=Q(status__in=_RUN_STATUS_VALUES),
+                name="adminairun_status_valid",
+            ),
         ]
         permissions = [
             ("use_admin_ai", "Can invoke the Admin AI assistant"),
@@ -100,6 +123,17 @@ class AdminAIToolInvocation(models.Model):
             models.Index(fields=["status"], name="aai_ti_status_idx"),
             models.Index(fields=["risk_level"], name="aai_ti_risk_idx"),
         ]
+        constraints = [
+            models.CheckConstraint(
+                check=~Q(tool_name=""),
+                name="adminaitoolinvocation_tool_name_nonempty",
+            ),
+            models.UniqueConstraint(
+                fields=["run", "tool_call_id"],
+                condition=~Q(tool_call_id=""),
+                name="adminaitoolinvocation_tool_call_id_unique",
+            ),
+        ]
 
     invocation_id = models.UUIDField(
         primary_key=True, default=uuid.uuid4, editable=False
@@ -109,10 +143,12 @@ class AdminAIToolInvocation(models.Model):
         on_delete=models.PROTECT,
         related_name="invocations",
     )
-    tool_call_id = models.CharField(max_length=128, blank=True, default="")
+    tool_call_id = models.CharField(max_length=256, blank=True, default="")
     tool_name = models.CharField(max_length=128, db_index=True)
     tool_version = models.CharField(max_length=32, blank=True, default="")
     owning_module = models.CharField(max_length=128, blank=True, default="")
+    required_permission = models.CharField(max_length=256, blank=True, default="")
+    correlation_id = models.CharField(max_length=128, blank=True, default="")
     risk_level = models.CharField(
         max_length=32,
         choices=RISK_LEVEL_CHOICES,

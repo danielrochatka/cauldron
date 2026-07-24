@@ -5,12 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cauldron-ai-admin"
 version = "0.1.0"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "cauldron>=0.1.0",
     "cauldron-ai>=0.1.0",
     "cauldron-content-operations>=0.1.0",
+    "cauldron-admin-content>=0.1.0",
     "django>=4.2",
+    "jsonschema>=4.0",
 ]
 
 [project.entry-points."cauldron.modules"]

@@ -84,15 +84,28 @@ def modules_view(request):
     else:
         cap_providers_setting = {}
 
-    # Lifecycle errors keyed by slug so we can flag degraded modules.
-    lifecycle_error_slugs: set[str] = set()
+    # Slugs with any resolution/lifecycle error — we degrade their status so
+    # the modules page surfaces problems inline rather than only in the
+    # diagnostics block at the bottom. An operator scanning the list should
+    # see the failed module marked red without reading the error section.
+    error_slugs: set[str] = set()
+
+    def _collect_error_slugs(iterable) -> None:
+        for err in (iterable or []):
+            for attr in ("module_slug", "slug", "module"):
+                val = getattr(err, attr, "") or ""
+                if isinstance(val, str) and val:
+                    error_slugs.add(val)
+                    break
+
     try:
-        for err in (mod_registry.lifecycle_errors() or []):
-            slug_val = getattr(err, "module_slug", "") or ""
-            if isinstance(slug_val, str) and slug_val:
-                lifecycle_error_slugs.add(slug_val)
+        _collect_error_slugs(mod_registry.errors())
     except Exception:
-        lifecycle_error_slugs = set()
+        pass
+    try:
+        _collect_error_slugs(mod_registry.lifecycle_errors())
+    except Exception:
+        pass
 
     for info in graph_list:
         if not isinstance(info, dict):
@@ -105,8 +118,9 @@ def modules_view(request):
         django_apps = list(info.get("django_apps", []) or [])
         load_index = info.get("load_index")
 
-        # Status: lifecycle errors override active/inactive with "error".
-        if slug in lifecycle_error_slugs:
+        # Status: resolution or lifecycle errors override active/inactive
+        # with "error" so failures are visible on the row itself.
+        if slug in error_slugs:
             status = "error"
             health = "degraded"
         elif is_active:

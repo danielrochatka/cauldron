@@ -81,20 +81,38 @@ def _record_apply_conflict(
             )
 
 
+class RollbackResult:
+    """Outcome of :func:`_attempt_filesystem_rollback`.
+
+    ``success`` is True when the previous on-disk state was restored (or the
+    freshly-written file was successfully deleted for a create). When False,
+    ``error_class`` names the exception type that defeated the rollback so
+    the caller can persist it for operators.
+    """
+
+    __slots__ = ("success", "error_class")
+
+    def __init__(self, success: bool, error_class: str = "") -> None:
+        self.success = success
+        self.error_class = error_class
+
+
 def _attempt_filesystem_rollback(
     store,
     scope: str,
     target_path: str,
     old_content: str | None,
     written_hash: str,
-) -> None:
+) -> RollbackResult:
     """Best-effort filesystem restore after a post-write DB failure.
 
     If we had captured the previous file content we try to restore it using
     the just-written hash as the optimistic-lock witness. If there was no
     previous content (the file was created by this apply), we try to delete
-    the freshly-written file instead. Either way, we swallow any error and
-    log a loud message so operators can reconcile manually.
+    the freshly-written file instead. Returns a :class:`RollbackResult` so
+    the caller can persist a durable outcome record — swallowing rollback
+    failures silently would let the DB and filesystem drift apart without
+    any operator-visible signal.
 
     ``scope`` and ``target_path`` are passed as separate arguments (rather
     than a model instance) because the caller invokes us from an outer
@@ -111,12 +129,14 @@ def _attempt_filesystem_rollback(
             store.delete_file_atomic(
                 scope, target_path, expected_hash=written_hash,
             )
-    except Exception:
+        return RollbackResult(success=True)
+    except Exception as exc:
         logger.exception(
             "CRITICAL: filesystem write succeeded but DB failed and rollback "
             "also failed. Manual reconciliation required for scope=%r target=%r",
             scope, target_path,
         )
+        return RollbackResult(success=False, error_class=type(exc).__name__)
 
 
 class UIStyleChangeService:
@@ -409,7 +429,9 @@ class UIStyleChangeService:
 
         # ── Phase 3: persist applied state ────────────────────────────────
         # If ANYTHING here fails (model save, audit creation, or the commit
-        # itself), roll the filesystem back to its captured pre-image.
+        # itself), roll the filesystem back to its captured pre-image AND
+        # persist a durable record of the rollback outcome — the DB and the
+        # filesystem must never be silently inconsistent.
         try:
             with transaction.atomic():
                 locked2 = UIStyleChangeRequest.objects.select_for_update().get(
@@ -437,11 +459,69 @@ class UIStyleChangeService:
                     actor=applied_by,
                     detail={"new_hash": new_hash},
                 )
-        except Exception:
-            _attempt_filesystem_rollback(
+        except Exception as phase3_exc:
+            rollback = _attempt_filesystem_rollback(
                 store, scope, target_path, old_content, new_hash,
             )
-            raise
+
+            # Persist the rollback outcome in an INDEPENDENT transaction. If
+            # rollback succeeded the proposal remains ``approved`` for retry
+            # (with an error trail so operators know Phase 3 failed once).
+            # If rollback failed, mark ``conflicted`` so the row cannot be
+            # applied again without human review of the DB↔FS mismatch.
+            try:
+                with transaction.atomic():
+                    locked3 = (
+                        UIStyleChangeRequest.objects
+                        .select_for_update()
+                        .get(pk=proposal.pk)
+                    )
+                    if rollback.success:
+                        locked3.error_code = "APPLY_DB_FAILED"
+                        locked3.error_summary = (
+                            "Database write failed after filesystem write; "
+                            "filesystem was restored."
+                        )
+                        locked3.save(update_fields=[
+                            "error_code", "error_summary",
+                        ])
+                        UIStyleAuditEvent.objects.create(
+                            change_request=locked3,
+                            sequence=_next_sequence_locked(locked3),
+                            event_type="failed",
+                            actor=applied_by,
+                            detail={
+                                "error_class": "DB_COMMIT_FAILED",
+                                "rollback": "succeeded",
+                            },
+                        )
+                    else:
+                        locked3.status = "conflicted"
+                        locked3.error_code = "ROLLBACK_FAILED"
+                        locked3.error_summary = (
+                            "Database and filesystem are inconsistent; "
+                            "manual review required."
+                        )
+                        locked3.save(update_fields=[
+                            "status", "error_code", "error_summary",
+                        ])
+                        UIStyleAuditEvent.objects.create(
+                            change_request=locked3,
+                            sequence=_next_sequence_locked(locked3),
+                            event_type="failed",
+                            actor=applied_by,
+                            detail={
+                                "error_class": "ROLLBACK_FAILED",
+                                "rollback_error_class": rollback.error_class,
+                            },
+                        )
+            except Exception:
+                logger.exception(
+                    "CRITICAL: could not persist rollback outcome for "
+                    "proposal %s",
+                    proposal.pk,
+                )
+            raise phase3_exc
 
         return UIStyleChangeRequest.objects.get(pk=proposal.pk)
 

@@ -278,3 +278,278 @@ def test_db_failure_after_write_restores_previous_bytes():
 
             store = UIOverrideStore(override_root)
             assert store.read_file("admin", "already.css") == original
+
+
+@pytest.mark.django_db(transaction=True)
+def test_phase3_db_failure_rollback_persists_apply_db_failed_new_file():
+    """A successful rollback after Phase 3 must persist a durable
+    ``APPLY_DB_FAILED`` audit record — swallowing the rollback outcome
+    silently would leave operators unable to see that a retry is safe.
+    The proposal stays ``approved`` (rollback succeeded) so a retry is
+    legitimate; the failure is recorded on ``error_code`` and via a
+    ``failed`` audit event.
+    """
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from cauldron_ai_admin.models import (
+        UIStyleAuditEvent, UIStyleChangeRequest,
+    )
+    from cauldron_django_admin.override_store import UIOverrideStore
+
+    user = _make_user("apply-persist-new-user")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        override_root = Path(tmpdir)
+        (override_root / "admin").mkdir()
+
+        proposal = _make_proposal(
+            status="approved",
+            scope="admin",
+            target_path="new-fail.css",
+            proposed_content="body { color: red; }",
+            base_exists=False,
+            base_hash="",
+        )
+        service = UIStyleChangeService()
+
+        original_save = UIStyleChangeRequest.save
+        fired = threading.Event()
+
+        def failing_save(self, *args, **kwargs):
+            update_fields = kwargs.get("update_fields") or []
+            if (
+                "status" in update_fields
+                and getattr(self, "status", "") == "applied"
+                and not fired.is_set()
+            ):
+                fired.set()
+                raise RuntimeError("Injected DB failure during apply commit.")
+            return original_save(self, *args, **kwargs)
+
+        with override_settings(CAULDRON_UI_OVERRIDES_DIR=str(override_root)):
+            with patch.object(UIStyleChangeRequest, "save", failing_save):
+                with pytest.raises(RuntimeError):
+                    service.apply(proposal, applied_by=user)
+
+            # Rollback should have removed the freshly-created file.
+            store = UIOverrideStore(override_root)
+            with pytest.raises(FileNotFoundError):
+                store.read_file("admin", "new-fail.css")
+
+        proposal.refresh_from_db()
+        assert proposal.status == "approved"
+        assert proposal.error_code == "APPLY_DB_FAILED"
+        assert "filesystem was restored" in (proposal.error_summary or "")
+
+        failed_events = list(UIStyleAuditEvent.objects.filter(
+            change_request=proposal, event_type="failed",
+        ))
+        assert len(failed_events) == 1
+        detail = failed_events[0].detail or {}
+        assert detail.get("error_class") == "DB_COMMIT_FAILED"
+        assert detail.get("rollback") == "succeeded"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_phase3_db_failure_rollback_persists_apply_db_failed_existing_file():
+    """Same durability guarantee, but for an existing-file proposal: the
+    pre-image must be restored on disk AND ``APPLY_DB_FAILED`` recorded
+    so the proposal can be retried safely.
+    """
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from cauldron_ai_admin.models import (
+        UIStyleAuditEvent, UIStyleChangeRequest,
+    )
+    from cauldron_django_admin.override_store import UIOverrideStore
+
+    user = _make_user("apply-persist-existing-user")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        override_root = Path(tmpdir)
+        admin_dir = override_root / "admin"
+        admin_dir.mkdir()
+
+        original = "body { color: chartreuse; }"
+        (admin_dir / "already.css").write_text(original, encoding="utf-8")
+        original_hash = hashlib.sha256(original.encode("utf-8")).hexdigest()
+
+        proposal = _make_proposal(
+            status="approved",
+            scope="admin",
+            target_path="already.css",
+            proposed_content="body { color: red; }",
+            base_exists=True,
+            base_hash=original_hash,
+        )
+        service = UIStyleChangeService()
+
+        original_save = UIStyleChangeRequest.save
+        fired = threading.Event()
+
+        def failing_save(self, *args, **kwargs):
+            update_fields = kwargs.get("update_fields") or []
+            if (
+                "status" in update_fields
+                and getattr(self, "status", "") == "applied"
+                and not fired.is_set()
+            ):
+                fired.set()
+                raise RuntimeError("Injected DB failure during apply commit.")
+            return original_save(self, *args, **kwargs)
+
+        with override_settings(CAULDRON_UI_OVERRIDES_DIR=str(override_root)):
+            with patch.object(UIStyleChangeRequest, "save", failing_save):
+                with pytest.raises(RuntimeError):
+                    service.apply(proposal, applied_by=user)
+
+            store = UIOverrideStore(override_root)
+            assert store.read_file("admin", "already.css") == original
+
+        proposal.refresh_from_db()
+        assert proposal.status == "approved"
+        assert proposal.error_code == "APPLY_DB_FAILED"
+
+        failed_events = list(UIStyleAuditEvent.objects.filter(
+            change_request=proposal, event_type="failed",
+        ))
+        assert len(failed_events) == 1
+        detail = failed_events[0].detail or {}
+        assert detail.get("error_class") == "DB_COMMIT_FAILED"
+        assert detail.get("rollback") == "succeeded"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_phase3_rollback_failure_marks_conflicted():
+    """When the DB fails AND the filesystem rollback also fails, the
+    proposal must be marked ``conflicted`` with ``ROLLBACK_FAILED`` so a
+    human review is required before another apply. Leaving the row in
+    ``approved`` would allow a second apply that could compound the DB↔FS
+    drift.
+    """
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from cauldron_ai_admin.models import (
+        UIStyleAuditEvent, UIStyleChangeRequest,
+    )
+    from cauldron_django_admin.override_store import UIOverrideStore
+
+    user = _make_user("apply-rollback-fail-user")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        override_root = Path(tmpdir)
+        (override_root / "admin").mkdir()
+
+        proposal = _make_proposal(
+            status="approved",
+            scope="admin",
+            target_path="new-rollback-fail.css",
+            proposed_content="body { color: red; }",
+            base_exists=False,
+            base_hash="",
+        )
+        service = UIStyleChangeService()
+
+        original_save = UIStyleChangeRequest.save
+        fired = threading.Event()
+
+        def failing_save(self, *args, **kwargs):
+            update_fields = kwargs.get("update_fields") or []
+            if (
+                "status" in update_fields
+                and getattr(self, "status", "") == "applied"
+                and not fired.is_set()
+            ):
+                fired.set()
+                raise RuntimeError("Injected DB failure during apply commit.")
+            return original_save(self, *args, **kwargs)
+
+        def failing_delete(self, *args, **kwargs):
+            raise RuntimeError("Injected filesystem rollback failure.")
+
+        with override_settings(CAULDRON_UI_OVERRIDES_DIR=str(override_root)):
+            with patch.object(UIStyleChangeRequest, "save", failing_save):
+                with patch.object(
+                    UIOverrideStore, "delete_file_atomic", failing_delete,
+                ):
+                    with pytest.raises(RuntimeError):
+                        service.apply(proposal, applied_by=user)
+
+            # The file remains on disk because rollback failed — this is
+            # exactly the DB↔FS mismatch the ``conflicted`` state signals.
+            store = UIOverrideStore(override_root)
+            assert store.read_file("admin", "new-rollback-fail.css") == \
+                "body { color: red; }"
+
+        proposal.refresh_from_db()
+        assert proposal.status == "conflicted"
+        assert proposal.error_code == "ROLLBACK_FAILED"
+
+        failed_events = list(UIStyleAuditEvent.objects.filter(
+            change_request=proposal, event_type="failed",
+        ))
+        assert len(failed_events) == 1
+        detail = failed_events[0].detail or {}
+        assert detail.get("error_class") == "ROLLBACK_FAILED"
+        assert detail.get("rollback_error_class") == "RuntimeError"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_simultaneous_apply_one_replace_one_applied_event():
+    """A dedicated race test with a hard barrier: two threads must hit
+    Phase 2 at the same instant, and the assertions specifically check
+    exactly-one ``applied`` audit event and that the final file bytes
+    equal the proposed content. This is stronger than the pre-existing
+    concurrent-apply test because it asserts both invariants explicitly.
+    """
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from cauldron_ai_admin.models import UIStyleAuditEvent
+    from cauldron_django_admin.override_store import UIOverrideStore
+
+    user = _make_user("apply-race-hard-user")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        override_root = Path(tmpdir)
+        (override_root / "admin").mkdir()
+
+        proposed = "body { color: magenta; }"
+        proposal = _make_proposal(
+            status="approved",
+            scope="admin",
+            target_path="hard-race.css",
+            proposed_content=proposed,
+            base_exists=False,
+            base_hash="",
+        )
+        service = UIStyleChangeService()
+
+        successes: list = []
+        errors: list[Exception] = []
+        lock = threading.Lock()
+        barrier = threading.Barrier(2, timeout=10)
+
+        def do_apply():
+            barrier.wait()
+            try:
+                with override_settings(CAULDRON_UI_OVERRIDES_DIR=str(override_root)):
+                    result = service.apply(proposal, applied_by=user)
+                    with lock:
+                        successes.append(result)
+            except Exception as exc:  # noqa: BLE001
+                with lock:
+                    errors.append(exc)
+            finally:
+                close_old_connections()
+
+        _run_threads(do_apply, do_apply)
+
+        applied_events = UIStyleAuditEvent.objects.filter(
+            change_request=proposal, event_type="applied",
+        )
+        assert applied_events.count() == 1, (
+            "Expected exactly one applied audit event, got "
+            f"{applied_events.count()}. errors={[type(e).__name__ for e in errors]}"
+        )
+
+        proposal.refresh_from_db()
+        assert proposal.status == "applied"
+
+        store = UIOverrideStore(override_root)
+        assert store.read_file("admin", "hard-race.css") == proposed

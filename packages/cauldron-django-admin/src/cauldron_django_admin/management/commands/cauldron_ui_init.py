@@ -157,6 +157,28 @@ class Command(BaseCommand):
                     issues.append(f"Hidden directory: {rel_dir / hd}")
                 dirnames[:] = [d for d in dirnames if not d.startswith(".")]
 
+                # Symlinked directories are equally invisible to the store
+                # (``_resolve_path`` rejects any symlink component), so we
+                # surface them and prevent ``os.walk`` from following them.
+                for dname in list(dirnames):
+                    dpath = dp / dname
+                    if not dpath.is_symlink():
+                        continue
+                    rel_dpath = dpath.relative_to(root)
+                    try:
+                        target = dpath.resolve()
+                        target.relative_to(root)
+                    except (ValueError, OSError):
+                        issues.append(
+                            f"Symlinked directory (escapes root): {rel_dpath}"
+                        )
+                    else:
+                        issues.append(
+                            f"Symlinked directory (resolves inside root): "
+                            f"{rel_dpath}"
+                        )
+                    dirnames.remove(dname)
+
                 for fname in sorted(filenames):
                     fpath = dp / fname
                     rel_path = fpath.relative_to(root)

@@ -97,3 +97,52 @@ def test_init_uses_base_dir(tmp_path, settings):
     call_command("cauldron_ui_init", stdout=out)
     expected_root = tmp_path / "cauldron-overrides"
     assert expected_root.is_dir()
+
+
+def test_check_detects_symlinked_directory(override_root, settings):
+    """A symlinked subdirectory inside a scope must be surfaced by
+    ``--check`` — the override store rejects any symlink in a resolve
+    chain, so files nested under it would silently vanish from
+    ``list_files`` without a clear warning.
+    """
+    from django.core.management.base import CommandError
+
+    settings.CAULDRON_UI_OVERRIDES_DIR = str(override_root)
+    call_command("cauldron_ui_init", stdout=StringIO())
+
+    real = override_root / "admin" / "real_sub"
+    real.mkdir()
+    (real / "x.css").write_text("/* real */", encoding="utf-8")
+    link = override_root / "admin" / "link_sub"
+    link.symlink_to(real, target_is_directory=True)
+
+    err = StringIO()
+    with pytest.raises(CommandError):
+        call_command("cauldron_ui_init", "--check", stdout=StringIO(), stderr=err)
+    combined = err.getvalue().lower()
+    assert "symlinked directory" in combined
+
+
+def test_check_detects_symlinked_directory_escaping_root(
+    override_root, settings, tmp_path,
+):
+    """A symlinked subdirectory that resolves *outside* the override root
+    is a stronger signal — the check emits an "escapes root" variant so
+    operators know a symlink is not just useless but actively dangerous.
+    """
+    from django.core.management.base import CommandError
+
+    settings.CAULDRON_UI_OVERRIDES_DIR = str(override_root)
+    call_command("cauldron_ui_init", stdout=StringIO())
+
+    outside = tmp_path / "outside_dir"
+    outside.mkdir()
+    link = override_root / "admin" / "escape_link"
+    link.symlink_to(outside, target_is_directory=True)
+
+    err = StringIO()
+    with pytest.raises(CommandError):
+        call_command("cauldron_ui_init", "--check", stdout=StringIO(), stderr=err)
+    combined = err.getvalue().lower()
+    assert "symlinked directory" in combined
+    assert "escapes root" in combined

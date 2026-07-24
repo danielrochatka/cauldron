@@ -9,12 +9,19 @@ import tempfile
 from pathlib import Path
 from typing import Literal
 
-try:  # Linux/POSIX only — falls back to thread lock elsewhere (e.g. Windows).
+try:  # Linux/POSIX only.
     import fcntl  # type: ignore[import]
     _HAS_FCNTL = True
+    _HAS_MSVCRT = False
 except ImportError:  # pragma: no cover — non-POSIX
     fcntl = None  # type: ignore[assignment]
     _HAS_FCNTL = False
+    try:  # Windows fallback for cross-process locking.
+        import msvcrt  # type: ignore[import]
+        _HAS_MSVCRT = True
+    except ImportError:  # pragma: no cover — no cross-process locking available
+        msvcrt = None  # type: ignore[assignment]
+        _HAS_MSVCRT = False
 
 _VALID_SCOPES = frozenset({"admin", "pages"})
 _MAX_FILE_BYTES = 256 * 1024       # 256 KB per file
@@ -86,6 +93,10 @@ class EncodingError(OverrideStoreError):
 
 class MissingExpectedHashError(OverrideStoreError):
     """No expected hash provided; operation rejected to prevent blind overwrite."""
+
+
+class OverrideLockError(OverrideStoreError):
+    """Cross-process lock cannot be obtained for a write or delete operation."""
 
 
 class UIOverrideStore:
@@ -204,65 +215,120 @@ class UIOverrideStore:
     def _root_file_lock(self):
         """Cross-process exclusive lock on the override root.
 
-        Uses ``fcntl.lockf`` on POSIX so concurrent worker processes serialise
-        writes/deletes.  Falls back to the process-wide thread lock when
-        ``fcntl`` is unavailable (e.g. Windows) or when the lock file cannot
-        be created (e.g. read-only filesystem).
+        Uses ``fcntl.lockf`` on POSIX or ``msvcrt.locking`` on Windows so
+        concurrent worker processes serialise writes/deletes. The
+        process-wide thread lock is ALWAYS acquired first because per-process
+        file locks (``fcntl`` on Linux) do not serialise between threads of
+        the same process.
 
-        Even on POSIX we ALWAYS acquire the process-wide thread lock first —
-        ``fcntl`` locks on Linux are per-process (not per-thread), so two
-        threads inside the same process can both acquire the same ``LOCK_EX``
-        without contention. The thread lock guarantees strict serialisation
-        within a single process; the file lock adds cross-process
-        serialisation on top.
+        Fail-closed contract: if the OS-level lock cannot be obtained (no
+        ``fcntl``/``msvcrt``, missing lock file, filesystem does not support
+        locking, etc.), we raise :class:`OverrideLockError` rather than
+        silently downgrade to thread-only serialisation. Silent downgrades
+        would let two worker processes race a write against each other and
+        clobber the atomic-replace guarantee this store relies on.
         """
         thread_lock = _get_process_root_lock(self._root)
 
-        if not _HAS_FCNTL:
-            with thread_lock:
-                yield
-            return
+        if not _HAS_FCNTL and not _HAS_MSVCRT:
+            raise OverrideLockError(
+                "Cross-process write locking is not available on this platform "
+                "(neither fcntl nor msvcrt present). Override store writes and "
+                "deletes are refused to preserve atomicity."
+            )
 
         try:
             self._root.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            with thread_lock:
-                yield
-            return
+        except OSError as exc:
+            raise OverrideLockError(
+                "Cannot create override root directory for lock file."
+            ) from exc
 
         lock_path = self._root / ".cauldron-store.lock"
         try:
             fd = open(str(lock_path), "w")
-        except OSError:
-            with thread_lock:
-                yield
-            return
+        except OSError as exc:
+            raise OverrideLockError(
+                "Cannot open lock file in override root."
+            ) from exc
 
-        with thread_lock:
+        try:
+            with thread_lock:
+                if _HAS_FCNTL:
+                    try:
+                        fcntl.lockf(fd, fcntl.LOCK_EX)
+                    except OSError as exc:
+                        raise OverrideLockError(
+                            "Cannot acquire cross-process lock on override root."
+                        ) from exc
+                    try:
+                        yield
+                    finally:
+                        try:
+                            fcntl.lockf(fd, fcntl.LOCK_UN)
+                        except OSError:
+                            pass
+                else:
+                    # Windows: msvcrt.locking locks a byte range on the fd.
+                    fd_raw = fd.fileno()
+                    try:
+                        msvcrt.locking(fd_raw, msvcrt.LK_LOCK, 1)  # type: ignore[union-attr]
+                    except OSError as exc:
+                        raise OverrideLockError(
+                            "Cannot acquire Windows file lock on override root."
+                        ) from exc
+                    try:
+                        yield
+                    finally:
+                        try:
+                            msvcrt.locking(  # type: ignore[union-attr]
+                                fd_raw, msvcrt.LK_UNLCK, 1,  # type: ignore[union-attr]
+                            )
+                        except OSError:
+                            pass
+        finally:
             try:
-                try:
-                    fcntl.lockf(fd, fcntl.LOCK_EX)
-                except OSError:
-                    # Locking not supported on this filesystem — thread lock
-                    # is already held, so we still serialise within-process.
-                    try:
-                        fd.close()
-                    except OSError:
-                        pass
-                    yield
-                    return
-                try:
-                    yield
-                finally:
-                    try:
-                        fcntl.lockf(fd, fcntl.LOCK_UN)
-                    except OSError:
-                        pass
-            finally:
-                try:
-                    fd.close()
-                except OSError:
-                    pass
+                fd.close()
+            except OSError:
+                pass
+
+    def _check_no_symlinks_in_chain(
+        self, scope: Scope, relative_path: str,
+    ) -> None:
+        """Raise TraversalError if any component of the *unresolved*
+        candidate path (from the scope directory down to the leaf) is a
+        symbolic link.
+
+        The lstat-based check on the unresolved path is what makes this
+        different from ``Path.resolve``: we specifically want to reject the
+        presence of a symlink anywhere along the chain, not merely reject
+        symlinks whose target escapes the root. A symlink that resolves
+        *inside* the root would still let an attacker or a mistake bypass
+        our per-scope containment checks by redirecting a write to a
+        different directory.
+        """
+        scope_dir = self._scope_dir(scope)
+        candidate = scope_dir / Path(relative_path)
+        check = candidate
+        while True:
+            if check == self._root:
+                break
+            try:
+                if check.is_symlink():
+                    raise TraversalError(
+                        "Symlink detected in target chain: a path component "
+                        "is a symbolic link."
+                    )
+            except OSError:
+                # Missing components (e.g. the leaf before creation) are
+                # fine — we only care about the components that DO exist.
+                pass
+            parent = check.parent
+            if parent == check:
+                break
+            if not str(check).startswith(str(self._root)):
+                break
+            check = parent
 
     def _sha256(self, content: bytes) -> str:
         return hashlib.sha256(content).hexdigest()
@@ -386,6 +452,10 @@ class UIOverrideStore:
 
         _, resolved = self._resolve_path(scope, relative_path)
 
+        # First-pass lstat scan (outside the lock) — cheap short-circuit for
+        # the common case where an operator has already staged a symlink.
+        self._check_no_symlinks_in_chain(scope, relative_path)
+
         try:
             encoded = content.encode("utf-8")
         except (UnicodeEncodeError, AttributeError) as exc:
@@ -403,6 +473,10 @@ class UIOverrideStore:
                 re_resolved.relative_to(self._root)
             except ValueError:
                 raise TraversalError("Path escapes root under lock.")
+
+            # Second-pass lstat scan — catch symlinks that appeared between
+            # the outside-lock resolve and now.
+            self._check_no_symlinks_in_chain(scope, relative_path)
 
             try:
                 current_stat = re_resolved.stat() if re_resolved.exists() else None
@@ -532,6 +606,10 @@ class UIOverrideStore:
 
         _, resolved = self._resolve_path(scope, relative_path)
 
+        # First-pass lstat scan (outside the lock) — matches write_file_atomic
+        # so operators cannot delete through a staged symlink either.
+        self._check_no_symlinks_in_chain(scope, relative_path)
+
         with self._root_file_lock():
             _, re_resolved = self._resolve_path(scope, relative_path)
             if re_resolved != resolved:
@@ -541,6 +619,9 @@ class UIOverrideStore:
             except ValueError:
                 raise TraversalError("Path escapes root under lock.")
 
+            # Second-pass lstat scan under the lock.
+            self._check_no_symlinks_in_chain(scope, relative_path)
+
             if not re_resolved.is_file():
                 if expected_hash == ABSENT:
                     return  # Already absent — idempotent delete
@@ -549,5 +630,39 @@ class UIOverrideStore:
             actual = self._sha256(re_resolved.read_bytes())
             if actual != expected_hash:
                 raise HashConflictError("File was modified since the hash was captured.")
+
+            # ------------------------------------------------------------- #
+            # Final pre-unlink safety verification (mirrors the write path). #
+            # A racing thread or adversary could have swapped the target     #
+            # or parent for a symlink between the hash check and unlink;    #
+            # re-verify containment and re-check the hash right before we    #
+            # mutate the filesystem.                                         #
+            # ------------------------------------------------------------- #
+            final_scope_dir = self._scope_dir(scope).resolve()
+            if re_resolved.parent.is_symlink():
+                raise TraversalError(
+                    "Target parent became a symlink before deletion."
+                )
+            final_parent = re_resolved.parent.resolve()
+            try:
+                final_parent.relative_to(final_scope_dir)
+            except ValueError:
+                raise TraversalError(
+                    "Target parent moved outside scope before deletion."
+                )
+            if re_resolved.is_symlink():
+                raise TraversalError(
+                    "Target became a symlink before deletion."
+                )
+            try:
+                actual_final = self._sha256(re_resolved.read_bytes())
+            except OSError as exc:
+                raise TraversalError(
+                    "Cannot read file for final hash revalidation before delete.",
+                ) from exc
+            if actual_final != expected_hash:
+                raise HashConflictError(
+                    "File changed between lock acquisition and deletion."
+                )
 
             os.unlink(str(re_resolved))

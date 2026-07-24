@@ -1,0 +1,27 @@
+{% extends "cauldron_admin/base.html" %}
+{% block page_title %}Style Proposals{% endblock %}
+{% block content %}
+{% if proposals %}
+<div class="cui-table-container">
+  <table class="cui-table">
+    <thead>
+      <tr><th>ID</th><th>Status</th><th>Scope</th><th>Path</th><th>Description</th><th>Created</th></tr>
+    </thead>
+    <tbody>
+      {% for p in proposals %}
+      <tr>
+        <td><a href="{% url 'cauldron_ai_admin:style-detail' p.request_id %}"><code>{{ p.request_id|stringformat:"s"|slice:":8" }}…</code></a></td>
+        <td>{% include "cauldron_admin/includes/status_badge.html" with status=p.status %}</td>
+        <td>{{ p.scope }}</td>
+        <td><code>{{ p.target_path }}</code></td>
+        <td class="cui-text-sm">{{ p.description|slice:":80" }}</td>
+        <td class="cui-text-sm cui-text-muted">{{ p.created_at }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+{% include "cauldron_admin/includes/empty_state.html" %}
+{% endif %}
+{% endblock %}

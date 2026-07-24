@@ -211,3 +211,105 @@ class AdminAIToolInvocation(models.Model):
 
     def __str__(self) -> str:
         return f"AdminAIToolInvocation({self.tool_name}, {self.status})"
+
+
+UI_STYLE_STATUS_CHOICES = [
+    ("proposed", "proposed"),
+    ("approved", "approved"),
+    ("applied", "applied"),
+    ("rejected", "rejected"),
+    ("conflicted", "conflicted"),
+]
+
+
+class UIStyleChangeRequest(models.Model):
+    """Durable record of an AI-proposed CSS style change."""
+
+    class Meta:
+        app_label = "cauldron_ai_admin"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["status"], name="uiscr_status_idx"),
+            models.Index(fields=["scope"], name="uiscr_scope_idx"),
+            models.Index(fields=["created_at"], name="uiscr_created_idx"),
+        ]
+        permissions = [
+            ("view_ui_styles", "Can view UI style overrides"),
+            ("propose_ui_style_changes", "Can propose UI style changes"),
+            ("approve_ui_style_changes", "Can approve UI style changes"),
+            ("view_ui_style_audit", "Can view UI style change audit"),
+        ]
+
+    request_id = models.UUIDField(default=uuid.uuid4, unique=True, db_index=True)
+    status = models.CharField(max_length=32, choices=UI_STYLE_STATUS_CHOICES, default="proposed", db_index=True)
+    scope = models.CharField(max_length=32)  # "admin" or "pages"
+    target_path = models.CharField(max_length=512)  # relative path within scope
+    proposed_content = models.TextField()
+    base_hash = models.CharField(max_length=64, blank=True, default="")
+    proposed_hash = models.CharField(max_length=64, blank=True, default="")
+    description = models.TextField(blank=True, default="")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name="ui_style_requests_created",
+    )
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name="ui_style_requests_reviewed",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    applied_at = models.DateTimeField(null=True, blank=True)
+    error_code = models.CharField(max_length=64, blank=True, default="")
+    error_summary = models.TextField(blank=True, default="")
+
+    def __str__(self) -> str:
+        return f"UIStyleChangeRequest({self.request_id}, {self.status}, {self.target_path})"
+
+
+UI_STYLE_EVENT_TYPES = [
+    ("proposed", "proposed"),
+    ("approved", "approved"),
+    ("rejected", "rejected"),
+    ("applied", "applied"),
+    ("conflict", "conflict"),
+    ("failed", "failed"),
+]
+
+
+class UIStyleAuditEvent(models.Model):
+    """Append-only audit log for UI style change request actions."""
+
+    class Meta:
+        app_label = "cauldron_ai_admin"
+        ordering = ["change_request", "sequence"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["change_request", "sequence"],
+                name="uisae_unique_request_sequence",
+            ),
+        ]
+
+    event_id = models.UUIDField(default=uuid.uuid4, unique=True, db_index=True)
+    change_request = models.ForeignKey(
+        UIStyleChangeRequest,
+        on_delete=models.PROTECT,
+        related_name="audit_events",
+        db_index=True,
+    )
+    sequence = models.PositiveIntegerField()
+    event_type = models.CharField(max_length=64)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name="ui_style_audit_events",
+    )
+    occurred_at = models.DateTimeField(auto_now_add=True)
+    detail = models.JSONField(default=dict, blank=True)
+
+    def __str__(self) -> str:
+        return f"UIStyleAuditEvent({self.event_id}, {self.event_type})"

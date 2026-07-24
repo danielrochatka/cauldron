@@ -5,10 +5,12 @@ import json
 import logging
 from typing import Any
 
+from django.contrib import messages
 from django.contrib.auth.decorators import login_required, permission_required
 from django.core.exceptions import PermissionDenied
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import render
+from django.urls import reverse
 from django.utils.decorators import method_decorator
 from django.views import View
 
@@ -104,6 +106,172 @@ class AdminAIPageView(View):
                 status=500,
             )
         return JsonResponse(_serialize_run(run))
+
+
+@method_decorator([
+    login_required,
+    permission_required("cauldron_ai_admin.view_admin_ai_runs", raise_exception=True),
+], name="dispatch")
+class AdminAIRunListView(View):
+    template_name = "cauldron_ai_admin/run_list.html"
+
+    def get(self, request):
+        runs = AdminAIRun.objects.filter(actor=request.user).order_by("-created_at")[:50]
+        return render(request, self.template_name, {
+            "runs": runs,
+            "breadcrumbs": [
+                {"label": "Admin AI", "url": reverse("cauldron_ai_admin:ai-page")},
+                {"label": "Runs", "url": ""},
+            ],
+        })
+
+
+@method_decorator([
+    login_required,
+    permission_required("cauldron_ai_admin.view_admin_ai_runs", raise_exception=True),
+], name="dispatch")
+class AdminAIRunDetailView(View):
+    template_name = "cauldron_ai_admin/run_detail.html"
+
+    def get(self, request, run_id):
+        from django.shortcuts import get_object_or_404
+        run = get_object_or_404(AdminAIRun, run_id=run_id, actor=request.user)
+        invocations = list(run.invocations.order_by("created_at"))
+        return render(request, self.template_name, {
+            "run": run,
+            "invocations": invocations,
+            "breadcrumbs": [
+                {"label": "Admin AI", "url": reverse("cauldron_ai_admin:ai-page")},
+                {"label": "Runs", "url": reverse("cauldron_ai_admin:run-list")},
+                {"label": str(run.run_id)[:8] + "…", "url": ""},
+            ],
+        })
+
+
+@method_decorator([
+    login_required,
+    permission_required("cauldron_ai_admin.view_ui_styles", raise_exception=True),
+], name="dispatch")
+class UIStyleChangeListView(View):
+    template_name = "cauldron_ai_admin/style_list.html"
+
+    def get(self, request):
+        from .models import UIStyleChangeRequest
+        proposals = UIStyleChangeRequest.objects.all().order_by("-created_at")[:50]
+        return render(request, self.template_name, {
+            "proposals": proposals,
+            "breadcrumbs": [{"label": "Style Proposals", "url": ""}],
+        })
+
+
+@method_decorator([
+    login_required,
+    permission_required("cauldron_ai_admin.view_ui_styles", raise_exception=True),
+], name="dispatch")
+class UIStyleChangeDetailView(View):
+    template_name = "cauldron_ai_admin/style_detail.html"
+
+    def get(self, request, request_id):
+        from django.shortcuts import get_object_or_404
+        from .models import UIStyleChangeRequest
+        proposal = get_object_or_404(UIStyleChangeRequest, request_id=request_id)
+        audit_events = list(proposal.audit_events.order_by("sequence"))
+        return render(request, self.template_name, {
+            "proposal": proposal,
+            "audit_events": audit_events,
+            "can_approve": request.user.has_perm("cauldron_ai_admin.approve_ui_style_changes"),
+            "breadcrumbs": [
+                {"label": "Style Proposals", "url": reverse("cauldron_ai_admin:style-list")},
+                {"label": str(proposal.request_id)[:8] + "…", "url": ""},
+            ],
+        })
+
+    def post(self, request, request_id):
+        """Handle approve/reject actions."""
+        from django.shortcuts import get_object_or_404, redirect
+        from django.utils import timezone
+        from .models import UIStyleChangeRequest, UIStyleAuditEvent
+        if not request.user.has_perm("cauldron_ai_admin.approve_ui_style_changes"):
+            raise PermissionDenied
+        proposal = get_object_or_404(UIStyleChangeRequest, request_id=request_id)
+        action = request.POST.get("action", "")
+        if action == "approve" and proposal.status == "proposed":
+            proposal.status = "approved"
+            proposal.reviewed_by = request.user
+            proposal.reviewed_at = timezone.now()
+            proposal.save(update_fields=["status", "reviewed_by", "reviewed_at"])
+            seq = proposal.audit_events.count() + 1
+            UIStyleAuditEvent.objects.create(
+                change_request=proposal, sequence=seq, event_type="approved",
+                actor=request.user, detail={"action": "approved"},
+            )
+            messages.success(request, "Proposal approved.")
+        elif action == "reject" and proposal.status == "proposed":
+            proposal.status = "rejected"
+            proposal.reviewed_by = request.user
+            proposal.reviewed_at = timezone.now()
+            proposal.save(update_fields=["status", "reviewed_by", "reviewed_at"])
+            seq = proposal.audit_events.count() + 1
+            UIStyleAuditEvent.objects.create(
+                change_request=proposal, sequence=seq, event_type="rejected",
+                actor=request.user, detail={"action": "rejected"},
+            )
+            messages.success(request, "Proposal rejected.")
+        elif action == "apply" and proposal.status == "approved":
+            self._apply_proposal(request, proposal)
+        return redirect("cauldron_ai_admin:style-detail", request_id=request_id)
+
+    def _apply_proposal(self, request, proposal):
+        from django.utils import timezone
+        from .models import UIStyleAuditEvent
+        from cauldron_django_admin.override_store import UIOverrideStore, HashConflictError, OverrideStoreError
+        from pathlib import Path
+        from django.conf import settings
+        override_dir = getattr(settings, "CAULDRON_UI_OVERRIDES_DIR", None)
+        if override_dir is None:
+            base_dir = getattr(settings, "BASE_DIR", None)
+            override_dir = Path(base_dir) / "cauldron-overrides" if base_dir else None
+        if override_dir is None:
+            messages.error(request, "Override directory not configured.")
+            return
+        store = UIOverrideStore(Path(override_dir))
+        try:
+            new_hash = store.write_file_atomic(
+                proposal.target_path,
+                proposal.proposed_content,
+                expected_hash=proposal.base_hash or None,
+            )
+            proposal.status = "applied"
+            proposal.applied_at = timezone.now()
+            proposal.proposed_hash = new_hash
+            proposal.save(update_fields=["status", "applied_at", "proposed_hash"])
+            seq = proposal.audit_events.count() + 1
+            UIStyleAuditEvent.objects.create(
+                change_request=proposal, sequence=seq, event_type="applied",
+                actor=request.user, detail={"new_hash": new_hash},
+            )
+            messages.success(request, "Style change applied successfully.")
+        except HashConflictError:
+            proposal.status = "conflicted"
+            proposal.error_code = "HASH_CONFLICT"
+            proposal.error_summary = "File was modified since the proposal was created."
+            proposal.save(update_fields=["status", "error_code", "error_summary"])
+            seq = proposal.audit_events.count() + 1
+            UIStyleAuditEvent.objects.create(
+                change_request=proposal, sequence=seq, event_type="conflict",
+                actor=request.user, detail={"error": "hash_conflict"},
+            )
+            messages.error(request, "Conflict: the target file was modified. Proposal marked as conflicted.")
+        except OverrideStoreError as exc:
+            proposal.error_code = "STORE_ERROR"
+            proposal.error_summary = str(exc)[:200]
+            proposal.save(update_fields=["error_code", "error_summary"])
+            seq = proposal.audit_events.count() + 1
+            UIStyleAuditEvent.objects.create(
+                change_request=proposal, sequence=seq, event_type="failed",
+                actor=request.user, detail={"error": str(exc)[:200]},
+            )
+            messages.error(request, "Failed to apply style change. See audit for details.")
 
 
 def _parse_json_body(request: HttpRequest) -> dict[str, Any]:

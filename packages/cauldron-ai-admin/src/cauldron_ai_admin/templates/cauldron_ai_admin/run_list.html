@@ -1,0 +1,26 @@
+{% extends "cauldron_admin/base.html" %}
+{% block page_title %}AI Runs{% endblock %}
+{% block content %}
+{% if runs %}
+<div class="cui-table-container">
+  <table class="cui-table">
+    <thead>
+      <tr><th>Run ID</th><th>Status</th><th>Request</th><th>Tools</th><th>Created</th></tr>
+    </thead>
+    <tbody>
+      {% for run in runs %}
+      <tr>
+        <td><a href="{% url 'cauldron_ai_admin:run-detail' run.run_id %}"><code>{{ run.run_id|stringformat:"s"|slice:":8" }}…</code></a></td>
+        <td>{% include "cauldron_admin/includes/status_badge.html" with status=run.status %}</td>
+        <td class="cui-text-sm">{{ run.user_request|slice:":100" }}</td>
+        <td>{{ run.tool_call_count }}</td>
+        <td class="cui-text-sm cui-text-muted">{{ run.created_at }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+{% include "cauldron_admin/includes/empty_state.html" %}
+{% endif %}
+{% endblock %}

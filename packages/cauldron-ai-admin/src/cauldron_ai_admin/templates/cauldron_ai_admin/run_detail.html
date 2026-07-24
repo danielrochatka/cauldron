@@ -1,0 +1,32 @@
+{% extends "cauldron_admin/base.html" %}
+{% block page_title %}Run Detail{% endblock %}
+{% block content %}
+<div class="cui-card">
+  <dl class="cui-dl">
+    <dt>Run ID</dt><dd><code>{{ run.run_id }}</code></dd>
+    <dt>Status</dt><dd>{% include "cauldron_admin/includes/status_badge.html" with status=run.status %}</dd>
+    <dt>Request</dt><dd>{{ run.user_request }}</dd>
+    <dt>Created</dt><dd>{{ run.created_at }}</dd>
+    {% if run.final_response %}<dt>Response</dt><dd><pre class="cui-pre">{{ run.final_response }}</pre></dd>{% endif %}
+    {% if run.error_summary %}<dt>Error</dt><dd class="cui-text-muted">{{ run.error_summary }}</dd>{% endif %}
+  </dl>
+</div>
+{% if invocations %}
+<h2>Tool Invocations</h2>
+<div class="cui-table-container">
+  <table class="cui-table">
+    <thead><tr><th>Tool</th><th>Risk</th><th>Status</th><th>Duration</th></tr></thead>
+    <tbody>
+      {% for inv in invocations %}
+      <tr>
+        <td><code>{{ inv.tool_name }}</code></td>
+        <td><span class="cui-badge">{{ inv.risk_level }}</span></td>
+        <td>{% include "cauldron_admin/includes/status_badge.html" with status=inv.status %}</td>
+        <td>{{ inv.duration_ms }}ms</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endblock %}

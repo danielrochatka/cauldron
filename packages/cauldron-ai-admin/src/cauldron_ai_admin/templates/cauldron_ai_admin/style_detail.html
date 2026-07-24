@@ -1,0 +1,58 @@
+{% extends "cauldron_admin/base.html" %}
+{% load static %}
+{% block page_title %}Style Proposal{% endblock %}
+
+{% block page_actions %}
+{% if proposal.status == "proposed" and can_approve %}
+<form method="post" style="display:inline;">
+  {% csrf_token %}
+  <button type="submit" name="action" value="approve" class="cui-button">Approve</button>
+  <button type="submit" name="action" value="reject" class="cui-button cui-button--danger">Reject</button>
+</form>
+{% elif proposal.status == "approved" and can_approve %}
+<form method="post" style="display:inline;">
+  {% csrf_token %}
+  <button type="submit" name="action" value="apply" class="cui-button">Apply</button>
+</form>
+{% endif %}
+{% endblock %}
+
+{% block content %}
+<div class="cui-card">
+  <dl class="cui-dl">
+    <dt>Request ID</dt><dd><code>{{ proposal.request_id }}</code></dd>
+    <dt>Status</dt><dd>{% include "cauldron_admin/includes/status_badge.html" with status=proposal.status %}</dd>
+    <dt>Scope</dt><dd>{{ proposal.scope }}</dd>
+    <dt>Target Path</dt><dd><code>{{ proposal.target_path }}</code></dd>
+    <dt>Description</dt><dd>{{ proposal.description }}</dd>
+    <dt>Created</dt><dd>{{ proposal.created_at }}</dd>
+    {% if proposal.reviewed_at %}<dt>Reviewed</dt><dd>{{ proposal.reviewed_at }}</dd>{% endif %}
+    {% if proposal.applied_at %}<dt>Applied</dt><dd>{{ proposal.applied_at }}</dd>{% endif %}
+    {% if proposal.error_summary %}<dt>Error</dt><dd class="cui-text-muted">{{ proposal.error_code }}: {{ proposal.error_summary }}</dd>{% endif %}
+  </dl>
+</div>
+
+<h2>Proposed CSS</h2>
+<div class="cui-table-container">
+  <pre class="cui-pre" style="padding:1rem; max-height:400px; overflow:auto;">{{ proposal.proposed_content }}</pre>
+</div>
+
+{% if audit_events %}
+<h2>Audit History</h2>
+<div class="cui-table-container">
+  <table class="cui-table">
+    <thead><tr><th>Sequence</th><th>Event</th><th>Actor</th><th>Occurred</th></tr></thead>
+    <tbody>
+      {% for ev in audit_events %}
+      <tr>
+        <td>{{ ev.sequence }}</td>
+        <td>{% include "cauldron_admin/includes/status_badge.html" with status=ev.event_type %}</td>
+        <td>{{ ev.actor|default:"—" }}</td>
+        <td class="cui-text-sm cui-text-muted">{{ ev.occurred_at }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endblock %}

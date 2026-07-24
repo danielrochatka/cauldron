@@ -1,89 +1,81 @@
+{% extends "cauldron_admin/base.html" %}
 {% load static %}
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Cauldron Admin AI</title>
-</head>
-<body>
-  <h1>Cauldron Admin AI</h1>
+{% block page_title %}Cauldron Admin AI{% endblock %}
 
-  <section>
-    <h2>Available tools for {{ request.user }}</h2>
+{% block page_actions %}
+<a href="{% url 'cauldron_ai_admin:run-list' %}" class="cui-button cui-button--secondary">View Runs</a>
+{% endblock %}
+
+{% block content %}
+<div class="cui-ai-page">
+  <section class="cui-card" aria-labelledby="tools-heading">
+    <h2 id="tools-heading" class="cui-card__title">Available Tools</h2>
     {% if allowed_tools %}
-      <ul>
-        {% for tool in allowed_tools %}
-          <li>
-            <code>{{ tool.name }}</code> ({{ tool.risk_level }}) —
-            {{ tool.description }}
-          </li>
-        {% endfor %}
-      </ul>
+    <div class="cui-tool-grid">
+      {% for tool in allowed_tools %}
+      <div class="cui-tool-card">
+        <code class="cui-tool-card__name">{{ tool.name }}</code>
+        <span class="cui-badge cui-badge--{{ tool.risk_level|lower }}">{{ tool.risk_level }}</span>
+        <p class="cui-tool-card__desc">{{ tool.description }}</p>
+      </div>
+      {% endfor %}
+    </div>
     {% else %}
-      <p>You have no Admin AI tools available.</p>
+    <p class="cui-text-muted">You have no Admin AI tools available.</p>
     {% endif %}
   </section>
 
-  <section>
-    <h2>Ask the Admin AI</h2>
-    <form id="ai-form" method="post">
+  <section class="cui-card cui-card--workspace" aria-labelledby="workspace-heading">
+    <h2 id="workspace-heading" class="cui-card__title">Ask the Admin AI</h2>
+    <form id="ai-form" method="post" class="cui-form">
       {% csrf_token %}
-      <label for="ai-request">Request</label>
-      <textarea id="ai-request" name="request" rows="6" cols="80"
-                required></textarea>
-      <br>
-      <button type="submit">Send</button>
+      <div class="cui-form-field">
+        <label for="ai-request">Request</label>
+        <textarea id="ai-request" name="request" rows="6" required
+                  placeholder="Describe what you'd like the AI to help with..."></textarea>
+      </div>
+      <div class="cui-form-actions">
+        <button type="submit" class="cui-button">Send Request</button>
+      </div>
     </form>
-    <pre id="ai-response" aria-live="polite"></pre>
+    <div id="ai-response-area" aria-live="polite" hidden>
+      <h3 class="cui-h3">Response</h3>
+      <pre id="ai-response" class="cui-pre"></pre>
+    </div>
   </section>
 
-  <section>
-    <h2>Your recent runs</h2>
+  <section class="cui-card" aria-labelledby="recent-heading">
+    <h2 id="recent-heading" class="cui-card__title">Recent Runs</h2>
     {% if recent_runs %}
-      <ul>
-        {% for run in recent_runs %}
-          <li>
-            <code>{{ run.run_id }}</code> — {{ run.status }} —
-            {{ run.created_at }}
-            <br>
-            <em>{{ run.user_request }}</em>
-          </li>
-        {% endfor %}
-      </ul>
+    <div class="cui-table-container">
+      <table class="cui-table">
+        <thead>
+          <tr>
+            <th>Run ID</th>
+            <th>Status</th>
+            <th>Request</th>
+            <th>Created</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for run in recent_runs %}
+          <tr>
+            <td><a href="{% url 'cauldron_ai_admin:run-detail' run.run_id %}" class="cui-link"><code>{{ run.run_id|slice:":8" }}…</code></a></td>
+            <td>{% include "cauldron_admin/includes/status_badge.html" with status=run.status %}</td>
+            <td class="cui-text-sm">{{ run.user_request }}</td>
+            <td class="cui-text-sm cui-text-muted">{{ run.created_at }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
     {% else %}
-      <p>No runs yet.</p>
+    {% include "cauldron_admin/includes/empty_state.html" %}
     {% endif %}
   </section>
+</div>
+{% endblock %}
 
-  <script>
-    (function () {
-      var form = document.getElementById("ai-form");
-      var responseEl = document.getElementById("ai-response");
-      if (!form) { return; }
-      form.addEventListener("submit", function (event) {
-        event.preventDefault();
-        responseEl.textContent = "Working...";
-        var textEl = document.getElementById("ai-request");
-        var text = textEl ? textEl.value : "";
-        var csrfEl = form.querySelector("input[name=csrfmiddlewaretoken]");
-        var csrf = csrfEl ? csrfEl.value : "";
-        fetch(window.location.pathname, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-CSRFToken": csrf,
-          },
-          body: JSON.stringify({request: text}),
-          credentials: "same-origin"
-        }).then(function (r) {
-          return r.json().then(function (body) {
-            responseEl.textContent = JSON.stringify(body, null, 2);
-          });
-        }).catch(function (err) {
-          responseEl.textContent = "Error: " + err;
-        });
-      });
-    }());
-  </script>
-</body>
-</html>
+{% block extra_js %}
+<script src="{% static 'cauldron_ai_admin/js/ai_page.js' %}"></script>
+{% endblock %}

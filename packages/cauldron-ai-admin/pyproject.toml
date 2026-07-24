@@ -22,7 +22,11 @@ dependencies = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-cauldron_ai_admin = ["templates/cauldron_ai_admin/*.html"]
+cauldron_ai_admin = [
+    "templates/**/*",
+    "static/**/*",
+    "migrations/*.py",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "../../src", "../.."]

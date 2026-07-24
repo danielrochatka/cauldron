@@ -55,6 +55,10 @@ BUILTIN_TOOL_NAMES: tuple[str, ...] = (
     "content.preview_change_request",
     "system.django_checks",
     "system.module_status",
+    "ui.styles.list_files",
+    "ui.styles.read_file",
+    "ui.styles.create_proposal",
+    "ui.styles.preview_proposal",
 )
 
 
@@ -803,6 +807,188 @@ def _handle_module_status(context: AdminAIToolContext, **kwargs) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# ui.styles helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_override_store():
+    from pathlib import Path
+    from django.conf import settings
+    from cauldron_django_admin.override_store import UIOverrideStore
+    override_dir = getattr(settings, "CAULDRON_UI_OVERRIDES_DIR", None)
+    if override_dir is None:
+        base_dir = getattr(settings, "BASE_DIR", None)
+        if base_dir is None:
+            raise RuntimeError("CAULDRON_UI_OVERRIDES_DIR or BASE_DIR must be set")
+        override_dir = Path(base_dir) / "cauldron-overrides"
+    return UIOverrideStore(Path(override_dir))
+
+
+_LIST_FILES_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "scope": {"type": "string", "enum": ["admin", "pages"]},
+    },
+    "required": ["scope"],
+}
+
+
+def _handle_list_files(context: AdminAIToolContext, **kwargs) -> Any:
+    deadline_err = _check_deadline("ui.styles.list_files", context)
+    if deadline_err is not None:
+        return deadline_err
+    scope = kwargs.get("scope")
+    try:
+        store = _get_override_store()
+        files = store.list_files(scope)
+    except Exception as exc:
+        return AdminAIToolError(
+            tool_name="ui.styles.list_files",
+            error_code="ui.styles.list_files_failed",
+            message=redact_exception(exc, max_bytes=200),
+        )
+    return AdminAIToolResult(
+        tool_name="ui.styles.list_files",
+        success=True,
+        data={"files": files},
+    )
+
+
+_READ_FILE_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "path": {"type": "string"},
+    },
+    "required": ["path"],
+}
+
+
+def _handle_read_file(context: AdminAIToolContext, **kwargs) -> Any:
+    deadline_err = _check_deadline("ui.styles.read_file", context)
+    if deadline_err is not None:
+        return deadline_err
+    path = kwargs.get("path")
+    try:
+        store = _get_override_store()
+        content = store.read_file(path)
+        file_hash = store.calculate_hash(path)
+    except FileNotFoundError:
+        return AdminAIToolError(
+            tool_name="ui.styles.read_file",
+            error_code="ui.styles.file_not_found",
+            message=f"File not found: {path!r}",
+        )
+    except Exception as exc:
+        return AdminAIToolError(
+            tool_name="ui.styles.read_file",
+            error_code="ui.styles.read_file_failed",
+            message=redact_exception(exc, max_bytes=200),
+        )
+    return AdminAIToolResult(
+        tool_name="ui.styles.read_file",
+        success=True,
+        data={"content": content, "hash": file_hash},
+    )
+
+
+_UI_CREATE_PROPOSAL_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "scope": {"type": "string", "enum": ["admin", "pages"]},
+        "target_path": {"type": "string"},
+        "proposed_content": {"type": "string"},
+        "base_hash": {"type": "string"},
+        "description": {"type": "string"},
+    },
+    "required": ["scope", "target_path", "proposed_content", "description"],
+}
+
+
+def _handle_ui_create_proposal(context: AdminAIToolContext, **kwargs) -> Any:
+    deadline_err = _check_deadline("ui.styles.create_proposal", context)
+    if deadline_err is not None:
+        return deadline_err
+    from .models import UIStyleChangeRequest, UIStyleAuditEvent
+    scope = kwargs.get("scope", "")
+    target_path = kwargs.get("target_path", "")
+    proposed_content = kwargs.get("proposed_content", "")
+    base_hash = kwargs.get("base_hash", "") or ""
+    description = kwargs.get("description", "")
+    try:
+        proposal = UIStyleChangeRequest.objects.create(
+            scope=scope,
+            target_path=target_path,
+            proposed_content=proposed_content,
+            base_hash=base_hash,
+            description=description,
+            created_by=context.actor if context.actor and context.actor.pk else None,
+            status="proposed",
+        )
+        UIStyleAuditEvent.objects.create(
+            change_request=proposal,
+            sequence=1,
+            event_type="proposed",
+            actor=context.actor if context.actor and context.actor.pk else None,
+            detail={"scope": scope, "target_path": target_path},
+        )
+    except Exception as exc:
+        return AdminAIToolError(
+            tool_name="ui.styles.create_proposal",
+            error_code="ui.styles.create_proposal_failed",
+            message=redact_exception(exc, max_bytes=200),
+        )
+    return AdminAIToolResult(
+        tool_name="ui.styles.create_proposal",
+        success=True,
+        data={"request_id": str(proposal.request_id), "status": "proposed"},
+        message="Style change proposal created; awaiting human review.",
+    )
+
+
+_PREVIEW_PROPOSAL_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "request_id": {"type": "string"},
+    },
+    "required": ["request_id"],
+}
+
+
+def _handle_preview_proposal(context: AdminAIToolContext, **kwargs) -> Any:
+    deadline_err = _check_deadline("ui.styles.preview_proposal", context)
+    if deadline_err is not None:
+        return deadline_err
+    from .models import UIStyleChangeRequest
+    request_id = kwargs.get("request_id", "")
+    try:
+        proposal = UIStyleChangeRequest.objects.get(request_id=request_id)
+    except UIStyleChangeRequest.DoesNotExist:
+        return AdminAIToolError(
+            tool_name="ui.styles.preview_proposal",
+            error_code="ui.styles.not_found",
+            message=f"No proposal found with request_id={request_id!r}",
+        )
+    except Exception as exc:
+        return AdminAIToolError(
+            tool_name="ui.styles.preview_proposal",
+            error_code="ui.styles.preview_failed",
+            message=redact_exception(exc, max_bytes=200),
+        )
+    return AdminAIToolResult(
+        tool_name="ui.styles.preview_proposal",
+        success=True,
+        data={
+            "request_id": str(proposal.request_id),
+            "status": proposal.status,
+            "scope": proposal.scope,
+            "target_path": proposal.target_path,
+            "description": proposal.description,
+            "proposed_content_preview": proposal.proposed_content[:2000],
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -912,6 +1098,55 @@ def _builtin_definitions() -> tuple[tuple[AdminAIToolDefinition, Any], ...]:
                 owning_module=OWNING_MODULE,
             ),
             _handle_module_status,
+        ),
+        (
+            AdminAIToolDefinition(
+                name="ui.styles.list_files",
+                version="1.0",
+                description="List CSS override files for a scope (admin or pages)",
+                argument_schema=_LIST_FILES_SCHEMA,
+                risk_level=RiskLevel.READ_ONLY,
+                required_permission="cauldron_ai_admin.view_ui_styles",
+                owning_module=OWNING_MODULE,
+            ),
+            _handle_list_files,
+        ),
+        (
+            AdminAIToolDefinition(
+                name="ui.styles.read_file",
+                version="1.0",
+                description="Read the content of a CSS override file",
+                argument_schema=_READ_FILE_SCHEMA,
+                risk_level=RiskLevel.READ_ONLY,
+                required_permission="cauldron_ai_admin.view_ui_styles",
+                owning_module=OWNING_MODULE,
+            ),
+            _handle_read_file,
+        ),
+        (
+            AdminAIToolDefinition(
+                name="ui.styles.create_proposal",
+                version="1.0",
+                description="Create a UI style change proposal for human review",
+                argument_schema=_UI_CREATE_PROPOSAL_SCHEMA,
+                risk_level=RiskLevel.PROPOSE,
+                required_permission="cauldron_ai_admin.propose_ui_style_changes",
+                owning_module=OWNING_MODULE,
+                requires_human_approval=True,
+            ),
+            _handle_ui_create_proposal,
+        ),
+        (
+            AdminAIToolDefinition(
+                name="ui.styles.preview_proposal",
+                version="1.0",
+                description="Preview a UI style change proposal (read-only diff view)",
+                argument_schema=_PREVIEW_PROPOSAL_SCHEMA,
+                risk_level=RiskLevel.READ_ONLY,
+                required_permission="cauldron_ai_admin.view_ui_styles",
+                owning_module=OWNING_MODULE,
+            ),
+            _handle_preview_proposal,
         ),
     )
 

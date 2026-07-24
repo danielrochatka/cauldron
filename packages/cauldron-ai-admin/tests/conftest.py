@@ -21,6 +21,7 @@ def pytest_configure(config):
                 "cauldron_content",
                 "cauldron_workspace_flatfile",
                 "cauldron_content_operations",
+                "cauldron_django_admin",
                 "cauldron_ai_admin",
             ],
             MIDDLEWARE=[
@@ -40,7 +41,7 @@ def pytest_configure(config):
                 "cauldron.ai.admin": {},
             },
             SECRET_KEY="test-secret-key-for-admin-ai-tests",
-            ROOT_URLCONF="tests.test_urls",
+            ROOT_URLCONF="tests.test_urls_with_shell",
             STATIC_URL="/static/",
             TEMPLATES=[{
                 "BACKEND": "django.template.backends.django.DjangoTemplates",

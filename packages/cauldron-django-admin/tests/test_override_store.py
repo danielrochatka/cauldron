@@ -1,0 +1,127 @@
+"""Tests for UIOverrideStore."""
+import os
+import tempfile
+from pathlib import Path
+
+import pytest
+
+from cauldron_django_admin.override_store import (
+    EncodingError,
+    FileSizeError,
+    HashConflictError,
+    InvalidFileError,
+    TraversalError,
+    UIOverrideStore,
+)
+
+
+@pytest.fixture()
+def store(tmp_path):
+    return UIOverrideStore(tmp_path)
+
+
+def test_list_files_empty(store, tmp_path):
+    (tmp_path / "admin").mkdir()
+    result = store.list_files("admin")
+    assert result == []
+
+
+def test_write_and_read(store):
+    store.write_file_atomic("admin/test.css", "body { color: red; }")
+    content = store.read_file("admin/test.css")
+    assert "color: red" in content
+
+
+def test_list_files_after_write(store):
+    store.write_file_atomic("admin/test.css", "/* hello */")
+    files = store.list_files("admin")
+    assert "admin/test.css" in files
+
+
+def test_traversal_rejected(store):
+    with pytest.raises((TraversalError, InvalidFileError, FileNotFoundError)):
+        store.read_file("../escape.css")
+
+
+def test_traversal_in_write_rejected(store):
+    with pytest.raises((TraversalError, InvalidFileError)):
+        store.write_file_atomic("../escape.css", "body {}")
+
+
+def test_symlink_escape_rejected(store, tmp_path):
+    # Create a target outside the root
+    outside = tmp_path.parent / "outside_dir"
+    outside.mkdir(exist_ok=True)
+    target_file = outside / "secret.css"
+    target_file.write_text("secret", encoding="utf-8")
+
+    admin_dir = tmp_path / "admin"
+    admin_dir.mkdir(exist_ok=True)
+    symlink = admin_dir / "symlink.css"
+    symlink.symlink_to(target_file)
+
+    with pytest.raises(TraversalError):
+        store.read_file("admin/symlink.css")
+
+
+def test_non_css_rejected(store):
+    with pytest.raises(InvalidFileError):
+        store.read_file("admin/file.txt")
+
+    with pytest.raises(InvalidFileError):
+        store.write_file_atomic("admin/file.txt", "body {}")
+
+
+def test_hash_conflict(store):
+    store.write_file_atomic("admin/test.css", "body { color: blue; }")
+    wrong_hash = "a" * 64
+    with pytest.raises(HashConflictError):
+        store.write_file_atomic("admin/test.css", "body { color: red; }", expected_hash=wrong_hash)
+
+
+def test_correct_hash_allows_write(store):
+    store.write_file_atomic("admin/test.css", "body { color: blue; }")
+    correct_hash = store.calculate_hash("admin/test.css")
+    new_hash = store.write_file_atomic("admin/test.css", "body { color: green; }", expected_hash=correct_hash)
+    content = store.read_file("admin/test.css")
+    assert "green" in content
+    assert len(new_hash) == 64  # SHA-256 hex
+
+
+def test_delete_file(store):
+    store.write_file_atomic("admin/test.css", "body {}")
+    file_hash = store.calculate_hash("admin/test.css")
+    store.delete_file_atomic("admin/test.css", file_hash)
+    with pytest.raises(FileNotFoundError):
+        store.read_file("admin/test.css")
+
+
+def test_delete_with_wrong_hash(store):
+    store.write_file_atomic("admin/test.css", "body {}")
+    with pytest.raises(HashConflictError):
+        store.delete_file_atomic("admin/test.css", "wrong" * 12 + "1234")
+
+
+def test_utf8_enforced(store, tmp_path):
+    # Write non-UTF8 bytes directly to a file
+    admin_dir = tmp_path / "admin"
+    admin_dir.mkdir(exist_ok=True)
+    bad_file = admin_dir / "bad.css"
+    bad_file.write_bytes(b"\xff\xfe body {}")
+
+    with pytest.raises(EncodingError):
+        store.read_file("admin/bad.css")
+
+
+def test_file_not_found(store):
+    with pytest.raises(FileNotFoundError):
+        store.read_file("admin/nonexistent.css")
+
+
+def test_calculate_hash_consistent(store):
+    content = "body { color: red; }"
+    store.write_file_atomic("admin/test.css", content)
+    hash1 = store.calculate_hash("admin/test.css")
+    hash2 = store.calculate_hash("admin/test.css")
+    assert hash1 == hash2
+    assert len(hash1) == 64

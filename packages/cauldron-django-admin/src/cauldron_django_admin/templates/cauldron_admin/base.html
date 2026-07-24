@@ -1,0 +1,47 @@
+{% load static %}<!DOCTYPE html>
+<html lang="en" class="{% block body_classes %}{% endblock %}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{% block head_title %}Cauldron{% endblock %} — Cauldron{% endblock %}</title>
+  <link rel="stylesheet" href="{% static 'cauldron_admin/css/tokens.css' %}">
+  <link rel="stylesheet" href="{% static 'cauldron_admin/css/reset.css' %}">
+  <link rel="stylesheet" href="{% static 'cauldron_admin/css/base.css' %}">
+  <link rel="stylesheet" href="{% static 'cauldron_admin/css/layout.css' %}">
+  <link rel="stylesheet" href="{% static 'cauldron_admin/css/components.css' %}">
+  <link rel="stylesheet" href="{% static 'cauldron_admin/css/forms.css' %}">
+  <link rel="stylesheet" href="{% static 'cauldron_admin/css/tables.css' %}">
+  <link rel="stylesheet" href="{% static 'cauldron_admin/css/utilities.css' %}">
+  <link rel="stylesheet" href="{% static 'cauldron_admin/css/responsive.css' %}">
+  {% block extra_css %}{% endblock %}
+  {% block extra_head %}{% endblock %}
+</head>
+<body>
+  <a href="#cui-main" class="cui-skip-link">Skip to main content</a>
+  <div class="cui-shell">
+    {% include "cauldron_admin/includes/header.html" %}
+    <div class="cui-shell__body">
+      {% include "cauldron_admin/includes/sidebar.html" %}
+      <main id="cui-main" class="cui-main" tabindex="-1">
+        <div class="cui-main__inner">
+          {% include "cauldron_admin/includes/breadcrumbs.html" %}
+          {% include "cauldron_admin/includes/messages.html" %}
+          <div class="cui-page-header">
+            <div class="cui-page-header__title-group">
+              <h1 class="cui-page-title">{% block page_title %}{% endblock %}</h1>
+              {% block page_description %}{% endblock %}
+            </div>
+            <div class="cui-page-actions">{% block page_actions %}{% endblock %}</div>
+          </div>
+          <div class="cui-content">{% block content %}{% endblock %}</div>
+        </div>
+      </main>
+    </div>
+    <footer class="cui-footer">
+      <span class="cui-footer__version">Cauldron {% block cauldron_version %}0.1.0{% endblock %}</span>
+    </footer>
+  </div>
+  <script src="{% static 'cauldron_admin/js/shell.js' %}"></script>
+  {% block extra_js %}{% endblock %}
+</body>
+</html>

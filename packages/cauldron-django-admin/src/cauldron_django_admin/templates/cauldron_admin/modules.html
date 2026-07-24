@@ -1,0 +1,30 @@
+{% extends "cauldron_admin/base.html" %}
+{% block page_title %}Module Status{% endblock %}
+{% block content %}
+<div class="cui-table-container">
+  <table class="cui-table">
+    <thead>
+      <tr>
+        <th>Slug</th><th>Label</th><th>Version</th><th>Status</th><th>Provides</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for mod in modules %}
+      <tr>
+        <td><code>{{ mod.slug }}</code></td>
+        <td>{{ mod.label }}</td>
+        <td>{{ mod.version }}</td>
+        <td>{% include "cauldron_admin/includes/status_badge.html" with status=mod.status %}</td>
+        <td>
+          {% for cap in mod.provides %}
+          <code class="cui-badge">{{ cap }}</code>
+          {% endfor %}
+        </td>
+      </tr>
+      {% empty %}
+      <tr><td colspan="5">No modules registered.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

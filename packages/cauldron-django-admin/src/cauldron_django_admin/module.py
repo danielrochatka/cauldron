@@ -24,6 +24,9 @@ _manifest = ModuleManifest(
         "admin.users",
         "admin.roles",
         "admin.permissions",
+        "admin.shell",
+        "admin.navigation",
+        "admin.ui.overrides",
     ),
 )
 

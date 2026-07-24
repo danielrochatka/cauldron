@@ -1,0 +1,26 @@
+{% load cauldron_admin_tags %}
+<nav id="cui-sidebar" class="cui-sidebar" aria-label="Main navigation">
+  <ul class="cui-sidebar__sections" role="list">
+    {% get_navigation request as nav_groups %}
+    {% for group in nav_groups %}
+    <li class="cui-sidebar__section">
+      <span class="cui-sidebar__section-label">{{ group.section.label }}</span>
+      <ul class="cui-sidebar__items" role="list">
+        {% for item in group.items %}
+        <li class="cui-sidebar__item">
+          {% url item.url_name as nav_item_url %}
+          <a href="{{ nav_item_url|default:'#' }}"
+             class="cui-sidebar__link{% if item.url_prefix and request.path|slice:item.url_prefix|length == item.url_prefix %} is-active{% endif %}"
+             {% if item.url_prefix and request.path == item.url_prefix %}aria-current="page"{% endif %}>
+            {{ item.label }}
+            {% if item.badge_count %}<span class="cui-badge" aria-label="{{ item.badge_count }} items">{{ item.badge_count }}</span>{% endif %}
+          </a>
+        </li>
+        {% endfor %}
+      </ul>
+    </li>
+    {% empty %}
+    <li class="cui-sidebar__empty">No navigation available.</li>
+    {% endfor %}
+  </ul>
+</nav>

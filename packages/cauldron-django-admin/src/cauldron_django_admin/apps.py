@@ -8,4 +8,41 @@ class CauldronDjangoAdminConfig(AppConfig):
     verbose_name = "Cauldron Django Admin"
 
     def ready(self) -> None:
-        from . import checks  # noqa: F401  — registers @checks.register decorators
+        from . import checks  # noqa: F401 — registers @checks.register decorators
+        self._register_navigation()
+
+    def _register_navigation(self) -> None:
+        from .navigation import get_navigation_registry, AdminNavigationSection, AdminNavigationItem
+        registry = get_navigation_registry()
+        try:
+            registry.register_section(AdminNavigationSection(
+                key="overview",
+                label="Overview",
+                order=10,
+            ))
+            registry.register_item(AdminNavigationItem(
+                key="cauldron.dashboard",
+                label="Dashboard",
+                url_name="cauldron:dashboard",
+                section="overview",
+                order=10,
+                permission="",
+                url_prefix="/cauldron/",
+            ))
+            registry.register_section(AdminNavigationSection(
+                key="system",
+                label="System",
+                order=900,
+            ))
+            registry.register_item(AdminNavigationItem(
+                key="cauldron.modules",
+                label="Modules",
+                url_name="cauldron:modules",
+                section="system",
+                order=10,
+                permission="",
+                url_prefix="/cauldron/modules/",
+                description="Active Cauldron modules and capabilities",
+            ))
+        except ValueError:
+            pass  # idempotent if already registered

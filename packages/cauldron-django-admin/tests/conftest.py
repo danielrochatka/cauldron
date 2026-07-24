@@ -1,4 +1,5 @@
 """Test configuration for cauldron-django-admin package tests."""
+from pathlib import Path
 
 
 def pytest_configure(config):
@@ -55,4 +56,6 @@ def pytest_configure(config):
             USE_TZ=True,
             SECRET_KEY="test-secret-key-for-admin-tests",
             STATIC_URL="/static/",
+            STATIC_ROOT="/tmp/cauldron-test-static",
+            BASE_DIR=Path(__file__).parent,
         )

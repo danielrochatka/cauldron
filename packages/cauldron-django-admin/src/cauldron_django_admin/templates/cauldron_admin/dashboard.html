@@ -1,0 +1,15 @@
+{% extends "cauldron_admin/base.html" %}
+{% block page_title %}Dashboard{% endblock %}
+{% block content %}
+<div class="cui-dashboard-grid">
+  {% for card in dashboard_cards %}
+  <div class="cui-card">
+    <h2 class="cui-card__title">{{ card.label }}</h2>
+    {% if card.description %}<p class="cui-card__description">{{ card.description }}</p>{% endif %}
+    {% if card.url %}<a href="{{ card.url }}" class="cui-button">View</a>{% endif %}
+  </div>
+  {% empty %}
+  <p>Welcome to Cauldron. No modules registered yet.</p>
+  {% endfor %}
+</div>
+{% endblock %}

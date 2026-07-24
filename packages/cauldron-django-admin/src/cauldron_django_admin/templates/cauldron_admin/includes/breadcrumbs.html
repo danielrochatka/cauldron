@@ -1,0 +1,14 @@
+{% if breadcrumbs %}
+{% url 'cauldron:dashboard' as breadcrumb_home_url %}
+<nav class="cui-breadcrumbs" aria-label="Breadcrumb">
+  <ol class="cui-breadcrumbs__list">
+    <li class="cui-breadcrumbs__item"><a href="{{ breadcrumb_home_url|default:'/' }}" class="cui-breadcrumbs__link">Home</a></li>
+    {% for crumb in breadcrumbs %}
+    <li class="cui-breadcrumbs__item">
+      {% if crumb.url %}<a href="{{ crumb.url }}" class="cui-breadcrumbs__link">{{ crumb.label }}</a>
+      {% else %}<span class="cui-breadcrumbs__current" aria-current="page">{{ crumb.label }}</span>{% endif %}
+    </li>
+    {% endfor %}
+  </ol>
+</nav>
+{% endif %}

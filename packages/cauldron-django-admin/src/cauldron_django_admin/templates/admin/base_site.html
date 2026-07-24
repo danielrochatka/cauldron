@@ -1,0 +1,13 @@
+{% extends "admin/base.html" %}
+{% load static %}
+{% block extrastyle %}{{ block.super }}
+<link rel="stylesheet" href="{% static 'cauldron_admin/css/tokens.css' %}">
+<link rel="stylesheet" href="{% static 'cauldron_admin/css/django-admin-bridge.css' %}">
+{% endblock %}
+{% block footer %}
+{{ block.super }}
+<div class="cauldron-admin-back-link">
+  {% url 'cauldron:dashboard' as cauldron_dashboard_url %}
+  {% if cauldron_dashboard_url %}<a href="{{ cauldron_dashboard_url }}">&#8592; Return to Cauldron</a>{% endif %}
+</div>
+{% endblock %}

@@ -74,6 +74,30 @@ def check_admin_config(app_configs, **kwargs):
                 )
             )
 
+    # E303: cauldron_django_admin must be in INSTALLED_APPS
+    if "cauldron_django_admin" not in installed_apps:
+        messages_list.append(
+            checks.Error(
+                "cauldron.django.admin requires 'cauldron_django_admin' in INSTALLED_APPS.",
+                hint="Add 'cauldron_django_admin' to your INSTALLED_APPS setting.",
+                id="cauldron.admin.E303",
+            )
+        )
+
+    # E304: check that CAULDRON_UI_OVERRIDES_DIR is readable if set
+    override_dir = getattr(settings, "CAULDRON_UI_OVERRIDES_DIR", None)
+    if override_dir is not None:
+        from pathlib import Path
+        od = Path(override_dir)
+        if od.exists() and not od.is_dir():
+            messages_list.append(
+                checks.Error(
+                    "CAULDRON_UI_OVERRIDES_DIR exists but is not a directory.",
+                    hint="Set CAULDRON_UI_OVERRIDES_DIR to a valid directory path.",
+                    id="cauldron.admin.E304",
+                )
+            )
+
     if not messages_list:
         messages_list.append(
             checks.Info(

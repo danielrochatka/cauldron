@@ -99,9 +99,20 @@ def check_admin_config(app_configs, **kwargs):
                 )
             )
 
+    # E308: override root must not be a symlink
+    if override_dir is not None:
+        from pathlib import Path
+        od = Path(override_dir)
+        if od.is_symlink():
+            messages_list.append(checks.Error(
+                "CAULDRON_UI_OVERRIDES_DIR is a symbolic link. "
+                "Configure a real directory as the override root.",
+                hint="Set CAULDRON_UI_OVERRIDES_DIR to a real directory, not a symlink.",
+                id="cauldron.admin.E308",
+            ))
+
     # E305: shell templates present
     try:
-        import importlib.resources as pkg_resources
         from pathlib import Path
         import cauldron_django_admin
         pkg_path = Path(cauldron_django_admin.__file__).parent
@@ -114,8 +125,12 @@ def check_admin_config(app_configs, **kwargs):
                     id="cauldron.admin.E305",
                 )
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        messages_list.append(checks.Error(
+            f"cauldron.django.admin: error inspecting shell templates: {exc}",
+            hint="Re-install the cauldron-django-admin package.",
+            id="cauldron.admin.E305",
+        ))
 
     # E306: packaged static assets present
     try:
@@ -131,8 +146,12 @@ def check_admin_config(app_configs, **kwargs):
                     id="cauldron.admin.E306",
                 )
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        messages_list.append(checks.Error(
+            f"cauldron.django.admin: error inspecting packaged static assets: {exc}",
+            hint="Re-install the cauldron-django-admin package.",
+            id="cauldron.admin.E306",
+        ))
 
     # E307: override root readable if configured
     if override_dir is not None:
@@ -149,6 +168,26 @@ def check_admin_config(app_configs, **kwargs):
                         id="cauldron.admin.E307",
                     )
                 )
+
+    # W313: raw-tree validation issues
+    if override_dir is not None:
+        from pathlib import Path
+        od_check = Path(override_dir)
+        if od_check.exists() and od_check.is_dir() and not od_check.is_symlink():
+            try:
+                from cauldron_django_admin.override_store import validate_override_tree
+                tree_issues = validate_override_tree(od_check)
+                for issue in tree_issues:
+                    messages_list.append(checks.Warning(
+                        f"Override directory: {issue}",
+                        hint="Run 'manage.py cauldron_ui_init --check' for details.",
+                        id="cauldron.admin.W313",
+                    ))
+            except Exception as exc:
+                messages_list.append(checks.Warning(
+                    f"Override directory validation failed: {exc}",
+                    id="cauldron.admin.W313",
+                ))
 
     # W310: cauldron-overrides dir writability warning if dir exists
     override_dir_check = override_dir
@@ -170,6 +209,25 @@ def check_admin_config(app_configs, **kwargs):
                         id="cauldron.admin.W310",
                     )
                 )
+
+    # W312: scope directories must not be symlinks
+    override_dir_w = override_dir if override_dir is not None else (
+        str(Path(getattr(settings, "BASE_DIR", "")) / "cauldron-overrides")
+        if getattr(settings, "BASE_DIR", None) is not None else None
+    )
+    if override_dir_w is not None:
+        from pathlib import Path
+        od_w = Path(override_dir_w)
+        if od_w.exists() and od_w.is_dir() and not od_w.is_symlink():
+            for scope in ("admin", "pages"):
+                scope_path = od_w / scope
+                if scope_path.exists() and scope_path.is_symlink():
+                    messages_list.append(checks.Warning(
+                        f"Override scope directory {scope!r} is a symbolic link. "
+                        "The store will reject all writes through this scope.",
+                        hint=f"Replace {scope_path} with a real directory.",
+                        id="cauldron.admin.W312",
+                    ))
 
     # Only add the healthy info if there are no errors (warnings are OK)
     from django.core.checks import Error as _Error

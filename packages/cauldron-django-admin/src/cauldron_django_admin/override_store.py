@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
+import stat as _stat
 import threading
 import tempfile
 from pathlib import Path
@@ -129,6 +130,11 @@ class UIOverrideStore:
     """
 
     def __init__(self, root: Path) -> None:
+        if root.is_symlink():
+            raise OverrideLockError(
+                f"Override root {str(root)!r} is a symbolic link. "
+                "Configure a real directory as the override root."
+            )
         self._root = root.resolve()
         self._path_locks: dict[str, threading.Lock] = {}
         self._meta_lock = threading.Lock()
@@ -245,12 +251,80 @@ class UIOverrideStore:
             ) from exc
 
         lock_path = self._root / ".cauldron-store.lock"
-        try:
-            fd = open(str(lock_path), "w")
-        except OSError as exc:
-            raise OverrideLockError(
-                "Cannot open lock file in override root."
-            ) from exc
+
+        if _HAS_FCNTL:
+            fd_int: int = -1
+            try:
+                open_flags = os.O_CREAT | os.O_RDWR
+                if hasattr(os, "O_NOFOLLOW"):
+                    open_flags |= os.O_NOFOLLOW
+                fd_int = os.open(str(lock_path), open_flags, 0o600)
+            except OSError as exc:
+                raise OverrideLockError(
+                    "Cannot open lock file in override root."
+                ) from exc
+
+            try:
+                # Verify the fd points to a regular file (not a symlink, device, etc.)
+                fd_stat = os.fstat(fd_int)
+                if not _stat.S_ISREG(fd_stat.st_mode):
+                    raise OverrideLockError(
+                        "Lock file is not a regular file."
+                    )
+                # Compare inode/device of the open fd against the directory entry
+                # to detect replacement (TOCTOU) between open and stat.
+                try:
+                    path_stat = os.stat(str(lock_path), follow_symlinks=False)
+                except OSError as exc:
+                    raise OverrideLockError(
+                        "Cannot stat lock file path after open."
+                    ) from exc
+                if (fd_stat.st_ino, fd_stat.st_dev) != (path_stat.st_ino, path_stat.st_dev):
+                    raise OverrideLockError(
+                        "Lock file inode changed between open and stat — "
+                        "possible replacement attack."
+                    )
+                fd = os.fdopen(fd_int, "r+b")
+                fd_int = -1  # ownership transferred
+            except OverrideLockError:
+                if fd_int >= 0:
+                    os.close(fd_int)
+                raise
+            except Exception as exc:
+                if fd_int >= 0:
+                    os.close(fd_int)
+                raise OverrideLockError(f"Lock file validation failed: {exc}") from exc
+        else:
+            # Windows: open in append mode (does not truncate).
+            try:
+                fd = open(str(lock_path), "a")
+            except OSError as exc:
+                raise OverrideLockError(
+                    "Cannot open lock file in override root."
+                ) from exc
+            # Verify the opened path is a regular file and not a symlink.
+            try:
+                if lock_path.is_symlink():
+                    raise OverrideLockError(
+                        "Lock file is a symbolic link."
+                    )
+                path_stat = os.stat(str(lock_path), follow_symlinks=False)
+                if not _stat.S_ISREG(path_stat.st_mode):
+                    raise OverrideLockError(
+                        "Lock file is not a regular file."
+                    )
+            except OverrideLockError:
+                try:
+                    fd.close()
+                except OSError:
+                    pass
+                raise
+            except Exception as exc:
+                try:
+                    fd.close()
+                except OSError:
+                    pass
+                raise OverrideLockError(f"Lock file validation failed: {exc}") from exc
 
         try:
             with thread_lock:
@@ -511,6 +585,24 @@ class UIOverrideStore:
             if total > _MAX_TOTAL_BYTES:
                 raise FileSizeError("Write would exceed total override-root size limit.")
 
+            # Capture the parent-directory inode so we can detect ancestor
+            # replacement between temp-file creation and os.replace().
+            _parent_fd: int = -1
+            _parent_ino: tuple | None = None
+            if hasattr(os, "O_RDONLY") and hasattr(os, "fstat"):
+                try:
+                    _parent_fd = os.open(
+                        str(re_resolved.parent),
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                    )
+                    s = os.fstat(_parent_fd)
+                    _parent_ino = (s.st_ino, s.st_dev)
+                except OSError:
+                    if _parent_fd >= 0:
+                        os.close(_parent_fd)
+                    _parent_fd = -1
+                    _parent_ino = None
+
             re_resolved.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp_path = tempfile.mkstemp(dir=str(re_resolved.parent), suffix=".tmp")
             try:
@@ -573,6 +665,24 @@ class UIOverrideStore:
                             "File changed between temp creation and replacement."
                         )
 
+                # Final chain check right before mutation — catches any symlink
+                # that appeared after the inside-lock check but before we act.
+                self._check_no_symlinks_in_chain(scope, relative_path)
+
+                # Re-verify parent-directory inode to detect ancestor replacement.
+                if _parent_ino is not None:
+                    try:
+                        s2 = os.stat(str(re_resolved.parent), follow_symlinks=False)
+                        if (s2.st_ino, s2.st_dev) != _parent_ino:
+                            raise TraversalError(
+                                "Target parent directory inode changed after temp-file "
+                                "creation — possible ancestor replacement attack."
+                            )
+                    except TraversalError:
+                        raise
+                    except OSError:
+                        pass  # If we can't stat, fall through to the existing checks
+
                 os.replace(tmp_path, str(re_resolved))
             except Exception:
                 try:
@@ -580,6 +690,13 @@ class UIOverrideStore:
                 except OSError:
                     pass
                 raise
+            finally:
+                if _parent_fd >= 0:
+                    try:
+                        os.close(_parent_fd)
+                    except OSError:
+                        pass
+                    _parent_fd = -1
 
         return self._sha256(encoded)
 
@@ -622,47 +739,227 @@ class UIOverrideStore:
             # Second-pass lstat scan under the lock.
             self._check_no_symlinks_in_chain(scope, relative_path)
 
-            if not re_resolved.is_file():
-                if expected_hash == ABSENT:
-                    return  # Already absent — idempotent delete
-                raise FileNotFoundError(f"File not found: {relative_path!r} in scope {scope!r}.")
+            # Capture the parent-directory inode to detect ancestor replacement
+            # between the existing checks and os.unlink().
+            _del_parent_fd: int = -1
+            _del_parent_ino: tuple | None = None
+            if hasattr(os, "O_RDONLY") and hasattr(os, "fstat"):
+                try:
+                    _del_parent_fd = os.open(
+                        str(re_resolved.parent),
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                    )
+                    s = os.fstat(_del_parent_fd)
+                    _del_parent_ino = (s.st_ino, s.st_dev)
+                except OSError:
+                    if _del_parent_fd >= 0:
+                        os.close(_del_parent_fd)
+                    _del_parent_fd = -1
+                    _del_parent_ino = None
 
-            actual = self._sha256(re_resolved.read_bytes())
-            if actual != expected_hash:
-                raise HashConflictError("File was modified since the hash was captured.")
-
-            # ------------------------------------------------------------- #
-            # Final pre-unlink safety verification (mirrors the write path). #
-            # A racing thread or adversary could have swapped the target     #
-            # or parent for a symlink between the hash check and unlink;    #
-            # re-verify containment and re-check the hash right before we    #
-            # mutate the filesystem.                                         #
-            # ------------------------------------------------------------- #
-            final_scope_dir = self._scope_dir(scope).resolve()
-            if re_resolved.parent.is_symlink():
-                raise TraversalError(
-                    "Target parent became a symlink before deletion."
-                )
-            final_parent = re_resolved.parent.resolve()
             try:
-                final_parent.relative_to(final_scope_dir)
-            except ValueError:
-                raise TraversalError(
-                    "Target parent moved outside scope before deletion."
-                )
-            if re_resolved.is_symlink():
-                raise TraversalError(
-                    "Target became a symlink before deletion."
-                )
-            try:
-                actual_final = self._sha256(re_resolved.read_bytes())
-            except OSError as exc:
-                raise TraversalError(
-                    "Cannot read file for final hash revalidation before delete.",
-                ) from exc
-            if actual_final != expected_hash:
-                raise HashConflictError(
-                    "File changed between lock acquisition and deletion."
-                )
+                if not re_resolved.is_file():
+                    if expected_hash == ABSENT:
+                        return  # Already absent — idempotent delete
+                    raise FileNotFoundError(f"File not found: {relative_path!r} in scope {scope!r}.")
 
-            os.unlink(str(re_resolved))
+                actual = self._sha256(re_resolved.read_bytes())
+                if actual != expected_hash:
+                    raise HashConflictError("File was modified since the hash was captured.")
+
+                # ------------------------------------------------------------- #
+                # Final pre-unlink safety verification (mirrors the write path). #
+                # A racing thread or adversary could have swapped the target     #
+                # or parent for a symlink between the hash check and unlink;    #
+                # re-verify containment and re-check the hash right before we    #
+                # mutate the filesystem.                                         #
+                # ------------------------------------------------------------- #
+                final_scope_dir = self._scope_dir(scope).resolve()
+                if re_resolved.parent.is_symlink():
+                    raise TraversalError(
+                        "Target parent became a symlink before deletion."
+                    )
+                final_parent = re_resolved.parent.resolve()
+                try:
+                    final_parent.relative_to(final_scope_dir)
+                except ValueError:
+                    raise TraversalError(
+                        "Target parent moved outside scope before deletion."
+                    )
+                if re_resolved.is_symlink():
+                    raise TraversalError(
+                        "Target became a symlink before deletion."
+                    )
+                try:
+                    actual_final = self._sha256(re_resolved.read_bytes())
+                except OSError as exc:
+                    raise TraversalError(
+                        "Cannot read file for final hash revalidation before delete.",
+                    ) from exc
+                if actual_final != expected_hash:
+                    raise HashConflictError(
+                        "File changed between lock acquisition and deletion."
+                    )
+
+                # Final chain check right before mutation — catches any symlink
+                # that appeared after the inside-lock check but before we act.
+                self._check_no_symlinks_in_chain(scope, relative_path)
+
+                # Re-verify parent-directory inode to detect ancestor replacement.
+                if _del_parent_ino is not None:
+                    try:
+                        s2 = os.stat(str(re_resolved.parent), follow_symlinks=False)
+                        if (s2.st_ino, s2.st_dev) != _del_parent_ino:
+                            raise TraversalError(
+                                "Target parent directory inode changed after hash check "
+                                "— possible ancestor replacement attack."
+                            )
+                    except TraversalError:
+                        raise
+                    except OSError:
+                        pass  # If we can't stat, fall through to existing checks
+
+                os.unlink(str(re_resolved))
+            finally:
+                if _del_parent_fd >= 0:
+                    try:
+                        os.close(_del_parent_fd)
+                    except OSError:
+                        pass
+
+
+def validate_override_tree(root: Path) -> list[str]:
+    """Walk the raw override tree and return a list of issue strings.
+
+    Returns an empty list when the tree is fully valid. Callers should treat
+    every returned string as an operator-visible problem to surface.
+
+    This function does NOT raise — it accumulates issues and returns them so
+    callers can choose how to report them (management command warning,
+    Django system check, etc.).
+    """
+    import os as _os
+    issues: list[str] = []
+
+    if not root.exists():
+        issues.append("Override root does not exist.")
+        return issues
+    if root.is_symlink():
+        issues.append("Override root is a symbolic link.")
+        return issues
+    if not root.is_dir():
+        issues.append("Override root path exists but is not a directory.")
+        return issues
+
+    allowed_root_names = frozenset({
+        "admin", "pages", ".gitignore", ".cauldron-store.lock",
+    })
+
+    total_bytes = 0
+
+    for entry in sorted(root.iterdir()):
+        name = entry.name
+        if entry.is_symlink():
+            try:
+                link_target = entry.resolve()
+                link_target.relative_to(root)
+            except (ValueError, OSError):
+                issues.append(f"Symlink escape at root level: {name!r}")
+            else:
+                issues.append(f"Symlink at root level: {name!r}")
+            continue
+
+        if name not in allowed_root_names:
+            if name.startswith("."):
+                issues.append(f"Hidden file at root level: {name!r}")
+            else:
+                issues.append(f"Unexpected root-level entry: {name!r}")
+            continue
+
+        if name not in ("admin", "pages"):
+            continue
+
+        scope_dir = entry
+        if not scope_dir.is_dir():
+            issues.append(f"Scope entry is not a directory: {name!r}")
+            continue
+
+        for dirpath, dirnames, filenames in _os.walk(
+            str(scope_dir), topdown=True, followlinks=False,
+        ):
+            dp = Path(dirpath)
+            rel_dir = dp.relative_to(root)
+
+            hidden_dirs = [d for d in dirnames if d.startswith(".")]
+            for hd in hidden_dirs:
+                issues.append(f"Hidden directory: {rel_dir / hd}")
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+
+            for dname in list(dirnames):
+                dpath = dp / dname
+                if not dpath.is_symlink():
+                    continue
+                rel_dpath = dpath.relative_to(root)
+                try:
+                    target = dpath.resolve()
+                    target.relative_to(root)
+                except (ValueError, OSError):
+                    issues.append(f"Symlinked directory (escapes root): {rel_dpath}")
+                else:
+                    issues.append(
+                        f"Symlinked directory (resolves inside root): {rel_dpath}"
+                    )
+                dirnames.remove(dname)
+
+            for fname in sorted(filenames):
+                fpath = dp / fname
+                rel_path = fpath.relative_to(root)
+
+                if fname.startswith("."):
+                    issues.append(f"Hidden file: {rel_path}")
+                    continue
+
+                if fpath.is_symlink():
+                    try:
+                        target = fpath.resolve()
+                        target.relative_to(root)
+                    except (ValueError, OSError):
+                        issues.append(f"Symlink escape: {rel_path}")
+                    else:
+                        issues.append(f"Symlink in override tree: {rel_path}")
+                    continue
+
+                if fpath.suffix.lower() != ".css":
+                    issues.append(f"Non-CSS file: {rel_path}")
+                    continue
+
+                try:
+                    raw = fpath.read_bytes()
+                except OSError as exc:
+                    issues.append(f"Cannot read file: {rel_path}: {type(exc).__name__}")
+                    continue
+
+                file_size = len(raw)
+                if file_size > _MAX_FILE_BYTES:
+                    issues.append(
+                        f"File exceeds per-file limit ({file_size} bytes): {rel_path}"
+                    )
+
+                try:
+                    raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    issues.append(f"Invalid UTF-8: {rel_path}")
+
+                total_bytes += file_size
+
+    for scope in ("admin", "pages"):
+        if not (root / scope).is_dir():
+            issues.append(f"Missing scope directory: {scope}/")
+
+    if total_bytes > _MAX_TOTAL_BYTES:
+        issues.append(
+            f"Total override root size ({total_bytes} bytes) exceeds "
+            f"limit ({_MAX_TOTAL_BYTES} bytes)."
+        )
+
+    return issues

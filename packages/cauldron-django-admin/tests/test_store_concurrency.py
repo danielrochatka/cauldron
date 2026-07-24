@@ -273,6 +273,69 @@ def test_lock_error_on_non_posix(override_root, monkeypatch):
         )
 
 
+def test_override_root_is_symlink(tmp_path):
+    """Configuring a symlinked directory as override root must fail at
+    construction time so the store never has an ambiguous containment root."""
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    link_root = tmp_path / "link"
+    link_root.symlink_to(real_root, target_is_directory=True)
+    with pytest.raises(OverrideLockError, match="symbolic link"):
+        UIOverrideStore(link_root)
+
+
+def test_lock_file_is_symlink(override_root):
+    """A symlink placed at .cauldron-store.lock must be rejected when a write
+    is attempted — the lock file must be a genuine regular file."""
+    outside = override_root.parent / "outside.lock"
+    outside.write_bytes(b"")
+    lock_path = override_root / ".cauldron-store.lock"
+    lock_path.symlink_to(outside)
+
+    store = UIOverrideStore(override_root)
+    with pytest.raises(OverrideLockError):
+        store.write_file_atomic("admin", "x.css", "/* v0 */", expected_hash=ABSENT)
+
+
+def test_existing_regular_lock_file_works(override_root):
+    """A pre-existing regular lock file must not block writes — the store
+    creates the lock file on first use and re-uses it on subsequent calls."""
+    lock_path = override_root / ".cauldron-store.lock"
+    lock_path.write_bytes(b"")  # pre-create as regular file
+
+    store = UIOverrideStore(override_root)
+    h = store.write_file_atomic("admin", "ok.css", "/* ok */", expected_hash=ABSENT)
+    assert len(h) == 64
+
+
+def test_ancestor_swapped_after_temp_creation(override_root, tmp_path):
+    """Swapping a higher ancestor directory for a symlink after the temp file
+    is created but before replacement must be caught by the pre-replace
+    checks.  This exercises the parent-inode re-verification window.
+    """
+    sub = override_root / "admin" / "sub"
+    sub.mkdir()
+    store = UIOverrideStore(override_root)
+
+    # Write an initial file so we can update it next.
+    h0 = store.write_file_atomic(
+        "admin", "sub/style.css", "/* v0 */", expected_hash=ABSENT,
+    )
+
+    # Now replace "sub" with a symlink that targets another directory.
+    other = override_root / "admin" / "sub_alt"
+    other.mkdir()
+    (other / "style.css").write_text("/* v0 */", encoding="utf-8")
+    import shutil
+    shutil.rmtree(sub)
+    sub.symlink_to(other, target_is_directory=True)
+
+    with pytest.raises(TraversalError):
+        store.write_file_atomic(
+            "admin", "sub/style.css", "/* v1 */", expected_hash=h0,
+        )
+
+
 def test_many_concurrent_writers_only_one_wins(override_root):
     """Ten threads race to write to the same file starting from ABSENT —
     only one should succeed, the rest should get ``HashConflictError``.

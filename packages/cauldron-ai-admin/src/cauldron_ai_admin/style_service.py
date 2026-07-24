@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import uuid as _uuid
 from typing import TYPE_CHECKING
 
 from django.db import transaction
@@ -48,29 +49,30 @@ def _next_sequence_locked(proposal: UIStyleChangeRequest) -> int:
     return (result["sequence__max"] or 0) + 1
 
 
-def _record_apply_conflict(
-    *,
+def _record_pre_read_conflict(
     proposal_pk,
+    lease_token: str,
     applied_by,
     summary: str,
 ) -> None:
-    """Record a hash-conflict transition in its own atomic block.
+    """Transition an 'applying' proposal to 'conflicted' during pre-read.
 
-    The DB record survives even when the caller re-raises past its own
-    transaction — Phase 1 released its lock and we need the ``conflicted``
-    status + audit event to commit before the ``HashConflictError`` bubbles
-    up to the caller.
+    Called when we detect a hash mismatch while reading the current file
+    content for rollback capture (before the filesystem write). The proposal
+    is in 'applying' status at this point; we verify the lease to guard
+    against a concurrent actor having already updated the row.
     """
     with transaction.atomic():
         locked = UIStyleChangeRequest.objects.select_for_update().get(
             pk=proposal_pk,
         )
-        if locked.status == "approved":
+        if locked.status == "applying" and locked.apply_lease == lease_token:
             locked.status = "conflicted"
+            locked.apply_lease = ""
             locked.error_code = "HASH_CONFLICT"
             locked.error_summary = summary
             locked.save(update_fields=[
-                "status", "error_code", "error_summary",
+                "status", "apply_lease", "error_code", "error_summary",
             ])
             UIStyleAuditEvent.objects.create(
                 change_request=locked,
@@ -272,34 +274,31 @@ class UIStyleChangeService:
     def apply(self, proposal: UIStyleChangeRequest, applied_by) -> UIStyleChangeRequest:
         """Apply an approved proposal to the filesystem.
 
-        Three-phase protocol that keeps the database and the filesystem in
-        agreement even under commit-time failures:
+        Four-transition protocol that keeps the database and the filesystem in
+        agreement even under commit-time failures and concurrent apply attempts:
 
-        1. **Lock + validate + capture.** Take ``select_for_update`` on the
-           proposal row inside its own transaction, re-validate the
-           ``approved`` status, and copy the fields needed after the lock is
-           released. For existing targets we also read the previous bytes and
-           verify they match the persisted ``base_hash`` — the pre-image is
-           required so a subsequent rollback can restore the exact content.
-           If the pre-read disagrees with ``base_hash`` we fail closed
-           without touching the filesystem.
-        2. **Filesystem write.** Runs OUTSIDE any transaction so the
-           optimistic-lock witness ``expected_hash`` faithfully reflects the
-           persisted base state. Failure branches (``HashConflictError``,
-           ``OverrideStoreError``) each open their OWN atomic block so the
-           conflict/failure record commits even though we re-raise past the
-           caller.
-        3. **Persist applied state.** Re-lock the row and write the
-           ``applied`` status + audit event under a fresh transaction. If
-           anything fails here — model save, audit creation, or the commit
-           itself — we roll the filesystem back to its captured pre-image.
+        1. **Claim with applying status.** Inside a transaction, transition
+           ``approved`` → ``applying`` with a UUID lease token so concurrent
+           callers can detect and lose the race cleanly.
+        2. **Pre-read.** Outside any transaction, capture the old file content
+           for rollback. If the pre-read disagrees with ``base_hash`` we
+           transition ``applying`` → ``conflicted`` and raise.
+        3. **Filesystem write.** Runs OUTSIDE any transaction. Failure branches
+           each open their own atomic block to record the outcome and
+           transition ``applying`` → ``conflicted``, then re-raise.
+        4. **Persist applied state.** Re-lock the row, verify the lease is
+           still ours, then transition ``applying`` → ``applied``. If anything
+           fails, roll the filesystem back to its captured pre-image and
+           transition to ``approved`` (rollback succeeded) or ``conflicted``
+           (rollback failed).
         """
         from cauldron_django_admin.override_store import (
             HashConflictError, OverrideStoreError, ABSENT,
         )
         store = _get_override_store()
 
-        # ── Phase 1: lock, validate, capture pre-state ────────────────────
+        # ── Phase 1: claim with applying status ───────────────────────────
+        lease = str(_uuid.uuid4())
         with transaction.atomic():
             locked = UIStyleChangeRequest.objects.select_for_update().get(
                 pk=proposal.pk,
@@ -313,29 +312,34 @@ class UIStyleChangeService:
             proposed_content = locked.proposed_content
             base_exists = locked.base_exists
             base_hash = locked.base_hash
+            locked.status = "applying"
+            locked.apply_lease = lease
+            locked.save(update_fields=["status", "apply_lease"])
+            UIStyleAuditEvent.objects.create(
+                change_request=locked,
+                sequence=_next_sequence_locked(locked),
+                event_type="applying",
+                actor=applied_by,
+                detail={},
+            )
 
         expected = base_hash if base_exists else ABSENT
 
-        # Capture the previous file content for potential rollback. For an
-        # existing target we MUST succeed and the captured bytes MUST match
-        # the persisted ``base_hash`` — otherwise the target was modified
-        # concurrently and we have no known-good pre-image to restore. A
-        # captured mismatch is fundamentally the same failure the store's
-        # optimistic lock would surface, so we record it as a HashConflict
-        # in DB (so audit + status transition survive) and raise
-        # HashConflictError to signal the caller.
+        # ── Pre-read: capture old content for rollback ────────────────────
+        # For existing targets we MUST succeed and the captured bytes MUST
+        # match the persisted ``base_hash`` — otherwise the target was
+        # modified concurrently and we have no known-good pre-image to restore.
         old_content: str | None = None
         if base_exists:
             try:
                 old_content = store.read_file(scope, target_path)
             except FileNotFoundError:
                 # base_exists=True but file is gone → definitely a conflict.
-                _record_apply_conflict(
-                    proposal_pk=proposal.pk,
-                    applied_by=applied_by,
-                    summary=(
-                        "Target file is missing but was expected to exist."
-                    ),
+                _record_pre_read_conflict(
+                    proposal.pk,
+                    lease,
+                    applied_by,
+                    "Target file is missing but was expected to exist.",
                 )
                 raise HashConflictError(
                     "Target file is missing but base_exists is True.",
@@ -347,12 +351,11 @@ class UIStyleChangeService:
                 ) from exc
             captured_hash = _sha256(old_content)
             if captured_hash != base_hash:
-                _record_apply_conflict(
-                    proposal_pk=proposal.pk,
-                    applied_by=applied_by,
-                    summary=(
-                        "Target file was modified since the proposal was created."
-                    ),
+                _record_pre_read_conflict(
+                    proposal.pk,
+                    lease,
+                    applied_by,
+                    "Target file was modified since the proposal was created.",
                 )
                 raise HashConflictError(
                     "Pre-read bytes do not match persisted base_hash; "
@@ -393,14 +396,15 @@ class UIStyleChangeService:
                 locked2 = UIStyleChangeRequest.objects.select_for_update().get(
                     pk=proposal.pk,
                 )
-                if locked2.status == "approved":
+                if locked2.status == "applying" and locked2.apply_lease == lease:
                     locked2.status = "conflicted"
+                    locked2.apply_lease = ""
                     locked2.error_code = "HASH_CONFLICT"
                     locked2.error_summary = (
                         "Target file was modified since the proposal was created."
                     )
                     locked2.save(update_fields=[
-                        "status", "error_code", "error_summary",
+                        "status", "apply_lease", "error_code", "error_summary",
                     ])
                     UIStyleAuditEvent.objects.create(
                         change_request=locked2,
@@ -415,16 +419,21 @@ class UIStyleChangeService:
                 locked2 = UIStyleChangeRequest.objects.select_for_update().get(
                     pk=proposal.pk,
                 )
-                locked2.error_code = "STORE_ERROR"
-                locked2.error_summary = type(exc).__name__
-                locked2.save(update_fields=["error_code", "error_summary"])
-                UIStyleAuditEvent.objects.create(
-                    change_request=locked2,
-                    sequence=_next_sequence_locked(locked2),
-                    event_type="failed",
-                    actor=applied_by,
-                    detail={"error_class": type(exc).__name__},
-                )
+                if locked2.status == "applying" and locked2.apply_lease == lease:
+                    locked2.status = "conflicted"
+                    locked2.apply_lease = ""
+                    locked2.error_code = "STORE_ERROR"
+                    locked2.error_summary = type(exc).__name__
+                    locked2.save(update_fields=[
+                        "status", "apply_lease", "error_code", "error_summary",
+                    ])
+                    UIStyleAuditEvent.objects.create(
+                        change_request=locked2,
+                        sequence=_next_sequence_locked(locked2),
+                        event_type="failed",
+                        actor=applied_by,
+                        detail={"error_class": type(exc).__name__},
+                    )
             raise
 
         # ── Phase 3: persist applied state ────────────────────────────────
@@ -437,20 +446,19 @@ class UIStyleChangeService:
                 locked2 = UIStyleChangeRequest.objects.select_for_update().get(
                     pk=proposal.pk,
                 )
-                # Guard against a race where another actor changed status
-                # between our filesystem write and now (e.g. an operator
-                # rejected in a different session). Roll back the filesystem
-                # so on-disk state matches the DB verdict.
-                if locked2.status != "approved":
+                # Verify we still hold the lease — a concurrent actor may have
+                # transitioned us out of 'applying' between our FS write and now.
+                if locked2.status != "applying" or locked2.apply_lease != lease:
                     raise ValueError(
-                        f"Proposal status changed to {locked2.status!r} "
-                        "after filesystem write; filesystem rolled back.",
+                        f"Lost applying lease (expected {lease!r}) — "
+                        f"proposal is in status {locked2.status!r}."
                     )
                 locked2.status = "applied"
+                locked2.apply_lease = ""
                 locked2.applied_at = timezone.now()
                 locked2.proposed_hash = new_hash
                 locked2.save(update_fields=[
-                    "status", "applied_at", "proposed_hash",
+                    "status", "apply_lease", "applied_at", "proposed_hash",
                 ])
                 UIStyleAuditEvent.objects.create(
                     change_request=locked2,
@@ -465,7 +473,7 @@ class UIStyleChangeService:
             )
 
             # Persist the rollback outcome in an INDEPENDENT transaction. If
-            # rollback succeeded the proposal remains ``approved`` for retry
+            # rollback succeeded the proposal returns to ``approved`` for retry
             # (with an error trail so operators know Phase 3 failed once).
             # If rollback failed, mark ``conflicted`` so the row cannot be
             # applied again without human review of the DB↔FS mismatch.
@@ -476,45 +484,49 @@ class UIStyleChangeService:
                         .select_for_update()
                         .get(pk=proposal.pk)
                     )
-                    if rollback.success:
-                        locked3.error_code = "APPLY_DB_FAILED"
-                        locked3.error_summary = (
-                            "Database write failed after filesystem write; "
-                            "filesystem was restored."
-                        )
-                        locked3.save(update_fields=[
-                            "error_code", "error_summary",
-                        ])
-                        UIStyleAuditEvent.objects.create(
-                            change_request=locked3,
-                            sequence=_next_sequence_locked(locked3),
-                            event_type="failed",
-                            actor=applied_by,
-                            detail={
-                                "error_class": "DB_COMMIT_FAILED",
-                                "rollback": "succeeded",
-                            },
-                        )
-                    else:
-                        locked3.status = "conflicted"
-                        locked3.error_code = "ROLLBACK_FAILED"
-                        locked3.error_summary = (
-                            "Database and filesystem are inconsistent; "
-                            "manual review required."
-                        )
-                        locked3.save(update_fields=[
-                            "status", "error_code", "error_summary",
-                        ])
-                        UIStyleAuditEvent.objects.create(
-                            change_request=locked3,
-                            sequence=_next_sequence_locked(locked3),
-                            event_type="failed",
-                            actor=applied_by,
-                            detail={
-                                "error_class": "ROLLBACK_FAILED",
-                                "rollback_error_class": rollback.error_class,
-                            },
-                        )
+                    if locked3.status == "applying" and locked3.apply_lease == lease:
+                        if rollback.success:
+                            locked3.status = "approved"
+                            locked3.apply_lease = ""
+                            locked3.error_code = "APPLY_DB_FAILED"
+                            locked3.error_summary = (
+                                "Database write failed after filesystem write; "
+                                "filesystem was restored."
+                            )
+                            locked3.save(update_fields=[
+                                "status", "apply_lease", "error_code", "error_summary",
+                            ])
+                            UIStyleAuditEvent.objects.create(
+                                change_request=locked3,
+                                sequence=_next_sequence_locked(locked3),
+                                event_type="failed",
+                                actor=applied_by,
+                                detail={
+                                    "error_class": "DB_COMMIT_FAILED",
+                                    "rollback": "succeeded",
+                                },
+                            )
+                        else:
+                            locked3.status = "conflicted"
+                            locked3.apply_lease = ""
+                            locked3.error_code = "ROLLBACK_FAILED"
+                            locked3.error_summary = (
+                                "Database and filesystem are inconsistent; "
+                                "manual review required."
+                            )
+                            locked3.save(update_fields=[
+                                "status", "apply_lease", "error_code", "error_summary",
+                            ])
+                            UIStyleAuditEvent.objects.create(
+                                change_request=locked3,
+                                sequence=_next_sequence_locked(locked3),
+                                event_type="failed",
+                                actor=applied_by,
+                                detail={
+                                    "error_class": "ROLLBACK_FAILED",
+                                    "rollback_error_class": rollback.error_class,
+                                },
+                            )
             except Exception:
                 logger.exception(
                     "CRITICAL: could not persist rollback outcome for "

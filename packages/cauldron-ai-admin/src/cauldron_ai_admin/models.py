@@ -216,6 +216,7 @@ class AdminAIToolInvocation(models.Model):
 UI_STYLE_STATUS_CHOICES = [
     ("proposed", "proposed"),
     ("approved", "approved"),
+    ("applying", "applying"),
     ("applied", "applied"),
     ("rejected", "rejected"),
     ("conflicted", "conflicted"),
@@ -313,6 +314,7 @@ class UIStyleChangeRequest(models.Model):
     applied_at = models.DateTimeField(null=True, blank=True)
     error_code = models.CharField(max_length=64, blank=True, default="")
     error_summary = models.TextField(blank=True, default="")
+    apply_lease = models.CharField(max_length=36, blank=True, default="")
 
     def __str__(self) -> str:
         return f"UIStyleChangeRequest({self.request_id}, {self.status}, {self.target_path})"
@@ -322,6 +324,7 @@ UI_STYLE_EVENT_TYPES = [
     ("proposed", "proposed"),
     ("approved", "approved"),
     ("rejected", "rejected"),
+    ("applying", "applying"),
     ("applied", "applied"),
     ("conflict", "conflict"),
     ("failed", "failed"),

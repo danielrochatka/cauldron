@@ -43,7 +43,14 @@ class ContentBrowserView(View):
 
     def get(self, request: HttpRequest) -> Any:
         collection = request.GET.get("collection", "")
-        include_drafts = request.GET.get("include_drafts", "").lower() in ("1", "true", "yes")
+        requested_drafts = request.GET.get("include_drafts", "").lower() in ("1", "true", "yes")
+        # view_draft_content gates access to any drafts. Silently ignore
+        # ?include_drafts=1 when the caller lacks the permission — surfacing
+        # a permission error would leak that drafts exist.
+        has_draft_perm = request.user.has_perm(
+            "cauldron_content_operations.view_draft_content"
+        )
+        include_drafts = requested_drafts and has_draft_perm
         from django.core.exceptions import ImproperlyConfigured
         try:
             service = _get_service()
@@ -123,8 +130,10 @@ class ContentProposalView(View):
             )
             if result.ok:
                 messages.success(request, f"Proposal created: {result.request_id}")
+                # Redirect to the shell-native change-request list, not the
+                # Django admin changelist — the shell owns the operator UI.
                 return HttpResponseRedirect(
-                    reverse("admin:cauldron_content_operations_contentchangerequest_changelist")
+                    reverse("cauldron_admin_content:change-request-list")
                 )
             else:
                 messages.error(request, html.escape(result.error.message))

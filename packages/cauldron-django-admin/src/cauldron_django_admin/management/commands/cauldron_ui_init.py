@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 
 
 _DEFAULT_ADMIN_FILES = {
@@ -85,7 +85,11 @@ class Command(BaseCommand):
         self.stdout.write(f"  Written: {path.name}")
 
     def _run_check(self, root: Path) -> None:
-        from cauldron_django_admin.override_store import UIOverrideStore, _MAX_FILE_BYTES, _MAX_TOTAL_BYTES
+        from cauldron_django_admin.override_store import (
+            UIOverrideStore, MAX_FILE_BYTES, MAX_TOTAL_BYTES,
+        )
+        _MAX_FILE_BYTES = MAX_FILE_BYTES
+        _MAX_TOTAL_BYTES = MAX_TOTAL_BYTES
 
         issues = []
 
@@ -126,8 +130,9 @@ class Command(BaseCommand):
         if issues:
             for issue in issues:
                 self.stderr.write(self.style.WARNING(f"  [WARN] {issue}"))
-            self.stderr.write(
-                self.style.WARNING("Override directory has validation issues. Run cauldron_ui_init to fix.")
+            # Raise CommandError so --check exits non-zero and CI can gate
+            # on it. Previously we merely printed a warning.
+            raise CommandError(
+                "Override directory has validation issues. Run cauldron_ui_init to fix."
             )
-        else:
-            self.stdout.write(self.style.SUCCESS("Override directory is valid."))
+        self.stdout.write(self.style.SUCCESS("Override directory is valid."))

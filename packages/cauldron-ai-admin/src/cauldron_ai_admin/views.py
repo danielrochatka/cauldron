@@ -117,7 +117,9 @@ class AdminAIRunListView(View):
     template_name = "cauldron_ai_admin/run_list.html"
 
     def get(self, request):
-        runs = AdminAIRun.objects.filter(actor=request.user).order_by("-created_at")[:50]
+        # view_admin_ai_runs is an admin-visibility permission: any user who
+        # holds it can see the full run history, not just their own runs.
+        runs = AdminAIRun.objects.all().order_by("-created_at")[:100]
         return render(request, self.template_name, {
             "runs": runs,
             "breadcrumbs": [
@@ -136,11 +138,19 @@ class AdminAIRunDetailView(View):
 
     def get(self, request, run_id):
         from django.shortcuts import get_object_or_404
-        run = get_object_or_404(AdminAIRun, run_id=run_id, actor=request.user)
-        invocations = list(run.invocations.order_by("created_at"))
+        run = get_object_or_404(AdminAIRun, run_id=run_id)
+        show_invocations = request.user.has_perm(
+            "cauldron_ai_admin.view_admin_ai_audit"
+        )
+        invocations = (
+            list(run.invocations.order_by("created_at"))
+            if show_invocations else []
+        )
         return render(request, self.template_name, {
             "run": run,
             "invocations": invocations,
+            "show_invocations": show_invocations,
+            "can_view_audit": show_invocations,
             "breadcrumbs": [
                 {"label": "Admin AI", "url": reverse("cauldron_ai_admin:ai-page")},
                 {"label": "Runs", "url": reverse("cauldron_ai_admin:run-list")},
@@ -172,15 +182,74 @@ class UIStyleChangeListView(View):
 class UIStyleChangeDetailView(View):
     template_name = "cauldron_ai_admin/style_detail.html"
 
+    # Maximum bytes of unified-diff text we render into the page.
+    _DIFF_LIMIT_BYTES = 32_000
+
     def get(self, request, request_id):
+        import difflib
+
         from django.shortcuts import get_object_or_404
         from .models import UIStyleChangeRequest
+
         proposal = get_object_or_404(UIStyleChangeRequest, request_id=request_id)
-        audit_events = list(proposal.audit_events.order_by("sequence"))
+
+        can_view_audit = request.user.has_perm(
+            "cauldron_ai_admin.view_ui_style_audit"
+        )
+        audit_events = (
+            list(proposal.audit_events.order_by("sequence"))
+            if can_view_audit else []
+        )
+
+        # Best-effort read of the current on-disk content so we can render
+        # a real diff view. Failures fall back to a "new file" summary.
+        current_content: str | None = None
+        current_label = "new file"
+        if proposal.base_exists:
+            try:
+                from cauldron_django_admin.override_views import _get_override_root
+                from cauldron_django_admin.override_store import UIOverrideStore
+                root = _get_override_root()
+                if root is not None and root.is_dir():
+                    store = UIOverrideStore(root)
+                    current_content = store.read_file(
+                        proposal.scope, proposal.target_path,
+                    )
+                    current_label = f"{proposal.scope}/{proposal.target_path}"
+            except Exception:
+                current_content = None
+
+        # Unified diff — bounded so a large proposal cannot blow up the
+        # response body.
+        diff_lines: list[str] = []
+        if current_content is not None:
+            diff_lines = list(difflib.unified_diff(
+                current_content.splitlines(keepends=True),
+                proposal.proposed_content.splitlines(keepends=True),
+                fromfile=f"current: {proposal.scope}/{proposal.target_path}",
+                tofile=f"proposed: {proposal.scope}/{proposal.target_path}",
+                lineterm="",
+            ))
+        elif not proposal.base_exists:
+            diff_lines = list(difflib.unified_diff(
+                [],
+                proposal.proposed_content.splitlines(keepends=True),
+                fromfile="/dev/null",
+                tofile=f"new: {proposal.scope}/{proposal.target_path}",
+                lineterm="",
+            ))
+        unified_diff = "".join(diff_lines)[: self._DIFF_LIMIT_BYTES]
+
         return render(request, self.template_name, {
             "proposal": proposal,
             "audit_events": audit_events,
-            "can_approve": request.user.has_perm("cauldron_ai_admin.approve_ui_style_changes"),
+            "can_approve": request.user.has_perm(
+                "cauldron_ai_admin.approve_ui_style_changes"
+            ),
+            "can_view_audit": can_view_audit,
+            "current_content": current_content,
+            "current_label": current_label,
+            "unified_diff": unified_diff,
             "breadcrumbs": [
                 {"label": "Style Proposals", "url": reverse("cauldron_ai_admin:style-list")},
                 {"label": str(proposal.request_id)[:8] + "…", "url": ""},

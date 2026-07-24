@@ -163,3 +163,74 @@ def test_pages_scope_isolated_from_admin(store):
     pages_content = store.read_file("pages", "test.css")
     assert "admin" in admin_content
     assert "pages" in pages_content
+
+
+# ---------------------------------------------------------------------------
+# validate_target / inspect_state — public APIs
+# ---------------------------------------------------------------------------
+
+
+def test_inspect_state_absent(store):
+    """inspect_state on a missing file returns exists=False and no hash."""
+    state = store.inspect_state("admin", "nope.css")
+    assert state == {"exists": False, "hash": None, "size": None}
+
+
+def test_inspect_state_present(store):
+    """inspect_state returns exists=True with the correct hash and size."""
+    body = "body { color: teal; }"
+    store.write_file_atomic("admin", "hello.css", body, expected_hash=ABSENT)
+    state = store.inspect_state("admin", "hello.css")
+    assert state["exists"] is True
+    assert state["size"] == len(body.encode("utf-8"))
+    assert len(state["hash"]) == 64  # sha256 hex
+
+
+def test_validate_target_rejects_scope_prefix(store):
+    """validate_target rejects non-CSS or otherwise invalid targets."""
+    with pytest.raises(InvalidFileError):
+        store.validate_target("admin", "foo.txt")
+
+
+def test_validate_target_ok_for_missing_file(store):
+    """validate_target does not require the file to exist."""
+    store.validate_target("admin", "does-not-exist-yet.css")
+
+
+def test_parallel_writes_total_size(store, tmp_path):
+    """When writes together exceed the total budget, later writes must fail."""
+    from cauldron_django_admin.override_store import (
+        MAX_TOTAL_BYTES, MAX_FILE_BYTES, FileSizeError,
+    )
+
+    # Fill up to just under the total-root budget with per-file-limit writes.
+    per_file = MAX_FILE_BYTES - 100
+    payload = "a" * per_file
+    written = 0
+    idx = 0
+    while written + per_file < MAX_TOTAL_BYTES:
+        store.write_file_atomic(
+            "admin", f"file{idx}.css", payload, expected_hash=ABSENT,
+        )
+        written += per_file
+        idx += 1
+
+    # Now one final write should push us over the total limit.
+    with pytest.raises(FileSizeError):
+        store.write_file_atomic(
+            "admin", f"file{idx}.css", payload, expected_hash=ABSENT,
+        )
+
+
+def test_write_file_absent_sentinel(store):
+    """ABSENT succeeds only for new files; existing files must use their hash."""
+    store.write_file_atomic("admin", "x.css", "body{}", expected_hash=ABSENT)
+    # Second ABSENT — file now exists → conflict.
+    with pytest.raises(HashConflictError):
+        store.write_file_atomic("admin", "x.css", "body{color:red}", expected_hash=ABSENT)
+
+
+def test_public_constants_exposed():
+    from cauldron_django_admin.override_store import MAX_FILE_BYTES, MAX_TOTAL_BYTES
+    assert MAX_FILE_BYTES == 256 * 1024
+    assert MAX_TOTAL_BYTES == 2 * 1024 * 1024

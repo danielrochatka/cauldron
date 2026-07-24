@@ -28,16 +28,34 @@
     <dt>Created</dt><dd>{{ proposal.created_at }}</dd>
     {% if proposal.reviewed_at %}<dt>Reviewed</dt><dd>{{ proposal.reviewed_at }}</dd>{% endif %}
     {% if proposal.applied_at %}<dt>Applied</dt><dd>{{ proposal.applied_at }}</dd>{% endif %}
+    <dt>Base</dt><dd>{% if proposal.base_exists %}<code>{{ proposal.base_hash }}</code>{% else %}<span class="cui-text-muted">new file</span>{% endif %}</dd>
+    <dt>Proposed Hash</dt><dd><code>{{ proposal.proposed_hash }}</code></dd>
     {% if proposal.error_summary %}<dt>Error</dt><dd class="cui-text-muted">{{ proposal.error_code }}: {{ proposal.error_summary }}</dd>{% endif %}
   </dl>
 </div>
 
-<h2>Proposed CSS</h2>
+<h2>Base ({{ current_label }})</h2>
 <div class="cui-table-container">
-  <pre class="cui-pre" style="padding:1rem; max-height:400px; overflow:auto;">{{ proposal.proposed_content }}</pre>
+  {% if proposal.base_exists and current_content is not None %}
+  <pre class="cui-pre" style="padding:1rem; max-height:300px; overflow:auto;">{{ current_content|slice:":32000" }}</pre>
+  {% else %}
+  <p class="cui-text-muted" style="padding:1rem;">No prior content — this proposal would create a new file.</p>
+  {% endif %}
 </div>
 
-{% if audit_events %}
+<h2>Proposed CSS</h2>
+<div class="cui-table-container">
+  <pre class="cui-pre" style="padding:1rem; max-height:400px; overflow:auto;">{{ proposal.proposed_content|slice:":32000" }}</pre>
+</div>
+
+{% if unified_diff %}
+<h2>Unified diff</h2>
+<div class="cui-table-container">
+  <pre class="cui-pre" style="padding:1rem; max-height:400px; overflow:auto;">{{ unified_diff }}</pre>
+</div>
+{% endif %}
+
+{% if can_view_audit %}
 <h2>Audit History</h2>
 <div class="cui-table-container">
   <table class="cui-table">
@@ -50,6 +68,8 @@
         <td>{{ ev.actor|default:"—" }}</td>
         <td class="cui-text-sm cui-text-muted">{{ ev.occurred_at }}</td>
       </tr>
+      {% empty %}
+      <tr><td colspan="4"><span class="cui-text-muted">No audit events recorded.</span></td></tr>
       {% endfor %}
     </tbody>
   </table>

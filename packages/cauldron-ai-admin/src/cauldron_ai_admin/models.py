@@ -246,13 +246,21 @@ class UIStyleChangeRequest(models.Model):
                 condition=Q(scope__in=["admin", "pages"]),
                 name="uiscr_scope_valid",
             ),
+            # proposed_hash is always the SHA-256 of the proposed content, so
+            # it must always be a lowercase 64-char hex digest.
             models.CheckConstraint(
-                condition=Q(proposed_hash="") | Q(proposed_hash__regex=_SHA256_RE),
+                condition=Q(proposed_hash__regex=_SHA256_RE),
                 name="uiscr_proposed_hash_format",
             ),
+            # base_exists=False implies base_hash MUST be empty.
             models.CheckConstraint(
-                condition=Q(base_hash="") | Q(base_hash__regex=_SHA256_RE),
-                name="uiscr_base_hash_format",
+                condition=Q(base_exists=True) | Q(base_hash=""),
+                name="uiscr_base_exists_false_hash_empty",
+            ),
+            # base_exists=True implies base_hash MUST be a 64-char hex digest.
+            models.CheckConstraint(
+                condition=Q(base_exists=False) | Q(base_hash__regex=_SHA256_RE),
+                name="uiscr_base_exists_true_hash_valid",
             ),
             models.CheckConstraint(
                 condition=(
@@ -281,6 +289,10 @@ class UIStyleChangeRequest(models.Model):
     scope = models.CharField(max_length=32)  # "admin" or "pages"
     target_path = models.CharField(max_length=512)  # relative path within scope
     proposed_content = models.TextField()
+    # True when the target file existed at proposal-creation time; drives the
+    # optimistic-lock semantics used at apply time. Stored explicitly so we
+    # do not need to reload the filesystem to interpret ``base_hash``.
+    base_exists = models.BooleanField(default=False)
     base_hash = models.CharField(max_length=64, blank=True, default="")
     proposed_hash = models.CharField(max_length=64, blank=True, default="")
     description = models.TextField(blank=True, default="")

@@ -44,6 +44,11 @@ class AdminNavigationItem:
     description: str = ""
     badge_count: int = 0
     badge_provider: Callable[[], int] | None = None
+    # When True, ``is_active`` compares the current request path to
+    # ``url_prefix`` exactly (rather than a startswith prefix match).  This
+    # is needed for the Dashboard item which shares its prefix with every
+    # nested cauldron page.
+    url_prefix_exact: bool = False
 
 
 @dataclass(frozen=True)
@@ -78,8 +83,13 @@ class NavigationRegistry:
         with self._lock:
             existing = self._sections.get(section.key)
             if existing is not None:
+                if existing == section:
+                    # Exact re-registration is idempotent (e.g. Django
+                    # autoreload re-executing AppConfig.ready()).
+                    return
                 raise ValueError(
-                    f"Navigation section {section.key!r} is already registered."
+                    f"Navigation section {section.key!r} is already registered "
+                    "with different attributes."
                 )
             self._sections[section.key] = section
 
@@ -100,9 +110,14 @@ class NavigationRegistry:
                     f"Navigation item {item.key!r} references unknown section {item.section!r}. "
                     "Register the section first."
                 )
-            if item.key in self._items:
+            existing = self._items.get(item.key)
+            if existing is not None:
+                if existing == item:
+                    # Exact re-registration is idempotent.
+                    return
                 raise ValueError(
-                    f"Navigation item {item.key!r} is already registered."
+                    f"Navigation item {item.key!r} is already registered "
+                    "with different attributes."
                 )
             self._items[item.key] = item
 
@@ -164,9 +179,19 @@ class NavigationRegistry:
                     badge = item.badge_provider()
                 except Exception:
                     badge = 0
-            is_active = bool(
-                item.url_prefix and current_path.startswith(item.url_prefix)
-            )
+            if item.url_prefix_exact:
+                # Exact-match items (e.g. Dashboard) are active only when the
+                # request path is precisely equal to the prefix (with an
+                # optional trailing slash).
+                normalised = current_path.rstrip("/") + "/"
+                is_active = bool(item.url_prefix) and (
+                    current_path == item.url_prefix
+                    or normalised == item.url_prefix
+                )
+            else:
+                is_active = bool(
+                    item.url_prefix and current_path.startswith(item.url_prefix)
+                )
             # Use SimpleNamespace so tests can access .key, .label, etc. as attributes
             # and the sidebar template can use {{ item.url }}, {{ item.is_active }}
             entry = types.SimpleNamespace(
@@ -179,6 +204,7 @@ class NavigationRegistry:
                 is_active=is_active,
                 permission=item.permission,
                 url_prefix=item.url_prefix,
+                url_prefix_exact=item.url_prefix_exact,
             )
             if item.section in section_items:
                 section_items[item.section].append(entry)

@@ -62,3 +62,25 @@ def test_modules_template_renders(client):
     response = client.get(reverse("cauldron:modules"))
     assert response.status_code == 200
     assert b"Module Status" in response.content
+
+
+@pytest.mark.django_db
+def test_site_overrides_load_after_extra_css():
+    """Site override CSS URLs are emitted AFTER the extra_css / extra_head
+    blocks so overrides win the cascade against page-level customisations."""
+    import os
+    from django.apps import apps
+    app = apps.get_app_config("cauldron_django_admin")
+    template_dir = os.path.join(app.path, "templates")
+    base_path = os.path.join(template_dir, "cauldron_admin", "base.html")
+    with open(base_path, encoding="utf-8") as f:
+        text = f.read()
+    idx_extra_css = text.find("{% block extra_css")
+    idx_extra_head = text.find("{% block extra_head")
+    idx_overrides = text.find('get_override_css_urls "admin"')
+    assert idx_extra_css > 0
+    assert idx_extra_head > 0
+    assert idx_overrides > 0
+    # Overrides come AFTER both extra_css and extra_head.
+    assert idx_overrides > idx_extra_css
+    assert idx_overrides > idx_extra_head

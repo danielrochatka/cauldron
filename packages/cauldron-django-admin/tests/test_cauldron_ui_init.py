@@ -64,13 +64,28 @@ def test_check_mode_valid(override_root, settings):
 
 
 def test_check_mode_missing(override_root, settings):
+    from django.core.management.base import CommandError
     settings.CAULDRON_UI_OVERRIDES_DIR = str(override_root)
-    # Do NOT initialize — root doesn't exist
+    # Do NOT initialize — root doesn't exist. --check must fail loudly so CI
+    # can gate on it.
     err = StringIO()
     out = StringIO()
-    call_command("cauldron_ui_init", "--check", stdout=out, stderr=err)
+    with pytest.raises(CommandError):
+        call_command("cauldron_ui_init", "--check", stdout=out, stderr=err)
     combined = out.getvalue() + err.getvalue()
-    assert "issues" in combined.lower() or "warn" in combined.lower() or "does not exist" in combined.lower()
+    assert (
+        "issues" in combined.lower()
+        or "warn" in combined.lower()
+        or "does not exist" in combined.lower()
+    )
+
+
+def test_check_nonzero_on_missing_dir(override_root, settings):
+    """`--check` must raise CommandError (non-zero exit) when the root is absent."""
+    from django.core.management.base import CommandError
+    settings.CAULDRON_UI_OVERRIDES_DIR = str(override_root)
+    with pytest.raises(CommandError):
+        call_command("cauldron_ui_init", "--check", stdout=StringIO(), stderr=StringIO())
 
 
 def test_init_uses_base_dir(tmp_path, settings):

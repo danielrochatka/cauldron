@@ -1,11 +1,27 @@
 {% extends "cauldron_admin/base.html" %}
 {% block page_title %}Module Status{% endblock %}
 {% block content %}
+{% if registry_errors %}
+<div class="cui-card">
+  <h2 class="cui-page-title">Registry diagnostics</h2>
+  <table class="cui-table">
+    <thead><tr><th>Error kind</th><th>Module</th></tr></thead>
+    <tbody>
+      {% for err in registry_errors %}
+      <tr>
+        <td><code>{{ err.kind }}</code></td>
+        <td>{% if err.module %}<code>{{ err.module }}</code>{% else %}<span class="cui-text-muted">—</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
 <div class="cui-table-container">
   <table class="cui-table">
     <thead>
       <tr>
-        <th>Slug</th><th>Label</th><th>Version</th><th>Status</th><th>Provides</th>
+        <th>Slug</th><th>Label</th><th>Version</th><th>Status</th><th>Provides</th><th>Dependencies</th>
       </tr>
     </thead>
     <tbody>
@@ -20,9 +36,16 @@
           <code class="cui-badge">{{ cap }}</code>
           {% endfor %}
         </td>
+        <td>
+          {% for dep in mod.dependencies %}
+          <code class="cui-badge">{{ dep }}</code>
+          {% empty %}
+          <span class="cui-text-muted">—</span>
+          {% endfor %}
+        </td>
       </tr>
       {% empty %}
-      <tr><td colspan="5">No modules registered.</td></tr>
+      <tr><td colspan="6">No modules registered.</td></tr>
       {% endfor %}
     </tbody>
   </table>

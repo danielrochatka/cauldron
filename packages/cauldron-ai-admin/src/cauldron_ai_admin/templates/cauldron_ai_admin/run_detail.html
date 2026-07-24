@@ -11,7 +11,7 @@
     {% if run.error_summary %}<dt>Error</dt><dd class="cui-text-muted">{{ run.error_summary }}</dd>{% endif %}
   </dl>
 </div>
-{% if invocations %}
+{% if show_invocations %}
 <h2>Tool Invocations</h2>
 <div class="cui-table-container">
   <table class="cui-table">
@@ -24,6 +24,8 @@
         <td>{% include "cauldron_admin/includes/status_badge.html" with status=inv.status %}</td>
         <td>{{ inv.duration_ms }}ms</td>
       </tr>
+      {% empty %}
+      <tr><td colspan="4"><span class="cui-text-muted">No invocations recorded for this run.</span></td></tr>
       {% endfor %}
     </tbody>
   </table>

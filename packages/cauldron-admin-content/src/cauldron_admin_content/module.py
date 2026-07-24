@@ -10,6 +10,10 @@ _manifest = ModuleManifest(
     requires=(
         ModuleRequirement(slug="content.operations", kind="capability"),
         ModuleRequirement(slug="admin.interface", kind="capability"),
+        # admin-content pages extend the Cauldron Admin Shell templates;
+        # depend on that capability explicitly so misconfigured deployments
+        # fail loudly at resolution time.
+        ModuleRequirement(slug="admin.shell", kind="capability"),
     ),
     provides=(
         "admin.content",

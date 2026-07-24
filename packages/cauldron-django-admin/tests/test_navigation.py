@@ -36,7 +36,9 @@ def test_register_item_and_section():
     assert items[0].key == "dashboard"
 
 
-def test_duplicate_key_raises():
+def test_duplicate_key_raises_on_conflict():
+    """Re-registering with different attributes must raise; identical
+    re-registration is a no-op (idempotent under Django autoreload)."""
     registry = _make_registry()
     section = AdminNavigationSection(key="overview", label="Overview", order=10)
     item = AdminNavigationItem(
@@ -50,11 +52,28 @@ def test_duplicate_key_raises():
     registry.register_section(section)
     registry.register_item(item)
 
-    with pytest.raises(ValueError, match="already registered"):
-        registry.register_item(item)
+    # Same instance again — idempotent.
+    registry.register_section(section)
+    registry.register_item(item)
 
+    # Conflicting section: same key, different label.
     with pytest.raises(ValueError, match="already registered"):
-        registry.register_section(section)
+        registry.register_section(
+            AdminNavigationSection(key="overview", label="Other", order=10),
+        )
+
+    # Conflicting item: same key, different label.
+    with pytest.raises(ValueError, match="already registered"):
+        registry.register_item(
+            AdminNavigationItem(
+                key="dashboard",
+                label="Different",
+                url_name="cauldron:dashboard",
+                section="overview",
+                order=10,
+                permission="",
+            ),
+        )
 
 
 def test_permission_filtered():
@@ -161,6 +180,107 @@ def test_get_grouped_nav():
     assert grouped[1]["section"].key == "system"
     assert len(grouped[1]["items"]) == 1
     assert grouped[1]["items"][0].key == "modules"
+
+
+def test_register_exact_duplicate_idempotent():
+    """Registering the exact same section or item twice is a no-op."""
+    registry = _make_registry()
+    section = AdminNavigationSection(key="s", label="S", order=10)
+    item = AdminNavigationItem(
+        key="i", label="I", url_name="cauldron:dashboard",
+        section="s", order=10, permission="",
+    )
+    registry.register_section(section)
+    registry.register_item(item)
+    # Repeat — must NOT raise.
+    registry.register_section(section)
+    registry.register_item(item)
+    assert len(registry.get_sections()) == 1
+    assert len(registry.get_items_for_user(None)) == 1
+
+
+def test_register_different_duplicate_raises():
+    """A collision on the same key with different attributes must raise."""
+    registry = _make_registry()
+    registry.register_section(
+        AdminNavigationSection(key="s", label="S", order=10),
+    )
+    registry.register_item(AdminNavigationItem(
+        key="i", label="Original", url_name="cauldron:dashboard",
+        section="s", order=10, permission="",
+    ))
+    with pytest.raises(ValueError, match="different attributes"):
+        registry.register_item(AdminNavigationItem(
+            key="i", label="Renamed", url_name="cauldron:dashboard",
+            section="s", order=10, permission="",
+        ))
+
+
+def _make_request(path: str):
+    from types import SimpleNamespace
+    return SimpleNamespace(path=path)
+
+
+def test_dashboard_active_only_at_exact_path():
+    """Dashboard entry (url_prefix_exact=True) is NOT active on nested pages."""
+    registry = _make_registry()
+    registry.register_section(
+        AdminNavigationSection(key="overview", label="Overview", order=10),
+    )
+    registry.register_section(
+        AdminNavigationSection(key="content", label="Content", order=200),
+    )
+    registry.register_item(AdminNavigationItem(
+        key="dashboard", label="Dashboard", url_name="cauldron:dashboard",
+        section="overview", order=10, permission="",
+        url_prefix="/cauldron/", url_prefix_exact=True,
+    ))
+    registry.register_item(AdminNavigationItem(
+        key="content", label="Content", url_name="cauldron:dashboard",
+        section="content", order=10, permission="",
+        url_prefix="/cauldron/content/",
+    ))
+    grouped = registry.get_grouped_nav(None, _make_request("/cauldron/content/"))
+    active = {
+        entry.key: entry.is_active
+        for group in grouped for entry in group["items"]
+    }
+    assert active["content"] is True
+    assert active["dashboard"] is False
+
+    grouped_root = registry.get_grouped_nav(None, _make_request("/cauldron/"))
+    active_root = {
+        entry.key: entry.is_active
+        for group in grouped_root for entry in group["items"]
+    }
+    assert active_root["dashboard"] is True
+
+
+def test_single_active_item():
+    """Only one item is active for a given nested path."""
+    registry = _make_registry()
+    registry.register_section(
+        AdminNavigationSection(key="overview", label="Overview", order=10),
+    )
+    registry.register_section(
+        AdminNavigationSection(key="system", label="System", order=900),
+    )
+    registry.register_item(AdminNavigationItem(
+        key="dashboard", label="Dashboard", url_name="cauldron:dashboard",
+        section="overview", order=10, permission="",
+        url_prefix="/cauldron/", url_prefix_exact=True,
+    ))
+    registry.register_item(AdminNavigationItem(
+        key="modules", label="Modules", url_name="cauldron:modules",
+        section="system", order=10, permission="",
+        url_prefix="/cauldron/modules/",
+    ))
+    grouped = registry.get_grouped_nav(None, _make_request("/cauldron/modules/"))
+    active = [
+        entry.key
+        for group in grouped for entry in group["items"] if entry.is_active
+    ]
+    assert active == ["modules"]
 
 
 def test_empty_sections_not_included_in_grouped_nav():

@@ -35,7 +35,7 @@ def _make_proposal(**kwargs):
     from django.utils import timezone
     defaults = dict(
         scope="admin",
-        target_path="admin/custom.css",
+        target_path="custom.css",
         proposed_content="body { color: red; }",
         description="Test proposal",
         status="proposed",
@@ -47,6 +47,16 @@ def _make_proposal(**kwargs):
     # Satisfy DB constraint: applied_at required for applied status
     if defaults.get("status") == "applied" and "applied_at" not in defaults:
         defaults["applied_at"] = timezone.now()
+    # proposed_hash MUST always be a 64-char lowercase hex digest.
+    if not defaults.get("proposed_hash"):
+        defaults["proposed_hash"] = hashlib.sha256(
+            defaults.get("proposed_content", "").encode("utf-8"),
+        ).hexdigest()
+    # base_exists MUST agree with base_hash under the new constraints:
+    #   base_hash == ""     → base_exists must be False
+    #   base_hash is 64 hex → base_exists must be True
+    if "base_exists" not in defaults:
+        defaults["base_exists"] = bool(defaults.get("base_hash", ""))
     return UIStyleChangeRequest.objects.create(**defaults)
 
 
@@ -59,17 +69,20 @@ def test_create_proposal_creates_record():
     from cauldron_ai_admin.builtin_tools import _handle_ui_create_proposal
     from cauldron_ai_admin.tools import AdminAIToolContext, AdminAIToolResult
     from cauldron_ai_admin.models import UIStyleChangeRequest, UIStyleAuditEvent
+    from django.test import override_settings
 
     user = _make_user(username="proposer")
     context = AdminAIToolContext(actor=user, run_id=str(uuid.uuid4()), correlation_id="")
 
-    result = _handle_ui_create_proposal(
-        context,
-        scope="admin",
-        target_path="admin/custom.css",
-        proposed_content="body { color: red; }",
-        description="Make body red",
-    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with override_settings(CAULDRON_UI_OVERRIDES_DIR=str(tmpdir)):
+            result = _handle_ui_create_proposal(
+                context,
+                scope="admin",
+                target_path="custom.css",
+                proposed_content="body { color: red; }",
+                description="Make body red",
+            )
 
     assert isinstance(result, AdminAIToolResult)
     assert result.success is True
@@ -79,7 +92,7 @@ def test_create_proposal_creates_record():
     request_id = result.data["request_id"]
     proposal = UIStyleChangeRequest.objects.get(request_id=request_id)
     assert proposal.scope == "admin"
-    assert proposal.target_path == "admin/custom.css"
+    assert proposal.target_path == "custom.css"
     assert proposal.status == "proposed"
     assert proposal.proposed_content == "body { color: red; }"
 
@@ -98,17 +111,20 @@ def test_ai_cannot_apply_own_proposal():
     from cauldron_ai_admin.builtin_tools import _handle_ui_create_proposal
     from cauldron_ai_admin.tools import AdminAIToolContext, AdminAIToolResult
     from cauldron_ai_admin.models import UIStyleChangeRequest
+    from django.test import override_settings
 
     user = _make_user(username="proposer2")
     context = AdminAIToolContext(actor=user, run_id=str(uuid.uuid4()), correlation_id="")
 
-    result = _handle_ui_create_proposal(
-        context,
-        scope="pages",
-        target_path="pages/theme.css",
-        proposed_content=".hero { background: blue; }",
-        description="Blue hero",
-    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with override_settings(CAULDRON_UI_OVERRIDES_DIR=str(tmpdir)):
+            result = _handle_ui_create_proposal(
+                context,
+                scope="pages",
+                target_path="theme.css",
+                proposed_content=".hero { background: blue; }",
+                description="Blue hero",
+            )
 
     assert isinstance(result, AdminAIToolResult)
     request_id = result.data["request_id"]
@@ -204,7 +220,7 @@ def test_conflict_on_apply():
         proposal = _make_proposal(
             status="approved",
             scope="admin",
-            target_path="admin/custom.css",
+            target_path="custom.css",
             proposed_content="body { color: red; }",
             base_hash=wrong_hash,
         )
@@ -345,3 +361,173 @@ def test_css_escaped_in_preview():
     # The raw <script> tag must NOT appear — it must be HTML-escaped
     assert "<script>alert(1)</script>" not in content
     assert "&lt;script&gt;" in content
+
+
+# ---------------------------------------------------------------------------
+# base_exists / base_hash — new persisted state contract
+# ---------------------------------------------------------------------------
+
+
+def test_base_exists_false_for_new_file():
+    """A proposal for a file that does not exist has base_exists=False and empty base_hash."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from django.test import override_settings
+
+    user = _make_user(username="new-file-proposer")
+    svc = UIStyleChangeService()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with override_settings(CAULDRON_UI_OVERRIDES_DIR=tmpdir):
+            proposal = svc.create_proposal(
+                scope="admin",
+                target_path="never-existed.css",
+                proposed_content="body { color: mauve; }",
+                description="new",
+                created_by=user,
+            )
+    assert proposal.base_exists is False
+    assert proposal.base_hash == ""
+    assert len(proposal.proposed_hash) == 64
+
+
+def test_base_exists_true_for_existing_file():
+    """A proposal for an existing file captures a 64-char base_hash."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from django.test import override_settings
+
+    user = _make_user(username="existing-file-proposer")
+    svc = UIStyleChangeService()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        admin_dir = Path(tmpdir) / "admin"
+        admin_dir.mkdir(parents=True)
+        (admin_dir / "already.css").write_text(
+            "body { color: chartreuse; }", encoding="utf-8",
+        )
+        with override_settings(CAULDRON_UI_OVERRIDES_DIR=tmpdir):
+            proposal = svc.create_proposal(
+                scope="admin",
+                target_path="already.css",
+                proposed_content="body { color: red; }",
+                description="update",
+                created_by=user,
+            )
+    assert proposal.base_exists is True
+    assert len(proposal.base_hash) == 64
+    assert all(c in "0123456789abcdef" for c in proposal.base_hash)
+
+
+def test_scope_prefixed_path_rejected():
+    """target_path='admin/foo.css' under scope='admin' is a validation error."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from django.test import override_settings
+
+    svc = UIStyleChangeService()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with override_settings(CAULDRON_UI_OVERRIDES_DIR=tmpdir):
+            with pytest.raises(ValueError, match="scope"):
+                svc.create_proposal(
+                    scope="admin",
+                    target_path="admin/foo.css",
+                    proposed_content="body {}",
+                    description="bad",
+                )
+
+
+def test_cross_scope_path_rejected():
+    """target_path='pages/foo.css' under scope='admin' is a validation error."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from django.test import override_settings
+
+    svc = UIStyleChangeService()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with override_settings(CAULDRON_UI_OVERRIDES_DIR=tmpdir):
+            with pytest.raises(ValueError, match="scope"):
+                svc.create_proposal(
+                    scope="admin",
+                    target_path="pages/foo.css",
+                    proposed_content="body {}",
+                    description="bad",
+                )
+
+
+def test_store_unavailable_fails_closed(settings):
+    """If neither CAULDRON_UI_OVERRIDES_DIR nor BASE_DIR is set, fail closed."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+
+    if hasattr(settings, "CAULDRON_UI_OVERRIDES_DIR"):
+        del settings.CAULDRON_UI_OVERRIDES_DIR
+    # Wipe BASE_DIR too so the store cannot fall back to a default location.
+    if hasattr(settings, "BASE_DIR"):
+        del settings.BASE_DIR
+    svc = UIStyleChangeService()
+    with pytest.raises(ValueError):
+        svc.create_proposal(
+            scope="admin",
+            target_path="somewhere.css",
+            proposed_content="body {}",
+            description="",
+        )
+
+
+def test_proposed_hash_is_always_64hex():
+    """proposed_hash is always a 64-char lowercase hex string."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from django.test import override_settings
+
+    svc = UIStyleChangeService()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with override_settings(CAULDRON_UI_OVERRIDES_DIR=tmpdir):
+            for content in ("body {}", "", "/* empty */"):
+                p = svc.create_proposal(
+                    scope="pages",
+                    target_path=f"hash-{hash(content)}.css",
+                    proposed_content=content,
+                    description="",
+                )
+                assert len(p.proposed_hash) == 64
+                assert all(c in "0123456789abcdef" for c in p.proposed_hash)
+
+
+def test_concurrent_approve_idempotent():
+    """Two simultaneous approves — only one succeeds; the second raises."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+
+    svc = UIStyleChangeService()
+    user = _make_user(username="approve-race")
+    proposal = _make_proposal(status="proposed")
+    svc.approve(proposal, reviewed_by=user)
+    with pytest.raises(ValueError):
+        svc.approve(proposal, reviewed_by=user)
+
+
+def test_apply_uses_persisted_base_state():
+    """apply() must derive its expected hash from base_hash / base_exists
+    on the model — never from a fresh filesystem read."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from django.test import override_settings
+
+    user = _make_user(username="apply-persisted")
+    svc = UIStyleChangeService()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Snapshot the file at proposal-creation time — file is empty on disk
+        # but we deliberately record base_exists=False in the model.
+        proposal = _make_proposal(
+            status="approved",
+            scope="admin",
+            target_path="fresh.css",
+            proposed_content="body { color: red; }",
+            base_exists=False,
+            base_hash="",
+        )
+        # Now something wrote a file at that path between proposal creation
+        # and apply. A naive fresh-read would use its hash; the correct
+        # behaviour is to use the persisted ABSENT witness → HashConflictError.
+        admin_dir = Path(tmpdir) / "admin"
+        admin_dir.mkdir(parents=True)
+        (admin_dir / "fresh.css").write_text("intruder", encoding="utf-8")
+        with override_settings(CAULDRON_UI_OVERRIDES_DIR=tmpdir):
+            from cauldron_django_admin.override_store import HashConflictError
+            with pytest.raises(HashConflictError):
+                svc.apply(proposal, applied_by=user)
+        proposal.refresh_from_db()
+        assert proposal.status == "conflicted"
+        assert proposal.error_code == "HASH_CONFLICT"

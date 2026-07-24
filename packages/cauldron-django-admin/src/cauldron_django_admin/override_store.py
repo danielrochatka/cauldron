@@ -1,6 +1,7 @@
 """UIOverrideStore — safe read/write service for site-owned CSS override files."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import threading
@@ -8,9 +9,21 @@ import tempfile
 from pathlib import Path
 from typing import Literal
 
+try:  # Linux/POSIX only — falls back to thread lock elsewhere (e.g. Windows).
+    import fcntl  # type: ignore[import]
+    _HAS_FCNTL = True
+except ImportError:  # pragma: no cover — non-POSIX
+    fcntl = None  # type: ignore[assignment]
+    _HAS_FCNTL = False
+
 _VALID_SCOPES = frozenset({"admin", "pages"})
 _MAX_FILE_BYTES = 256 * 1024       # 256 KB per file
 _MAX_TOTAL_BYTES = 2 * 1024 * 1024 # 2 MB for entire override root
+
+# Public size constants — services / management commands should import these
+# instead of reaching for the underscore-prefixed values.
+MAX_FILE_BYTES = _MAX_FILE_BYTES
+MAX_TOTAL_BYTES = _MAX_TOTAL_BYTES
 
 # Sentinel for "file must not exist" in optimistic-lock operations.
 ABSENT = "__absent__"
@@ -69,9 +82,14 @@ class UIOverrideStore:
       - Per-file: 256 KB
       - Total override root: 2 MB (checked before every write)
 
-    Concurrency: per-target locks ensure only one write/delete runs at a time
-    for the same resolved path. Reads are unsynchronized (CSS files are
-    immutable once written; the OS guarantees atomic rename visibility).
+    Concurrency:
+      - A cross-process ``fcntl`` file lock on ``<root>/.cauldron-store.lock``
+        serialises every write and delete when POSIX file locks are available.
+      - On platforms without ``fcntl`` we fall back to a process-local
+        ``threading.Lock`` so single-process test/dev use still serialises
+        correctly.
+      - Reads are unsynchronised (CSS files are immutable once written; the
+        OS guarantees atomic rename visibility).
     """
 
     def __init__(self, root: Path) -> None:
@@ -157,6 +175,57 @@ class UIOverrideStore:
                 self._path_locks[key] = threading.Lock()
             return self._path_locks[key]
 
+    @contextlib.contextmanager
+    def _root_file_lock(self):
+        """Cross-process exclusive lock on the override root.
+
+        Uses ``fcntl.lockf`` on POSIX so concurrent worker processes serialise
+        writes/deletes.  Falls back to the process-local meta lock when
+        ``fcntl`` is unavailable (e.g. Windows) or when the lock file cannot
+        be created (e.g. read-only filesystem).
+        """
+        if not _HAS_FCNTL:
+            with self._meta_lock:
+                yield
+            return
+
+        try:
+            self._root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            with self._meta_lock:
+                yield
+            return
+
+        lock_path = self._root / ".cauldron-store.lock"
+        try:
+            fd = open(str(lock_path), "w")
+        except OSError:
+            with self._meta_lock:
+                yield
+            return
+
+        try:
+            try:
+                fcntl.lockf(fd, fcntl.LOCK_EX)
+            except OSError:
+                # Locking not supported on this filesystem — fall back.
+                fd.close()
+                with self._meta_lock:
+                    yield
+                return
+            try:
+                yield
+            finally:
+                try:
+                    fcntl.lockf(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+        finally:
+            try:
+                fd.close()
+            except OSError:
+                pass
+
     def _sha256(self, content: bytes) -> str:
         return hashlib.sha256(content).hexdigest()
 
@@ -165,6 +234,10 @@ class UIOverrideStore:
         if self._root.is_dir():
             for p in self._root.rglob("*"):
                 if p.is_file():
+                    # Skip the lock file itself so it doesn't count toward
+                    # the total override-root budget.
+                    if p.name == ".cauldron-store.lock" and p.parent == self._root:
+                        continue
                     try:
                         total += p.stat().st_size
                     except OSError:
@@ -174,6 +247,38 @@ class UIOverrideStore:
     # ------------------------------------------------------------------ #
     # Public API                                                            #
     # ------------------------------------------------------------------ #
+
+    def validate_target(self, scope: Scope, relative_path: str) -> None:
+        """Validate that ``scope`` and ``relative_path`` are acceptable.
+
+        Raises :class:`InvalidScopeError`, :class:`InvalidFileError`, or
+        :class:`TraversalError` on any policy violation.  Does not require the
+        file to exist.
+        """
+        # ``_resolve_path`` performs every safety check; discard the result.
+        self._resolve_path(scope, relative_path)
+
+    def inspect_state(self, scope: Scope, relative_path: str) -> dict:
+        """Return the current on-disk state of the target file.
+
+        Always succeeds when the scope/path pass validation.  The returned
+        dictionary has:
+
+        * ``exists``: bool — whether the file exists.
+        * ``hash``: str | None — SHA-256 hex digest of the current content
+          (``None`` when the file does not exist).
+        * ``size``: int | None — byte size (``None`` when the file does
+          not exist).
+        """
+        _, resolved = self._resolve_path(scope, relative_path)
+        if not resolved.is_file():
+            return {"exists": False, "hash": None, "size": None}
+        raw = resolved.read_bytes()
+        return {
+            "exists": True,
+            "hash": self._sha256(raw),
+            "size": len(raw),
+        }
 
     def list_files(self, scope: Scope) -> list[str]:
         """Return sorted relative paths (relative to scope dir) of all valid CSS files."""
@@ -251,33 +356,42 @@ class UIOverrideStore:
         if len(encoded) > _MAX_FILE_BYTES:
             raise FileSizeError("Content exceeds per-file size limit.")
 
-        lock = self._path_lock(resolved)
-        with lock:
-            # Re-resolve immediately inside the lock
+        with self._root_file_lock():
+            # Re-resolve inside the lock and confirm containment again.
+            _, re_resolved = self._resolve_path(scope, relative_path)
+            if re_resolved != resolved:
+                raise TraversalError("Path resolved differently under lock.")
             try:
-                current_stat = resolved.stat() if resolved.exists() else None
+                re_resolved.relative_to(self._root)
+            except ValueError:
+                raise TraversalError("Path escapes root under lock.")
+
+            try:
+                current_stat = re_resolved.stat() if re_resolved.exists() else None
             except OSError:
                 current_stat = None
 
-            file_exists = current_stat is not None
+            file_exists_now = current_stat is not None
 
             if expected_hash == ABSENT:
-                if file_exists:
+                if file_exists_now:
                     raise HashConflictError(
                         "File already exists but ABSENT was expected."
                     )
             else:
-                if not file_exists:
+                if not file_exists_now:
                     raise HashConflictError(
                         "File does not exist but a hash was expected."
                     )
-                # Revalidate immediately before replacement
+                # Revalidate immediately before replacement.
                 try:
-                    actual = self._sha256(resolved.read_bytes())
+                    actual_now = self._sha256(re_resolved.read_bytes())
                 except OSError as exc:
                     raise TraversalError("Cannot read file for hash revalidation.") from exc
-                if actual != expected_hash:
-                    raise HashConflictError("File was modified since the hash was captured.")
+                if actual_now != expected_hash:
+                    raise HashConflictError(
+                        "File was modified since the hash was captured."
+                    )
 
             # Check total size limit (approximate; excludes the file being replaced)
             current_file_size = current_stat.st_size if current_stat else 0
@@ -285,12 +399,12 @@ class UIOverrideStore:
             if total > _MAX_TOTAL_BYTES:
                 raise FileSizeError("Write would exceed total override-root size limit.")
 
-            resolved.parent.mkdir(parents=True, exist_ok=True)
-            fd, tmp_path = tempfile.mkstemp(dir=str(resolved.parent), suffix=".tmp")
+            re_resolved.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(dir=str(re_resolved.parent), suffix=".tmp")
             try:
                 with os.fdopen(fd, "wb") as f:
                     f.write(encoded)
-                os.replace(tmp_path, str(resolved))
+                os.replace(tmp_path, str(re_resolved))
             except Exception:
                 try:
                     os.unlink(tmp_path)
@@ -323,15 +437,22 @@ class UIOverrideStore:
 
         _, resolved = self._resolve_path(scope, relative_path)
 
-        lock = self._path_lock(resolved)
-        with lock:
-            if not resolved.is_file():
+        with self._root_file_lock():
+            _, re_resolved = self._resolve_path(scope, relative_path)
+            if re_resolved != resolved:
+                raise TraversalError("Path resolved differently under lock.")
+            try:
+                re_resolved.relative_to(self._root)
+            except ValueError:
+                raise TraversalError("Path escapes root under lock.")
+
+            if not re_resolved.is_file():
                 if expected_hash == ABSENT:
                     return  # Already absent — idempotent delete
                 raise FileNotFoundError(f"File not found: {relative_path!r} in scope {scope!r}.")
 
-            actual = self._sha256(resolved.read_bytes())
+            actual = self._sha256(re_resolved.read_bytes())
             if actual != expected_hash:
                 raise HashConflictError("File was modified since the hash was captured.")
 
-            os.unlink(str(resolved))
+            os.unlink(str(re_resolved))

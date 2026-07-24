@@ -19,90 +19,97 @@ def dashboard_view(request):
 @login_required
 def modules_view(request):
     modules = []
-    registry_errors = []
+    registry_errors: list[dict[str, str]] = []
+
+    def _add_error(err, default_slug: str = "") -> None:
+        slug = ""
+        for attr in ("module_slug", "slug", "module"):
+            value = getattr(err, attr, "") or ""
+            if isinstance(value, str) and value:
+                slug = value
+                break
+        if not slug and default_slug:
+            slug = default_slug
+        registry_errors.append({
+            "kind": type(err).__name__,
+            "module": slug,
+        })
+
     try:
-        from cauldron.modules.registry import get_module_registry
-        reg = get_module_registry()
-        # Use supported public APIs
-        try:
-            graph = reg.graph_info() if hasattr(reg, "graph_info") else {}
-        except Exception as exc:
-            registry_errors.append(f"graph_info: {type(exc).__name__}: {exc}")
-            graph = {}
-
-        try:
-            caps = reg.capabilities() if hasattr(reg, "capabilities") else {}
-        except Exception as exc:
-            registry_errors.append(f"capabilities: {type(exc).__name__}: {exc}")
-            caps = {}
-
-        try:
-            dep_graph = reg.dependency_graph() if hasattr(reg, "dependency_graph") else {}
-        except Exception as exc:
-            registry_errors.append(f"dependency_graph: {type(exc).__name__}: {exc}")
-            dep_graph = {}
-
-        try:
-            errs = reg.errors() if hasattr(reg, "errors") else []
-        except Exception as exc:
-            registry_errors.append(f"errors: {type(exc).__name__}: {exc}")
-            errs = []
-
-        try:
-            disc_errs = reg.discovery_errors() if hasattr(reg, "discovery_errors") else []
-        except Exception as exc:
-            registry_errors.append(f"discovery_errors: {type(exc).__name__}: {exc}")
-            disc_errs = []
-
-        try:
-            life_errs = reg.lifecycle_errors() if hasattr(reg, "lifecycle_errors") else []
-        except Exception as exc:
-            registry_errors.append(f"lifecycle_errors: {type(exc).__name__}: {exc}")
-            life_errs = []
-
-        # Fall back to iterating modules directly if graph_info not available
-        if not graph and hasattr(reg, "modules"):
-            for mod in reg.modules.values():
-                manifest = getattr(mod, "manifest", None)
-                slug = getattr(mod, "slug", str(mod))
-                label = getattr(mod, "label", slug)
-                version = getattr(manifest, "version", "") if manifest else ""
-                provides = list(getattr(manifest, "provides", [])) if manifest else []
-                deps = dep_graph.get(slug, []) if isinstance(dep_graph, dict) else []
-                module_caps = caps.get(slug, []) if isinstance(caps, dict) else []
-                modules.append({
-                    "slug": slug,
-                    "label": label,
-                    "version": version,
-                    "status": "active",
-                    "provides": provides,
-                    "capabilities": module_caps,
-                    "dependencies": deps,
-                })
-        elif isinstance(graph, dict):
-            for slug, info in graph.items():
-                modules.append({
-                    "slug": slug,
-                    "label": info.get("label", slug),
-                    "version": info.get("version", ""),
-                    "status": info.get("status", "active"),
-                    "provides": info.get("provides", []),
-                    "capabilities": caps.get(slug, []) if isinstance(caps, dict) else [],
-                    "dependencies": dep_graph.get(slug, []) if isinstance(dep_graph, dict) else [],
-                })
-
-        for err in (errs or []):
-            registry_errors.append(str(err))
-        for err in (disc_errs or []):
-            registry_errors.append(str(err))
-        for err in (life_errs or []):
-            registry_errors.append(str(err))
-
+        from cauldron.modules.registry import registry as mod_registry
     except ImportError:
-        pass
+        # cauldron.modules is not installed — nothing to display.
+        return render(request, "cauldron_admin/modules.html", {
+            "modules": modules,
+            "registry_errors": registry_errors,
+            "breadcrumbs": [{"label": "Modules", "url": ""}],
+        })
     except Exception as exc:
-        # Do not suppress programming errors — surface them
-        registry_errors.append(f"{type(exc).__name__}: {exc}")
+        registry_errors.append({
+            "kind": type(exc).__name__,
+            "module": "",
+        })
+        return render(request, "cauldron_admin/modules.html", {
+            "modules": modules,
+            "registry_errors": registry_errors,
+            "breadcrumbs": [{"label": "Modules", "url": ""}],
+        })
+
+    try:
+        graph_list = mod_registry.graph_info() or []
+    except Exception as exc:
+        graph_list = []
+        registry_errors.append({"kind": type(exc).__name__, "module": ""})
+
+    try:
+        cap_map_raw = mod_registry.capabilities()
+        cap_map = cap_map_raw if isinstance(cap_map_raw, dict) else {}
+    except Exception as exc:
+        cap_map = {}
+        registry_errors.append({"kind": type(exc).__name__, "module": ""})
+
+    try:
+        dep_graph_raw = mod_registry.dependency_graph()
+        dep_graph = dep_graph_raw if isinstance(dep_graph_raw, dict) else {}
+    except Exception as exc:
+        dep_graph = {}
+        registry_errors.append({"kind": type(exc).__name__, "module": ""})
+
+    for info in graph_list:
+        if not isinstance(info, dict):
+            continue
+        slug = info.get("slug", "") or ""
+        modules.append({
+            "slug": slug,
+            "label": info.get("label", slug),
+            "version": info.get("version", "") or "",
+            "status": info.get("status", "active") or "active",
+            "provides": list(info.get("provides", []) or []),
+            "capabilities": sorted(
+                cap for cap, providers in cap_map.items()
+                if isinstance(providers, (list, tuple)) and slug in providers
+            ),
+            "dependencies": list(dep_graph.get(slug, []) or []),
+        })
+
+    # Diagnostic errors — redacted to type-name + module slug only.
+    try:
+        for err in (mod_registry.errors() or []):
+            _add_error(err)
+    except Exception as exc:
+        registry_errors.append({"kind": type(exc).__name__, "module": ""})
+
+    try:
+        for err in (mod_registry.discovery_errors() or []):
+            _add_error(err)
+    except Exception as exc:
+        registry_errors.append({"kind": type(exc).__name__, "module": ""})
+
+    try:
+        for err in (mod_registry.lifecycle_errors() or []):
+            _add_error(err)
+    except Exception as exc:
+        registry_errors.append({"kind": type(exc).__name__, "module": ""})
 
     return render(request, "cauldron_admin/modules.html", {
         "modules": modules,

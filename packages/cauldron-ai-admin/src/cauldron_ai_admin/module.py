@@ -11,6 +11,10 @@ _manifest = ModuleManifest(
         ModuleRequirement(slug="ai.model.providers", kind="capability"),
         ModuleRequirement(slug="content.operations", kind="capability"),
         ModuleRequirement(slug="admin.interface", kind="capability"),
+        # Admin AI views/templates depend on the shell chrome and CSS
+        # override plumbing. Declare it explicitly so resolution fails if
+        # the shell is not present in the deployment.
+        ModuleRequirement(slug="admin.shell", kind="capability"),
         ModuleRequirement(slug="django.state", kind="capability"),
         ModuleRequirement(slug="identity.authentication", kind="capability"),
         ModuleRequirement(slug="identity.permissions", kind="capability"),

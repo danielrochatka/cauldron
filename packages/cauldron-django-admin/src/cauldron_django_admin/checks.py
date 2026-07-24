@@ -15,9 +15,6 @@ _REQUIRED_CONTEXT_PROCESSORS = [
     "django.contrib.messages.context_processors.messages",
     "django.template.context_processors.request",
 ]
-_RECOMMENDED_CONTEXT_PROCESSORS = [
-    "django.template.context_processors.debug",
-]
 
 
 def _is_admin_active() -> bool:
@@ -75,17 +72,6 @@ def check_admin_config(app_configs, **kwargs):
                     f"cauldron.django.admin requires context processor {cp!r} in TEMPLATES.",
                     hint=f"Add '{cp}' to the context_processors in your TEMPLATES setting.",
                     id="cauldron.admin.E302",
-                )
-            )
-
-    # W309: recommended context processors
-    for cp in _RECOMMENDED_CONTEXT_PROCESSORS:
-        if cp not in all_cp:
-            messages_list.append(
-                checks.Warning(
-                    f"cauldron.django.admin recommends context processor {cp!r} in TEMPLATES.",
-                    hint=f"Add '{cp}' to the context_processors in your TEMPLATES setting.",
-                    id="cauldron.admin.W309",
                 )
             )
 
@@ -196,4 +182,45 @@ def check_admin_config(app_configs, **kwargs):
             )
         )
 
+    return messages_list
+
+
+@checks.register()
+def check_navigation_urls(app_configs, **kwargs):
+    """W311: every registered navigation item must have a reversible URL name."""
+    if not _is_admin_active():
+        return []
+
+    from django.urls import reverse, NoReverseMatch
+    from .navigation import get_navigation_registry
+
+    messages_list: list = []
+    registry = get_navigation_registry()
+
+    try:
+        with registry._lock:
+            items = list(registry._items.values())
+    except Exception:
+        return []
+
+    for item in items:
+        try:
+            reverse(item.url_name)
+        except NoReverseMatch:
+            messages_list.append(
+                checks.Warning(
+                    f"Navigation item {item.key!r} has URL name {item.url_name!r} "
+                    "that cannot be reversed.",
+                    hint=(
+                        "Ensure the URL pattern is registered and the "
+                        "namespace is correct."
+                    ),
+                    id="cauldron.admin.W311",
+                )
+            )
+        except Exception:
+            # A reverse() failure other than NoReverseMatch (e.g. import
+            # error inside a URL module) is surfaced by the URL system
+            # itself; do not double-report here.
+            continue
     return messages_list

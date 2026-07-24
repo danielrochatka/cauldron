@@ -509,10 +509,26 @@ class AdminAIService:
                 call.id, "restricted", "Restricted tool.",
             )
 
+        # Compute the effective deadline for this tool call: the earlier of
+        # the run deadline and (now + tool_timeout). This is the deadline the
+        # handler sees on its context and it is also the value the EPSILON
+        # check consults — a very short per-tool budget must trip
+        # ``tool.timeout`` even when the overall run deadline is far away.
+        effective_tool_timeout_seconds = min(
+            definition.timeout_seconds, self._tool_timeout_seconds,
+        )
+        now_pre = datetime.now(tz=timezone.utc)
+        effective_deadline = min(
+            deadline,
+            now_pre + timedelta(seconds=effective_tool_timeout_seconds),
+        )
+
         # Deadline check before execution: refuse if less than the minimum
-        # meaningful budget remains. Persist the full requested → authorized
-        # → timed_out transition so the audit row reflects reality.
-        remaining = (deadline - datetime.now(tz=timezone.utc)).total_seconds()
+        # meaningful budget remains on the effective (per-tool or run,
+        # whichever is earlier) deadline. Persist the transitions
+        # requested → authorized → timed_out so the audit row reflects
+        # reality — the invocation never enters ``running``.
+        remaining = (effective_deadline - now_pre).total_seconds()
         if remaining < _DEADLINE_EPSILON:
             invocation = self._new_invocation_row(
                 run, call, definition, status="requested",
@@ -523,7 +539,8 @@ class AdminAIService:
             invocation.status = "timed_out"
             invocation.error_code = "tool.timeout"
             invocation.result_summary = redact(
-                "Run deadline exceeded before tool execution.", max_bytes=1024,
+                "Effective tool deadline expired before execution.",
+                max_bytes=1024,
             )
             invocation.completed_at = django_timezone.now()
             invocation.duration_ms = 0
@@ -535,7 +552,7 @@ class AdminAIService:
             run.save(update_fields=["tool_call_count"])
             self._finalize_error(
                 run, "tool.timeout",
-                "Run deadline exceeded before tool execution.",
+                "Effective tool deadline expired before execution.",
             )
             return _tool_error_message(
                 call.id, "tool.timeout", "Tool execution deadline exceeded.",
@@ -552,13 +569,6 @@ class AdminAIService:
         invocation.status = "running"
         invocation.started_at = django_timezone.now()
         invocation.save(update_fields=["status", "started_at"])
-
-        effective_deadline = min(
-            deadline,
-            datetime.now(tz=timezone.utc) + timedelta(
-                seconds=min(definition.timeout_seconds, self._tool_timeout_seconds)
-            ),
-        )
         context = AdminAIToolContext(
             actor=actor,
             run_id=str(run.run_id),

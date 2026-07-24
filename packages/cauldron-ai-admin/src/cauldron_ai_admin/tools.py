@@ -265,9 +265,17 @@ def _validate_handler_signature(
     positional-or-keyword, keyword-only, or captured by ``**kwargs``).
 
     When *definition* is provided the argument-schema and handler kwargs
-    must be bidirectionally compatible: unless the handler accepts
-    ``**kwargs``, every schema property must be a kwarg the handler
-    accepts, and every handler-required kwarg must appear in the schema.
+    must be bidirectionally compatible:
+
+    * Every required Python parameter after context (those with no
+      default) must appear in ``schema["required"]`` — this check is
+      enforced even when the handler accepts ``**kwargs`` because a
+      schema-valid call that omits a required Python param would raise
+      ``TypeError`` at dispatch.
+    * If the handler does NOT accept ``**kwargs``: every schema
+      ``properties`` key must correspond to a keyword-capable handler
+      parameter, otherwise a schema-valid call could send an unknown
+      keyword.
     """
     try:
         sig = inspect.signature(handler)
@@ -313,10 +321,11 @@ def _validate_handler_signature(
         return
 
     schema_props = set(definition.argument_schema.get("properties", {}).keys())
-    if has_var_keyword:
-        # Handler accepts arbitrary kwargs; no need to compare specific names.
-        return
+    schema_required = set(definition.argument_schema.get("required", []))
 
+    # Keyword-capable handler params (positional-or-keyword and keyword-only).
+    # These are the parameters that can be filled by ``**call_arguments`` at
+    # dispatch time.
     handler_kw = {
         name for name, p in remaining.items()
         if p.kind in (
@@ -324,6 +333,7 @@ def _validate_handler_signature(
             inspect.Parameter.POSITIONAL_OR_KEYWORD,
         )
     }
+    # Required Python params: no default value.
     handler_required = {
         name for name, p in remaining.items()
         if p.default is inspect.Parameter.empty
@@ -332,15 +342,30 @@ def _validate_handler_signature(
             inspect.Parameter.POSITIONAL_OR_KEYWORD,
         )
     }
+
+    # Rule 1 (applies unconditionally, even with **kwargs): every required
+    # Python param must appear in the schema's required[] array. Otherwise
+    # a schema-valid call could omit a value and TypeError at dispatch.
+    not_in_schema_required = handler_required - schema_required
+    if not_in_schema_required:
+        raise ValueError(
+            f"Handler requires parameters not in schema required[]: "
+            f"{sorted(not_in_schema_required)}"
+        )
+
+    if has_var_keyword:
+        # Handler accepts arbitrary additional kwargs; no need to check
+        # that every schema property has a matching keyword-capable param.
+        return
+
+    # Rule 2 (no **kwargs): every schema property must be a kwarg the
+    # handler accepts, otherwise a schema-valid call could pass an
+    # unexpected keyword.
     unsupported = schema_props - handler_kw
     if unsupported:
         raise ValueError(
-            f"Schema properties not in handler: {sorted(unsupported)}"
-        )
-    missing = handler_required - schema_props
-    if missing:
-        raise ValueError(
-            f"Handler requires params not in schema: {sorted(missing)}"
+            f"Schema properties without handler parameters: "
+            f"{sorted(unsupported)}"
         )
 
 

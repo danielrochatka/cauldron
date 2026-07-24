@@ -277,6 +277,114 @@ def test_register_rejects_schema_property_missing_from_handler():
         r.register(_schema_defn("a.b", schema), narrow_handler)
 
 
+# ------ handler/schema required[] compatibility (checked with or without **kw)
+
+
+def test_required_param_in_properties_not_required_raises():
+    """Handler-required param must appear in schema['required'], not just
+    schema['properties']."""
+    r = AdminAIToolRegistry()
+
+    def handler(ctx, foo):  # 'foo' required by Python (no default)
+        return AdminAIToolResult(tool_name="a.b", success=True)
+
+    schema = {
+        "type": "object",
+        "properties": {"foo": {"type": "string"}},
+        "required": [],  # foo is optional in the schema — mismatch
+    }
+    with pytest.raises(ValueError, match="not in schema required"):
+        r.register(_schema_defn("a.b", schema), handler)
+
+
+def test_required_param_with_var_keyword_also_checked():
+    """The required[]-check must fire even when handler has **kwargs."""
+    r = AdminAIToolRegistry()
+
+    def handler(ctx, foo, **kwargs):  # 'foo' required by Python
+        return AdminAIToolResult(tool_name="a.b", success=True)
+
+    schema = {
+        "type": "object",
+        "properties": {"foo": {"type": "string"}},
+        "required": [],
+    }
+    with pytest.raises(ValueError, match="not in schema required"):
+        r.register(_schema_defn("a.b", schema), handler)
+
+
+def test_optional_handler_param_with_optional_schema_prop_ok():
+    """Optional in both places should register cleanly."""
+    r = AdminAIToolRegistry()
+
+    def handler(ctx, foo="default"):
+        return AdminAIToolResult(tool_name="a.b", success=True)
+
+    schema = {
+        "type": "object",
+        "properties": {"foo": {"type": "string"}},
+        "required": [],
+    }
+    r.register(_schema_defn("a.b", schema), handler)  # no raise
+
+
+def test_required_keyword_only_in_schema_required_ok():
+    """Required kwarg matched by schema required[] should register cleanly."""
+    r = AdminAIToolRegistry()
+
+    def handler(ctx, *, foo):  # required kwarg
+        return AdminAIToolResult(tool_name="a.b", success=True)
+
+    schema = {
+        "type": "object",
+        "properties": {"foo": {"type": "string"}},
+        "required": ["foo"],
+    }
+    r.register(_schema_defn("a.b", schema), handler)  # no raise
+
+
+def test_context_plus_var_keyword_with_no_required_ok():
+    """ctx + **kwargs and no required Python params should register cleanly."""
+    r = AdminAIToolRegistry()
+
+    def handler(ctx, **kwargs):
+        return AdminAIToolResult(tool_name="a.b", success=True)
+
+    schema = {
+        "type": "object",
+        "properties": {"anything": {"type": "string"}},
+        "required": [],
+    }
+    r.register(_schema_defn("a.b", schema), handler)  # no raise
+
+
+def test_schema_prop_without_handler_param_no_var_keyword_raises():
+    """Schema property with no handler kwarg AND no **kwargs is a mismatch."""
+    r = AdminAIToolRegistry()
+
+    def handler(ctx):  # no foo param, no **kwargs
+        return AdminAIToolResult(tool_name="a.b", success=True)
+
+    schema = {
+        "type": "object",
+        "properties": {"foo": {"type": "string"}},
+        "required": ["foo"],
+    }
+    with pytest.raises(ValueError, match="without handler parameters"):
+        r.register(_schema_defn("a.b", schema), handler)
+
+
+def test_args_after_context_raises():
+    """*args after context is rejected."""
+    r = AdminAIToolRegistry()
+
+    def handler(ctx, *args):
+        return AdminAIToolResult(tool_name="a.b", success=True)
+
+    with pytest.raises(ValueError, match=r"\*args"):
+        r.register(_schema_defn("a.b", {"type": "object"}), handler)
+
+
 # ---------------------------------------------------------- builtin protection
 
 

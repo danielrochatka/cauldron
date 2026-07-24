@@ -434,3 +434,109 @@ def test_service_stores_provider_request_id():
     user = _make_user()
     run = svc.run(user, "Say hi.")
     assert run.provider_request_id == "prov-req-1"
+
+
+# ------------------ ITEM 2: effective per-tool deadline & EPSILON check
+
+
+def _short_timeout_defn(name: str, timeout_seconds: float):
+    """Build a definition with a very short tool-level timeout."""
+    return AdminAIToolDefinition(
+        name=name,
+        version="1.0",
+        description="short timeout tool",
+        argument_schema={"type": "object", "properties": {}},
+        risk_level=RiskLevel.READ_ONLY,
+        required_permission="auth.view_user",
+        owning_module="test.module",
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def test_short_tool_timeout_triggers_timed_out_before_handler():
+    """A per-tool timeout < DEADLINE_EPSILON must produce ``tool.timeout``
+    and never invoke the handler."""
+    calls: list[bool] = []
+
+    def handler(ctx, **kw):
+        calls.append(True)
+        return AdminAIToolResult(
+            tool_name="t.short", success=True, data={},
+        )
+
+    reg = AdminAIToolRegistry()
+    # 0.05s tool timeout -> effective_deadline is only 50ms away, which is
+    # below the 0.1s DEADLINE_EPSILON -> pre-handler timeout fires.
+    reg.register(_short_timeout_defn("t.short", 0.05), handler)
+    fake = FakeAIModelProvider()
+    fake.queue_response(AIModelResponse(
+        provider_request_id="r1",
+        tool_calls=(AIModelToolCall(id="c1", name="t.short", arguments={}),),
+        stop_reason="tool_use",
+    ))
+    svc = _service(fake, reg)
+    user = _make_user()
+    run = svc.run(user, "Try short.")
+    assert run.status == "failed"
+    assert run.error_code == "tool.timeout"
+    # Handler MUST NOT be called when the effective deadline is exhausted.
+    assert calls == []
+    inv = AdminAIToolInvocation.objects.get(run=run)
+    assert inv.status == "timed_out"
+    assert inv.error_code == "tool.timeout"
+
+
+def test_normal_deadline_calls_handler():
+    """A comfortable tool timeout does not short-circuit the handler."""
+    reg = AdminAIToolRegistry()
+    called = []
+
+    def handler(ctx, **kw):
+        called.append(True)
+        return AdminAIToolResult(tool_name="t.ok", success=True, data={})
+
+    reg.register(_short_timeout_defn("t.ok", 30.0), handler)
+    fake = FakeAIModelProvider()
+    fake.queue_response(AIModelResponse(
+        provider_request_id="r1",
+        tool_calls=(AIModelToolCall(id="c1", name="t.ok", arguments={}),),
+        stop_reason="tool_use",
+    ))
+    fake.queue_response(AIModelResponse(
+        provider_request_id="r2", content="done", stop_reason="end_turn",
+    ))
+    svc = _service(fake, reg)
+    user = _make_user()
+    run = svc.run(user, "Do it.")
+    assert called == [True]
+    assert run.status == "completed"
+
+
+def test_invocation_never_enters_running_when_timed_out_pre_handler():
+    """When pre-handler timed_out: no ``running`` state persisted, no
+    ``started_at`` set — only requested -> authorized -> timed_out."""
+    calls: list[bool] = []
+
+    def handler(ctx, **kw):
+        calls.append(True)
+        return AdminAIToolResult(
+            tool_name="t.pre", success=True, data={},
+        )
+
+    reg = AdminAIToolRegistry()
+    reg.register(_short_timeout_defn("t.pre", 0.01), handler)
+    fake = FakeAIModelProvider()
+    fake.queue_response(AIModelResponse(
+        provider_request_id="r1",
+        tool_calls=(AIModelToolCall(id="c1", name="t.pre", arguments={}),),
+        stop_reason="tool_use",
+    ))
+    svc = _service(fake, reg)
+    user = _make_user()
+    run = svc.run(user, "Try.")
+    assert run.status == "failed"
+    inv = AdminAIToolInvocation.objects.get(run=run)
+    assert inv.status == "timed_out"
+    # No handler execution -> started_at should be unset.
+    assert inv.started_at is None
+    assert calls == []

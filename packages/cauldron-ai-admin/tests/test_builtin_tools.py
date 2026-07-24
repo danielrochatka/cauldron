@@ -245,9 +245,12 @@ def test_module_status_no_secrets_or_paths():
     for m in modules:
         assert set(m.keys()) == {
             "name", "capabilities", "dependencies",
-            "status", "version", "health",
-            "capability_providers", "dependency_health", "errors",
+            "status", "version", "health", "dependency_health",
         }
+    # Top-level shape is stable too.
+    assert set(result.data.keys()) == {
+        "modules", "capabilities", "resolution_errors", "discovery_errors",
+    }
 
 
 def test_module_status_health_is_unknown_not_ok_for_active_modules():
@@ -265,6 +268,10 @@ def test_module_status_health_is_unknown_not_ok_for_active_modules():
         "version": "1.0.0",
     }]
     fake_registry.lifecycle_errors.return_value = []
+    fake_registry.capabilities.return_value = {"ex.cap": ["cauldron.example"]}
+    fake_registry.dependency_graph.return_value = {"cauldron.example": []}
+    fake_registry.errors.return_value = []
+    fake_registry.discovery_errors.return_value = []
     with patch(
         "cauldron.modules.registry.registry", fake_registry,
     ):
@@ -290,7 +297,12 @@ def test_module_status_reports_error_status_for_lifecycle_failures():
     }]
     fake_error = MagicMock()
     fake_error.module_slug = "cauldron.broken"
+    fake_error.phase = "register"
     fake_registry.lifecycle_errors.return_value = [fake_error]
+    fake_registry.capabilities.return_value = {}
+    fake_registry.dependency_graph.return_value = {"cauldron.broken": []}
+    fake_registry.errors.return_value = []
+    fake_registry.discovery_errors.return_value = []
     with patch(
         "cauldron.modules.registry.registry", fake_registry,
     ):

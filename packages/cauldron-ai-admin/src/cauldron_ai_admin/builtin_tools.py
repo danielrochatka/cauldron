@@ -16,6 +16,7 @@ stack. When ``context.content_service`` is ``None`` the handler returns
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from .redaction import redact_exception
@@ -563,10 +564,31 @@ _MAX_MODULE_STATUS_ERROR_STRING_BYTES = 400
 _MAX_MODULE_STATUS_ERRORS = 20
 
 
+_PATH_RE = re.compile(r"(?:[A-Za-z]:)?/[\w./+-]+")
+
+
 def _bound_error_string(text: str) -> str:
-    """Truncate an error surface string to a bounded UTF-8 length."""
+    """Sanitize a diagnostic string to a bounded, path-free surface.
+
+    Registry error messages typically embed filesystem paths, environment
+    variable values, or full exception messages. To keep the audit
+    surface bounded and secret-free:
+
+    1. Filesystem-looking tokens (anything containing a ``/`` that looks
+       like a path) are replaced with the literal ``<redacted>``.
+    2. Everything after the first ``:`` — which usually holds raw
+       exception text or interpolated values — is dropped, keeping only
+       the leading label (e.g. a module slug or entry-point name).
+    3. The result is capped at
+       ``_MAX_MODULE_STATUS_ERROR_STRING_BYTES`` UTF-8 bytes.
+    """
     if not isinstance(text, str):
         text = str(text)
+    # Redact any filesystem-looking tokens up front so a path before the
+    # first ``:`` (e.g. entry-point load errors) is scrubbed too.
+    text = _PATH_RE.sub("<redacted>", text)
+    head, _sep, _tail = text.partition(":")
+    text = head.strip()
     encoded = text.encode("utf-8")
     if len(encoded) <= _MAX_MODULE_STATUS_ERROR_STRING_BYTES:
         return text
@@ -591,61 +613,26 @@ def _capability_provider_overrides() -> dict[str, str]:
     return overrides
 
 
-def _ai_provider_names() -> list[str]:
-    """Return the sorted list of registered AI-model provider names, or []."""
-    try:
-        from cauldron_ai.providers import provider_names
-        return sorted(provider_names())
-    except Exception:
-        return []
-
-
 def _resolve_capability(
     capability: str,
     providers: list[str],
     overrides: dict[str, str],
-) -> tuple[str | None, bool, list[str]]:
-    """Resolve (selected, ambiguous, errors) for a single capability."""
+) -> tuple[str | None, bool]:
+    """Resolve (selected, ambiguous) for a single capability.
+
+    * No providers → (None, False)
+    * Exactly one provider → (only_provider, False)
+    * Multiple providers + a valid override in ``providers`` → (override, False)
+    * Multiple providers with no valid override → (None, True)
+    """
     if not providers:
-        # No providers registered for the capability. Not ambiguous, but a
-        # missing provider is a resolution error the caller can bubble up.
-        return None, False, []
+        return None, False
     if len(providers) == 1:
-        return providers[0], False, []
+        return providers[0], False
     override = overrides.get(capability)
     if override and override in providers:
-        return override, False, []
-    return (
-        None,
-        True,
-        [_bound_error_string(
-            f"Capability {capability!r} has multiple providers "
-            f"{providers!r}; set CAULDRON_CAPABILITY_PROVIDERS to select."
-        )],
-    )
-
-
-def _dependency_health(dep_slug: str, active_slugs: set[str]) -> str:
-    """Return 'ok', 'missing', or 'unknown' for a declared dependency."""
-    if not dep_slug:
-        return "unknown"
-    # First look for the slug in the active module set.
-    if dep_slug in active_slugs:
-        return "ok"
-    # Then look up whether it's the app-label of a Django installed app.
-    try:
-        from django.conf import settings
-        installed = list(getattr(settings, "INSTALLED_APPS", []) or [])
-    except Exception:
-        return "unknown"
-    # Match slug directly or by dotted last segment (app_label).
-    for entry in installed:
-        if entry == dep_slug:
-            return "ok"
-        # e.g. dep "django.state" and INSTALLED_APPS has "cauldron_django_state"
-        if entry.endswith(dep_slug.replace(".", "_")):
-            return "ok"
-    return "missing"
+        return override, False
+    return None, True
 
 
 def _handle_module_status(context: AdminAIToolContext, **kwargs) -> Any:
@@ -674,114 +661,144 @@ def _handle_module_status(context: AdminAIToolContext, **kwargs) -> Any:
         return deadline_err
 
     graph = module_registry.graph_info() or []
+
+    # Which modules the registry considers active (used for dependency-health).
+    active_slugs = {
+        entry.get("slug", "") for entry in graph if entry.get("active")
+    }
+    # Full set of registered module slugs, active or not — dependencies that
+    # resolve to a discovered module are "ok" even if that module is inactive
+    # in this deployment.
+    registered_slugs = {
+        entry.get("slug", "") for entry in graph if entry.get("slug")
+    }
+
+    # Lifecycle errors keyed by module slug. Registry LifecycleError carries
+    # ``exception`` and ``message`` fields; we only surface a bounded label.
     lifecycle_errors_by_slug: dict[str, list[str]] = {}
     try:
         for lifecycle_error in module_registry.lifecycle_errors():
             slug = getattr(lifecycle_error, "module_slug", "")
             if isinstance(slug, str) and slug:
-                # We don't surface raw exception text — just a bounded
-                # class-name summary consistent with redact_exception.
-                exc = getattr(lifecycle_error, "exception", None)
-                if exc is not None:
-                    err_str = redact_exception(exc, max_bytes=200)
-                else:
-                    err_str = "LifecycleError: [details omitted]"
-                lifecycle_errors_by_slug.setdefault(slug, []).append(err_str)
+                phase = getattr(lifecycle_error, "phase", "") or ""
+                summary = _bound_error_string(
+                    f"{slug} lifecycle error in phase {phase!r}"
+                )
+                lifecycle_errors_by_slug.setdefault(slug, []).append(summary)
     except Exception:
-        # Older registries may not expose lifecycle_errors — treat as none.
         lifecycle_errors_by_slug = {}
 
     # Registry-level capability provider mapping (module system).
     try:
-        capability_map = module_registry.capabilities()
-        if not isinstance(capability_map, dict):
-            capability_map = {}
+        capability_map_raw = module_registry.capabilities()
+        capability_map = (
+            capability_map_raw if isinstance(capability_map_raw, dict) else {}
+        )
     except Exception:
         capability_map = {}
 
-    # Overrides from Django settings (module system + AI provider system).
+    # Dependency graph: resolved deps per module slug (produced by the
+    # resolver). This is authoritative for what a module actually depends on
+    # after capability→module resolution — much more meaningful than the raw
+    # ``requires`` field.
+    try:
+        dep_graph_raw = module_registry.dependency_graph()
+        dep_graph = (
+            dep_graph_raw if isinstance(dep_graph_raw, dict) else {}
+        )
+    except Exception:
+        dep_graph = {}
+
+    # Resolution errors: raw ResolutionError messages from the resolver.
+    resolution_errors: list[str] = []
+    try:
+        for err in module_registry.errors():
+            msg = getattr(err, "message", "") or ""
+            resolution_errors.append(_bound_error_string(msg))
+    except Exception:
+        pass
+    resolution_errors = sorted(
+        set(resolution_errors)
+    )[:_MAX_MODULE_STATUS_ERRORS]
+
+    # Discovery errors: raw DiscoveryError messages from the loader.
+    discovery_errors: list[str] = []
+    try:
+        for err in module_registry.discovery_errors():
+            msg = getattr(err, "message", "") or ""
+            discovery_errors.append(_bound_error_string(msg))
+    except Exception:
+        pass
+    discovery_errors = sorted(
+        set(discovery_errors)
+    )[:_MAX_MODULE_STATUS_ERRORS]
+
+    # Overrides from Django settings for capability→provider selection.
     overrides = _capability_provider_overrides()
 
-    # Registered AI providers (a separate registry from the module system).
-    ai_provider_names = _ai_provider_names()
-
-    active_slugs = {
-        entry.get("slug", "") for entry in graph if entry.get("active")
-    }
+    # Build the top-level capability map. This uses the module registry's
+    # capability map exclusively — the AI provider registry is a separate
+    # per-request registry and does not participate in module-level
+    # resolution.
+    capabilities_out: dict[str, dict[str, Any]] = {}
+    for cap in sorted(capability_map.keys()):
+        providers = sorted(capability_map.get(cap, []) or [])
+        selected, ambiguous = _resolve_capability(cap, providers, overrides)
+        capabilities_out[cap] = {
+            "providers": providers,
+            "selected": selected,
+            "ambiguous": ambiguous,
+        }
 
     modules = []
     for entry in graph:
         slug = entry.get("slug", "") or ""
-        # Dependencies: unique, deterministically ordered slugs.
-        deps: list[str] = []
-        for req in entry.get("requires", []) or []:
-            dep_slug = req.get("slug") if isinstance(req, dict) else None
-            if isinstance(dep_slug, str) and dep_slug and dep_slug not in deps:
-                deps.append(dep_slug)
-        capabilities_provided = list(entry.get("provides", []) or [])
+        # Resolved dependencies from the resolver's dependency graph — these
+        # are actual module slugs (capability→module resolution done).
+        deps = sorted(set(dep_graph.get(slug, []) or []))
+
         active = bool(entry.get("active"))
-        entry_errors: list[str] = []
+        module_lifecycle = lifecycle_errors_by_slug.get(slug, [])
 
         # Status: derived from active flag + lifecycle errors.
-        if lifecycle_errors_by_slug.get(slug):
+        if module_lifecycle:
             status = "error"
             health: str = "degraded"
-            entry_errors.extend(lifecycle_errors_by_slug[slug])
         elif active:
             status = "active"
-            health = "unknown"  # true health signal is not fabricated.
+            health = "unknown"
         else:
             status = "inactive"
             health = "unknown"
 
-        # Capability providers this module provides.
-        capability_providers: dict[str, dict[str, Any]] = {}
-        resolution_errors: list[str] = []
-        for cap in sorted(set(capabilities_provided)):
-            if cap == "ai.model.providers":
-                cap_providers = list(ai_provider_names)
-            else:
-                cap_providers = sorted(capability_map.get(cap, []) or [])
-            selected, ambiguous, errors = _resolve_capability(
-                cap, cap_providers, overrides,
-            )
-            if errors:
-                resolution_errors.extend(errors)
-                entry_errors.extend(errors)
-            capability_providers[cap] = {
-                "providers": cap_providers,
-                "selected": selected,
-                "ambiguous": ambiguous,
-                "resolution_errors": errors,
-            }
-
-        # Dependency health for declared requires.
+        # Dependency health: for each resolved dep, check if it appears in
+        # the module registry at all (active OR discovered-but-inactive).
         dependency_health: dict[str, str] = {}
-        for dep_slug in sorted(deps):
-            dependency_health[dep_slug] = _dependency_health(
-                dep_slug, active_slugs,
-            )
-
-        # Bound the surfaced entry-level error list.
-        bounded_errors = [
-            _bound_error_string(s) for s in entry_errors
-        ][:_MAX_MODULE_STATUS_ERRORS]
+        for dep_slug in deps:
+            if dep_slug in registered_slugs:
+                dependency_health[dep_slug] = "ok"
+            else:
+                dependency_health[dep_slug] = "missing"
 
         modules.append({
             "name": slug,
-            "version": entry.get("version", ""),
-            "capabilities": capabilities_provided,
-            "dependencies": sorted(deps),
+            "version": entry.get("version", "") or "",
             "status": status,
             "health": health,
-            "capability_providers": capability_providers,
+            "capabilities": sorted(set(entry.get("provides", []) or [])),
+            "dependencies": deps,
             "dependency_health": dependency_health,
-            "errors": bounded_errors,
         })
+
     return AdminAIToolResult(
         tool_name="system.module_status",
         success=True,
-        data={"modules": modules},
+        data={
+            "modules": modules,
+            "capabilities": capabilities_out,
+            "resolution_errors": resolution_errors,
+            "discovery_errors": discovery_errors,
+        },
     )
 
 

@@ -37,12 +37,29 @@ CAULDRON_MODULES = {
     },
     "cauldron.content.api": {},
     "cauldron.admin.content": {},
+    "cauldron.ai": {},
+    # Admin AI: uses the deterministic FakeAIModelProvider that
+    # config.admin_ai_bootstrap registers in AppConfig.ready(). Real
+    # deployments configure a vendor provider package instead.
+    "cauldron.ai.admin": {
+        "provider": "fake",
+        "max_model_turns": 3,
+        "max_tool_calls": 5,
+        "tool_timeout_seconds": 10,
+        "run_timeout_seconds": 30,
+        "max_argument_bytes": 4096,
+        "max_result_bytes": 8192,
+    },
 }
 
 _plan = compose_django_settings(
     installed_apps=[
         "django.contrib.contenttypes",
         "cauldron",
+        # Registers the FakeAIModelProvider used by cauldron.ai.admin.
+        "config.admin_ai_bootstrap.AdminAIBootstrapConfig",
+        # Admin AI models/migrations/checks.
+        "cauldron_ai_admin",
     ],
     middleware=[
         "django.middleware.security.SecurityMiddleware",

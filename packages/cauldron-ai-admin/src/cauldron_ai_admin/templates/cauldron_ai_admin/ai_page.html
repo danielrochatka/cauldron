@@ -1,0 +1,89 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Cauldron Admin AI</title>
+</head>
+<body>
+  <h1>Cauldron Admin AI</h1>
+
+  <section>
+    <h2>Available tools for {{ request.user }}</h2>
+    {% if allowed_tools %}
+      <ul>
+        {% for tool in allowed_tools %}
+          <li>
+            <code>{{ tool.name }}</code> ({{ tool.risk_level }}) —
+            {{ tool.description }}
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p>You have no Admin AI tools available.</p>
+    {% endif %}
+  </section>
+
+  <section>
+    <h2>Ask the Admin AI</h2>
+    <form id="ai-form" method="post">
+      {% csrf_token %}
+      <label for="ai-request">Request</label>
+      <textarea id="ai-request" name="request" rows="6" cols="80"
+                required></textarea>
+      <br>
+      <button type="submit">Send</button>
+    </form>
+    <pre id="ai-response" aria-live="polite"></pre>
+  </section>
+
+  <section>
+    <h2>Your recent runs</h2>
+    {% if recent_runs %}
+      <ul>
+        {% for run in recent_runs %}
+          <li>
+            <code>{{ run.run_id }}</code> — {{ run.status }} —
+            {{ run.created_at }}
+            <br>
+            <em>{{ run.user_request }}</em>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p>No runs yet.</p>
+    {% endif %}
+  </section>
+
+  <script>
+    (function () {
+      var form = document.getElementById("ai-form");
+      var responseEl = document.getElementById("ai-response");
+      if (!form) { return; }
+      form.addEventListener("submit", function (event) {
+        event.preventDefault();
+        responseEl.textContent = "Working...";
+        var textEl = document.getElementById("ai-request");
+        var text = textEl ? textEl.value : "";
+        var csrfEl = form.querySelector("input[name=csrfmiddlewaretoken]");
+        var csrf = csrfEl ? csrfEl.value : "";
+        fetch(window.location.pathname, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-CSRFToken": csrf,
+          },
+          body: JSON.stringify({request: text}),
+          credentials: "same-origin"
+        }).then(function (r) {
+          return r.json().then(function (body) {
+            responseEl.textContent = JSON.stringify(body, null, 2);
+          });
+        }).catch(function (err) {
+          responseEl.textContent = "Error: " + err;
+        });
+      });
+    }());
+  </script>
+</body>
+</html>

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cauldron-ai-admin"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "cauldron>=0.1.0",
+    "cauldron-ai>=0.1.0",
+    "cauldron-content-operations>=0.1.0",
+    "cauldron-admin-content>=0.1.0",
+    "django>=4.2",
+    "jsonschema>=4.0",
+]
+
+[project.entry-points."cauldron.modules"]
+"cauldron.ai.admin" = "cauldron_ai_admin.module:module"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cauldron_ai_admin = ["templates/cauldron_ai_admin/*.html"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "../../src", "../.."]
+addopts = "-ra"
+testpaths = ["tests"]

@@ -15,12 +15,14 @@
         {% endfor %}
       </select>
     </div>
+    {% if can_view_drafts %}
     <div class="cui-form-field">
       <label>
         <input type="checkbox" name="include_drafts" value="1" {% if include_drafts %}checked{% endif %}>
         Include Drafts
       </label>
     </div>
+    {% endif %}
     <button type="submit" class="cui-button">Browse</button>
   </form>
 </div>

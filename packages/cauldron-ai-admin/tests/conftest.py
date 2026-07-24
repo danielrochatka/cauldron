@@ -9,6 +9,11 @@ def pytest_configure(config):
                 "default": {
                     "ENGINE": "django.db.backends.sqlite3",
                     "NAME": ":memory:",
+                    # Longer busy timeout so concurrent transactions have a
+                    # chance to serialise (SQLite retries under contention)
+                    # instead of failing immediately with "database is
+                    # locked".
+                    "OPTIONS": {"timeout": 20},
                 }
             },
             INSTALLED_APPS=[

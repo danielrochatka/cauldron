@@ -85,53 +85,136 @@ class Command(BaseCommand):
         self.stdout.write(f"  Written: {path.name}")
 
     def _run_check(self, root: Path) -> None:
-        from cauldron_django_admin.override_store import (
-            UIOverrideStore, MAX_FILE_BYTES, MAX_TOTAL_BYTES,
-        )
-        _MAX_FILE_BYTES = MAX_FILE_BYTES
-        _MAX_TOTAL_BYTES = MAX_TOTAL_BYTES
+        """Validate the override directory by walking the raw tree.
 
-        issues = []
+        Uses ``os.walk`` rather than ``UIOverrideStore.list_files`` so we
+        surface anything the store would *silently skip* — hidden files,
+        symlinks, non-CSS files, entries above the scope directories,
+        oversize files, invalid UTF-8, and roots that exceed the total-size
+        budget.
+        """
+        import os
+        from cauldron_django_admin.override_store import (
+            MAX_FILE_BYTES, MAX_TOTAL_BYTES,
+        )
+
+        issues: list[str] = []
 
         if not root.exists():
-            issues.append("Override root does not exist. Run cauldron_ui_init to create it.")
-        elif not root.is_dir():
-            issues.append("Override root path exists but is not a directory.")
-        else:
-            for scope in ("admin", "pages"):
-                scope_dir = root / scope
-                if not scope_dir.is_dir():
-                    issues.append(f"Missing scope directory: {scope}/")
-                    continue
+            msg = "Override root does not exist. Run cauldron_ui_init to create it."
+            self.stderr.write(self.style.WARNING(f"  [WARN] {msg}"))
+            raise CommandError(msg)
+        if not root.is_dir():
+            msg = "Override root path exists but is not a directory."
+            self.stderr.write(self.style.WARNING(f"  [WARN] {msg}"))
+            raise CommandError(msg)
 
-                store = UIOverrideStore(root)
+        # Allowed root-level entries. Everything else is reported.
+        allowed_root_names = frozenset({
+            "admin", "pages", ".gitignore", ".cauldron-store.lock",
+        })
+
+        total_bytes = 0
+
+        for entry in sorted(root.iterdir()):
+            name = entry.name
+            if entry.is_symlink():
                 try:
-                    files = store.list_files(scope)
-                except Exception as exc:
-                    issues.append(f"Cannot list files in scope {scope!r}: {type(exc).__name__}")
-                    continue
+                    link_target = entry.resolve()
+                    link_target.relative_to(root)
+                except (ValueError, OSError):
+                    issues.append(f"Symlink escape at root level: {name!r}")
+                else:
+                    issues.append(f"Symlink at root level: {name!r}")
+                continue
 
-                total = 0
-                for rel_path in files:
+            if name not in allowed_root_names:
+                if name.startswith("."):
+                    issues.append(f"Hidden file at root level: {name!r}")
+                else:
+                    issues.append(f"Unexpected root-level entry: {name!r}")
+                continue
+
+            if name not in ("admin", "pages"):
+                # .gitignore and .cauldron-store.lock are fine.
+                continue
+
+            scope_dir = entry
+            if not scope_dir.is_dir():
+                issues.append(f"Scope entry is not a directory: {name!r}")
+                continue
+
+            for dirpath, dirnames, filenames in os.walk(
+                str(scope_dir), topdown=True, followlinks=False,
+            ):
+                dp = Path(dirpath)
+                rel_dir = dp.relative_to(root)
+
+                # Hidden directories are skipped from recursion but reported
+                # so operators know why files inside them are not visible.
+                hidden_dirs = [d for d in dirnames if d.startswith(".")]
+                for hd in hidden_dirs:
+                    issues.append(f"Hidden directory: {rel_dir / hd}")
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+
+                for fname in sorted(filenames):
+                    fpath = dp / fname
+                    rel_path = fpath.relative_to(root)
+
+                    if fname.startswith("."):
+                        issues.append(f"Hidden file: {rel_path}")
+                        continue
+
+                    if fpath.is_symlink():
+                        try:
+                            target = fpath.resolve()
+                            target.relative_to(root)
+                        except (ValueError, OSError):
+                            issues.append(f"Symlink escape: {rel_path}")
+                        else:
+                            issues.append(f"Symlink in override tree: {rel_path}")
+                        continue
+
+                    if fpath.suffix.lower() != ".css":
+                        issues.append(f"Non-CSS file: {rel_path}")
+                        continue
+
                     try:
-                        content = store.read_file(scope, rel_path)
-                        size = len(content.encode("utf-8"))
-                        if size > _MAX_FILE_BYTES:
-                            issues.append(
-                                f"File exceeds size limit: scope={scope!r}, path={rel_path!r} ({size} bytes)"
-                            )
-                        total += size
-                    except Exception as exc:
-                        issues.append(f"Cannot read {scope!r}/{rel_path!r}: {type(exc).__name__}")
+                        raw = fpath.read_bytes()
+                    except OSError as exc:
+                        issues.append(
+                            f"Cannot read file: {rel_path}: {type(exc).__name__}",
+                        )
+                        continue
 
-                if total > _MAX_TOTAL_BYTES:
-                    issues.append(f"Total size in scope {scope!r} exceeds limit ({total} bytes).")
+                    file_size = len(raw)
+                    if file_size > MAX_FILE_BYTES:
+                        issues.append(
+                            f"File exceeds per-file limit ({file_size} bytes): {rel_path}"
+                        )
+
+                    try:
+                        raw.decode("utf-8")
+                    except UnicodeDecodeError:
+                        issues.append(f"Invalid UTF-8: {rel_path}")
+
+                    total_bytes += file_size
+
+        for scope in ("admin", "pages"):
+            if not (root / scope).is_dir():
+                issues.append(f"Missing scope directory: {scope}/")
+
+        if total_bytes > MAX_TOTAL_BYTES:
+            issues.append(
+                f"Total override root size ({total_bytes} bytes) exceeds "
+                f"limit ({MAX_TOTAL_BYTES} bytes).",
+            )
 
         if issues:
             for issue in issues:
                 self.stderr.write(self.style.WARNING(f"  [WARN] {issue}"))
             # Raise CommandError so --check exits non-zero and CI can gate
-            # on it. Previously we merely printed a warning.
+            # on it.
             raise CommandError(
                 "Override directory has validation issues. Run cauldron_ui_init to fix."
             )

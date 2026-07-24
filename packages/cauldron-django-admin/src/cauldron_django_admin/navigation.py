@@ -160,15 +160,82 @@ class NavigationRegistry:
     def get_grouped_nav(self, user, request=None) -> list[dict]:
         """Return grouped navigation with resolved URLs and is_active flags.
 
-        Each item in the result is an object supporting both attribute access
-        (item.key, item.label, item.url, item.is_active) and dict-style access.
+        Exactly one item across the whole navigation is marked active for a
+        given request. Selection priority:
+
+        1. Item whose ``url_name`` matches the currently resolved URL name
+           (e.g. ``"cauldron:modules"``). This is the most precise signal
+           and wins over any prefix-based match.
+        2. Item with ``url_prefix_exact=True`` whose ``url_prefix`` matches
+           the request path exactly (optionally normalised with a trailing
+           slash).
+        3. Item with the longest matching ``url_prefix`` — the most specific
+           prefix wins, so ``/cauldron/modules/foo/`` picks the modules
+           entry, not the dashboard entry rooted at ``/cauldron/``.
+
+        Each returned item is a ``SimpleNamespace`` so tests can access
+        ``.key`` / ``.label`` and templates can use ``{{ item.url }}`` etc.
         """
         import types
+        from django.urls import resolve, Resolver404
 
         sections = self.get_sections()
         items = self.get_items_for_user(user, request)
 
         current_path = request.path if request is not None else ""
+
+        # Resolve the current URL name (e.g. "cauldron:modules") so we can
+        # compare it against each item's declared ``url_name``.
+        current_url_name = ""
+        if current_path:
+            try:
+                match = resolve(current_path)
+                current_url_name = ":".join(
+                    p for p in (match.namespace, match.url_name) if p
+                ) or (match.url_name or "")
+            except Resolver404:
+                current_url_name = ""
+            except Exception:
+                # Any other resolver failure (misconfiguration during tests,
+                # etc.) is not fatal — fall through to prefix matching.
+                current_url_name = ""
+
+        # Bucket candidates by priority.
+        exact_name_candidates: list[AdminNavigationItem] = []
+        exact_path_candidates: list[AdminNavigationItem] = []
+        prefix_candidates: list[tuple[int, AdminNavigationItem]] = []
+
+        for item in items:
+            if (
+                item.url_name
+                and current_url_name
+                and item.url_name == current_url_name
+            ):
+                exact_name_candidates.append(item)
+                continue
+            if item.url_prefix_exact and item.url_prefix:
+                normalised = current_path.rstrip("/") + "/"
+                if (
+                    current_path == item.url_prefix
+                    or normalised == item.url_prefix
+                ):
+                    exact_path_candidates.append(item)
+                continue
+            if item.url_prefix and current_path.startswith(item.url_prefix):
+                prefix_candidates.append((len(item.url_prefix), item))
+
+        active_key: str | None = None
+        if exact_name_candidates:
+            active_key = exact_name_candidates[0].key
+        elif exact_path_candidates:
+            active_key = exact_path_candidates[0].key
+        elif prefix_candidates:
+            # Longest url_prefix wins; break ties deterministically by key.
+            best = max(
+                prefix_candidates,
+                key=lambda pair: (pair[0], pair[1].key),
+            )
+            active_key = best[1].key
 
         section_items: dict[str, list] = {s.key: [] for s in sections}
         for item in items:
@@ -179,21 +246,7 @@ class NavigationRegistry:
                     badge = item.badge_provider()
                 except Exception:
                     badge = 0
-            if item.url_prefix_exact:
-                # Exact-match items (e.g. Dashboard) are active only when the
-                # request path is precisely equal to the prefix (with an
-                # optional trailing slash).
-                normalised = current_path.rstrip("/") + "/"
-                is_active = bool(item.url_prefix) and (
-                    current_path == item.url_prefix
-                    or normalised == item.url_prefix
-                )
-            else:
-                is_active = bool(
-                    item.url_prefix and current_path.startswith(item.url_prefix)
-                )
-            # Use SimpleNamespace so tests can access .key, .label, etc. as attributes
-            # and the sidebar template can use {{ item.url }}, {{ item.is_active }}
+            is_active = (item.key == active_key)
             entry = types.SimpleNamespace(
                 key=item.key,
                 label=item.label,

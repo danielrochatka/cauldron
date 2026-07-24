@@ -68,28 +68,79 @@ def modules_view(request):
         cap_map = {}
         registry_errors.append({"kind": type(exc).__name__, "module": ""})
 
+    # Capability provider selections come from Django settings — the same
+    # source the resolver consults for CAULDRON_CAPABILITY_PROVIDERS. We
+    # surface them per-module so operators can see which provider they
+    # explicitly chose for each capability the module offers.
+    from django.conf import settings
+    cap_providers_setting_raw = getattr(
+        settings, "CAULDRON_CAPABILITY_PROVIDERS", None,
+    ) or {}
+    if isinstance(cap_providers_setting_raw, dict):
+        cap_providers_setting = {
+            k: v for k, v in cap_providers_setting_raw.items()
+            if isinstance(k, str) and isinstance(v, str) and k and v
+        }
+    else:
+        cap_providers_setting = {}
+
+    # Lifecycle errors keyed by slug so we can flag degraded modules.
+    lifecycle_error_slugs: set[str] = set()
     try:
-        dep_graph_raw = mod_registry.dependency_graph()
-        dep_graph = dep_graph_raw if isinstance(dep_graph_raw, dict) else {}
-    except Exception as exc:
-        dep_graph = {}
-        registry_errors.append({"kind": type(exc).__name__, "module": ""})
+        for err in (mod_registry.lifecycle_errors() or []):
+            slug_val = getattr(err, "module_slug", "") or ""
+            if isinstance(slug_val, str) and slug_val:
+                lifecycle_error_slugs.add(slug_val)
+    except Exception:
+        lifecycle_error_slugs = set()
 
     for info in graph_list:
         if not isinstance(info, dict):
             continue
         slug = info.get("slug", "") or ""
+        is_active = bool(info.get("active", False))
+        provided_caps = list(info.get("provides", []) or [])
+        requires = list(info.get("requires", []) or [])
+        deps = list(info.get("deps", []) or [])
+        django_apps = list(info.get("django_apps", []) or [])
+        load_index = info.get("load_index")
+
+        # Status: lifecycle errors override active/inactive with "error".
+        if slug in lifecycle_error_slugs:
+            status = "error"
+            health = "degraded"
+        elif is_active:
+            status = "active"
+            health = "healthy"
+        else:
+            status = "inactive"
+            health = "unknown"
+
+        # Only surface a selected provider when the module actually provides
+        # that capability AND the operator picked it in settings.
+        selected_providers = {
+            cap: cap_providers_setting[cap]
+            for cap in provided_caps
+            if cap in cap_providers_setting
+        }
+
         modules.append({
             "slug": slug,
-            "label": info.get("label", slug),
+            "label": info.get("label", slug) or slug,
             "version": info.get("version", "") or "",
-            "status": info.get("status", "active") or "active",
-            "provides": list(info.get("provides", []) or []),
+            "status": status,
+            "health": health,
+            "active": is_active,
+            "load_index": load_index,
+            "provides": provided_caps,
+            "requires": requires,
+            "deps": deps,
+            "django_apps": django_apps,
+            "selected_providers": selected_providers,
             "capabilities": sorted(
                 cap for cap, providers in cap_map.items()
                 if isinstance(providers, (list, tuple)) and slug in providers
             ),
-            "dependencies": list(dep_graph.get(slug, []) or []),
         })
 
     # Diagnostic errors — redacted to type-name + module slug only.

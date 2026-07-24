@@ -21,7 +21,16 @@
   <table class="cui-table">
     <thead>
       <tr>
-        <th>Slug</th><th>Label</th><th>Version</th><th>Status</th><th>Provides</th><th>Dependencies</th>
+        <th>Slug</th>
+        <th>Label</th>
+        <th>Version</th>
+        <th>Status</th>
+        <th>Health</th>
+        <th>Load</th>
+        <th>Provides</th>
+        <th>Dependencies</th>
+        <th>Django apps</th>
+        <th>Selected providers</th>
       </tr>
     </thead>
     <tbody>
@@ -31,21 +40,41 @@
         <td>{{ mod.label }}</td>
         <td>{{ mod.version }}</td>
         <td>{% include "cauldron_admin/includes/status_badge.html" with status=mod.status %}</td>
+        <td>{{ mod.health }}</td>
+        <td>
+          {% if mod.load_index is not None %}{{ mod.load_index }}{% else %}<span class="cui-text-muted">—</span>{% endif %}
+        </td>
         <td>
           {% for cap in mod.provides %}
           <code class="cui-badge">{{ cap }}</code>
+          {% empty %}
+          <span class="cui-text-muted">—</span>
           {% endfor %}
         </td>
         <td>
-          {% for dep in mod.dependencies %}
+          {% for dep in mod.deps %}
           <code class="cui-badge">{{ dep }}</code>
+          {% empty %}
+          <span class="cui-text-muted">—</span>
+          {% endfor %}
+        </td>
+        <td>
+          {% for app in mod.django_apps %}
+          <code class="cui-badge">{{ app }}</code>
+          {% empty %}
+          <span class="cui-text-muted">—</span>
+          {% endfor %}
+        </td>
+        <td>
+          {% for cap, provider in mod.selected_providers.items %}
+          <div><code>{{ cap }}</code> &rarr; <code>{{ provider }}</code></div>
           {% empty %}
           <span class="cui-text-muted">—</span>
           {% endfor %}
         </td>
       </tr>
       {% empty %}
-      <tr><td colspan="6">No modules registered.</td></tr>
+      <tr><td colspan="10">No modules registered.</td></tr>
       {% endfor %}
     </tbody>
   </table>

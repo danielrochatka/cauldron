@@ -61,6 +61,7 @@ class ContentBrowserView(View):
                 "selected_collection": "",
                 "items": [],
                 "include_drafts": False,
+                "can_view_drafts": has_draft_perm,
                 "error": "Service unavailable",
             })
 
@@ -85,6 +86,7 @@ class ContentBrowserView(View):
             "selected_collection": collection,
             "items": items,
             "include_drafts": include_drafts,
+            "can_view_drafts": has_draft_perm,
             "error": error,
         })
 

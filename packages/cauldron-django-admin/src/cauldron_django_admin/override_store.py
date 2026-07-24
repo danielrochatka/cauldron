@@ -31,6 +31,31 @@ ABSENT = "__absent__"
 Scope = Literal["admin", "pages"]
 
 
+# ---------------------------------------------------------------------------
+# Process-wide thread locks keyed by resolved override root.
+#
+# Multiple ``UIOverrideStore`` instances rooted at the same directory MUST
+# serialise writes/deletes across the process — storing the lock on ``self``
+# would leave each instance with its own private lock, defeating the guarantee
+# that no two writes to the same override root can happen simultaneously
+# inside a single Python process. The registry below is process-wide and keyed
+# by the resolved root path so any store instance rooted at the same location
+# shares the same underlying ``threading.Lock``.
+# ---------------------------------------------------------------------------
+_PROCESS_ROOT_LOCKS: dict[str, threading.Lock] = {}
+_PROCESS_ROOT_LOCKS_META: threading.Lock = threading.Lock()
+
+
+def _get_process_root_lock(root: Path) -> threading.Lock:
+    key = str(root)
+    with _PROCESS_ROOT_LOCKS_META:
+        lock = _PROCESS_ROOT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _PROCESS_ROOT_LOCKS[key] = lock
+        return lock
+
+
 class OverrideStoreError(Exception):
     """Base error for UIOverrideStore operations."""
 
@@ -180,19 +205,28 @@ class UIOverrideStore:
         """Cross-process exclusive lock on the override root.
 
         Uses ``fcntl.lockf`` on POSIX so concurrent worker processes serialise
-        writes/deletes.  Falls back to the process-local meta lock when
+        writes/deletes.  Falls back to the process-wide thread lock when
         ``fcntl`` is unavailable (e.g. Windows) or when the lock file cannot
         be created (e.g. read-only filesystem).
+
+        Even on POSIX we ALWAYS acquire the process-wide thread lock first —
+        ``fcntl`` locks on Linux are per-process (not per-thread), so two
+        threads inside the same process can both acquire the same ``LOCK_EX``
+        without contention. The thread lock guarantees strict serialisation
+        within a single process; the file lock adds cross-process
+        serialisation on top.
         """
+        thread_lock = _get_process_root_lock(self._root)
+
         if not _HAS_FCNTL:
-            with self._meta_lock:
+            with thread_lock:
                 yield
             return
 
         try:
             self._root.mkdir(parents=True, exist_ok=True)
         except OSError:
-            with self._meta_lock:
+            with thread_lock:
                 yield
             return
 
@@ -200,31 +234,35 @@ class UIOverrideStore:
         try:
             fd = open(str(lock_path), "w")
         except OSError:
-            with self._meta_lock:
+            with thread_lock:
                 yield
             return
 
-        try:
+        with thread_lock:
             try:
-                fcntl.lockf(fd, fcntl.LOCK_EX)
-            except OSError:
-                # Locking not supported on this filesystem — fall back.
-                fd.close()
-                with self._meta_lock:
+                try:
+                    fcntl.lockf(fd, fcntl.LOCK_EX)
+                except OSError:
+                    # Locking not supported on this filesystem — thread lock
+                    # is already held, so we still serialise within-process.
+                    try:
+                        fd.close()
+                    except OSError:
+                        pass
                     yield
-                return
-            try:
-                yield
+                    return
+                try:
+                    yield
+                finally:
+                    try:
+                        fcntl.lockf(fd, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
             finally:
                 try:
-                    fcntl.lockf(fd, fcntl.LOCK_UN)
+                    fd.close()
                 except OSError:
                     pass
-        finally:
-            try:
-                fd.close()
-            except OSError:
-                pass
 
     def _sha256(self, content: bytes) -> str:
         return hashlib.sha256(content).hexdigest()
@@ -404,6 +442,63 @@ class UIOverrideStore:
             try:
                 with os.fdopen(fd, "wb") as f:
                     f.write(encoded)
+
+                # ------------------------------------------------------- #
+                # Final pre-replace safety verification.                    #
+                #                                                            #
+                # Between the earlier ``_resolve_path`` and the actual        #
+                # ``os.replace`` an adversary or racing thread could have     #
+                # mutated the target parent (e.g. swapping it for a symlink   #
+                # that points outside the root). Re-verify containment and   #
+                # optimistic state right before we make the change visible.   #
+                # ------------------------------------------------------- #
+                final_scope_dir = self._scope_dir(scope).resolve()
+                if re_resolved.parent.is_symlink():
+                    raise TraversalError(
+                        "Target parent became a symlink before replacement."
+                    )
+                final_parent = re_resolved.parent.resolve()
+                try:
+                    final_parent.relative_to(final_scope_dir)
+                except ValueError:
+                    raise TraversalError(
+                        "Target parent moved outside scope before replacement."
+                    )
+                if re_resolved.exists() and re_resolved.is_symlink():
+                    raise TraversalError(
+                        "Target became a symlink before replacement."
+                    )
+                # Confirm the temp file we're about to promote is still
+                # inside the validated parent directory.
+                tmp_resolved = Path(tmp_path).resolve()
+                try:
+                    tmp_resolved.relative_to(final_parent)
+                except ValueError:
+                    raise TraversalError(
+                        "Temporary file is not inside the target parent."
+                    )
+                # Re-check the optimistic state one last time.
+                if expected_hash == ABSENT:
+                    if re_resolved.exists():
+                        raise HashConflictError(
+                            "File appeared between temp creation and replacement."
+                        )
+                else:
+                    if not re_resolved.exists():
+                        raise HashConflictError(
+                            "File disappeared between temp creation and replacement."
+                        )
+                    try:
+                        actual_final = self._sha256(re_resolved.read_bytes())
+                    except OSError as exc:
+                        raise TraversalError(
+                            "Cannot read file for final hash revalidation.",
+                        ) from exc
+                    if actual_final != expected_hash:
+                        raise HashConflictError(
+                            "File changed between temp creation and replacement."
+                        )
+
                 os.replace(tmp_path, str(re_resolved))
             except Exception:
                 try:

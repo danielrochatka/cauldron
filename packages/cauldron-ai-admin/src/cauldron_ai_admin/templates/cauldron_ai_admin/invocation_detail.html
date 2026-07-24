@@ -1,0 +1,21 @@
+{% extends "cauldron_admin/base.html" %}
+{% block page_title %}Invocation Detail{% endblock %}
+{% block content %}
+<div class="cui-card">
+  <dl class="cui-dl">
+    <dt>Invocation ID</dt><dd><code>{{ invocation.invocation_id }}</code></dd>
+    <dt>Run ID</dt><dd><code>{{ run.run_id }}</code></dd>
+    <dt>Tool</dt><dd><code>{{ invocation.tool_name }}</code></dd>
+    <dt>Risk Level</dt><dd><span class="cui-badge">{{ invocation.risk_level }}</span></dd>
+    <dt>Status</dt><dd>{% include "cauldron_admin/includes/status_badge.html" with status=invocation.status %}</dd>
+    <dt>Created</dt><dd>{{ invocation.created_at }}</dd>
+    {% if invocation.started_at %}<dt>Started</dt><dd>{{ invocation.started_at }}</dd>{% endif %}
+    {% if invocation.completed_at %}<dt>Completed</dt><dd>{{ invocation.completed_at }}</dd>{% endif %}
+    {% if invocation.duration_ms is not None %}<dt>Duration</dt><dd>{{ invocation.duration_ms }}ms</dd>{% endif %}
+    {% if invocation.argument_summary %}<dt>Arguments</dt><dd><code class="cui-text-sm">{{ invocation.argument_summary }}</code></dd>{% endif %}
+    {% if invocation.result_summary %}<dt>Result</dt><dd><pre class="cui-pre">{{ invocation.result_summary }}</pre></dd>{% endif %}
+    {% if invocation.error_code %}<dt>Error</dt><dd class="cui-text-muted">{{ invocation.error_code }}</dd>{% endif %}
+    {% if invocation.owning_module %}<dt>Module</dt><dd>{{ invocation.owning_module }}</dd>{% endif %}
+  </dl>
+</div>
+{% endblock %}

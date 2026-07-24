@@ -1,0 +1,22 @@
+@media (max-width: 768px) {
+  .cui-nav-toggle { display: flex; }
+  .cui-sidebar {
+    position: fixed;
+    top: var(--cui-header-height);
+    left: 0;
+    bottom: 0;
+    z-index: 50;
+    transform: translateX(-100%);
+    transition: transform 0.3s ease;
+    width: var(--cui-sidebar-width);
+    max-width: 85vw;
+  }
+  .cui-sidebar.is-open { transform: translateX(0); }
+  .cui-main { width: 100%; }
+  .cui-page-header { flex-direction: column; }
+  .cui-dashboard-grid { grid-template-columns: 1fr; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cui-sidebar { transition: none; }
+  .cui-nav-toggle__bar { transition: none; }
+}

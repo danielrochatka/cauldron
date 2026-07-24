@@ -1,0 +1,6 @@
+<div class="cui-form-field{% if field.errors %} cui-form-field--error{% endif %}">
+  {{ field.label_tag }}
+  {{ field }}
+  {% if field.help_text %}<p class="cui-form-field__help">{{ field.help_text }}</p>{% endif %}
+  {% for error in field.errors %}<p class="cui-form-field__error" role="alert">{{ error }}</p>{% endfor %}
+</div>

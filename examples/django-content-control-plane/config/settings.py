@@ -102,11 +102,12 @@ TEMPLATES = [
 ]
 
 STATIC_URL = "/static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "UTC"
 USE_I18N = True
 USE_TZ = True
 
 LOGIN_URL = "/accounts/login/"
-LOGIN_REDIRECT_URL = "/admin/"
+LOGIN_REDIRECT_URL = "/cauldron/"
 LOGOUT_REDIRECT_URL = "/accounts/login/"

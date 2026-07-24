@@ -1,0 +1,86 @@
+:root {
+  /* Colors */
+  --cui-color-bg: #ffffff;
+  --cui-color-bg-subtle: #f8f9fa;
+  --cui-color-bg-muted: #f1f3f5;
+  --cui-color-surface: #ffffff;
+  --cui-color-surface-raised: #ffffff;
+  --cui-color-border: #dee2e6;
+  --cui-color-border-strong: #adb5bd;
+  --cui-color-text: #212529;
+  --cui-color-text-muted: #6c757d;
+  --cui-color-text-subtle: #868e96;
+  --cui-color-link: #0d6efd;
+  --cui-color-link-hover: #0a58ca;
+  --cui-color-primary: #0d6efd;
+  --cui-color-primary-hover: #0a58ca;
+  --cui-color-primary-text: #ffffff;
+  --cui-color-danger: #dc3545;
+  --cui-color-danger-text: #ffffff;
+  --cui-color-warning: #ffc107;
+  --cui-color-warning-text: #000000;
+  --cui-color-success: #198754;
+  --cui-color-success-text: #ffffff;
+  --cui-color-info: #0dcaf0;
+  --cui-color-info-text: #000000;
+  /* Status colors */
+  --cui-status-active: #198754;
+  --cui-status-inactive: #6c757d;
+  --cui-status-pending: #ffc107;
+  --cui-status-error: #dc3545;
+  --cui-status-proposed: #0d6efd;
+  --cui-status-approved: #198754;
+  --cui-status-rejected: #dc3545;
+  --cui-status-applied: #198754;
+  --cui-status-conflicted: #fd7e14;
+  /* Typography */
+  --cui-font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --cui-font-family-mono: "SFMono-Regular", Menlo, Monaco, Consolas, "Courier New", monospace;
+  --cui-font-size-xs: 0.75rem;
+  --cui-font-size-sm: 0.875rem;
+  --cui-font-size-base: 1rem;
+  --cui-font-size-lg: 1.125rem;
+  --cui-font-size-xl: 1.25rem;
+  --cui-font-size-2xl: 1.5rem;
+  --cui-font-size-3xl: 1.875rem;
+  --cui-line-height-tight: 1.25;
+  --cui-line-height-normal: 1.5;
+  --cui-font-weight-normal: 400;
+  --cui-font-weight-medium: 500;
+  --cui-font-weight-semibold: 600;
+  --cui-font-weight-bold: 700;
+  /* Spacing */
+  --cui-space-1: 0.25rem;
+  --cui-space-2: 0.5rem;
+  --cui-space-3: 0.75rem;
+  --cui-space-4: 1rem;
+  --cui-space-5: 1.25rem;
+  --cui-space-6: 1.5rem;
+  --cui-space-8: 2rem;
+  --cui-space-10: 2.5rem;
+  --cui-space-12: 3rem;
+  --cui-space-16: 4rem;
+  /* Borders */
+  --cui-border-width: 1px;
+  --cui-border-style: solid;
+  --cui-border: var(--cui-border-width) var(--cui-border-style) var(--cui-color-border);
+  --cui-radius-sm: 0.25rem;
+  --cui-radius-md: 0.375rem;
+  --cui-radius-lg: 0.5rem;
+  --cui-radius-xl: 0.75rem;
+  /* Shadows */
+  --cui-shadow-sm: 0 1px 2px 0 rgba(0,0,0,0.05);
+  --cui-shadow-md: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -1px rgba(0,0,0,0.06);
+  --cui-shadow-lg: 0 10px 15px -3px rgba(0,0,0,0.1), 0 4px 6px -2px rgba(0,0,0,0.05);
+  /* Layout */
+  --cui-sidebar-width: 240px;
+  --cui-header-height: 56px;
+  --cui-content-max-width: 1200px;
+  --cui-breakpoint-sm: 640px;
+  --cui-breakpoint-md: 768px;
+  --cui-breakpoint-lg: 1024px;
+  --cui-breakpoint-xl: 1280px;
+  /* Focus */
+  --cui-focus-ring: 0 0 0 3px rgba(13, 110, 253, 0.4);
+  --cui-focus-ring-color: rgba(13, 110, 253, 0.4);
+}

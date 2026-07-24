@@ -9,6 +9,11 @@ def pytest_configure(config):
                 "default": {
                     "ENGINE": "django.db.backends.sqlite3",
                     "NAME": ":memory:",
+                    # Longer busy timeout so concurrent transactions have a
+                    # chance to serialise (SQLite retries under contention)
+                    # instead of failing immediately with "database is
+                    # locked".
+                    "OPTIONS": {"timeout": 20},
                 }
             },
             INSTALLED_APPS=[
@@ -21,6 +26,7 @@ def pytest_configure(config):
                 "cauldron_content",
                 "cauldron_workspace_flatfile",
                 "cauldron_content_operations",
+                "cauldron_django_admin",
                 "cauldron_ai_admin",
             ],
             MIDDLEWARE=[
@@ -40,7 +46,7 @@ def pytest_configure(config):
                 "cauldron.ai.admin": {},
             },
             SECRET_KEY="test-secret-key-for-admin-ai-tests",
-            ROOT_URLCONF="tests.test_urls",
+            ROOT_URLCONF="tests.test_urls_with_shell",
             STATIC_URL="/static/",
             TEMPLATES=[{
                 "BACKEND": "django.template.backends.django.DjangoTemplates",

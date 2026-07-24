@@ -6,12 +6,12 @@ import json
 from typing import Any
 
 from django.contrib import messages
-from django.contrib.admin.views.decorators import staff_member_required
+from django.contrib.auth.decorators import login_required, permission_required
 from django.http import HttpRequest, HttpResponseRedirect
 from django.shortcuts import render
 from django.urls import reverse
 from django.views import View
-from django.contrib.auth.decorators import login_required
+from django.views.generic import RedirectView
 from django.utils.decorators import method_decorator
 
 from .forms import ContentProposalForm
@@ -32,7 +32,10 @@ def _handle_config_error(request):
     )
 
 
-@method_decorator([login_required, staff_member_required], name="dispatch")
+@method_decorator([
+    login_required,
+    permission_required("cauldron_content_operations.view_published_content", raise_exception=True),
+], name="dispatch")
 class ContentBrowserView(View):
     """Browse published and draft content via ContentOperationService."""
 
@@ -40,7 +43,14 @@ class ContentBrowserView(View):
 
     def get(self, request: HttpRequest) -> Any:
         collection = request.GET.get("collection", "")
-        include_drafts = request.GET.get("include_drafts", "").lower() in ("1", "true", "yes")
+        requested_drafts = request.GET.get("include_drafts", "").lower() in ("1", "true", "yes")
+        # view_draft_content gates access to any drafts. Silently ignore
+        # ?include_drafts=1 when the caller lacks the permission — surfacing
+        # a permission error would leak that drafts exist.
+        has_draft_perm = request.user.has_perm(
+            "cauldron_content_operations.view_draft_content"
+        )
+        include_drafts = requested_drafts and has_draft_perm
         from django.core.exceptions import ImproperlyConfigured
         try:
             service = _get_service()
@@ -51,6 +61,7 @@ class ContentBrowserView(View):
                 "selected_collection": "",
                 "items": [],
                 "include_drafts": False,
+                "can_view_drafts": has_draft_perm,
                 "error": "Service unavailable",
             })
 
@@ -75,11 +86,21 @@ class ContentBrowserView(View):
             "selected_collection": collection,
             "items": items,
             "include_drafts": include_drafts,
+            "can_view_drafts": has_draft_perm,
             "error": error,
         })
 
 
-@method_decorator([login_required, staff_member_required], name="dispatch")
+class ContentBrowserRedirectView(RedirectView):
+    """Permanent redirect from legacy content-browser/ to canonical content/ route."""
+    permanent = True
+    pattern_name = "cauldron_admin_content:content-browser"
+
+
+@method_decorator([
+    login_required,
+    permission_required("cauldron_content_operations.propose_content_changes", raise_exception=True),
+], name="dispatch")
 class ContentProposalView(View):
     """Create a content proposal via ContentOperationService."""
 
@@ -111,11 +132,95 @@ class ContentProposalView(View):
             )
             if result.ok:
                 messages.success(request, f"Proposal created: {result.request_id}")
+                # Redirect to the shell-native change-request list, not the
+                # Django admin changelist — the shell owns the operator UI.
                 return HttpResponseRedirect(
-                    reverse("admin:cauldron_content_operations_contentchangerequest_changelist")
+                    reverse("cauldron_admin_content:change-request-list")
                 )
             else:
                 messages.error(request, html.escape(result.error.message))
         except Exception as exc:
             messages.error(request, html.escape(str(exc)[:200]))
         return render(request, self.template_name, {"form": form})
+
+
+@method_decorator([
+    login_required,
+    permission_required("cauldron_content_operations.view_content_change_requests", raise_exception=True),
+], name="dispatch")
+class ChangeRequestListView(View):
+    template_name = "cauldron_admin_content/change_request_list.html"
+
+    def get(self, request):
+        from cauldron_content_operations.models import ContentChangeRequest
+        qs = ContentChangeRequest.objects.all().order_by("-created_at")[:50]
+        return render(request, self.template_name, {
+            "change_requests": qs,
+            "breadcrumbs": [
+                {"label": "Content", "url": reverse("cauldron_admin_content:content-browser")},
+                {"label": "Change Requests", "url": ""},
+            ],
+        })
+
+
+@method_decorator([
+    login_required,
+    permission_required("cauldron_content_operations.view_content_change_requests", raise_exception=True),
+], name="dispatch")
+class ChangeRequestDetailView(View):
+    template_name = "cauldron_admin_content/change_request_detail.html"
+
+    def get(self, request, request_id):
+        from django.shortcuts import get_object_or_404
+        from cauldron_content_operations.models import ContentChangeRequest, ContentAuditEvent
+        cr = get_object_or_404(ContentChangeRequest, request_id=request_id)
+        audit_events = list(ContentAuditEvent.objects.filter(change_request=cr).order_by("sequence"))
+        return render(request, self.template_name, {
+            "cr": cr,
+            "audit_events": audit_events,
+            "breadcrumbs": [
+                {"label": "Content", "url": reverse("cauldron_admin_content:content-browser")},
+                {"label": "Change Requests", "url": reverse("cauldron_admin_content:change-request-list")},
+                {"label": request_id[:8] + "…", "url": ""},
+            ],
+        })
+
+
+@method_decorator([
+    login_required,
+    permission_required("cauldron_content_operations.view_content_audit", raise_exception=True),
+], name="dispatch")
+class AuditListView(View):
+    template_name = "cauldron_admin_content/audit_list.html"
+
+    def get(self, request):
+        from cauldron_content_operations.models import ContentAuditEvent
+        events = ContentAuditEvent.objects.all().order_by("-occurred_at")[:100]
+        return render(request, self.template_name, {
+            "events": events,
+            "breadcrumbs": [
+                {"label": "Content", "url": reverse("cauldron_admin_content:content-browser")},
+                {"label": "Audit", "url": ""},
+            ],
+        })
+
+
+@method_decorator([
+    login_required,
+    permission_required("cauldron_content_operations.view_content_audit", raise_exception=True),
+], name="dispatch")
+class AuditDetailView(View):
+    template_name = "cauldron_admin_content/audit_detail.html"
+
+    def get(self, request, event_id):
+        from django.shortcuts import get_object_or_404
+        from cauldron_content_operations.models import ContentAuditEvent
+        event = get_object_or_404(ContentAuditEvent, event_id=event_id)
+        return render(request, self.template_name, {
+            "event": event,
+            "breadcrumbs": [
+                {"label": "Content", "url": reverse("cauldron_admin_content:content-browser")},
+                {"label": "Audit", "url": reverse("cauldron_admin_content:audit-list")},
+                {"label": event_id[:8] + "…", "url": ""},
+            ],
+        })

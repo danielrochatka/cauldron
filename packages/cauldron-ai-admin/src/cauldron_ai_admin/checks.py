@@ -55,6 +55,46 @@ def _resolve_provider(cfg: dict, names: list[str]) -> tuple[Any | None, str | No
 
 
 @checks.register(checks.Tags.compatibility)
+def check_cauldron_django_admin_installed(app_configs, **kwargs):
+    """cauldron.ai_admin.E200: cauldron_django_admin must be in INSTALLED_APPS."""
+    if not _is_admin_ai_active():
+        return []
+    from django.conf import settings
+    installed = list(getattr(settings, "INSTALLED_APPS", []) or [])
+    if "cauldron_django_admin" not in installed:
+        return [checks.Error(
+            "cauldron.ai.admin requires 'cauldron_django_admin' in INSTALLED_APPS.",
+            hint="Add 'cauldron_django_admin' to INSTALLED_APPS.",
+            id="cauldron.ai_admin.E200",
+        )]
+    return []
+
+
+@checks.register(checks.Tags.compatibility)
+def check_admin_shell_capability_provided(app_configs, **kwargs):
+    """cauldron.ai_admin.E201: admin.shell capability must be provided."""
+    if not _is_admin_ai_active():
+        return []
+    try:
+        from cauldron.modules.registry import registry as module_registry
+    except Exception:
+        return []
+    if not getattr(module_registry, "is_populated", False):
+        return []
+    try:
+        capabilities = module_registry.capabilities()
+        if "admin.shell" not in capabilities:
+            return [checks.Error(
+                "cauldron.ai.admin requires the 'admin.shell' capability to be provided by an active module.",
+                hint="Ensure cauldron_django_admin (or equivalent) is in INSTALLED_APPS and CAULDRON_MODULES.",
+                id="cauldron.ai_admin.E201",
+            )]
+    except Exception:
+        return []
+    return []
+
+
+@checks.register(checks.Tags.compatibility)
 def check_ai_provider_registered(app_configs, **kwargs):
     """admin_ai.E001/E002/E003: an AI provider must resolve deterministically."""
     if not _is_admin_ai_active():

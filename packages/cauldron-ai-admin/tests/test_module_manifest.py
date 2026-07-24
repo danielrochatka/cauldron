@@ -15,6 +15,7 @@ EXPECTED_REQUIRED_CAPABILITIES = {
     "ai.model.providers",
     "content.operations",
     "admin.interface",
+    "admin.shell",
     "django.state",
     "identity.authentication",
     "identity.permissions",

@@ -1,0 +1,41 @@
+{% extends "cauldron_admin/base.html" %}
+{% block page_title %}Change Request{% endblock %}
+
+{% block content %}
+<div class="cui-card">
+  <dl class="cui-dl">
+    <dt>Request ID</dt><dd><code>{{ cr.request_id }}</code></dd>
+    <dt>Status</dt><dd>{% include "cauldron_admin/includes/status_badge.html" with status=cr.lifecycle_state %}</dd>
+    <dt>Provider</dt><dd>{{ cr.provider_name }}</dd>
+    <dt>Workspace Changeset</dt><dd><code>{{ cr.workspace_changeset_id }}</code></dd>
+    <dt>Created</dt><dd>{{ cr.created_at }}</dd>
+    <dt>Updated</dt><dd>{{ cr.updated_at }}</dd>
+    {% if cr.last_error_summary %}
+    <dt>Last Error</dt><dd class="cui-text-muted">{{ cr.last_error_code }}: {{ cr.last_error_summary }}</dd>
+    {% endif %}
+  </dl>
+</div>
+
+{% if audit_events %}
+<h2>Audit History</h2>
+<div class="cui-table-container">
+  <table class="cui-table">
+    <thead>
+      <tr><th>Seq</th><th>Event</th><th>From</th><th>To</th><th>Actor</th><th>Occurred</th></tr>
+    </thead>
+    <tbody>
+      {% for ev in audit_events %}
+      <tr>
+        <td>{{ ev.sequence }}</td>
+        <td>{% include "cauldron_admin/includes/status_badge.html" with status=ev.event_type %}</td>
+        <td><span class="cui-badge">{{ ev.previous_state|default:"—" }}</span></td>
+        <td><span class="cui-badge">{{ ev.resulting_state|default:"—" }}</span></td>
+        <td>{{ ev.actor|default:"—" }}</td>
+        <td class="cui-text-sm cui-text-muted">{{ ev.occurred_at }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endblock %}

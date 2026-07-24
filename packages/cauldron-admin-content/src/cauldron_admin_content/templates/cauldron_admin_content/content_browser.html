@@ -1,38 +1,59 @@
-{% extends "admin/base_site.html" %}
-{% block title %}Content Browser{% endblock %}
+{% extends "cauldron_admin/base.html" %}
+{% block page_title %}Content Browser{% endblock %}
+
 {% block content %}
-<h1>Content Browser</h1>
-{% if error %}<p class="errornote">{{ error }}</p>{% endif %}
-<form method="get">
-    <label for="collection">Collection:</label>
-    <select name="collection" id="collection">
-        <option value="">-- Select Collection --</option>
+{% include "cauldron_admin/includes/messages.html" %}
+
+<div class="cui-card">
+  <form method="get" class="cui-form cui-form--inline">
+    <div class="cui-form-field">
+      <label for="collection">Collection</label>
+      <select name="collection" id="collection">
+        <option value="">— Select Collection —</option>
         {% for coll in collections %}
         <option value="{{ coll|escape }}" {% if coll == selected_collection %}selected{% endif %}>{{ coll|escape }}</option>
         {% endfor %}
-    </select>
-    <label><input type="checkbox" name="include_drafts" value="1" {% if include_drafts %}checked{% endif %}> Include Drafts</label>
-    <button type="submit">Browse</button>
-</form>
+      </select>
+    </div>
+    {% if can_view_drafts %}
+    <div class="cui-form-field">
+      <label>
+        <input type="checkbox" name="include_drafts" value="1" {% if include_drafts %}checked{% endif %}>
+        Include Drafts
+      </label>
+    </div>
+    {% endif %}
+    <button type="submit" class="cui-button">Browse</button>
+  </form>
+</div>
+
+{% if error %}
+<div class="cui-alert cui-alert--error" role="alert">{{ error }}</div>
+{% endif %}
+
 {% if selected_collection %}
 <h2>Items in {{ selected_collection|escape }}</h2>
 {% if items %}
-<table>
-    <thead><tr><th>ID</th><th>Slug</th><th>Status</th><th>Provider</th><th>Hash</th></tr></thead>
+<div class="cui-table-container">
+  <table class="cui-table">
+    <thead>
+      <tr><th>ID</th><th>Slug</th><th>Status</th><th>Provider</th><th>Hash</th></tr>
+    </thead>
     <tbody>
-    {% for item in items %}
-    <tr>
+      {% for item in items %}
+      <tr>
         <td>{{ item.id|escape }}</td>
         <td>{{ item.slug|escape }}</td>
-        <td>{{ item.status|escape }}</td>
+        <td>{% include "cauldron_admin/includes/status_badge.html" with status=item.status %}</td>
         <td>{{ item.provider|escape }}</td>
-        <td>{{ item.hash|escape }}</td>
-    </tr>
-    {% endfor %}
+        <td><code>{{ item.hash|escape|slice:":12" }}…</code></td>
+      </tr>
+      {% endfor %}
     </tbody>
-</table>
+  </table>
+</div>
 {% else %}
-<p>No items found.</p>
+{% include "cauldron_admin/includes/empty_state.html" %}
 {% endif %}
 {% endif %}
 {% endblock %}

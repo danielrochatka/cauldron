@@ -1,0 +1,9 @@
+{% if messages %}
+<div class="cui-messages" aria-live="polite">
+  {% for message in messages %}
+  <div class="cui-alert cui-alert--{{ message.tags|default:'info' }}" role="alert">
+    {{ message }}
+  </div>
+  {% endfor %}
+</div>
+{% endif %}

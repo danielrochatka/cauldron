@@ -211,3 +211,162 @@ class AdminAIToolInvocation(models.Model):
 
     def __str__(self) -> str:
         return f"AdminAIToolInvocation({self.tool_name}, {self.status})"
+
+
+UI_STYLE_STATUS_CHOICES = [
+    ("proposed", "proposed"),
+    ("approved", "approved"),
+    ("applying", "applying"),
+    ("applied", "applied"),
+    ("rejected", "rejected"),
+    ("conflicted", "conflicted"),
+]
+
+_UI_STYLE_STATUS_VALUES = [v for v, _ in UI_STYLE_STATUS_CHOICES]
+
+_SHA256_RE = r"^[0-9a-f]{64}$"
+
+
+class UIStyleChangeRequest(models.Model):
+    """Durable record of an AI-proposed CSS style change."""
+
+    class Meta:
+        app_label = "cauldron_ai_admin"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["status"], name="uiscr_status_idx"),
+            models.Index(fields=["scope"], name="uiscr_scope_idx"),
+            models.Index(fields=["created_at"], name="uiscr_created_idx"),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(status__in=_UI_STYLE_STATUS_VALUES),
+                name="uiscr_status_valid",
+            ),
+            models.CheckConstraint(
+                condition=Q(scope__in=["admin", "pages"]),
+                name="uiscr_scope_valid",
+            ),
+            # proposed_hash is always the SHA-256 of the proposed content, so
+            # it must always be a lowercase 64-char hex digest.
+            models.CheckConstraint(
+                condition=Q(proposed_hash__regex=_SHA256_RE),
+                name="uiscr_proposed_hash_format",
+            ),
+            # base_exists=False implies base_hash MUST be empty.
+            models.CheckConstraint(
+                condition=Q(base_exists=True) | Q(base_hash=""),
+                name="uiscr_base_exists_false_hash_empty",
+            ),
+            # base_exists=True implies base_hash MUST be a 64-char hex digest.
+            models.CheckConstraint(
+                condition=Q(base_exists=False) | Q(base_hash__regex=_SHA256_RE),
+                name="uiscr_base_exists_true_hash_valid",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~Q(status__in=["approved", "rejected", "conflicted"])
+                    | Q(reviewed_at__isnull=False)
+                ),
+                name="uiscr_reviewed_at_when_terminal",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~Q(status="applied")
+                    | Q(applied_at__isnull=False)
+                ),
+                name="uiscr_applied_at_when_applied",
+            ),
+        ]
+        permissions = [
+            ("view_ui_styles", "Can view UI style overrides"),
+            ("propose_ui_style_changes", "Can propose UI style changes"),
+            ("approve_ui_style_changes", "Can approve UI style changes"),
+            ("view_ui_style_audit", "Can view UI style change audit"),
+        ]
+
+    request_id = models.UUIDField(default=uuid.uuid4, unique=True, db_index=True)
+    status = models.CharField(max_length=32, choices=UI_STYLE_STATUS_CHOICES, default="proposed", db_index=True)
+    scope = models.CharField(max_length=32)  # "admin" or "pages"
+    target_path = models.CharField(max_length=512)  # relative path within scope
+    proposed_content = models.TextField()
+    # True when the target file existed at proposal-creation time; drives the
+    # optimistic-lock semantics used at apply time. Stored explicitly so we
+    # do not need to reload the filesystem to interpret ``base_hash``.
+    base_exists = models.BooleanField(default=False)
+    base_hash = models.CharField(max_length=64, blank=True, default="")
+    proposed_hash = models.CharField(max_length=64, blank=True, default="")
+    description = models.TextField(blank=True, default="")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name="ui_style_requests_created",
+    )
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name="ui_style_requests_reviewed",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    applied_at = models.DateTimeField(null=True, blank=True)
+    error_code = models.CharField(max_length=64, blank=True, default="")
+    error_summary = models.TextField(blank=True, default="")
+    apply_lease = models.CharField(max_length=36, blank=True, default="")
+
+    def __str__(self) -> str:
+        return f"UIStyleChangeRequest({self.request_id}, {self.status}, {self.target_path})"
+
+
+UI_STYLE_EVENT_TYPES = [
+    ("proposed", "proposed"),
+    ("approved", "approved"),
+    ("rejected", "rejected"),
+    ("applying", "applying"),
+    ("applied", "applied"),
+    ("conflict", "conflict"),
+    ("failed", "failed"),
+]
+
+_UI_STYLE_EVENT_TYPES = [v for v, _ in UI_STYLE_EVENT_TYPES]
+
+
+class UIStyleAuditEvent(models.Model):
+    """Append-only audit log for UI style change request actions."""
+
+    class Meta:
+        app_label = "cauldron_ai_admin"
+        ordering = ["change_request", "sequence"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["change_request", "sequence"],
+                name="uisae_unique_request_sequence",
+            ),
+            models.CheckConstraint(
+                condition=Q(event_type__in=_UI_STYLE_EVENT_TYPES),
+                name="uisae_event_type_valid",
+            ),
+        ]
+
+    event_id = models.UUIDField(default=uuid.uuid4, unique=True, db_index=True)
+    change_request = models.ForeignKey(
+        UIStyleChangeRequest,
+        on_delete=models.PROTECT,
+        related_name="audit_events",
+        db_index=True,
+    )
+    sequence = models.PositiveIntegerField()
+    event_type = models.CharField(max_length=64)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name="ui_style_audit_events",
+    )
+    occurred_at = models.DateTimeField(auto_now_add=True)
+    detail = models.JSONField(default=dict, blank=True)
+
+    def __str__(self) -> str:
+        return f"UIStyleAuditEvent({self.event_id}, {self.event_type})"

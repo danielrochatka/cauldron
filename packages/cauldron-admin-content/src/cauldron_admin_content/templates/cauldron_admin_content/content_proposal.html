@@ -1,15 +1,23 @@
-{% extends "admin/base_site.html" %}
-{% block title %}Create Content Proposal{% endblock %}
+{% extends "cauldron_admin/base.html" %}
+{% block page_title %}Create Content Proposal{% endblock %}
+
 {% block content %}
-<h1>Create Content Proposal</h1>
-{% if messages %}
-{% for message in messages %}
-<p class="{{ message.tags }}">{{ message|escape }}</p>
-{% endfor %}
-{% endif %}
-<form method="post">
+<div class="cui-card">
+  <form method="post" class="cui-form">
     {% csrf_token %}
-    {{ form.as_p }}
-    <button type="submit">Submit Proposal</button>
-</form>
+    {% for field in form %}
+      <div class="cui-form-field{% if field.errors %} cui-form-field--error{% endif %}">
+        {{ field.label_tag }}
+        {{ field }}
+        {% if field.help_text %}<p class="cui-form-field__help">{{ field.help_text }}</p>{% endif %}
+        {% for error in field.errors %}
+          <p class="cui-form-field__error" role="alert">{{ error }}</p>
+        {% endfor %}
+      </div>
+    {% endfor %}
+    <div class="cui-form-actions">
+      <button type="submit" class="cui-button">Submit Proposal</button>
+    </div>
+  </form>
+</div>
 {% endblock %}

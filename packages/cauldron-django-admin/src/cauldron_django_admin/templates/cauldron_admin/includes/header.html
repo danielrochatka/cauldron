@@ -1,0 +1,31 @@
+{% load static %}
+{% url 'cauldron:dashboard' as cauldron_dashboard_url %}
+{% url 'admin:index' as django_admin_url %}
+{% url 'cauldron_auth:logout' as cauldron_logout_url %}
+<header class="cui-header" role="banner">
+  <button class="cui-nav-toggle" aria-expanded="false" aria-controls="cui-sidebar" aria-label="Toggle navigation">
+    <span class="cui-nav-toggle__bar"></span>
+    <span class="cui-nav-toggle__bar"></span>
+    <span class="cui-nav-toggle__bar"></span>
+  </button>
+  <div class="cui-header__brand">
+    <a href="{{ cauldron_dashboard_url|default:'/' }}" class="cui-brand-link">
+      <span class="cui-brand-logo" aria-hidden="true">&#8857;</span>
+      <span class="cui-brand-name">Cauldron</span>
+    </a>
+  </div>
+  <nav class="cui-header__user-nav" aria-label="User menu">
+    {% if request.user.is_authenticated %}
+    <div class="cui-user-menu">
+      <button class="cui-user-menu__trigger" aria-expanded="false" aria-haspopup="menu">
+        <span class="cui-user-menu__name">{{ request.user.get_full_name|default:request.user.username }}</span>
+        <span class="cui-user-menu__caret" aria-hidden="true">&#9662;</span>
+      </button>
+      <ul class="cui-user-menu__dropdown" role="menu">
+        {% if django_admin_url %}<li role="none"><a href="{{ django_admin_url }}" class="cui-user-menu__item" role="menuitem">Technical Admin</a></li>{% endif %}
+        <li role="none"><a href="{{ cauldron_logout_url|default:'/auth/logout/' }}" class="cui-user-menu__item" role="menuitem">Sign out</a></li>
+      </ul>
+    </div>
+    {% endif %}
+  </nav>
+</header>

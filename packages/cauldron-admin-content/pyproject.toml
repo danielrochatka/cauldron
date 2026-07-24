@@ -19,6 +19,11 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+cauldron_admin_content = [
+    "templates/**/*",
+]
+
 [tool.pytest.ini_options]
 pythonpath = ["src", "../../src", "../.."]
 addopts = "-ra"

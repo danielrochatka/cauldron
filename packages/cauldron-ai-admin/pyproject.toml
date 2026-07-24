@@ -9,6 +9,7 @@ requires-python = ">=3.11"
 dependencies = [
     "cauldron>=0.1.0",
     "cauldron-ai>=0.1.0",
+    "cauldron-django-admin>=0.1.0",
     "cauldron-content-operations>=0.1.0",
     "cauldron-admin-content>=0.1.0",
     "django>=4.2",
@@ -22,7 +23,11 @@ dependencies = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-cauldron_ai_admin = ["templates/cauldron_ai_admin/*.html"]
+cauldron_ai_admin = [
+    "templates/**/*",
+    "static/**/*",
+    "migrations/*.py",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "../../src", "../.."]

@@ -1,0 +1,25 @@
+:where(.cui-table-container) {
+  overflow-x: auto;
+  border-radius: var(--cui-radius-lg);
+  border: var(--cui-border);
+  background: var(--cui-color-surface);
+}
+:where(.cui-table) {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--cui-font-size-sm);
+}
+:where(.cui-table th) {
+  text-align: left;
+  padding: var(--cui-space-3) var(--cui-space-4);
+  font-weight: var(--cui-font-weight-semibold);
+  background: var(--cui-color-bg-subtle);
+  border-bottom: var(--cui-border);
+}
+:where(.cui-table td) {
+  padding: var(--cui-space-3) var(--cui-space-4);
+  border-bottom: var(--cui-border);
+  vertical-align: top;
+}
+:where(.cui-table tr:last-child td) { border-bottom: none; }
+:where(.cui-table tr:hover td) { background: var(--cui-color-bg-subtle); }

@@ -1,0 +1,27 @@
+{% extends "cauldron_admin/base.html" %}
+{% block page_title %}Content Audit{% endblock %}
+
+{% block content %}
+{% if events %}
+<div class="cui-table-container">
+  <table class="cui-table">
+    <thead>
+      <tr><th>Event ID</th><th>Type</th><th>Change Request</th><th>Actor</th><th>Occurred</th></tr>
+    </thead>
+    <tbody>
+      {% for ev in events %}
+      <tr>
+        <td><a href="{% url 'cauldron_admin_content:audit-detail' ev.event_id %}"><code>{{ ev.event_id|slice:":8" }}…</code></a></td>
+        <td>{% include "cauldron_admin/includes/status_badge.html" with status=ev.event_type %}</td>
+        <td><a href="{% url 'cauldron_admin_content:change-request-detail' ev.change_request.request_id %}"><code>{{ ev.change_request.request_id|slice:":8" }}…</code></a></td>
+        <td>{{ ev.actor|default:"—" }}</td>
+        <td class="cui-text-sm cui-text-muted">{{ ev.occurred_at }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+{% include "cauldron_admin/includes/empty_state.html" %}
+{% endif %}
+{% endblock %}

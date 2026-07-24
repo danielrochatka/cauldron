@@ -21,6 +21,7 @@ def pytest_configure(config):
                 "cauldron_content",
                 "cauldron_workspace_flatfile",
                 "cauldron_content_operations",
+                "cauldron_django_admin",
                 "cauldron_admin_content",
             ],
             MIDDLEWARE=[

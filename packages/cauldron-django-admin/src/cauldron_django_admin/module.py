@@ -3,7 +3,7 @@ from cauldron.modules import BaseModule, ModuleManifest, ModuleRequirement
 
 _manifest = ModuleManifest(
     slug="cauldron.django.admin",
-    label="Cauldron Django Admin",
+    label="Cauldron Technical Admin",
     version="0.1.0",
     cauldron_version=">=0.1.0",
     django_apps=(
@@ -24,6 +24,9 @@ _manifest = ModuleManifest(
         "admin.users",
         "admin.roles",
         "admin.permissions",
+        "admin.shell",
+        "admin.navigation",
+        "admin.ui.overrides",
     ),
 )
 

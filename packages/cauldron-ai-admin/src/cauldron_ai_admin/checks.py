@@ -300,6 +300,60 @@ def check_required_capabilities_present(app_configs, **kwargs):
 
 
 @checks.register(checks.Tags.compatibility)
+def check_ai_config_file_permissions(app_configs, **kwargs):
+    """admin_ai.W002: config file exists but is not mode 0600."""
+    if not _is_admin_ai_active():
+        return []
+    try:
+        from .provider_config import get_store
+        store = get_store()
+        if store.file_exists() and not store.file_permissions_ok():
+            return [checks.Warning(
+                f"AI config file {store.path} exists but is not mode 0600. "
+                "Credentials may be readable by other users.",
+                hint=f"Run: chmod 0600 {store.path}",
+                id="admin_ai.W002",
+            )]
+    except Exception:
+        pass
+    return []
+
+
+@checks.register(checks.Tags.compatibility)
+def check_selected_provider_has_factory_or_instance(app_configs, **kwargs):
+    """admin_ai.E010: the provider selected in the config file must be registered.
+
+    Only validates an explicit selection persisted in the config store;
+    CAULDRON_MODULES selections are covered by E001/E002/E003.
+    """
+    if not _is_admin_ai_active():
+        return []
+    try:
+        from .provider_config import get_store
+        from cauldron_ai.providers import factory_names, provider_names
+
+        store = get_store()
+        name = store.get_selected_provider()
+        if not name:
+            return []  # No config-file selection; existing checks handle CAULDRON_MODULES.
+        all_known = set(provider_names()) | set(factory_names())
+        if name not in all_known:
+            return [checks.Error(
+                f"AI provider {name!r} is selected in the config store but is "
+                "not registered as a provider instance or factory. "
+                f"Available: {sorted(all_known)!r}.",
+                hint=(
+                    "Install the provider package, add it to INSTALLED_APPS, "
+                    "or update the AI settings page."
+                ),
+                id="admin_ai.E010",
+            )]
+    except Exception:
+        pass
+    return []
+
+
+@checks.register(checks.Tags.compatibility)
 def check_registered_tool_contracts(app_configs, **kwargs):
     """admin_ai.E009: a registered tool has a contract violation.
 

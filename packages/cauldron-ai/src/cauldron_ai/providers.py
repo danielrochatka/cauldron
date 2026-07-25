@@ -5,14 +5,24 @@ Providers register themselves at import/AppConfig.ready() time and are
 looked up by consumers (e.g. `cauldron.ai.admin`) at request time.
 The registry is intentionally minimal: no configuration, no discovery,
 no fallbacks. Sites that need multiple providers pick one by name.
+
+Provider factories may also be registered alongside pre-built provider
+instances. A factory is a callable object that builds a provider from
+a configuration dict and a secrets dict, enabling dynamic provider
+construction (e.g. from stored API credentials).
 """
 from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from .contracts import AIModelRequest, AIModelResponse
+from .provider_configuration import (
+    AIModelProviderFactory,
+    AIProviderConfigurationSpec,
+    AIProviderConnectionResult,
+)
 
 
 class ProviderRegistryError(RuntimeError):
@@ -52,18 +62,23 @@ class AIModelProviderDescriptor:
 
 
 class AIModelProviderRegistry:
-    """Thread-safe registry of AI providers.
+    """Thread-safe registry of AI providers and provider factories.
 
     The registry is deliberately dumb: it does not resolve capabilities,
     parse configuration, or select a default automatically. Callers ask
     for a provider by name. ``default()`` is only meaningful when exactly
     one provider is registered.
+
+    Provider factories may be registered alongside pre-built provider
+    instances.  A factory is looked up by ``get_factory(name)`` and then
+    called with ``build(config, secrets)`` to obtain a live provider.
     """
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._providers: dict[str, AIModelProvider] = {}
         self._descriptors: dict[str, AIModelProviderDescriptor] = {}
+        self._factories: dict[str, AIModelProviderFactory] = {}
 
     def register(
         self,
@@ -146,11 +161,87 @@ class AIModelProviderRegistry:
             )
         return items[0]
 
+    def register_factory(self, factory: AIModelProviderFactory) -> None:
+        """Register a provider factory.
+
+        The factory's ``name`` must be unique across both provider instances
+        and factories.  Registering a factory under a name already held by
+        a pre-built provider instance raises ``ProviderRegistryError``.
+        """
+        name = getattr(factory, "name", None)
+        if not isinstance(name, str) or not name:
+            raise ValueError("Factory must expose a non-empty string 'name' attribute")
+        if not callable(getattr(factory, "build", None)):
+            raise TypeError("Factory must implement build(config, secrets)")
+        if not callable(getattr(factory, "test_connection", None)):
+            raise TypeError("Factory must implement test_connection(config, secrets)")
+        with self._lock:
+            if name in self._providers:
+                raise ProviderRegistryError(
+                    f"AI provider instance {name!r} is already registered; "
+                    "cannot also register a factory under the same name"
+                )
+            existing_factory = self._factories.get(name)
+            if existing_factory is not None and existing_factory is not factory:
+                raise ProviderRegistryError(
+                    f"AI provider factory {name!r} is already registered"
+                )
+            self._factories[name] = factory
+
+    def unregister_factory(self, name: str) -> None:
+        """Remove a factory. Silent no-op if it isn't registered."""
+        with self._lock:
+            self._factories.pop(name, None)
+
+    def get_factory(self, name: str) -> AIModelProviderFactory:
+        with self._lock:
+            factory = self._factories.get(name)
+        if factory is None:
+            raise ProviderRegistryError(
+                f"No AI provider factory registered with name {name!r}"
+            )
+        return factory
+
+    def factory_names(self) -> list[str]:
+        with self._lock:
+            return sorted(self._factories)
+
+    def configuration_spec(self, name: str) -> AIProviderConfigurationSpec:
+        """Return the configuration spec for a factory registered under ``name``."""
+        factory = self.get_factory(name)
+        return factory.configuration_spec
+
+    def build_provider(
+        self,
+        name: str,
+        config: dict[str, Any],
+        secrets: dict[str, str],
+    ) -> AIModelProvider:
+        """Build a provider from its factory using the supplied config/secrets."""
+        factory = self.get_factory(name)
+        return factory.build(config, secrets)
+
+    def run_provider_connection_test(
+        self,
+        name: str,
+        config: dict[str, Any],
+        secrets: dict[str, str],
+    ) -> AIProviderConnectionResult:
+        """Delegate a connection test to the named factory."""
+        factory = self.get_factory(name)
+        return factory.test_connection(config, secrets)
+
+    def provider_descriptors(self) -> list[AIModelProviderDescriptor]:
+        """Return descriptors for all registered provider instances."""
+        with self._lock:
+            return list(self._descriptors.values())
+
     def clear(self) -> None:
-        """Test helper: remove every registered provider."""
+        """Test helper: remove every registered provider and factory."""
         with self._lock:
             self._providers.clear()
             self._descriptors.clear()
+            self._factories.clear()
 
 
 # Module-level singleton used by consumers and tests.
@@ -183,6 +274,46 @@ def get_default_provider() -> AIModelProvider:
 
 def provider_names() -> list[str]:
     return _registry.names()
+
+
+def register_provider_factory(factory: AIModelProviderFactory) -> None:
+    _registry.register_factory(factory)
+
+
+def unregister_provider_factory(name: str) -> None:
+    _registry.unregister_factory(name)
+
+
+def get_provider_factory(name: str) -> AIModelProviderFactory:
+    return _registry.get_factory(name)
+
+
+def factory_names() -> list[str]:
+    return _registry.factory_names()
+
+
+def get_configuration_spec(name: str) -> AIProviderConfigurationSpec:
+    return _registry.configuration_spec(name)
+
+
+def build_provider(
+    name: str,
+    config: dict[str, Any],
+    secrets: dict[str, str],
+) -> AIModelProvider:
+    return _registry.build_provider(name, config, secrets)
+
+
+def run_provider_connection_test(
+    name: str,
+    config: dict[str, Any],
+    secrets: dict[str, str],
+) -> AIProviderConnectionResult:
+    return _registry.run_provider_connection_test(name, config, secrets)
+
+
+def provider_descriptors() -> list[AIModelProviderDescriptor]:
+    return _registry.provider_descriptors()
 
 
 def _reset_registry_for_tests() -> None:

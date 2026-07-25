@@ -4,7 +4,12 @@ from __future__ import annotations
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 
-from cauldron_ai.providers import provider_names
+from cauldron_ai.providers import (
+    build_provider,
+    factory_names,
+    get_provider,
+    provider_names,
+)
 
 from .checks import _resolve_provider
 from .service import AdminAIService
@@ -17,20 +22,61 @@ def _admin_ai_config() -> dict:
     return cfg if isinstance(cfg, dict) else {}
 
 
+def _resolve_provider_with_factory(provider_name: str):
+    """Try to resolve a provider: first as a registered instance, then as a factory.
+
+    Returns the resolved ``AIModelProvider`` or raises ``ImproperlyConfigured``.
+    """
+    # 1. Pre-built registered instance.
+    if provider_name in provider_names():
+        return get_provider(provider_name)
+
+    # 2. Factory — build from stored config and secrets.
+    if provider_name in factory_names():
+        from .provider_config import get_store, resolve_provider_config
+        store = get_store()
+        config = resolve_provider_config(provider_name, store)
+        secrets = store.get_secrets(provider_name)
+        try:
+            return build_provider(provider_name, config, secrets)
+        except Exception as exc:
+            raise ImproperlyConfigured(
+                f"Failed to build AI provider {provider_name!r} from factory: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+    raise ImproperlyConfigured(
+        f"AI provider {provider_name!r} is not registered as an instance or factory. "
+        f"Registered instances: {provider_names()!r}. "
+        f"Registered factories: {factory_names()!r}."
+    )
+
+
 def get_admin_ai_service() -> AdminAIService:
     """Return the Admin AI service configured for the running site.
 
     Provider selection order:
-    1. The ``provider`` name in ``CAULDRON_MODULES['cauldron.ai.admin']``.
-    2. Otherwise the single registered provider (via
-       :func:`cauldron_ai.get_default_provider`), if unambiguous.
+    1. The provider name from the config store (``AIProviderSettingsStore``).
+    2. The ``provider`` name in ``CAULDRON_MODULES['cauldron.ai.admin']``.
+    3. Otherwise the single registered provider/factory (if unambiguous).
     """
+    from .provider_config import get_store, resolve_provider_name
+
+    store = get_store()
     cfg = _admin_ai_config()
-    provider, err = _resolve_provider(cfg, provider_names())
-    if err is not None or provider is None:
-        raise ImproperlyConfigured(
-            f"Admin AI cannot resolve a provider: {err or 'unknown'}"
-        )
+
+    # Resolve provider name using config store → CAULDRON_MODULES precedence.
+    provider_name = resolve_provider_name(store)
+
+    if provider_name:
+        provider = _resolve_provider_with_factory(provider_name)
+    else:
+        # Fall back to the single-provider check (existing E001/E003 path).
+        provider, err = _resolve_provider(cfg, provider_names())
+        if err is not None or provider is None:
+            raise ImproperlyConfigured(
+                f"Admin AI cannot resolve a provider: {err or 'unknown'}"
+            )
 
     # Optionally attach the content-operations service so PROPOSE tools
     # can call it. We fetch it lazily to avoid tying admin-ai to a
@@ -42,8 +88,6 @@ def get_admin_ai_service() -> AdminAIService:
             from cauldron_admin_content.service_factory import get_service as _get_cs
             content_service = _get_cs()
         except ImproperlyConfigured:
-            # Explicit misconfiguration on the content side is a hard
-            # error — do not silently fall back.
             raise
         except Exception as exc:
             raise ImproperlyConfigured(

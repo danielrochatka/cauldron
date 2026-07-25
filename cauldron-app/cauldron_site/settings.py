@@ -168,6 +168,13 @@ STORAGES = {
 CAULDRON_UI_OVERRIDES_DIR = str(BASE_DIR / "overrides")
 
 # ---------------------------------------------------------------------------
+# Cauldron AI config file path
+#
+# Override with CAULDRON_AI_CONFIG_PATH env var to use a non-default path.
+# The default is BASE_DIR/data/ai/config.json (mode 0600, created on save).
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Internationalisation
 # ---------------------------------------------------------------------------
 

@@ -112,6 +112,7 @@ class AdminAIRun(models.Model):
         db_index=True,
     )
     provider_name = models.CharField(max_length=128)
+    model_name = models.CharField(max_length=128, blank=True, default="")
     provider_request_id = models.CharField(max_length=256, blank=True, default="")
     user_request = models.TextField()
     final_response = models.TextField(blank=True, default="")

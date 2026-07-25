@@ -25,17 +25,110 @@
         </span>
       </dd>
     </dl>
+
+    {% if available_providers %}
+    <form method="post" class="cui-form" style="margin-top:1rem">
+      {% csrf_token %}
+      <input type="hidden" name="action" value="select_provider">
+      <div class="cui-form-field">
+        <label for="{{ select_form.provider.id_for_label }}">{{ select_form.provider.label }}</label>
+        {{ select_form.provider }}
+      </div>
+      <button type="submit" class="cui-button cui-button--sm">Switch Provider</button>
+    </form>
+    {% endif %}
   </section>
 
+  {% if success_message %}
+  <div class="cui-alert cui-alert--success" role="status">{{ success_message }}</div>
+  {% endif %}
+  {% if error_message %}
+  <div class="cui-alert cui-alert--error" role="alert">{{ error_message }}</div>
+  {% endif %}
+
+  {% if test_result %}
   <section class="cui-settings-section">
-    <h2 class="cui-settings-section__title">Phase 1 — Settings Shell</h2>
+    <h2 class="cui-settings-section__title">Connection Test Result</h2>
+    {% if test_result.success %}
+    <div class="cui-alert cui-alert--success" role="status">
+      <strong>Connected.</strong> {{ test_result.message }}
+      {% if test_result.latency_ms %}
+      &nbsp;<span class="cui-text-muted">({{ test_result.latency_ms|floatformat:0 }} ms)</span>
+      {% endif %}
+    </div>
+    {% else %}
+    <div class="cui-alert cui-alert--error" role="alert">
+      <strong>Failed ({{ test_result.status }}).</strong> {{ test_result.message }}
+    </div>
+    {% endif %}
+  </section>
+  {% endif %}
+
+  {% if spec %}
+  <section class="cui-settings-section">
+    <h2 class="cui-settings-section__title">{{ spec.display_name }} Configuration</h2>
+    {% if spec.description %}
+    <p class="cui-text-muted">{{ spec.description }}</p>
+    {% endif %}
+
+    <form method="post" class="cui-form" style="margin-top:1rem">
+      {% csrf_token %}
+      <input type="hidden" name="action" value="save">
+
+      {% for field in form.standard_fields %}
+      <div class="cui-form-field">
+        <label for="{{ field.id_for_label }}">{{ field.label }}</label>
+        {{ field }}
+        {% if field.help_text %}
+        <small class="cui-form-help">{{ field.help_text }}</small>
+        {% endif %}
+        {% if field.errors %}
+        <ul class="cui-form-errors">
+          {% for error in field.errors %}<li>{{ error }}</li>{% endfor %}
+        </ul>
+        {% endif %}
+      </div>
+      {% endfor %}
+
+      {% if form.advanced_fields %}
+      <details class="cui-advanced" style="margin-top:1rem">
+        <summary>Advanced options</summary>
+        <div style="margin-top:0.75rem">
+          {% for field in form.advanced_fields %}
+          <div class="cui-form-field">
+            <label for="{{ field.id_for_label }}">{{ field.label }}</label>
+            {{ field }}
+            {% if field.help_text %}
+            <small class="cui-form-help">{{ field.help_text }}</small>
+            {% endif %}
+            {% if field.errors %}
+            <ul class="cui-form-errors">
+              {% for error in field.errors %}<li>{{ error }}</li>{% endfor %}
+            </ul>
+            {% endif %}
+          </div>
+          {% endfor %}
+        </div>
+      </details>
+      {% endif %}
+
+      <div class="cui-form-actions" style="margin-top:1.25rem">
+        <button type="submit" name="action" value="save" class="cui-button">Save Settings</button>
+        {% if supports_connection_test %}
+        <button type="submit" name="action" value="test" class="cui-button cui-button--secondary">Test Connection</button>
+        {% endif %}
+      </div>
+    </form>
+  </section>
+  {% elif not available_providers %}
+  <section class="cui-settings-section">
     <div class="cui-alert cui-alert--info">
-      Provider selection, API credentials, and connection testing will be
-      added in the next Admin AI implementation phase. This page establishes
-      the stable URL (<code>/cauldron/admin/ai/settings/</code>), permission,
-      and layout that the next PR will extend.
+      No AI provider packages are installed. Install a Cauldron AI provider
+      package (such as <code>cauldron-ai-openai</code>) and add it to
+      <code>INSTALLED_APPS</code>.
     </div>
   </section>
+  {% endif %}
 
 </div>
 {% endblock %}

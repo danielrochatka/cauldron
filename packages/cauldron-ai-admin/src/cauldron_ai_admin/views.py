@@ -65,31 +65,212 @@ def _get_provider_display() -> tuple[str, str]:
         return "Unknown", "Provider status unavailable"
 
 
+def _get_available_providers() -> list[str]:
+    """Return all provider names that can be selected (instances + factories)."""
+    from cauldron_ai.providers import factory_names, provider_names
+    return sorted(set(provider_names()) | set(factory_names()))
+
+
+def _get_provider_spec(provider_name: str):
+    """Return ``AIProviderConfigurationSpec`` for ``provider_name``, or None."""
+    from cauldron_ai.providers import factory_names, get_configuration_spec
+    if provider_name in factory_names():
+        try:
+            return get_configuration_spec(provider_name)
+        except Exception:
+            pass
+    return None
+
+
+_SETTINGS_TEST_CACHE_KEY = "cauldron_ai_admin.settings.connection_test"
+_SETTINGS_TEST_THROTTLE_SECONDS = 30
+
+
 @method_decorator([
     login_required,
     permission_required(MANAGE_AI_SETTINGS_PERMISSION, raise_exception=True),
 ], name="dispatch")
 class AdminAISettingsView(View):
-    """Settings shell for the Admin AI module.
+    """Settings page for the Admin AI module.
 
-    Phase 1: establishes the stable URL, permission, breadcrumbs, and layout
-    that the next AI Admin PR will extend with provider and credential
-    configuration.  No API-key fields, no provider selection, no secret
-    storage are implemented here.
+    GET: Shows the current provider, a dynamic configuration form driven by
+         the provider's ``AIProviderConfigurationSpec``, and a connection test
+         button (when supported). Password fields are never pre-populated.
+
+    POST: Saves provider selection and configuration. When ``action=test``
+          is submitted, runs a connection test throttled via Django's cache.
     """
 
     template_name = "cauldron_ai_admin/settings.html"
 
-    def get(self, request: HttpRequest) -> HttpResponse:
-        provider_name, provider_status = _get_provider_display()
-        return render(request, self.template_name, {
-            "provider_name": provider_name,
+    def _context(
+        self,
+        request: HttpRequest,
+        *,
+        form=None,
+        test_result=None,
+        success_message: str = "",
+        error_message: str = "",
+    ) -> dict:
+        from .provider_config import get_store, resolve_provider_name
+        from .forms import ProviderConfigForm, ProviderSelectForm
+
+        store = get_store()
+        available = _get_available_providers()
+        current_provider = resolve_provider_name(store)
+        spec = _get_provider_spec(current_provider) if current_provider else None
+
+        if form is None and spec is not None:
+            current_config = store.get_config(current_provider)
+            form = ProviderConfigForm(spec=spec, current_config=current_config)
+
+        provider_name_display, provider_status = _get_provider_display()
+        select_form = ProviderSelectForm(
+            available_providers=available,
+            initial={"provider": current_provider},
+        )
+
+        return {
+            "provider_name": provider_name_display,
             "provider_status": provider_status,
+            "current_provider": current_provider,
+            "available_providers": available,
+            "spec": spec,
+            "form": form,
+            "select_form": select_form,
+            "test_result": test_result,
+            "success_message": success_message,
+            "error_message": error_message,
+            "supports_connection_test": spec.supports_connection_test if spec else False,
             "breadcrumbs": [
                 {"label": "AI Assistant", "url": reverse("cauldron_ai_admin:ai-page")},
                 {"label": "Settings", "url": ""},
             ],
-        })
+        }
+
+    def get(self, request: HttpRequest) -> HttpResponse:
+        return render(request, self.template_name, self._context(request))
+
+    def post(self, request: HttpRequest) -> HttpResponse:
+        from .forms import ProviderConfigForm, ProviderSelectForm
+        from .provider_config import get_store, resolve_provider_name
+
+        store = get_store()
+        action = request.POST.get("action", "save")
+
+        if action == "select_provider":
+            available = _get_available_providers()
+            select_form = ProviderSelectForm(
+                request.POST, available_providers=available
+            )
+            if select_form.is_valid():
+                new_provider = select_form.cleaned_data["provider"]
+                store.set_selected_provider(new_provider)
+                messages.success(request, f"Provider changed to {new_provider!r}.")
+            return render(
+                request, self.template_name,
+                self._context(request, success_message="Provider updated."),
+            )
+
+        current_provider = resolve_provider_name(store)
+        spec = _get_provider_spec(current_provider) if current_provider else None
+
+        if spec is None:
+            return render(
+                request, self.template_name,
+                self._context(
+                    request,
+                    error_message="No configurable provider is selected.",
+                ),
+            )
+
+        current_config = store.get_config(current_provider)
+        form = ProviderConfigForm(
+            request.POST, spec=spec, current_config=current_config
+        )
+
+        if action == "test":
+            return self._handle_test(request, form, spec, store, current_provider)
+
+        if not form.is_valid():
+            return render(
+                request, self.template_name,
+                self._context(request, form=form),
+            )
+
+        config, secrets = form.split_config_and_secrets()
+        store.set_config(current_provider, config)
+        if secrets:
+            for key, value in secrets.items():
+                store.set_secret(current_provider, key, value)
+
+        messages.success(request, "AI settings saved.")
+        return render(
+            request, self.template_name,
+            self._context(request, success_message="Settings saved."),
+        )
+
+    def _handle_test(
+        self,
+        request: HttpRequest,
+        form,
+        spec,
+        store,
+        current_provider: str,
+    ) -> HttpResponse:
+        from django.core.cache import cache
+        from cauldron_ai.providers import run_provider_connection_test
+
+        if not spec.supports_connection_test:
+            return render(
+                request, self.template_name,
+                self._context(
+                    request, form=form,
+                    error_message="This provider does not support connection testing.",
+                ),
+            )
+
+        # Throttle: one test per user per 30 s.
+        cache_key = f"{_SETTINGS_TEST_CACHE_KEY}.{request.user.pk}"
+        if cache.get(cache_key):
+            return render(
+                request, self.template_name,
+                self._context(
+                    request, form=form,
+                    error_message=(
+                        "Connection test throttled. "
+                        f"Please wait {_SETTINGS_TEST_THROTTLE_SECONDS} seconds."
+                    ),
+                ),
+            )
+        cache.set(cache_key, True, _SETTINGS_TEST_THROTTLE_SECONDS)
+
+        # Use submitted form values for the test; fall back to stored secrets
+        # for password fields not re-submitted (render_value=False).
+        if form.is_valid():
+            config, submitted_secrets = form.split_config_and_secrets()
+        else:
+            config = store.get_config(current_provider)
+            submitted_secrets = {}
+
+        # Merge: submitted secrets take precedence, then stored secrets.
+        stored_secrets = store.get_secrets(current_provider)
+        merged_secrets = {**stored_secrets, **submitted_secrets}
+
+        try:
+            result = run_provider_connection_test(current_provider, config, merged_secrets)
+        except Exception as exc:
+            from cauldron_ai.provider_configuration import AIProviderConnectionResult
+            result = AIProviderConnectionResult(
+                success=False,
+                status="error",
+                message=f"Test failed: {type(exc).__name__}: {exc}",
+            )
+
+        return render(
+            request, self.template_name,
+            self._context(request, form=form, test_result=result),
+        )
 
 
 @method_decorator([

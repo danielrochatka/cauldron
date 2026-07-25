@@ -15,11 +15,18 @@ initialize_config() {
   local first_run=0
 
   if [ ! -f "$config_file" ]; then
-    cp "$example_file" "$config_file"
+    if [ ! -f "$example_file" ]; then
+      echo "ERROR: Configuration template not found: $example_file" >&2
+      return 1
+    fi
+    if ! cp "$example_file" "$config_file"; then
+      echo "ERROR: Failed to create $config_file from template." >&2
+      return 1
+    fi
     first_run=1
   fi
 
-  python3 - "$config_file" <<'PY'
+  if ! python3 - "$config_file" <<'PY'
 from pathlib import Path
 import os, secrets, sys, tempfile
 
@@ -59,10 +66,34 @@ finally:
     except FileNotFoundError:
         pass
 PY
+  then
+    echo "ERROR: Failed to write configuration to $config_file." >&2
+    return 1
+  fi
 
-  chmod 600 "$config_file"
+  if ! chmod 600 "$config_file"; then
+    echo "ERROR: Failed to set permissions on $config_file." >&2
+    return 1
+  fi
 
   if [ "$first_run" -eq 1 ]; then
     echo "Created config.env with secure installation settings."
   fi
+}
+
+# install_python_projects REPO_DIR REQUIREMENTS_FILE
+#
+# Installs requirements, the root cauldron package, and all Python packages
+# under packages/. Skips directories without pyproject.toml (e.g. cauldron-astro).
+install_python_projects() {
+  local repo_dir="$1"
+  local requirements_file="$2"
+
+  pip install -q -r "$requirements_file"
+  pip install -q -e "$repo_dir"
+
+  for pkg in "$repo_dir"/packages/*; do
+    [ -f "$pkg/pyproject.toml" ] || continue
+    pip install -q -e "$pkg"
+  done
 }

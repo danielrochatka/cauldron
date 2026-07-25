@@ -27,14 +27,8 @@ fi
 source "$CAULDRON_DIR/.venv/bin/activate"
 
 # 4. Install/upgrade dependencies.
-#    Only pip-install packages that have a pyproject.toml — this skips
-#    non-Python packages such as cauldron-astro.
 echo "--> Installing dependencies..."
-pip install -q -r "$CAULDRON_DIR/requirements.txt"
-for pkg in "$REPO_DIR"/packages/*; do
-  [ -f "$pkg/pyproject.toml" ] || continue
-  pip install -q -e "$pkg"
-done
+install_python_projects "$REPO_DIR" "$CAULDRON_DIR/requirements.txt"
 
 # 5. Initialize config.env (creates it on first run, fills in SECRET_KEY).
 initialize_config "$CAULDRON_DIR/config.env" "$CAULDRON_DIR/config.env.example"

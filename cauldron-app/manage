@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -euo pipefail
 # Wrapper so `./manage <command>` always uses the Cauldron virtualenv.
 CAULDRON_DIR="$(cd "$(dirname "$0")" && pwd)"
 

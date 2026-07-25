@@ -92,11 +92,7 @@ _rollback() {
 
   # Reinstall packages from the restored commit and restart.
   source "$VENV/bin/activate"
-  pip install -q -r "$CAULDRON_DIR/requirements.txt"
-  for pkg in "$REPO_DIR"/packages/*; do
-    [ -f "$pkg/pyproject.toml" ] || continue
-    pip install -q -e "$pkg"
-  done
+  install_python_projects "$REPO_DIR" "$CAULDRON_DIR/requirements.txt"
   "$CAULDRON_DIR/start" 2>/dev/null || true
 
   echo ""
@@ -113,11 +109,7 @@ git pull --ff-only
 # 6. Install/upgrade all Python packages and their dependencies.
 echo "--> Upgrading dependencies..."
 source "$VENV/bin/activate"
-pip install -q -r "$CAULDRON_DIR/requirements.txt"
-for pkg in "$REPO_DIR"/packages/*; do
-  [ -f "$pkg/pyproject.toml" ] || continue
-  pip install -q -e "$pkg"
-done
+install_python_projects "$REPO_DIR" "$CAULDRON_DIR/requirements.txt"
 
 # 7. Run migrations.
 echo "--> Applying database migrations..."

@@ -3,7 +3,7 @@
 {% block content %}
 <div class="cui-dashboard-grid">
   {% for card in dashboard_cards %}
-  <div class="cui-card">
+  {% if card.url %}<a href="{{ card.url }}" class="cui-card cui-card--link">{% else %}<div class="cui-card">{% endif %}
     <h2 class="cui-card__title">{{ card.label }}</h2>
     {% if card.status %}
     <div class="cui-card__status">
@@ -12,8 +12,7 @@
     </div>
     {% endif %}
     {% if card.description %}<p class="cui-card__description">{{ card.description }}</p>{% endif %}
-    {% if card.url %}<a href="{{ card.url }}" class="cui-button">View</a>{% endif %}
-  </div>
+  {% if card.url %}</a>{% else %}</div>{% endif %}
   {% empty %}
   <p class="cui-text-muted">Welcome to Cauldron. No modules registered yet.</p>
   {% endfor %}

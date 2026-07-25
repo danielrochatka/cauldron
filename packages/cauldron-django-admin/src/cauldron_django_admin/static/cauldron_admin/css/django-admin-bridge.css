@@ -43,11 +43,11 @@
   --selected-bg:          rgba(54, 95, 99, 0.06);
   --selected-row:         rgba(54, 95, 99, 0.06);
 
-  --button-fg:            var(--cui-color-primary-text);
-  --button-bg:            var(--cui-color-primary);
-  --button-hover-bg:      var(--cui-color-primary-hover);
-  --default-button-bg:    var(--cui-color-primary);
-  --default-button-hover-bg: var(--cui-color-primary-hover);
+  --button-fg:            var(--cui-color-action-text);
+  --button-bg:            var(--cui-color-action);
+  --button-hover-bg:      var(--cui-color-action-hover);
+  --default-button-bg:    var(--cui-color-action);
+  --default-button-hover-bg: var(--cui-color-action-hover);
   --close-button-bg:      var(--cui-color-text-muted);
   --close-button-hover-bg: var(--cui-color-text);
   --delete-button-bg:     var(--cui-color-danger);
@@ -181,8 +181,8 @@ a.button {
   align-items: center;
   justify-content: center;
   padding: var(--cui-space-2) var(--cui-space-4);
-  background: var(--cui-color-primary);
-  color: var(--cui-color-primary-text) !important;
+  background: var(--cui-color-action);
+  color: var(--cui-color-action-text) !important;
   border: var(--cui-border-width) solid transparent;
   border-radius: var(--cui-radius-md);
   font-size: var(--cui-font-size-sm);
@@ -198,13 +198,13 @@ input[type="submit"]:hover,
 input[type="button"]:hover,
 .submit-row input:hover,
 a.button:hover {
-  background: var(--cui-color-primary-hover);
-  color: var(--cui-color-primary-text) !important;
+  background: var(--cui-color-action-hover);
+  color: var(--cui-color-action-text) !important;
 }
 .button.default,
 input[type="submit"].default,
 .submit-row input.default {
-  background: var(--cui-color-primary);
+  background: var(--cui-color-action);
 }
 .deletelink,
 .deletelink:link,

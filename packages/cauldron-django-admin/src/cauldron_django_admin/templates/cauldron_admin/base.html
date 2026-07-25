@@ -15,8 +15,7 @@
   <link rel="stylesheet" href="{% static 'cauldron_admin/css/responsive.css' %}">
   {% block extra_css %}{% endblock %}
   {% block extra_head %}{% endblock %}
-  {# Site-owned overrides load LAST so they win the cascade against both
-     packaged CSS and any page-level extra_css / extra_head blocks. #}
+  {% comment %}Site-owned overrides load last so they win the cascade.{% endcomment %}
   {% get_override_css_urls "admin" as override_css_urls %}
   {% for css_url in override_css_urls %}
   <link rel="stylesheet" href="{{ css_url }}">

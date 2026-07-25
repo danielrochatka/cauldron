@@ -2,7 +2,9 @@
 import pytest
 from django.template.loader import get_template
 from django.template import Context, RequestContext
-from django.test import RequestFactory
+from django.test import RequestFactory, Client
+from django.urls import reverse
+from unittest.mock import patch
 
 
 @pytest.mark.django_db
@@ -84,3 +86,209 @@ def test_site_overrides_load_after_extra_css():
     # Overrides come AFTER both extra_css and extra_head.
     assert idx_overrides > idx_extra_css
     assert idx_overrides > idx_extra_head
+
+
+# ---------------------------------------------------------------------------
+# Dashboard card HTML structure
+# ---------------------------------------------------------------------------
+
+def _make_cards_with_and_without_url():
+    """Return (card_with_url, card_without_url, card_with_status)."""
+    from cauldron_django_admin.navigation import AdminDashboardCard
+    return [
+        AdminDashboardCard(
+            key="alpha", label="Alpha", description="Has a link",
+            url="/cauldron/", section="main", order=0
+        ),
+        AdminDashboardCard(
+            key="beta", label="Beta", description="No link",
+            url="", section="main", order=1
+        ),
+        AdminDashboardCard(
+            key="gamma", label="Gamma", description="With status",
+            url="/cauldron/modules/", section="main", order=2,
+            status="active"
+        ),
+    ]
+
+
+@pytest.mark.django_db
+def test_dashboard_card_with_url_renders_as_anchor():
+    """A card with a URL must render as <a class="cui-card cui-card--link">."""
+    from django.contrib.auth import get_user_model
+    User = get_user_model()
+    user = User.objects.create_user(username="cardanchor", password="pw")
+
+    with patch("cauldron_django_admin.navigation.get_navigation_registry") as mock_reg:
+        mock_reg.return_value.get_dashboard_cards.return_value = _make_cards_with_and_without_url()
+        client = Client()
+        client.force_login(user)
+        response = client.get(reverse("cauldron:dashboard"))
+
+    assert response.status_code == 200
+    content = response.content.decode()
+    assert 'href="/cauldron/"' in content
+    assert "cui-card--link" in content
+
+
+@pytest.mark.django_db
+def test_dashboard_card_without_url_renders_as_div():
+    """A card with no URL must render as a non-anchor element."""
+    from django.contrib.auth import get_user_model
+    User = get_user_model()
+    user = User.objects.create_user(username="carddiv", password="pw")
+
+    with patch("cauldron_django_admin.navigation.get_navigation_registry") as mock_reg:
+        mock_reg.return_value.get_dashboard_cards.return_value = _make_cards_with_and_without_url()
+        client = Client()
+        client.force_login(user)
+        response = client.get(reverse("cauldron:dashboard"))
+
+    assert response.status_code == 200
+    content = response.content.decode()
+    assert "Beta" in content
+    # Cards with a URL (Alpha, Gamma) carry cui-card--link; the Beta card
+    # (url="") must not.  Verify the rendered non-link card is a <div>.
+    import re
+    # Count cui-card--link occurrences: should equal number of cards with URLs (2).
+    link_count = len(re.findall(r"cui-card--link", content))
+    assert link_count == 2, (
+        f"Expected 2 cui-card--link cards (Alpha + Gamma), found {link_count}"
+    )
+    # The plain card for Beta must appear as a <div class="cui-card">.
+    assert '<div class="cui-card">' in content
+
+
+@pytest.mark.django_db
+def test_dashboard_card_has_no_view_button():
+    """No separate 'View' button text must appear alongside card content."""
+    from django.contrib.auth import get_user_model
+    User = get_user_model()
+    user = User.objects.create_user(username="cardnoview", password="pw")
+
+    with patch("cauldron_django_admin.navigation.get_navigation_registry") as mock_reg:
+        mock_reg.return_value.get_dashboard_cards.return_value = _make_cards_with_and_without_url()
+        client = Client()
+        client.force_login(user)
+        response = client.get(reverse("cauldron:dashboard"))
+
+    assert response.status_code == 200
+    content = response.content.decode()
+    assert ">View<" not in content
+
+
+@pytest.mark.django_db
+def test_dashboard_card_status_indicator_renders():
+    """Cards with a status must render the status dot and label."""
+    from django.contrib.auth import get_user_model
+    User = get_user_model()
+    user = User.objects.create_user(username="cardstatus", password="pw")
+
+    with patch("cauldron_django_admin.navigation.get_navigation_registry") as mock_reg:
+        mock_reg.return_value.get_dashboard_cards.return_value = _make_cards_with_and_without_url()
+        client = Client()
+        client.force_login(user)
+        response = client.get(reverse("cauldron:dashboard"))
+
+    assert response.status_code == 200
+    content = response.content.decode()
+    assert "cui-card__status-dot--active" in content
+    assert "Active" in content
+
+
+# ---------------------------------------------------------------------------
+# Template comment — must not render visibly
+# ---------------------------------------------------------------------------
+
+def test_base_template_comment_not_visible():
+    """The template comment in base.html must not appear in rendered output."""
+    import os
+    from django.apps import apps
+    app = apps.get_app_config("cauldron_django_admin")
+    template_dir = os.path.join(app.path, "templates")
+    base_path = os.path.join(template_dir, "cauldron_admin", "base.html")
+    with open(base_path, encoding="utf-8") as f:
+        text = f.read()
+    # Must use Django block comment syntax, not bare {# multi-line #}.
+    assert "{% comment %}" in text, "base.html must use {% comment %} for multi-line comments"
+    # The old inline {# ... #} spanning multiple lines must be gone.
+    assert "Site-owned overrides load LAST" not in text, (
+        "Old multi-line {# #} comment text found; it may render as visible HTML"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Action tokens present in tokens.css
+# ---------------------------------------------------------------------------
+
+def test_action_tokens_defined_in_tokens_css():
+    """All required action color tokens must be defined in tokens.css."""
+    import os
+    from django.apps import apps
+    app = apps.get_app_config("cauldron_django_admin")
+    tokens_path = os.path.join(
+        app.path, "static", "cauldron_admin", "css", "tokens.css"
+    )
+    with open(tokens_path, encoding="utf-8") as f:
+        css = f.read()
+
+    required = [
+        "--cui-color-action:",
+        "--cui-color-action-hover:",
+        "--cui-color-action-text:",
+        "--cui-color-action-subtle:",
+        "--cui-color-action-border:",
+    ]
+    missing = [t for t in required if t not in css]
+    assert not missing, f"Action tokens missing from tokens.css: {missing}"
+
+    # Primary brand tokens must remain unchanged.
+    assert "--cui-color-primary: #365f63" in css
+    assert "--cui-color-primary-hover: #294c50" in css
+
+
+# ---------------------------------------------------------------------------
+# base.css specificity — link rules must not override component colors
+# ---------------------------------------------------------------------------
+
+def test_base_link_selectors_use_where():
+    """base.css must use :where(a) so generic link color cannot override
+    component styles like .cui-button that declare their own color."""
+    import os
+    from django.apps import apps
+    app = apps.get_app_config("cauldron_django_admin")
+    base_path = os.path.join(
+        app.path, "static", "cauldron_admin", "css", "base.css"
+    )
+    with open(base_path, encoding="utf-8") as f:
+        css = f.read()
+
+    assert ":where(a)" in css, (
+        "base.css must use :where(a) so the link color rule has zero specificity"
+    )
+    assert ":where(a:hover)" in css, (
+        "base.css must use :where(a:hover) so the hover color rule has zero specificity"
+    )
+    # Bare high-specificity selectors must not be present.
+    import re
+    bare_a = re.search(r'(?<!:where\()(?<!\w)a\s*\{', css)
+    assert bare_a is None, (
+        "bare 'a { }' selector found in base.css — use :where(a) instead"
+    )
+
+
+def test_cui_button_declares_action_text_color():
+    """.cui-button must declare color: var(--cui-color-action-text) so it beats
+    any zero-specificity link rule and the text stays white on hover."""
+    import os
+    from django.apps import apps
+    app = apps.get_app_config("cauldron_django_admin")
+    components_path = os.path.join(
+        app.path, "static", "cauldron_admin", "css", "components.css"
+    )
+    with open(components_path, encoding="utf-8") as f:
+        css = f.read()
+
+    assert "color: var(--cui-color-action-text)" in css, (
+        ".cui-button must declare color: var(--cui-color-action-text)"
+    )

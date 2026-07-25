@@ -9,7 +9,7 @@
         {% for item in group.items %}
         <li class="cui-sidebar__item">
           <a href="{{ item.url }}"
-             class="cui-sidebar__link{% if item.is_active %} is-active{% endif %}"
+             class="cui-sidebar__link{% if item.kind == 'settings' %} cui-sidebar__link--settings{% endif %}{% if item.is_active %} is-active{% endif %}"
              {% if item.is_active %}aria-current="page"{% endif %}>
             {{ item.label }}
             {% if item.badge_count %}<span class="cui-badge" aria-label="{{ item.badge_count }} items">{{ item.badge_count }}</span>{% endif %}

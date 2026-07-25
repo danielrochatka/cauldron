@@ -49,6 +49,13 @@ class AdminNavigationItem:
     # is needed for the Dashboard item which shares its prefix with every
     # nested cauldron page.
     url_prefix_exact: bool = False
+    # "page" for normal navigation entries; "settings" for module settings
+    # links.  Settings links always sort last within their section and never
+    # appear as dashboard cards, regardless of their numeric order.
+    kind: str = "page"
+    # When False the item is excluded from dashboard card generation even if
+    # the user has the required permission.  Settings items default to False.
+    show_on_dashboard: bool = True
 
 
 @dataclass(frozen=True)
@@ -139,7 +146,14 @@ class NavigationRegistry:
                     continue
             result.append(item)
         section_order_map = self._get_section_order_map()
-        result.sort(key=lambda i: (section_order_map.get(i.section, 9999), i.order, i.label))
+        # kind="settings" items sort last within their section regardless of
+        # their numeric order value.  kind="page" items sort by order then label.
+        result.sort(key=lambda i: (
+            section_order_map.get(i.section, 9999),
+            0 if i.kind == "page" else 1,
+            i.order,
+            i.label,
+        ))
         return result
 
     def _get_section_order_map(self) -> dict[str, int]:
@@ -261,6 +275,7 @@ class NavigationRegistry:
                 permission=item.permission,
                 url_prefix=item.url_prefix,
                 url_prefix_exact=item.url_prefix_exact,
+                kind=item.kind,
             )
             if item.section in section_items:
                 section_items[item.section].append(entry)
@@ -275,9 +290,15 @@ class NavigationRegistry:
         return result
 
     def get_dashboard_cards(self, user, request=None) -> list[AdminDashboardCard]:
-        """Return AdminDashboardCard list for the dashboard."""
+        """Return AdminDashboardCard list for the dashboard.
+
+        Items with ``show_on_dashboard=False`` (e.g. settings links) are
+        excluded even when the user holds the required permission.
+        """
         cards = []
         for item in self.get_items_for_user(user, request):
+            if not item.show_on_dashboard:
+                continue
             url = self.resolve_url(item)
             cards.append(AdminDashboardCard(
                 key=item.key,

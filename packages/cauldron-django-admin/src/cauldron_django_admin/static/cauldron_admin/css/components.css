@@ -169,6 +169,50 @@
   border-right: 3px solid var(--cui-color-primary);
 }
 
+/* Settings navigation links — muted red, always last in their sidebar section */
+.cui-sidebar__link--settings { color: var(--cui-color-settings); }
+.cui-sidebar__link--settings:hover {
+  background: var(--cui-color-settings-bg);
+  color: var(--cui-color-settings-hover);
+}
+/* Override the inherited teal active-state colors for settings links.
+   Specificity matches the base .cui-sidebar__link.is-active rule, so this
+   block must appear after it in the file cascade. */
+.cui-sidebar__link--settings.is-active,
+.cui-sidebar__link--settings[aria-current="page"] {
+  color: var(--cui-color-settings);
+  background: var(--cui-color-settings-bg);
+  border-right-color: var(--cui-color-settings);
+}
+.cui-sidebar__link--settings:focus-visible {
+  box-shadow: 0 0 0 3px rgba(154, 63, 63, 0.35);
+}
+
+/* Settings page layout helpers */
+.cui-settings-page { max-width: 720px; }
+.cui-settings-section { margin-bottom: var(--cui-space-8); }
+.cui-settings-section__title {
+  font-size: var(--cui-font-size-lg);
+  font-weight: var(--cui-font-weight-semibold);
+  margin: 0 0 var(--cui-space-4);
+  padding-bottom: var(--cui-space-2);
+  border-bottom: var(--cui-border);
+  color: var(--cui-color-text);
+}
+.cui-settings-summary {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--cui-space-2) var(--cui-space-4);
+  font-size: var(--cui-font-size-sm);
+}
+.cui-settings-summary dt { color: var(--cui-color-text-muted); font-weight: var(--cui-font-weight-medium); }
+.cui-settings-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--cui-space-2);
+  font-size: var(--cui-font-size-sm);
+}
+
 /* User menu */
 .cui-header__user-nav { margin-left: auto; }
 .cui-user-menu { position: relative; }

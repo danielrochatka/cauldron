@@ -64,3 +64,18 @@ class CauldronAIAdminConfig(AppConfig):
             url_prefix="/cauldron/ui/style-changes/",
             description="Review AI-proposed CSS changes",
         ))
+        # Settings spec — projects as kind="settings" at the end of the ai section.
+        try:
+            from cauldron_django_admin.module_settings import (
+                ModuleSettingsSpec,
+                register_module_settings,
+            )
+            register_module_settings(ModuleSettingsSpec(
+                module_slug="cauldron.ai.admin",
+                url_name="cauldron_ai_admin:settings",
+                navigation_section="ai",
+                permission="cauldron_ai_admin.manage_admin_ai_settings",
+                description="Configure the Admin AI module",
+            ))
+        except ImportError:
+            pass

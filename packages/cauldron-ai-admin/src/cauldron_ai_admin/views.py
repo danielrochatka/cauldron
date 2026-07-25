@@ -22,11 +22,74 @@ logger = logging.getLogger(__name__)
 
 
 ADMIN_AI_PERMISSION = "cauldron_ai_admin.use_admin_ai"
+MANAGE_AI_SETTINGS_PERMISSION = "cauldron_ai_admin.manage_admin_ai_settings"
 
 
 def _get_service():
     from .service_factory import get_admin_ai_service
     return get_admin_ai_service()
+
+
+def _get_provider_display() -> tuple[str, str]:
+    """Return (display_name, status) for the currently configured AI provider.
+
+    Never raises — falls back to descriptive error strings so the settings
+    page always renders even when the provider is misconfigured.
+    """
+    try:
+        from cauldron_ai.providers import descriptor_for, provider_names
+        from .checks import _admin_ai_config, _resolve_provider
+
+        cfg = _admin_ai_config()
+        names = provider_names()
+        provider, err_id = _resolve_provider(cfg, names)
+
+        if err_id == "admin_ai.E001":
+            return "None", "No AI provider registered"
+        if err_id == "admin_ai.E002":
+            configured = cfg.get("provider", "")
+            return configured or "Unknown", "Provider not found — check CAULDRON_MODULES"
+        if err_id == "admin_ai.E003":
+            return "Ambiguous", f"Multiple providers registered: {', '.join(names)}"
+        if provider is None:
+            return "Unknown", "Provider could not be resolved"
+
+        try:
+            desc = descriptor_for(provider.name)
+            display_name = desc.display_name or provider.name
+        except Exception:
+            display_name = provider.name
+
+        return display_name, "Active"
+    except Exception:
+        return "Unknown", "Provider status unavailable"
+
+
+@method_decorator([
+    login_required,
+    permission_required(MANAGE_AI_SETTINGS_PERMISSION, raise_exception=True),
+], name="dispatch")
+class AdminAISettingsView(View):
+    """Settings shell for the Admin AI module.
+
+    Phase 1: establishes the stable URL, permission, breadcrumbs, and layout
+    that the next AI Admin PR will extend with provider and credential
+    configuration.  No API-key fields, no provider selection, no secret
+    storage are implemented here.
+    """
+
+    template_name = "cauldron_ai_admin/settings.html"
+
+    def get(self, request: HttpRequest) -> HttpResponse:
+        provider_name, provider_status = _get_provider_display()
+        return render(request, self.template_name, {
+            "provider_name": provider_name,
+            "provider_status": provider_status,
+            "breadcrumbs": [
+                {"label": "AI Assistant", "url": reverse("cauldron_ai_admin:ai-page")},
+                {"label": "Settings", "url": ""},
+            ],
+        })
 
 
 @method_decorator([

@@ -96,6 +96,7 @@ class AdminAIRun(models.Model):
             ("use_admin_ai", "Can invoke the Admin AI assistant"),
             ("view_admin_ai_runs", "Can view Admin AI run history"),
             ("view_admin_ai_audit", "Can view Admin AI audit records"),
+            ("manage_admin_ai_settings", "Can manage Admin AI settings"),
         ]
 
     run_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

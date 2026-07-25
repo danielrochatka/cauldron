@@ -2,7 +2,7 @@
 {% block page_title %}{{ item.data.title|escape|default:"Page" }}{% endblock %}
 
 {% block page_actions %}
-{% if can_propose %}
+{% if can_edit %}
 <a href="{% url 'cauldron_admin_content:page-edit' item.id %}" class="cui-button">Edit Page</a>
 {% endif %}
 <a href="{% url 'cauldron_admin_content:content-browser' %}" class="cui-button cui-button--secondary">Back to Browser</a>

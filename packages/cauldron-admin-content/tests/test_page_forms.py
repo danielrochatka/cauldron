@@ -218,6 +218,20 @@ def test_robots_index_false_when_unchecked():
     assert form.cleaned_data["robots_index"] is False
 
 
+def test_robots_index_initial_true_on_unbound_form():
+    """Unbound form must render robots_index checked by default (initial=True)."""
+    from cauldron_admin_content.forms import PageCreateForm
+    form = PageCreateForm()
+    assert form.fields["robots_index"].initial is True
+
+
+def test_robots_follow_initial_true_on_unbound_form():
+    """Unbound form must render robots_follow checked by default (initial=True)."""
+    from cauldron_admin_content.forms import PageCreateForm
+    form = PageCreateForm()
+    assert form.fields["robots_follow"].initial is True
+
+
 # ---------------------------------------------------------------------------
 # Form does not expose internal fields
 # ---------------------------------------------------------------------------

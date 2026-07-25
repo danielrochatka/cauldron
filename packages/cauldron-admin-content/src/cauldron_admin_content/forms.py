@@ -150,13 +150,18 @@ class _PageBaseForm(forms.Form):
         label="Canonical URL",
         help_text="Canonical URL override (optional).",
     )
+    # initial=True ensures the checkbox renders checked on an unbound form.
+    # BooleanField(required=False) cleans an absent checkbox value to False,
+    # which is correct — unchecking the box should disable the option.
     robots_index = forms.BooleanField(
         required=False,
+        initial=True,
         label="Allow search indexing",
         help_text="Allow search engines to index this page.",
     )
     robots_follow = forms.BooleanField(
         required=False,
+        initial=True,
         label="Allow link following",
         help_text="Allow search engines to follow links on this page.",
     )
@@ -194,7 +199,9 @@ class _PageBaseForm(forms.Form):
         help_text=(
             "Page body written in Markdown. "
             "Use # for headings, **bold**, _italic_, and [link](url). "
-            "Content is displayed as plain text until a renderer is configured."
+            "Content is displayed as plain text until a renderer is configured. "
+            "Note: clearing this field and submitting preserves the existing body "
+            "in the current repository implementation."
         ),
     )
 
@@ -332,6 +339,7 @@ class PageEditForm(_PageBaseForm):
 
     Slug is read-only during Phase 1 and is not included as a form field;
     the view displays the current slug and preserves it from the loaded item.
+    Only items with schema == "page" should be presented through this form.
     """
 
     field_order = [

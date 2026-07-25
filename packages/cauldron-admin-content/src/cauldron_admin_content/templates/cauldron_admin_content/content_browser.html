@@ -70,8 +70,10 @@
         <td>{% include "cauldron_admin/includes/status_badge.html" with status=item.status %}</td>
         <td>{{ item.schema|escape }}</td>
         <td><code>{{ item.hash|escape|slice:":12" }}…</code></td>
-        {% if can_propose %}
+        {% if can_propose and item.schema == page_schema %}
         <td><a href="{% url 'cauldron_admin_content:page-edit' item.id %}" class="cui-button cui-button--sm">Edit</a></td>
+        {% elif can_propose %}
+        <td></td>
         {% endif %}
         {% else %}
         <td>{{ item.id|escape }}</td>

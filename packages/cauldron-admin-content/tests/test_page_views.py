@@ -139,7 +139,8 @@ def test_page_create_get_no_schema_field(client):
 def _post_create(client, user, overrides=None):
     from django.test import override_settings
     from django.core import signing
-    token = signing.dumps(str(uuid.uuid4()), salt="cauldron.page.submit")
+    item_id = str(uuid.uuid4())
+    token = signing.dumps({"key": str(uuid.uuid4()), "item_id": item_id}, salt="cauldron.page.submit")
     data = {
         "title": "About Us",
         "slug": "about-us",
@@ -215,7 +216,7 @@ def test_page_create_post_no_force_in_operation(client):
 
 def test_page_create_post_success_redirects_to_change_request(client):
     from django.test import override_settings
-    user = _make_user("redir_user", ["propose_content_changes"])
+    user = _make_user("redir_user", ["propose_content_changes", "view_content_change_requests"])
     req_id = str(uuid.uuid4())
     mock_result = _make_result(ok=True, request_id=req_id)
     mock_service = MagicMock()
@@ -480,7 +481,7 @@ def _make_edit_token(item_id, collection="pages", expected_hash="abc" * 21 + "d"
 def _post_edit(client, user, item_id, edit_token, overrides=None):
     from django.test import override_settings
     from django.core import signing
-    submit_token = signing.dumps(str(uuid.uuid4()), salt="cauldron.page.submit")
+    submit_token = signing.dumps({"key": str(uuid.uuid4()), "item_id": ""}, salt="cauldron.page.submit")
     data = {
         "title": "Updated Title",
         "navigation_title": "",
@@ -597,7 +598,7 @@ def test_page_edit_post_item_mismatch_rejected(client):
 
 
 def test_page_edit_post_success_redirects(client):
-    user = _make_user("edit_redir", ["propose_content_changes", "view_published_content"])
+    user = _make_user("edit_redir", ["propose_content_changes", "view_published_content", "view_content_change_requests"])
     item = _make_item()
     edit_token = _make_edit_token(item.id)
     req_id = str(uuid.uuid4())
@@ -664,3 +665,119 @@ def test_audit_log_accessible(client):
     with override_settings(ROOT_URLCONF="tests.urls"):
         response = client.get("/cauldron-admin/content/audit/")
     assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Fix: redirect after proposal — authors without view_content_change_requests
+# ---------------------------------------------------------------------------
+
+def test_create_redirect_to_browser_without_cr_permission(client):
+    """Authors holding only propose_content_changes must not be redirected to a 403."""
+    user = _make_user("no_cr_perm", ["propose_content_changes"])
+    req_id = str(uuid.uuid4())
+    mock_result = _make_result(ok=True, request_id=req_id)
+    mock_service = MagicMock()
+    mock_service.create_change_request.return_value = mock_result
+
+    with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+        response = _post_create(client, user)
+
+    # Must redirect somewhere accessible — not to change-request-detail
+    assert response.status_code == 302
+    assert req_id not in response["Location"]  # not sent to detail page
+    assert "change-requests" not in response["Location"] or "list" not in response["Location"]
+
+
+def test_create_redirect_to_detail_with_cr_permission(client):
+    """Authors with view_content_change_requests are redirected to detail."""
+    user = _make_user("full_perm", ["propose_content_changes", "view_content_change_requests"])
+    req_id = str(uuid.uuid4())
+    mock_result = _make_result(ok=True, request_id=req_id)
+    mock_service = MagicMock()
+    mock_service.create_change_request.return_value = mock_result
+
+    with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+        response = _post_create(client, user)
+
+    assert response.status_code == 302
+    assert req_id in response["Location"]
+
+
+# ---------------------------------------------------------------------------
+# Fix: schema guard — edit/detail 404 for non-page schema items
+# ---------------------------------------------------------------------------
+
+def test_edit_view_404_for_non_page_schema(client):
+    from django.test import override_settings
+    user = _make_user("wrongschema", ["propose_content_changes", "view_published_content"])
+    item = _make_item()
+    item.schema = "legacy-pages"  # wrong schema
+    mock_service = MagicMock()
+    mock_service.get_item.return_value = item
+
+    with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+        client.force_login(user)
+        with override_settings(ROOT_URLCONF="tests.urls"):
+            response = client.get(f"/cauldron-admin/content/pages/{item.id}/edit/")
+
+    assert response.status_code == 404
+
+
+def test_detail_no_edit_action_for_non_page_schema(client):
+    from django.test import override_settings
+    user = _make_user("noedit_schema", ["view_published_content", "propose_content_changes"])
+    item = _make_item(status="published")
+    item.schema = "legacy-pages"
+    mock_service = MagicMock()
+    mock_service.get_item.return_value = item
+
+    with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+        client.force_login(user)
+        with override_settings(ROOT_URLCONF="tests.urls"):
+            response = client.get(f"/cauldron-admin/content/pages/{item.id}/")
+
+    content = response.content.decode()
+    assert "Edit Page" not in content
+
+
+# ---------------------------------------------------------------------------
+# Fix: idempotency — same submission token produces stable item_id
+# ---------------------------------------------------------------------------
+
+def test_create_submission_token_contains_stable_item_id(client):
+    """The same submission token must produce the same item_id on retry."""
+    from django.core import signing
+    from django.test import override_settings
+
+    user = _make_user("idem2_user", ["propose_content_changes"])
+    req_id = str(uuid.uuid4())
+    captured_ops = []
+
+    def capture_service(*args, **kwargs):
+        mock_service = MagicMock()
+        def capture_create(**kw):
+            captured_ops.append(kw["operations"])
+            return _make_result(ok=True, request_id=req_id)
+        mock_service.create_change_request.side_effect = capture_create
+        return mock_service
+
+    # Build a token with known item_id
+    known_item_id = str(uuid.uuid4())
+    stable_token = signing.dumps(
+        {"key": str(uuid.uuid4()), "item_id": known_item_id},
+        salt="cauldron.page.submit",
+    )
+
+    with patch("cauldron_admin_content.views._get_service", new_callable=lambda: lambda: capture_service()):
+        client.force_login(user)
+        with override_settings(ROOT_URLCONF="tests.urls"):
+            client.post("/cauldron-admin/content/pages/new/", data={
+                "title": "Stable Page",
+                "slug": "stable-page",
+                "intended_status": "draft",
+                "submission_token": stable_token,
+            })
+
+    if captured_ops:
+        op = captured_ops[0][0]
+        assert op["item_id"] == known_item_id

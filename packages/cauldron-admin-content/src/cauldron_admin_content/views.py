@@ -22,6 +22,10 @@ _EDIT_TOKEN_SALT = "cauldron.page.edit"
 _SUBMIT_TOKEN_SALT = "cauldron.page.submit"
 _TOKEN_MAX_AGE = 3600  # 1 hour
 
+# Schema that PageCreateView/PageEditView handle. Items with other schemas
+# are not exposed through the page form to prevent cross-schema data merging.
+_PAGE_SCHEMA = "page"
+
 
 def _get_service():
     from .service_factory import get_service
@@ -38,19 +42,34 @@ def _handle_config_error(request):
     )
 
 
-def _make_submit_token() -> tuple[str, str]:
-    """Return (raw_key, signed_token) for a single-use submission idempotency key."""
-    raw_key = str(uuid.uuid4())
-    token = signing.dumps(raw_key, salt=_SUBMIT_TOKEN_SALT)
-    return raw_key, token
+def _make_submit_token(item_id: str = "") -> tuple[str, str]:
+    """Return (idempotency_key, signed_token).
+
+    For create flows, item_id is embedded in the token so that the same token
+    always produces the same item_id, keeping the payload hash stable across
+    idempotent retries.
+    """
+    idempotency_key = str(uuid.uuid4())
+    token = signing.dumps(
+        {"key": idempotency_key, "item_id": item_id},
+        salt=_SUBMIT_TOKEN_SALT,
+    )
+    return idempotency_key, token
 
 
-def _extract_idempotency_key(token: str) -> str:
-    """Return the idempotency key from a signed submission token, or '' on failure."""
+def _extract_submit_token(token: str) -> tuple[str, str]:
+    """Return (idempotency_key, item_id) from a signed submission token.
+
+    Returns ('', '') on any failure — callers proceed without idempotency
+    protection rather than blocking the user.
+    """
     try:
-        return signing.loads(token, salt=_SUBMIT_TOKEN_SALT, max_age=_TOKEN_MAX_AGE)
+        data = signing.loads(token, salt=_SUBMIT_TOKEN_SALT, max_age=_TOKEN_MAX_AGE)
+        if not isinstance(data, dict):
+            return "", ""
+        return data.get("key", ""), data.get("item_id", "")
     except (signing.BadSignature, signing.SignatureExpired):
-        return ""
+        return "", ""
 
 
 def _make_edit_token(item_id: str, collection: str, expected_hash: str) -> str:
@@ -68,6 +87,23 @@ def _load_edit_token(token: str) -> dict | None:
         return data
     except (signing.BadSignature, signing.SignatureExpired):
         return None
+
+
+def _redirect_after_proposal(request: HttpRequest, request_id: str) -> HttpResponseRedirect:
+    """Redirect to change-request detail when permitted, else content browser.
+
+    Proposal authors hold propose_content_changes, which does not imply
+    view_content_change_requests. Redirecting unconditionally to the detail
+    view would produce a 403 for authors without the broader permission.
+    """
+    if request.user.has_perm("cauldron_content_operations.view_content_change_requests"):
+        return HttpResponseRedirect(
+            reverse(
+                "cauldron_admin_content:change-request-detail",
+                kwargs={"request_id": request_id},
+            )
+        )
+    return HttpResponseRedirect(reverse("cauldron_admin_content:content-browser"))
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +171,7 @@ class ContentBrowserView(View):
             "can_propose": can_propose,
             "is_pages_collection": collection == PAGE_COLLECTION,
             "page_collection": PAGE_COLLECTION,
+            "page_schema": _PAGE_SCHEMA,
             "error": error,
         })
 
@@ -221,19 +258,28 @@ class PageCreateView(View):
 
     def get(self, request: HttpRequest) -> Any:
         form = PageCreateForm()
-        _, submission_token = _make_submit_token()
+        # Embed item_id in the submission token so that retries of the same
+        # signed token produce the same item_id, keeping the payload hash stable
+        # for ContentOperationService's idempotency check.
+        item_id = str(uuid.uuid4())
+        _, submission_token = _make_submit_token(item_id=item_id)
         return render(request, self.template_name, self._context(form, submission_token))
 
     def post(self, request: HttpRequest) -> Any:
         form = PageCreateForm(request.POST)
         submission_token = request.POST.get("submission_token", "")
-        idempotency_key = _extract_idempotency_key(submission_token)
+
+        # Extract stable item_id and idempotency key from the signed token.
+        idempotency_key, item_id = _extract_submit_token(submission_token)
+        if not item_id:
+            # Fallback: fresh UUID. Idempotency protection is lost on this path
+            # (e.g. tampered token), but the form can still be submitted.
+            item_id = str(uuid.uuid4())
 
         if not form.is_valid():
             return render(request, self.template_name, self._context(form, submission_token))
 
         from cauldron_content.pages import build_page_operation
-        item_id = str(uuid.uuid4())
         intended = form.cleaned_data["intended_status"]
         status = "draft" if intended == "draft" else "published"
 
@@ -282,12 +328,7 @@ class PageCreateView(View):
                 f"Page proposal created ({result.request_id[:8]}…). "
                 "It will be published once the change request is approved and applied.",
             )
-            return HttpResponseRedirect(
-                reverse(
-                    "cauldron_admin_content:change-request-detail",
-                    kwargs={"request_id": result.request_id},
-                )
-            )
+            return _redirect_after_proposal(request, result.request_id)
 
         error_msg = result.error.message if result.error else "An unknown error occurred."
         messages.error(request, html.escape(error_msg[:400]))
@@ -329,9 +370,14 @@ class PageDetailView(View):
             raise Http404
 
         title = item.data.get("title", item.id)
+        # Only offer the Edit action for schema=="page" items. Items with other
+        # schemas in the pages collection are not safe to edit through this form
+        # because the page schema uses additionalProperties:false.
+        can_edit = can_propose and item.schema == _PAGE_SCHEMA
         return render(request, self.template_name, {
             "item": item,
             "can_propose": can_propose,
+            "can_edit": can_edit,
             "breadcrumbs": [
                 {"label": "Content", "url": reverse("cauldron_admin_content:content-browser")},
                 {"label": title, "url": ""},
@@ -348,7 +394,13 @@ class PageDetailView(View):
     permission_required("cauldron_content_operations.propose_content_changes", raise_exception=True),
 ], name="dispatch")
 class PageEditView(View):
-    """Edit an existing page through the standard page content pipeline."""
+    """Edit an existing page through the standard page content pipeline.
+
+    Only items with schema == "page" are accepted. Items using other schemas
+    must not be presented through this editor because the page schema uses
+    additionalProperties:false and data merging at apply time could produce
+    validation failures for retained legacy fields.
+    """
 
     template_name = "cauldron_admin_content/page_form.html"
 
@@ -370,7 +422,6 @@ class PageEditView(View):
         return item, service
 
     def _render_form(self, request, form, item, edit_token, submission_token):
-        from cauldron_content.pages import PAGE_COLLECTION
         title = item.data.get("title", item.id)
         return render(request, self.template_name, {
             "form": form,
@@ -390,8 +441,15 @@ class PageEditView(View):
         })
 
     def get(self, request: HttpRequest, item_id: str) -> Any:
+        from cauldron_content.pages import PAGE_COLLECTION
         item, _ = self._load_item(request, item_id)
         if item is None:
+            raise Http404
+
+        # Guard against editing pages with non-page schemas. Merging page-form
+        # data into an item that uses a different schema (e.g. "pages") could
+        # corrupt existing fields not present in page.schema.json.
+        if item.schema != _PAGE_SCHEMA:
             raise Http404
 
         data = item.data
@@ -413,7 +471,6 @@ class PageEditView(View):
             "change_description": "",
         })
 
-        from cauldron_content.pages import PAGE_COLLECTION
         edit_token = _make_edit_token(item.id, PAGE_COLLECTION, item.hash)
         _, submission_token = _make_submit_token()
         return self._render_form(request, form, item, edit_token, submission_token)
@@ -441,13 +498,16 @@ class PageEditView(View):
 
         expected_hash = token_data.get("expected_hash", "")
         submission_token = request.POST.get("submission_token", "")
-        idempotency_key = _extract_idempotency_key(submission_token)
+        idempotency_key, _ = _extract_submit_token(submission_token)
 
         form = PageEditForm(request.POST)
 
-        # Load item to get current slug (read-only in Phase 1)
+        # Load item to get current slug (read-only in Phase 1) and validate schema.
         item, service = self._load_item(request, item_id)
         if item is None:
+            raise Http404
+
+        if item.schema != _PAGE_SCHEMA:
             raise Http404
 
         if not form.is_valid():
@@ -495,12 +555,7 @@ class PageEditView(View):
                 f"Page update proposal created ({result.request_id[:8]}…). "
                 "Changes will go live once the change request is approved and applied.",
             )
-            return HttpResponseRedirect(
-                reverse(
-                    "cauldron_admin_content:change-request-detail",
-                    kwargs={"request_id": result.request_id},
-                )
-            )
+            return _redirect_after_proposal(request, result.request_id)
 
         error_msg = result.error.message if result.error else "An unknown error occurred."
         messages.error(request, html.escape(error_msg[:400]))

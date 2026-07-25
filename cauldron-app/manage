@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Wrapper so `./manage <command>` always uses the Cauldron virtualenv.
+CAULDRON_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$CAULDRON_DIR/config.env" ]; then
+  set -a
+  source "$CAULDRON_DIR/config.env"
+  set +a
+fi
+exec "$CAULDRON_DIR/.venv/bin/python" "$CAULDRON_DIR/manage.py" "$@"

@@ -1,8 +1,13 @@
 {% extends "cauldron_admin/base.html" %}
 {% block page_title %}Content Browser{% endblock %}
 
+{% block page_actions %}
+{% if can_propose %}
+<a href="{% url 'cauldron_admin_content:page-create' %}" class="cui-button">New Page</a>
+{% endif %}
+{% endblock %}
+
 {% block content %}
-{% include "cauldron_admin/includes/messages.html" %}
 
 <div class="cui-card">
   <form method="get" class="cui-form cui-form--inline">
@@ -32,21 +37,49 @@
 {% endif %}
 
 {% if selected_collection %}
-<h2>Items in {{ selected_collection|escape }}</h2>
+<div class="cui-page-header" style="margin-top:1.5rem">
+  <h2>Items in <strong>{{ selected_collection|escape }}</strong></h2>
+  {% if is_pages_collection and can_propose %}
+  <div class="cui-page-header__actions">
+    <a href="{% url 'cauldron_admin_content:page-create' %}" class="cui-button">New Page</a>
+  </div>
+  {% endif %}
+</div>
 {% if items %}
 <div class="cui-table-container">
   <table class="cui-table">
     <thead>
+      {% if is_pages_collection %}
+      <tr><th>Title</th><th>Slug</th><th>Status</th><th>Schema</th><th>Hash</th>{% if can_propose %}<th>Actions</th>{% endif %}</tr>
+      {% else %}
       <tr><th>ID</th><th>Slug</th><th>Status</th><th>Provider</th><th>Hash</th></tr>
+      {% endif %}
     </thead>
     <tbody>
       {% for item in items %}
       <tr>
+        {% if is_pages_collection %}
+        <td>
+          {% if item.data.title %}
+          <a href="{% url 'cauldron_admin_content:page-detail' item.id %}">{{ item.data.title|escape }}</a>
+          {% else %}
+          <a href="{% url 'cauldron_admin_content:page-detail' item.id %}">{{ item.id|escape }}</a>
+          {% endif %}
+        </td>
+        <td><code>{{ item.slug|escape }}</code></td>
+        <td>{% include "cauldron_admin/includes/status_badge.html" with status=item.status %}</td>
+        <td>{{ item.schema|escape }}</td>
+        <td><code>{{ item.hash|escape|slice:":12" }}…</code></td>
+        {% if can_propose %}
+        <td><a href="{% url 'cauldron_admin_content:page-edit' item.id %}" class="cui-button cui-button--sm">Edit</a></td>
+        {% endif %}
+        {% else %}
         <td>{{ item.id|escape }}</td>
         <td>{{ item.slug|escape }}</td>
         <td>{% include "cauldron_admin/includes/status_badge.html" with status=item.status %}</td>
         <td>{{ item.provider|escape }}</td>
         <td><code>{{ item.hash|escape|slice:":12" }}…</code></td>
+        {% endif %}
       </tr>
       {% endfor %}
     </tbody>

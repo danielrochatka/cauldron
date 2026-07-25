@@ -1,0 +1,107 @@
+{% extends "cauldron_admin/base.html" %}
+{% block page_title %}{{ form_title|default:"Page" }}{% endblock %}
+
+{% block page_actions %}
+<a href="{% url 'cauldron_admin_content:content-browser' %}" class="cui-button cui-button--secondary">Cancel</a>
+{% endblock %}
+
+{% block content %}
+
+{% if is_edit and item %}
+<div class="cui-card">
+  <dl class="cui-dl">
+    <dt>URL slug</dt>
+    <dd><code>{{ item.slug|escape }}</code> <span class="cui-text-muted">(read-only in this phase)</span></dd>
+    <dt>Item ID</dt>
+    <dd><code>{{ item.id|escape }}</code></dd>
+    <dt>Current status</dt>
+    <dd>{% include "cauldron_admin/includes/status_badge.html" with status=item.status %}</dd>
+  </dl>
+</div>
+{% endif %}
+
+<form method="post" novalidate>
+  {% csrf_token %}
+
+  {% if is_edit %}
+  <input type="hidden" name="edit_token" value="{{ edit_token|escape }}">
+  {% endif %}
+  <input type="hidden" name="submission_token" value="{{ submission_token|escape }}">
+
+  {# Page section #}
+  <div class="cui-card">
+    <h2 class="cui-card__heading">Page</h2>
+    <div class="cui-form">
+      {% include "cauldron_admin/includes/form_field.html" with field=form.title %}
+      {% if not is_edit %}
+      {% include "cauldron_admin/includes/form_field.html" with field=form.slug %}
+      {% endif %}
+      {% include "cauldron_admin/includes/form_field.html" with field=form.navigation_title %}
+      {% include "cauldron_admin/includes/form_field.html" with field=form.summary %}
+      {% include "cauldron_admin/includes/form_field.html" with field=form.template %}
+    </div>
+  </div>
+
+  {# Search metadata section #}
+  <div class="cui-card">
+    <h2 class="cui-card__heading">Search metadata</h2>
+    <div class="cui-form">
+      {% include "cauldron_admin/includes/form_field.html" with field=form.seo_title %}
+      {% include "cauldron_admin/includes/form_field.html" with field=form.meta_description %}
+      {% include "cauldron_admin/includes/form_field.html" with field=form.canonical_url %}
+      {% include "cauldron_admin/includes/form_field.html" with field=form.robots_index %}
+      {% include "cauldron_admin/includes/form_field.html" with field=form.robots_follow %}
+    </div>
+  </div>
+
+  {# Social metadata section #}
+  <div class="cui-card">
+    <h2 class="cui-card__heading">Social metadata</h2>
+    <div class="cui-form">
+      {% include "cauldron_admin/includes/form_field.html" with field=form.social_title %}
+      {% include "cauldron_admin/includes/form_field.html" with field=form.social_description %}
+      {% include "cauldron_admin/includes/form_field.html" with field=form.social_image %}
+    </div>
+  </div>
+
+  {# Content section #}
+  <div class="cui-card">
+    <h2 class="cui-card__heading">Content</h2>
+    <div class="cui-form">
+      <div class="cui-form-field{% if form.body.errors %} cui-form-field--error{% endif %}">
+        {{ form.body.label_tag }}
+        {{ form.body }}
+        <p class="cui-form-field__help">
+          Markdown reference: <code># Heading</code>, <code>**bold**</code>, <code>_italic_</code>,
+          <code>[link text](url)</code>, <code>- item</code> (list).
+          Content is displayed as escaped text until a renderer is configured.
+        </p>
+        {% for error in form.body.errors %}
+        <p class="cui-form-field__error" role="alert">{{ error }}</p>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+  {# Workflow section #}
+  <div class="cui-card">
+    <h2 class="cui-card__heading">Workflow</h2>
+    <div class="cui-form">
+      {% include "cauldron_admin/includes/form_field.html" with field=form.intended_status %}
+      <div class="cui-alert cui-alert--info" role="note">
+        This creates a <strong>change request</strong> that must be approved and applied
+        before the page is visible. No file is written until the request is applied.
+      </div>
+      {% include "cauldron_admin/includes/form_field.html" with field=form.change_description %}
+    </div>
+  </div>
+
+  <div class="cui-form-actions">
+    <button type="submit" class="cui-button">
+      {% if is_edit %}Submit Update Proposal{% else %}Submit Page Proposal{% endif %}
+    </button>
+    <a href="{% url 'cauldron_admin_content:content-browser' %}" class="cui-button cui-button--secondary">Cancel</a>
+  </div>
+
+</form>
+{% endblock %}

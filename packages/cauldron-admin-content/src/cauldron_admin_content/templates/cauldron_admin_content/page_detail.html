@@ -1,0 +1,67 @@
+{% extends "cauldron_admin/base.html" %}
+{% block page_title %}{{ item.data.title|escape|default:"Page" }}{% endblock %}
+
+{% block page_actions %}
+{% if can_propose %}
+<a href="{% url 'cauldron_admin_content:page-edit' item.id %}" class="cui-button">Edit Page</a>
+{% endif %}
+<a href="{% url 'cauldron_admin_content:content-browser' %}" class="cui-button cui-button--secondary">Back to Browser</a>
+{% endblock %}
+
+{% block content %}
+
+<div class="cui-card">
+  <h2 class="cui-card__heading">Page information</h2>
+  <dl class="cui-dl">
+    <dt>Title</dt><dd>{{ item.data.title|escape|default:"—" }}</dd>
+    <dt>Status</dt><dd>{% include "cauldron_admin/includes/status_badge.html" with status=item.status %}</dd>
+    <dt>URL slug</dt><dd><code>{{ item.slug|escape }}</code></dd>
+    <dt>Item ID</dt><dd><code>{{ item.id|escape }}</code></dd>
+    <dt>Schema</dt><dd><code>{{ item.schema|escape }}</code></dd>
+    <dt>Provider</dt><dd>{{ item.provider|escape }}</dd>
+    <dt>Content hash</dt><dd><code>{{ item.hash|escape|slice:":16" }}…</code></dd>
+  </dl>
+</div>
+
+<div class="cui-card">
+  <h2 class="cui-card__heading">Page metadata</h2>
+  <dl class="cui-dl">
+    <dt>Navigation title</dt><dd>{{ item.data.navigation_title|escape|default:"—" }}</dd>
+    <dt>Summary</dt><dd>{{ item.data.summary|escape|default:"—" }}</dd>
+    <dt>Template</dt><dd>{{ item.data.template|escape|default:"page" }}</dd>
+  </dl>
+</div>
+
+<div class="cui-card">
+  <h2 class="cui-card__heading">Search metadata</h2>
+  <dl class="cui-dl">
+    <dt>SEO title</dt><dd>{{ item.data.seo_title|escape|default:"—" }}</dd>
+    <dt>Meta description</dt><dd>{{ item.data.meta_description|escape|default:"—" }}</dd>
+    <dt>Canonical URL</dt><dd>{{ item.data.canonical_url|escape|default:"—" }}</dd>
+    <dt>Allow search indexing</dt><dd>{% if item.data.robots_index %}Yes{% else %}No{% endif %}</dd>
+    <dt>Allow link following</dt><dd>{% if item.data.robots_follow %}Yes{% else %}No{% endif %}</dd>
+  </dl>
+</div>
+
+<div class="cui-card">
+  <h2 class="cui-card__heading">Social metadata</h2>
+  <dl class="cui-dl">
+    <dt>Social title</dt><dd>{{ item.data.social_title|escape|default:"—" }}</dd>
+    <dt>Social description</dt><dd>{{ item.data.social_description|escape|default:"—" }}</dd>
+    <dt>Social image URL</dt><dd>{{ item.data.social_image|escape|default:"—" }}</dd>
+  </dl>
+</div>
+
+<div class="cui-card">
+  <h2 class="cui-card__heading">Markdown content</h2>
+  <div class="cui-alert cui-alert--info" role="note">
+    Content is displayed as plain text. Markdown rendering is not active in this phase.
+  </div>
+  {% if item.body %}
+  <pre class="cui-body-preview"><code>{{ item.body|escape }}</code></pre>
+  {% else %}
+  <p class="cui-text-muted">No content body.</p>
+  {% endif %}
+</div>
+
+{% endblock %}

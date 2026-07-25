@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "page",
+  "title": "Page",
+  "description": "Data schema for a Cauldron page content item. The Markdown body is stored separately.",
+  "type": "object",
+  "required": ["title"],
+  "additionalProperties": false,
+  "properties": {
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "navigation_title": {
+      "type": "string",
+      "maxLength": 100
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 500
+    },
+    "seo_title": {
+      "type": "string",
+      "maxLength": 70
+    },
+    "meta_description": {
+      "type": "string",
+      "maxLength": 320
+    },
+    "canonical_url": {
+      "type": "string",
+      "maxLength": 2048
+    },
+    "robots_index": {
+      "type": "boolean",
+      "default": true
+    },
+    "robots_follow": {
+      "type": "boolean",
+      "default": true
+    },
+    "social_title": {
+      "type": "string",
+      "maxLength": 100
+    },
+    "social_description": {
+      "type": "string",
+      "maxLength": 300
+    },
+    "social_image": {
+      "type": "string",
+      "maxLength": 2048
+    },
+    "template": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "default": "page"
+    }
+  }
+}

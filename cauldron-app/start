@@ -4,6 +4,8 @@ set -euo pipefail
 CAULDRON_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$CAULDRON_DIR")"
 
+source "$CAULDRON_DIR/lib.sh"
+
 # 1. Check Python 3.11+
 PYTHON_VERSION=$(python3 --version 2>&1 | awk '{print $2}')
 PYTHON_MAJOR=$(echo "$PYTHON_VERSION" | cut -d. -f1)
@@ -34,20 +36,13 @@ for pkg in "$REPO_DIR"/packages/*; do
   pip install -q -e "$pkg"
 done
 
-# 5. Load config.env
-if [ -f "$CAULDRON_DIR/config.env" ]; then
-  set -a
-  source "$CAULDRON_DIR/config.env"
-  set +a
-fi
+# 5. Initialize config.env (creates it on first run, fills in SECRET_KEY).
+initialize_config "$CAULDRON_DIR/config.env" "$CAULDRON_DIR/config.env.example"
 
-# 6. Require SECRET_KEY
-if [ -z "${SECRET_KEY:-}" ]; then
-  echo "ERROR: SECRET_KEY is not set in config.env."
-  echo "       Generate one with:"
-  echo "       python3 -c \"import secrets; print(secrets.token_hex(32))\""
-  exit 1
-fi
+# 6. Load config.env
+set -a
+source "$CAULDRON_DIR/config.env"
+set +a
 
 cd "$CAULDRON_DIR"
 

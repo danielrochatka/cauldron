@@ -16,12 +16,10 @@ WORKSPACE_DIR = BASE_DIR / "data" / "workspace"
 
 _secret = os.environ.get("SECRET_KEY", "").strip()
 if not _secret:
+    # initialize_config in lib.sh fills this before Django starts.
+    # If it is still empty the script was bypassed — surface a clear error.
     raise RuntimeError(
-        "SECRET_KEY is not set.\n"
-        "Add it to cauldron-app/config.env:\n"
-        "  SECRET_KEY=<value>\n"
-        "Generate one with:\n"
-        "  python3 -c \"import secrets; print(secrets.token_hex(32))\""
+        "SECRET_KEY is not set. Run ./start to initialize the installation."
     )
 SECRET_KEY = _secret
 

@@ -5,22 +5,18 @@ CAULDRON_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$CAULDRON_DIR")"
 VENV="$CAULDRON_DIR/.venv"
 
+source "$CAULDRON_DIR/lib.sh"
+
 echo "==> Cauldron Update"
 echo ""
 
-# Load configuration so $CAULDRON_PORT and $SECRET_KEY are available.
-if [ -f "$CAULDRON_DIR/config.env" ]; then
-  set -a
-  source "$CAULDRON_DIR/config.env"
-  set +a
-fi
+# Ensure config.env exists and has a stable SECRET_KEY before doing anything.
+initialize_config "$CAULDRON_DIR/config.env" "$CAULDRON_DIR/config.env.example"
 
-if [ -z "${SECRET_KEY:-}" ]; then
-  echo "ERROR: SECRET_KEY is not set in config.env."
-  echo "       Generate one with:"
-  echo "       python3 -c \"import secrets; print(secrets.token_hex(32))\""
-  exit 1
-fi
+# Load configuration so $CAULDRON_PORT and $SECRET_KEY are available.
+set -a
+source "$CAULDRON_DIR/config.env"
+set +a
 
 PORT="${CAULDRON_PORT:-8000}"
 

@@ -16,31 +16,19 @@ git clone https://github.com/danielrochatka/cauldron.git
 cd cauldron/cauldron-app
 ```
 
-**2. Configure your site**
-
-```bash
-cp config.env.example config.env
-```
-
-Open `config.env` and set a `SECRET_KEY`. Generate one with:
-
-```bash
-python3 -c "import secrets; print(secrets.token_hex(32))"
-```
-
-**3. Start Cauldron**
+**2. Start Cauldron**
 
 ```bash
 ./start
 ```
 
-This will set up the environment, apply database migrations, and start the server.
+On first launch, `./start` creates `config.env`, generates a secure secret key, sets up the environment, applies database migrations, and starts the server. No manual configuration is needed.
 
-**4. Open your browser**
+**3. Open your browser**
 
 Visit [http://localhost:8000](http://localhost:8000)
 
-**5. Create your admin account**
+**4. Create your admin account**
 
 ```bash
 ./manage createsuperuser

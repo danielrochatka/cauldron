@@ -33,6 +33,11 @@
   --cui-color-action-subtle: #e9f0f0;
   --cui-color-action-border: #9fb3b5;
 
+  /* Settings navigation — muted red accent, distinct from destructive danger */
+  --cui-color-settings: #9a3f3f;
+  --cui-color-settings-hover: #7f3030;
+  --cui-color-settings-bg: #f8eded;
+
   /* Semantic colours */
   --cui-color-danger: #c0392b;
   --cui-color-danger-text: #ffffff;

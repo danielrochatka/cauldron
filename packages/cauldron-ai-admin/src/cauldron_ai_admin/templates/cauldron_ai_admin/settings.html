@@ -1,0 +1,41 @@
+{% extends "cauldron_admin/base.html" %}
+{% block page_title %}AI Settings{% endblock %}
+{% block content %}
+<div class="cui-settings-page">
+
+  <section class="cui-settings-section">
+    <h2 class="cui-settings-section__title">Module</h2>
+    <dl class="cui-settings-summary">
+      <dt>Name</dt>
+      <dd>Cauldron Admin AI</dd>
+      <dt>Module slug</dt>
+      <dd><code>cauldron.ai.admin</code></dd>
+    </dl>
+  </section>
+
+  <section class="cui-settings-section">
+    <h2 class="cui-settings-section__title">Provider</h2>
+    <dl class="cui-settings-summary">
+      <dt>Current provider</dt>
+      <dd>{{ provider_name }}</dd>
+      <dt>Status</dt>
+      <dd>
+        <span class="cui-settings-status">
+          <span class="cui-badge cui-badge--active">{{ provider_status }}</span>
+        </span>
+      </dd>
+    </dl>
+  </section>
+
+  <section class="cui-settings-section">
+    <h2 class="cui-settings-section__title">Phase 1 — Settings Shell</h2>
+    <div class="cui-alert cui-alert--info">
+      Provider selection, API credentials, and connection testing will be
+      added in the next Admin AI implementation phase. This page establishes
+      the stable URL (<code>/cauldron/admin/ai/settings/</code>), permission,
+      and layout that the next PR will extend.
+    </div>
+  </section>
+
+</div>
+{% endblock %}

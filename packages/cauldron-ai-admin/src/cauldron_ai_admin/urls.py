@@ -14,6 +14,7 @@ urlpatterns = [
         views.AdminAIInvocationDetailView.as_view(),
         name="invocation-detail",
     ),
+    path("admin/ai/settings/", views.AdminAISettingsView.as_view(), name="settings"),
     path("ui/style-changes/", views.UIStyleChangeListView.as_view(), name="style-list"),
     path("ui/style-changes/<uuid:request_id>/", views.UIStyleChangeDetailView.as_view(), name="style-detail"),
 ]

@@ -22,11 +22,38 @@ logger = logging.getLogger(__name__)
 
 
 ADMIN_AI_PERMISSION = "cauldron_ai_admin.use_admin_ai"
+MANAGE_AI_SETTINGS_PERMISSION = "cauldron_ai_admin.manage_admin_ai_settings"
 
 
 def _get_service():
     from .service_factory import get_admin_ai_service
     return get_admin_ai_service()
+
+
+@method_decorator([
+    login_required,
+    permission_required(MANAGE_AI_SETTINGS_PERMISSION, raise_exception=True),
+], name="dispatch")
+class AdminAISettingsView(View):
+    """Settings shell for the Admin AI module.
+
+    Phase 1: establishes the stable URL, permission, breadcrumbs, and layout
+    that the next AI Admin PR will extend with provider and credential
+    configuration.  No API-key fields, no provider selection, no secret
+    storage are implemented here.
+    """
+
+    template_name = "cauldron_ai_admin/settings.html"
+
+    def get(self, request: HttpRequest) -> HttpResponse:
+        return render(request, self.template_name, {
+            "provider_name": "fake",
+            "provider_status": "Demo provider active",
+            "breadcrumbs": [
+                {"label": "AI Assistant", "url": reverse("cauldron_ai_admin:ai-page")},
+                {"label": "Settings", "url": ""},
+            ],
+        })
 
 
 @method_decorator([

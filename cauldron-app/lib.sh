@@ -84,16 +84,17 @@ PY
 # install_python_projects REPO_DIR REQUIREMENTS_FILE
 #
 # Installs requirements, the root cauldron package, and all Python packages
-# under packages/. Skips directories without pyproject.toml (e.g. cauldron-astro).
+# under packages/ in a single pip invocation so pip can resolve cross-package
+# dependencies correctly. Skips non-Python dirs (e.g. cauldron-astro).
 install_python_projects() {
   local repo_dir="$1"
   local requirements_file="$2"
 
-  pip install -q -r "$requirements_file"
-  pip install -q -e "$repo_dir"
-
+  local args=(-q -r "$requirements_file" -e "$repo_dir")
   for pkg in "$repo_dir"/packages/*; do
     [ -f "$pkg/pyproject.toml" ] || continue
-    pip install -q -e "$pkg"
+    args+=(-e "$pkg")
   done
+
+  pip install "${args[@]}"
 }

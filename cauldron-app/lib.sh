@@ -92,6 +92,7 @@ launch_server() {
 
   if command -v gunicorn &>/dev/null; then
     gunicorn \
+      --chdir "$cauldron_dir" \
       --bind "0.0.0.0:$port" \
       --workers "${CAULDRON_WORKERS:-2}" \
       --pid "$pid_file" \

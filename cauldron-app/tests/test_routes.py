@@ -255,16 +255,15 @@ def test_static_tokens_css_served_via_whitenoise(tmp_path):
     """
     /static/cauldron_admin/css/tokens.css returns 200 with a CSS content-type
     through the full WSGI middleware stack (including WhiteNoiseMiddleware)
-    with DEBUG=False, matching the production Gunicorn configuration.
+    with DEBUG=False and the production CompressedManifestStaticFilesStorage backend.
     """
+    import os
+    from pathlib import Path
     from django.core.management import call_command
     from django.test import Client, override_settings
 
     static_root = str(tmp_path / "staticfiles")
 
-    # Use the simple (non-hashing) backend so collected filenames are
-    # identical to source filenames; the WhiteNoise serving path is the
-    # same regardless of whether hashing is used.
     with override_settings(
         DEBUG=False,
         STATIC_ROOT=static_root,
@@ -273,12 +272,16 @@ def test_static_tokens_css_served_via_whitenoise(tmp_path):
                 "BACKEND": "django.core.files.storage.FileSystemStorage",
             },
             "staticfiles": {
-                "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+                "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
             },
         },
         ALLOWED_HOSTS=["*"],
     ):
         call_command("collectstatic", "--no-input", verbosity=0, clear=True)
+
+        # Production manifest created alongside collected assets.
+        manifest = Path(static_root) / "staticfiles.json"
+        assert manifest.exists(), "collectstatic did not create staticfiles.json"
 
         # Create the client inside the override context so ClientHandler
         # initialises WhiteNoiseMiddleware with the correct STATIC_ROOT.
@@ -291,4 +294,21 @@ def test_static_tokens_css_served_via_whitenoise(tmp_path):
     content_type = response.get("Content-Type", "")
     assert "css" in content_type, (
         f"Expected CSS content-type, got {content_type!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# launch_server chdir safety
+# ---------------------------------------------------------------------------
+
+def test_launch_server_includes_chdir():
+    """launch_server() must pass --chdir to Gunicorn so it finds cauldron_site
+    regardless of the calling script's working directory."""
+    from pathlib import Path
+
+    lib_sh = Path(__file__).parent.parent / "lib.sh"
+    content = lib_sh.read_text()
+    assert "--chdir" in content, (
+        "launch_server() in lib.sh must pass --chdir so Gunicorn imports "
+        "cauldron_site.wsgi correctly when called from outside cauldron-app/"
     )

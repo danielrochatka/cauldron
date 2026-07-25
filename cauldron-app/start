@@ -29,7 +29,7 @@ pip install -q -r "$CAULDRON_DIR/requirements.txt"
 
 REPO_DIR="$(dirname "$CAULDRON_DIR")"
 for pkg in "$REPO_DIR"/packages/*/; do
-  pip install -q --no-deps -e "$pkg"
+  pip install -q -e "$pkg"
 done
 
 # 5. Load config.env if it exists

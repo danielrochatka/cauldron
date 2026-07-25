@@ -12,7 +12,7 @@ Cauldron is an AI-powered CMS — create, edit, and publish content with built-i
 **1. Clone the repository**
 
 ```bash
-git clone https://github.com/your-org/cauldron.git
+git clone https://github.com/danielrochatka/cauldron.git
 cd cauldron/cauldron-app
 ```
 
@@ -43,8 +43,7 @@ Visit [http://localhost:8000](http://localhost:8000)
 **5. Create your admin account**
 
 ```bash
-source .venv/bin/activate
-python manage.py createsuperuser
+./manage createsuperuser
 ```
 
 Then log in at [http://localhost:8000/accounts/login/](http://localhost:8000/accounts/login/)

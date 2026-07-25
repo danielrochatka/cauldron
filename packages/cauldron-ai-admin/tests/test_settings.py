@@ -9,7 +9,17 @@ from django.contrib.auth.models import Permission
 from django.test import Client
 from django.urls import reverse
 
+from cauldron_ai.providers import _reset_registry_for_tests, register_provider
+
 pytestmark = pytest.mark.django_db
+
+
+@pytest.fixture(autouse=True)
+def reset_provider_registry():
+    """Isolate each test from provider-registry state."""
+    _reset_registry_for_tests()
+    yield
+    _reset_registry_for_tests()
 
 
 def _make_user(*, username, perms=()):
@@ -71,7 +81,16 @@ def test_settings_authorized_user_gets_200():
 # Page content contract
 # ---------------------------------------------------------------------------
 
-def test_settings_page_shows_provider_name():
+class _FakeProvider:
+    name = "test-ai"
+    display_name = "Test AI Provider"
+
+    def complete(self, req):  # pragma: no cover
+        return None
+
+
+def test_settings_page_shows_registered_provider_name():
+    register_provider(_FakeProvider())
     user = _make_user(
         username="settings-content",
         perms=("cauldron_ai_admin.manage_admin_ai_settings",),
@@ -80,10 +99,11 @@ def test_settings_page_shows_provider_name():
     client.force_login(user)
     response = client.get(reverse("cauldron_ai_admin:settings"))
     assert response.status_code == 200
-    assert b"fake" in response.content
+    assert b"Test AI Provider" in response.content
 
 
-def test_settings_page_shows_provider_status():
+def test_settings_page_shows_active_status_when_provider_configured():
+    register_provider(_FakeProvider())
     user = _make_user(
         username="settings-status",
         perms=("cauldron_ai_admin.manage_admin_ai_settings",),
@@ -91,7 +111,20 @@ def test_settings_page_shows_provider_status():
     client = Client()
     client.force_login(user)
     response = client.get(reverse("cauldron_ai_admin:settings"))
-    assert b"Demo provider active" in response.content
+    assert b"Active" in response.content
+
+
+def test_settings_page_shows_no_provider_status_when_none_registered():
+    """With no provider registered the page still renders and reports the error."""
+    user = _make_user(
+        username="settings-noprovider",
+        perms=("cauldron_ai_admin.manage_admin_ai_settings",),
+    )
+    client = Client()
+    client.force_login(user)
+    response = client.get(reverse("cauldron_ai_admin:settings"))
+    assert response.status_code == 200
+    assert b"No AI provider registered" in response.content
 
 
 def test_settings_page_has_no_api_key_input():

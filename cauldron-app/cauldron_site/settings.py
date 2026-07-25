@@ -1,7 +1,5 @@
 """Django settings for the Cauldron self-hosted instance."""
 import os
-import secrets
-import sys
 from pathlib import Path
 
 # Base directory is the cauldron-app/ directory (parent of this file's package)
@@ -16,14 +14,15 @@ WORKSPACE_DIR = BASE_DIR / "data" / "workspace"
 # Security
 # ---------------------------------------------------------------------------
 
-_secret = os.environ.get("SECRET_KEY")
+_secret = os.environ.get("SECRET_KEY", "").strip()
 if not _secret:
-    if sys.argv[1:2] in [["runserver"], ["start"]]:
-        print(
-            "WARNING: SECRET_KEY is not set. Set it in config.env for production.",
-            file=sys.stderr,
-        )
-    _secret = secrets.token_hex(32)
+    raise RuntimeError(
+        "SECRET_KEY is not set.\n"
+        "Add it to cauldron-app/config.env:\n"
+        "  SECRET_KEY=<value>\n"
+        "Generate one with:\n"
+        "  python3 -c \"import secrets; print(secrets.token_hex(32))\""
+    )
 SECRET_KEY = _secret
 
 DEBUG = os.environ.get("CAULDRON_DEBUG", "false").lower() == "true"

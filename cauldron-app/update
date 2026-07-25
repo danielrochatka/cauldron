@@ -8,22 +8,60 @@ VENV="$CAULDRON_DIR/.venv"
 echo "==> Cauldron Update"
 echo ""
 
-# 1. Detect local modifications to tracked files before touching anything
-cd "$REPO_DIR"
-if ! git diff --quiet HEAD 2>/dev/null || ! git diff --cached --quiet HEAD 2>/dev/null; then
-  echo "ERROR: Tracked files have uncommitted local changes."
-  echo "       Undo them with: git checkout -- ."
-  echo "       Or stash with:  git stash  (then ./update, then git stash pop)"
+# Load configuration so $CAULDRON_PORT and $SECRET_KEY are available.
+if [ -f "$CAULDRON_DIR/config.env" ]; then
+  set -a
+  source "$CAULDRON_DIR/config.env"
+  set +a
+fi
+
+if [ -z "${SECRET_KEY:-}" ]; then
+  echo "ERROR: SECRET_KEY is not set in config.env."
+  echo "       Generate one with:"
+  echo "       python3 -c \"import secrets; print(secrets.token_hex(32))\""
   exit 1
 fi
 
-# 2. Stop server and wait for all workers to exit
+PORT="${CAULDRON_PORT:-8000}"
+
+# 1. Validate repository state before touching anything.
+cd "$REPO_DIR"
+
+if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+  echo "ERROR: $REPO_DIR is not a Git repository."
+  exit 1
+fi
+
+# Detect uncommitted local modifications to tracked files.
+if ! git diff --quiet HEAD 2>/dev/null || ! git diff --cached --quiet HEAD 2>/dev/null; then
+  echo "ERROR: Tracked files have uncommitted local changes."
+  echo "       Inspect changes with: git diff"
+  echo "       Discard them with:    git checkout -- ."
+  echo "       Or stash them with:   git stash  (then ./update, then git stash pop)"
+  exit 1
+fi
+
+# Ensure the current branch has a configured upstream.
+if ! git rev-parse --abbrev-ref --symbolic-full-name '@{u}' &>/dev/null; then
+  echo "ERROR: No upstream branch is configured for the current branch."
+  echo "       Set one with: git branch --set-upstream-to=origin/main main"
+  exit 1
+fi
+
+# Verify the remote is reachable (avoids stopping the server before a network error).
+echo "--> Checking remote reachability..."
+if ! git fetch --dry-run origin &>/dev/null; then
+  echo "ERROR: Cannot reach the remote repository. Check your network connection."
+  exit 1
+fi
+
+# 2. Stop server and wait for all workers to exit.
 if [ -f "$CAULDRON_DIR/data/cauldron.pid" ]; then
   echo "--> Stopping server..."
   "$CAULDRON_DIR/stop"
 fi
 
-# 3. Back up the database
+# 3. Back up the database.
 DB="$CAULDRON_DIR/data/cauldron.db"
 BACKUP=""
 if [ -f "$DB" ]; then
@@ -32,39 +70,37 @@ if [ -f "$DB" ]; then
   echo "--> Database backed up to $(basename "$BACKUP")"
 fi
 
-# 4. Record the current commit so we can roll back to it
+# 4. Record the current commit so rollback can return to it exactly.
 PREV_COMMIT="$(git rev-parse HEAD)"
 echo "--> Current commit: ${PREV_COMMIT:0:8}"
 
-# Rollback: restore previous commit, database, and restart on old code
+# Rollback: move HEAD back, restore DB, reinstall old packages, restart.
 _rollback() {
-  local EXIT_CODE=$?
   echo ""
-  echo "!!! Update failed (exit $EXIT_CODE). Rolling back to ${PREV_COMMIT:0:8}..."
+  echo "!!! Update failed. Rolling back to ${PREV_COMMIT:0:8}..."
 
-  # Stop any partially-started server
+  # Stop any partially-started server.
   if [ -f "$CAULDRON_DIR/data/cauldron.pid" ]; then
     "$CAULDRON_DIR/stop" 2>/dev/null || true
   fi
 
-  # Restore repository to the previous commit
+  # Return HEAD and working tree to the previous commit.
   cd "$REPO_DIR"
-  git checkout "$PREV_COMMIT" -- . 2>/dev/null || true
+  git reset --hard "$PREV_COMMIT" 2>/dev/null || true
 
-  # Restore the database backup
+  # Restore the database backup.
   if [ -n "${BACKUP:-}" ] && [ -f "$BACKUP" ]; then
     cp "$BACKUP" "$DB"
     echo "!!! Database restored from backup."
   fi
 
-  # Re-install packages for the restored commit and restart
+  # Reinstall packages from the restored commit and restart.
   source "$VENV/bin/activate"
   pip install -q -r "$CAULDRON_DIR/requirements.txt"
-  for pkg in "$REPO_DIR"/packages/*/; do
+  for pkg in "$REPO_DIR"/packages/*; do
+    [ -f "$pkg/pyproject.toml" ] || continue
     pip install -q -e "$pkg"
   done
-  cd "$CAULDRON_DIR"
-  python manage.py migrate --no-input 2>/dev/null || true
   "$CAULDRON_DIR/start" 2>/dev/null || true
 
   echo ""
@@ -73,38 +109,37 @@ _rollback() {
 }
 trap '_rollback' ERR
 
-# 5. Pull latest code
+# 5. Pull latest code.
 echo "--> Pulling latest Cauldron..."
 cd "$REPO_DIR"
 git pull --ff-only
 
-# 6. Install/upgrade all packages and their dependencies
+# 6. Install/upgrade all Python packages and their dependencies.
 echo "--> Upgrading dependencies..."
 source "$VENV/bin/activate"
 pip install -q -r "$CAULDRON_DIR/requirements.txt"
-for pkg in "$REPO_DIR"/packages/*/; do
+for pkg in "$REPO_DIR"/packages/*; do
+  [ -f "$pkg/pyproject.toml" ] || continue
   pip install -q -e "$pkg"
 done
 
-# 7. Run migrations
+# 7. Run migrations.
 echo "--> Applying database migrations..."
-cd "$CAULDRON_DIR"
-python manage.py migrate --no-input
+"$CAULDRON_DIR/manage" migrate --no-input
 
-# 8. Collect static assets
+# 8. Collect static assets.
 echo "--> Collecting static assets..."
-python manage.py collectstatic --no-input --clear -v 0
+"$CAULDRON_DIR/manage" collectstatic --no-input --clear -v 0
 
-# 9. Run system check
+# 9. Run system check.
 echo "--> Running system check..."
-python manage.py check
+"$CAULDRON_DIR/manage" check
 
-# 10. Restart server
+# 10. Restart server.
 echo "--> Starting server..."
 "$CAULDRON_DIR/start"
 
-# 11. Health check — verify the server responds before declaring success
-PORT="${CAULDRON_PORT:-8000}"
+# 11. Health check — trigger the ERR trap (and therefore rollback) on failure.
 echo "--> Verifying server health..."
 HEALTHY=0
 for i in $(seq 1 20); do
@@ -117,7 +152,7 @@ done
 
 if [ "$HEALTHY" -eq 0 ]; then
   echo "ERROR: Server did not respond on port $PORT after 20 seconds."
-  exit 1
+  false  # Triggers the ERR trap → _rollback
 fi
 
 trap - ERR

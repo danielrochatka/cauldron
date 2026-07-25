@@ -92,6 +92,7 @@ _plan = compose_django_settings(
     ],
     middleware=[
         "django.middleware.security.SecurityMiddleware",
+        "whitenoise.middleware.WhiteNoiseMiddleware",
         "django.middleware.common.CommonMiddleware",
         "django.middleware.csrf.CsrfViewMiddleware",
         "django.middleware.clickjacking.XFrameOptionsMiddleware",
@@ -150,6 +151,15 @@ STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "data" / "media"
+
+STORAGES = {
+    "default": {
+        "BACKEND": "django.core.files.storage.FileSystemStorage",
+    },
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Cauldron UI override directory

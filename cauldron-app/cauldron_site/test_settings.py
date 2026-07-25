@@ -13,3 +13,16 @@ os.environ.setdefault(
 )
 
 from cauldron_site.settings import *  # noqa: F401,F403,E402
+
+# CompressedManifestStaticFilesStorage requires collectstatic to have been run
+# before any {% static %} tag can render (it needs the manifest file).  Use the
+# simple backend in tests so requests work without a pre-existing staticfiles
+# directory.  The whitenoise-static test overrides this explicitly.
+STORAGES = {
+    "default": {
+        "BACKEND": "django.core.files.storage.FileSystemStorage",
+    },
+    "staticfiles": {
+        "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+    },
+}

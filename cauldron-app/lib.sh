@@ -81,6 +81,32 @@ PY
   fi
 }
 
+# launch_server CAULDRON_DIR PORT
+#
+# Starts Gunicorn in daemon mode, or falls back to Django's dev server.
+# Called from ./start and ./update so each performs this step exactly once.
+launch_server() {
+  local cauldron_dir="$1"
+  local port="$2"
+  local pid_file="$cauldron_dir/data/cauldron.pid"
+
+  if command -v gunicorn &>/dev/null; then
+    gunicorn \
+      --chdir "$cauldron_dir" \
+      --bind "0.0.0.0:$port" \
+      --workers "${CAULDRON_WORKERS:-2}" \
+      --pid "$pid_file" \
+      --access-logfile "$cauldron_dir/logs/access.log" \
+      --error-logfile "$cauldron_dir/logs/error.log" \
+      --daemon \
+      cauldron_site.wsgi:application
+    echo "Cauldron started on http://localhost:$port (gunicorn)"
+  else
+    echo "Cauldron starting on http://localhost:$port (press Ctrl+C to stop)"
+    "$cauldron_dir/manage" runserver "0.0.0.0:$port"
+  fi
+}
+
 # install_python_projects REPO_DIR REQUIREMENTS_FILE
 #
 # Installs requirements, the root cauldron package, and all Python packages

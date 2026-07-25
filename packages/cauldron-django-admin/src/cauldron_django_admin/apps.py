@@ -9,7 +9,14 @@ class CauldronDjangoAdminConfig(AppConfig):
 
     def ready(self) -> None:
         from . import checks  # noqa: F401 — registers @checks.register decorators
+        self._configure_admin_site()
         self._register_navigation()
+
+    def _configure_admin_site(self) -> None:
+        from django.contrib import admin
+        admin.site.site_header = "Cauldron Administration"
+        admin.site.site_title = "Cauldron Administration"
+        admin.site.index_title = "Cauldron Administration"
 
     def _register_navigation(self) -> None:
         # Exact re-registration of the same (section, item) is idempotent

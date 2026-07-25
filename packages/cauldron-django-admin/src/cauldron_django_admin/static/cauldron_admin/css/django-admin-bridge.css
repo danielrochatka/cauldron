@@ -1,11 +1,582 @@
-/* Bridge: apply Cauldron tokens to Django admin interface */
-#header {
-  background: var(--cui-color-primary, #0d6efd) !important;
+/* ==========================================================================
+   Cauldron → Django admin bridge
+   Maps Cauldron tokens onto Django admin's CSS custom properties so the
+   native Django admin CRUD UI uses Cauldron's visual identity.
+   Targets Django 5.x admin variables (defined in admin/css/base.css).
+   ========================================================================== */
+
+/* --- Django admin CSS variable overrides --- */
+:root {
+  --primary:              var(--cui-color-primary);
+  --secondary:            var(--cui-color-primary-hover);
+  --accent:               var(--cui-color-primary-text);
+  --primary-fg:           var(--cui-color-primary-text);
+
+  --body-fg:              var(--cui-color-text);
+  --body-bg:              var(--cui-color-bg);
+  --body-quiet-color:     var(--cui-color-text-muted);
+  --body-loud-color:      var(--cui-color-text);
+
+  --header-color:         var(--cui-color-primary-text);
+  --header-branding-color: var(--cui-color-primary-text);
+  --header-bg:            var(--cui-color-primary);
+  --header-link-color:    var(--cui-color-primary-text);
+
+  --breadcrumbs-fg:       var(--cui-color-text-muted);
+  --breadcrumbs-link-fg:  var(--cui-color-primary);
+  --breadcrumbs-bg:       var(--cui-color-bg-subtle);
+
+  --link-fg:              var(--cui-color-primary);
+  --link-hover-color:     var(--cui-color-primary-hover);
+  --link-selected-fg:     var(--cui-color-primary-hover);
+
+  --hairline-color:       var(--cui-color-border);
+  --border-color:         var(--cui-color-border-strong);
+
+  --error-fg:             var(--cui-color-danger);
+
+  --message-success-bg:   #ecfdf5;
+  --message-warning-bg:   #fffbeb;
+  --message-error-bg:     #fef2f2;
+
+  --darkened-bg:          var(--cui-color-bg-subtle);
+  --selected-bg:          rgba(54, 95, 99, 0.06);
+  --selected-row:         rgba(54, 95, 99, 0.06);
+
+  --button-fg:            var(--cui-color-primary-text);
+  --button-bg:            var(--cui-color-primary);
+  --button-hover-bg:      var(--cui-color-primary-hover);
+  --default-button-bg:    var(--cui-color-primary);
+  --default-button-hover-bg: var(--cui-color-primary-hover);
+  --close-button-bg:      var(--cui-color-text-muted);
+  --close-button-hover-bg: var(--cui-color-text);
+  --delete-button-bg:     var(--cui-color-danger);
+  --delete-button-hover-bg: #a93226;
 }
-a:link, a:visited { color: var(--cui-color-link, #0d6efd); }
+
+/* ==========================================================================
+   Header
+   ========================================================================== */
+#header {
+  background: var(--cui-color-primary) !important;
+  color: var(--cui-color-primary-text);
+  font-family: var(--cui-font-family);
+  padding: 0 var(--cui-space-4);
+  min-height: var(--cui-header-height);
+  display: flex;
+  align-items: center;
+  gap: var(--cui-space-4);
+  border-bottom: none;
+  box-shadow: var(--cui-shadow-sm);
+}
+#branding h1 {
+  font-size: var(--cui-font-size-lg);
+  font-weight: var(--cui-font-weight-semibold);
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+#branding h1 a,
+#branding a:link,
+#branding a:visited {
+  color: var(--cui-color-primary-text) !important;
+  text-decoration: none;
+}
+#user-tools {
+  font-size: var(--cui-font-size-sm);
+  color: rgba(255, 255, 255, 0.85);
+}
+#user-tools a:link,
+#user-tools a:visited {
+  color: rgba(255, 255, 255, 0.9);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+#user-tools a:hover {
+  color: #ffffff;
+}
+
+/* ==========================================================================
+   Breadcrumbs
+   ========================================================================== */
+div.breadcrumbs {
+  background: var(--cui-color-bg-subtle);
+  color: var(--cui-color-text-muted);
+  font-size: var(--cui-font-size-sm);
+  padding: var(--cui-space-2) var(--cui-space-4);
+  border-bottom: var(--cui-border);
+}
+div.breadcrumbs a {
+  color: var(--cui-color-primary);
+}
+
+/* ==========================================================================
+   Page body
+   ========================================================================== */
+body {
+  font-family: var(--cui-font-family);
+  background: var(--cui-color-bg);
+  color: var(--cui-color-text);
+}
+a:link, a:visited {
+  color: var(--cui-color-link);
+}
+a:hover {
+  color: var(--cui-color-link-hover);
+}
+
+/* ==========================================================================
+   Module cards (admin index & changelist sidebar)
+   ========================================================================== */
+.module {
+  background: var(--cui-color-surface);
+  border: var(--cui-border);
+  border-radius: var(--cui-radius-lg);
+  box-shadow: var(--cui-shadow-sm);
+  margin-bottom: var(--cui-space-4);
+  overflow: hidden;
+}
+.module h2,
+.module caption {
+  background: var(--cui-color-primary);
+  color: var(--cui-color-primary-text);
+  padding: var(--cui-space-3) var(--cui-space-4);
+  font-size: var(--cui-font-size-sm);
+  font-weight: var(--cui-font-weight-semibold);
+  letter-spacing: 0.01em;
+  text-align: left;
+  border-radius: 0;
+}
+.module caption a {
+  color: var(--cui-color-primary-text) !important;
+  text-decoration: none;
+}
+.module table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.module table td,
+.module table th {
+  padding: var(--cui-space-2) var(--cui-space-4);
+  border-bottom: var(--cui-border);
+  font-size: var(--cui-font-size-sm);
+  vertical-align: middle;
+}
+.module table tr:last-child td,
+.module table tr:last-child th {
+  border-bottom: none;
+}
+.module table tr:hover td {
+  background: var(--cui-color-bg-subtle);
+}
+
+/* ==========================================================================
+   Buttons
+   ========================================================================== */
+.button,
+input[type="submit"],
+input[type="button"],
+.submit-row input,
+a.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--cui-space-2) var(--cui-space-4);
+  background: var(--cui-color-primary);
+  color: var(--cui-color-primary-text) !important;
+  border: var(--cui-border-width) solid transparent;
+  border-radius: var(--cui-radius-md);
+  font-size: var(--cui-font-size-sm);
+  font-weight: var(--cui-font-weight-medium);
+  font-family: var(--cui-font-family);
+  cursor: pointer;
+  text-decoration: none;
+  transition: background 0.15s;
+  min-height: 36px;
+}
+.button:hover,
+input[type="submit"]:hover,
+input[type="button"]:hover,
+.submit-row input:hover,
+a.button:hover {
+  background: var(--cui-color-primary-hover);
+  color: var(--cui-color-primary-text) !important;
+}
+.button.default,
+input[type="submit"].default,
+.submit-row input.default {
+  background: var(--cui-color-primary);
+}
+.deletelink,
+.deletelink:link,
+.deletelink:visited,
+input[type="submit"].deletelink {
+  background: var(--cui-color-danger);
+  color: #fff !important;
+  border-color: transparent;
+}
+.deletelink:hover {
+  background: #a93226;
+}
+
+/* ==========================================================================
+   Forms
+   ========================================================================== */
+.form-row {
+  padding: var(--cui-space-3) var(--cui-space-4);
+  border-bottom: var(--cui-border);
+}
+.form-row:last-child {
+  border-bottom: none;
+}
+.aligned label {
+  display: block;
+  font-size: var(--cui-font-size-sm);
+  font-weight: var(--cui-font-weight-medium);
+  color: var(--cui-color-text);
+  margin-bottom: var(--cui-space-1);
+}
+input[type="text"],
+input[type="password"],
+input[type="email"],
+input[type="number"],
+input[type="url"],
+input[type="search"],
+input[type="tel"],
+select,
+textarea {
+  font-family: var(--cui-font-family);
+  font-size: var(--cui-font-size-sm);
+  color: var(--cui-color-text);
+  background: var(--cui-color-surface);
+  border: var(--cui-border);
+  border-radius: var(--cui-radius-md);
+  padding: var(--cui-space-2) var(--cui-space-3);
+}
+input[type="text"]:focus,
+input[type="password"]:focus,
+input[type="email"]:focus,
+input[type="number"]:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  box-shadow: var(--cui-focus-ring);
+  border-color: var(--cui-color-primary);
+}
+.errornote,
+.errorlist li {
+  color: var(--cui-color-danger);
+  font-size: var(--cui-font-size-sm);
+}
+p.errornote {
+  background: #fef2f2;
+  border: 1px solid var(--cui-color-danger);
+  border-radius: var(--cui-radius-md);
+  padding: var(--cui-space-3) var(--cui-space-4);
+}
+.field-box {
+  margin-bottom: var(--cui-space-3);
+}
+.help {
+  font-size: var(--cui-font-size-xs);
+  color: var(--cui-color-text-muted);
+  margin-top: var(--cui-space-1);
+}
+
+/* Submit row */
+.submit-row {
+  display: flex;
+  align-items: center;
+  gap: var(--cui-space-2);
+  flex-wrap: wrap;
+  padding: var(--cui-space-3) var(--cui-space-4);
+  border-top: var(--cui-border);
+  background: var(--cui-color-bg-subtle);
+  border-radius: 0 0 var(--cui-radius-md) var(--cui-radius-md);
+}
+
+/* ==========================================================================
+   Change list (table)
+   ========================================================================== */
+#changelist {
+  background: var(--cui-color-surface);
+  border: var(--cui-border);
+  border-radius: var(--cui-radius-lg);
+  overflow: hidden;
+}
+#result_list {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--cui-font-size-sm);
+}
+#result_list th {
+  background: var(--cui-color-bg-subtle);
+  padding: var(--cui-space-3) var(--cui-space-4);
+  font-weight: var(--cui-font-weight-semibold);
+  border-bottom: var(--cui-border);
+  text-align: left;
+  white-space: nowrap;
+}
+#result_list td {
+  padding: var(--cui-space-3) var(--cui-space-4);
+  border-bottom: var(--cui-border);
+  vertical-align: middle;
+}
+#result_list tr:last-child td {
+  border-bottom: none;
+}
+#result_list tr:hover td {
+  background: var(--cui-color-bg-subtle);
+}
+#result_list th.sorted {
+  background: var(--cui-color-bg-muted);
+}
+#result_list th a,
+#result_list th .sortoptions a {
+  color: var(--cui-color-primary);
+}
+
+/* Change list toolbar */
+#changelist-filter {
+  background: var(--cui-color-surface);
+  border: var(--cui-border);
+  border-radius: var(--cui-radius-lg);
+  padding: var(--cui-space-4) 0;
+  font-size: var(--cui-font-size-sm);
+}
+#changelist-filter h2 {
+  font-size: var(--cui-font-size-xs);
+  font-weight: var(--cui-font-weight-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--cui-color-text-subtle);
+  padding: 0 var(--cui-space-4) var(--cui-space-2);
+  border-bottom: var(--cui-border);
+  margin: 0 0 var(--cui-space-2);
+}
+#changelist-filter h3 {
+  font-size: var(--cui-font-size-sm);
+  font-weight: var(--cui-font-weight-semibold);
+  color: var(--cui-color-text);
+  padding: var(--cui-space-2) var(--cui-space-4) var(--cui-space-1);
+  margin: 0;
+}
+#changelist-filter li a {
+  display: block;
+  padding: var(--cui-space-1) var(--cui-space-4);
+  color: var(--cui-color-text-muted);
+  text-decoration: none;
+  font-size: var(--cui-font-size-sm);
+}
+#changelist-filter li.selected a {
+  color: var(--cui-color-primary);
+  font-weight: var(--cui-font-weight-medium);
+}
+#changelist-search {
+  padding: var(--cui-space-3) var(--cui-space-4);
+  display: flex;
+  gap: var(--cui-space-2);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+/* ==========================================================================
+   Messages
+   ========================================================================== */
+.messagelist {
+  list-style: none;
+  margin: 0 0 var(--cui-space-4);
+  padding: 0;
+}
+.messagelist li {
+  padding: var(--cui-space-3) var(--cui-space-4);
+  border-left: 4px solid transparent;
+  border-radius: var(--cui-radius-md);
+  margin-bottom: var(--cui-space-2);
+  font-size: var(--cui-font-size-sm);
+}
+.messagelist li.success {
+  background: #ecfdf5;
+  border-color: var(--cui-status-active);
+  color: #14532d;
+}
+.messagelist li.warning {
+  background: #fffbeb;
+  border-color: var(--cui-color-warning);
+  color: #78350f;
+}
+.messagelist li.error {
+  background: #fef2f2;
+  border-color: var(--cui-color-danger);
+  color: #7f1d1d;
+}
+
+/* ==========================================================================
+   Pagination
+   ========================================================================== */
+.paginator {
+  padding: var(--cui-space-3) var(--cui-space-4);
+  font-size: var(--cui-font-size-sm);
+  color: var(--cui-color-text-muted);
+  border-top: var(--cui-border);
+  display: flex;
+  align-items: center;
+  gap: var(--cui-space-2);
+  flex-wrap: wrap;
+}
+.paginator a {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--cui-space-1) var(--cui-space-3);
+  border: var(--cui-border);
+  border-radius: var(--cui-radius-md);
+  color: var(--cui-color-primary);
+  text-decoration: none;
+  font-size: var(--cui-font-size-sm);
+  min-height: 32px;
+}
+.paginator a:hover {
+  background: var(--cui-color-bg-subtle);
+}
+.paginator .this-page {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--cui-space-1) var(--cui-space-3);
+  background: var(--cui-color-primary);
+  color: var(--cui-color-primary-text);
+  border: var(--cui-border-width) solid var(--cui-color-primary);
+  border-radius: var(--cui-radius-md);
+  font-size: var(--cui-font-size-sm);
+  font-weight: var(--cui-font-weight-medium);
+  min-height: 32px;
+}
+
+/* ==========================================================================
+   Login page
+   ========================================================================== */
+body.login {
+  background: var(--cui-color-bg);
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+body.login #header {
+  flex-shrink: 0;
+}
+body.login #main {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  padding: var(--cui-space-8) var(--cui-space-4);
+}
+body.login #content {
+  background: var(--cui-color-surface);
+  border: var(--cui-border);
+  border-radius: var(--cui-radius-lg);
+  box-shadow: var(--cui-shadow-md);
+  padding: var(--cui-space-8);
+  width: 100%;
+  max-width: 400px;
+}
+body.login #content-main h1,
+body.login #content-main h2 {
+  font-size: var(--cui-font-size-xl);
+  font-weight: var(--cui-font-weight-semibold);
+  color: var(--cui-color-text);
+  margin: 0 0 var(--cui-space-6);
+}
+body.login .form-row {
+  border-bottom: none;
+  padding: 0;
+  margin-bottom: var(--cui-space-4);
+}
+body.login .form-row label {
+  font-size: var(--cui-font-size-sm);
+  font-weight: var(--cui-font-weight-medium);
+  display: block;
+  margin-bottom: var(--cui-space-1);
+}
+body.login .form-row input {
+  width: 100%;
+}
+body.login .submit-row {
+  background: transparent;
+  border: none;
+  padding: 0;
+  margin-top: var(--cui-space-2);
+}
+body.login .submit-row input[type="submit"] {
+  width: 100%;
+  justify-content: center;
+  min-height: 44px;
+  font-size: var(--cui-font-size-base);
+}
+
+/* ==========================================================================
+   Focus states
+   ========================================================================== */
+*:focus-visible {
+  outline: none;
+  box-shadow: var(--cui-focus-ring);
+}
+a:focus-visible {
+  border-radius: var(--cui-radius-sm);
+}
+
+/* ==========================================================================
+   Django admin responsive navigation (nav-sidebar)
+   ========================================================================== */
+#nav-sidebar {
+  background: var(--cui-color-surface);
+  border-right: var(--cui-border);
+  font-size: var(--cui-font-size-sm);
+}
+.toggle-nav-sidebar {
+  background: var(--cui-color-surface);
+  border: none;
+  border-right: var(--cui-border);
+  color: var(--cui-color-text-muted);
+  cursor: pointer;
+  min-height: 44px;
+  min-width: 44px;
+}
+.toggle-nav-sidebar:hover {
+  background: var(--cui-color-bg-subtle);
+  color: var(--cui-color-primary);
+}
+#nav-sidebar .module a {
+  color: var(--cui-color-text);
+  font-size: var(--cui-font-size-sm);
+}
+#nav-sidebar .module a:hover {
+  color: var(--cui-color-primary);
+}
+
+/* ==========================================================================
+   Return to Cauldron link
+   ========================================================================== */
 .cauldron-admin-back-link {
-  margin-top: 1rem;
-  padding: 0.5rem;
+  margin-top: var(--cui-space-4);
+  padding: var(--cui-space-3) var(--cui-space-4);
   text-align: center;
-  font-size: 0.875rem;
+  font-size: var(--cui-font-size-sm);
+  border-top: var(--cui-border);
+}
+.cauldron-admin-back-link a:link,
+.cauldron-admin-back-link a:visited {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--cui-space-1);
+  color: var(--cui-color-primary);
+  font-weight: var(--cui-font-weight-medium);
+  text-decoration: none;
+}
+.cauldron-admin-back-link a:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.cauldron-admin-back-link a:focus-visible {
+  border-radius: var(--cui-radius-sm);
 }

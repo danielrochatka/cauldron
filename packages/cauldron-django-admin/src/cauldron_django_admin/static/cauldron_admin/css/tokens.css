@@ -1,39 +1,53 @@
 :root {
-  /* Colors */
-  --cui-color-bg: #ffffff;
+  /* Page backgrounds */
+  --cui-color-bg: #f4f5f6;
   --cui-color-bg-subtle: #f8f9fa;
-  --cui-color-bg-muted: #f1f3f5;
+  --cui-color-bg-muted: #edf0f2;
+
+  /* Surfaces (cards, sidebar, header) */
   --cui-color-surface: #ffffff;
   --cui-color-surface-raised: #ffffff;
-  --cui-color-border: #dee2e6;
-  --cui-color-border-strong: #adb5bd;
-  --cui-color-text: #212529;
-  --cui-color-text-muted: #6c757d;
-  --cui-color-text-subtle: #868e96;
-  --cui-color-link: #0d6efd;
-  --cui-color-link-hover: #0a58ca;
-  --cui-color-primary: #0d6efd;
-  --cui-color-primary-hover: #0a58ca;
+
+  /* Text */
+  --cui-color-text: #202428;
+  --cui-color-text-muted: #667085;
+  --cui-color-text-subtle: #858c95;
+
+  /* Borders */
+  --cui-color-border: #d8dde3;
+  --cui-color-border-strong: #b7bec7;
+
+  /* Links */
+  --cui-color-link: #365f63;
+  --cui-color-link-hover: #294c50;
+
+  /* Primary brand */
+  --cui-color-primary: #365f63;
+  --cui-color-primary-hover: #294c50;
   --cui-color-primary-text: #ffffff;
-  --cui-color-danger: #dc3545;
+
+  /* Semantic colours */
+  --cui-color-danger: #c0392b;
   --cui-color-danger-text: #ffffff;
-  --cui-color-warning: #ffc107;
+  --cui-color-warning: #d68910;
   --cui-color-warning-text: #000000;
-  --cui-color-success: #198754;
+  --cui-color-success: #1a7a4a;
   --cui-color-success-text: #ffffff;
-  --cui-color-info: #0dcaf0;
-  --cui-color-info-text: #000000;
-  /* Status colors */
-  --cui-status-active: #198754;
-  --cui-status-inactive: #6c757d;
-  --cui-status-pending: #ffc107;
-  --cui-status-error: #dc3545;
-  --cui-status-proposed: #0d6efd;
-  --cui-status-approved: #198754;
-  --cui-status-rejected: #dc3545;
-  --cui-status-applied: #198754;
-  --cui-status-conflicted: #fd7e14;
-  /* Typography */
+  --cui-color-info: #1a6a8a;
+  --cui-color-info-text: #ffffff;
+
+  /* Status colours */
+  --cui-status-active: #1a7a4a;
+  --cui-status-inactive: #667085;
+  --cui-status-pending: #d68910;
+  --cui-status-error: #c0392b;
+  --cui-status-proposed: #365f63;
+  --cui-status-approved: #1a7a4a;
+  --cui-status-rejected: #c0392b;
+  --cui-status-applied: #1a7a4a;
+  --cui-status-conflicted: #c0671b;
+
+  /* Typography — system-font stack only, no external fonts */
   --cui-font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --cui-font-family-mono: "SFMono-Regular", Menlo, Monaco, Consolas, "Courier New", monospace;
   --cui-font-size-xs: 0.75rem;
@@ -49,6 +63,7 @@
   --cui-font-weight-medium: 500;
   --cui-font-weight-semibold: 600;
   --cui-font-weight-bold: 700;
+
   /* Spacing */
   --cui-space-1: 0.25rem;
   --cui-space-2: 0.5rem;
@@ -60,18 +75,21 @@
   --cui-space-10: 2.5rem;
   --cui-space-12: 3rem;
   --cui-space-16: 4rem;
+
   /* Borders */
   --cui-border-width: 1px;
   --cui-border-style: solid;
   --cui-border: var(--cui-border-width) var(--cui-border-style) var(--cui-color-border);
-  --cui-radius-sm: 0.25rem;
-  --cui-radius-md: 0.375rem;
-  --cui-radius-lg: 0.5rem;
-  --cui-radius-xl: 0.75rem;
+  --cui-radius-sm: 4px;
+  --cui-radius-md: 6px;
+  --cui-radius-lg: 8px;
+  --cui-radius-xl: 12px;
+
   /* Shadows */
-  --cui-shadow-sm: 0 1px 2px 0 rgba(0,0,0,0.05);
-  --cui-shadow-md: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -1px rgba(0,0,0,0.06);
-  --cui-shadow-lg: 0 10px 15px -3px rgba(0,0,0,0.1), 0 4px 6px -2px rgba(0,0,0,0.05);
+  --cui-shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.06);
+  --cui-shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.08), 0 2px 4px -1px rgba(0, 0, 0, 0.04);
+  --cui-shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.08), 0 4px 6px -2px rgba(0, 0, 0, 0.04);
+
   /* Layout */
   --cui-sidebar-width: 240px;
   --cui-header-height: 56px;
@@ -80,7 +98,8 @@
   --cui-breakpoint-md: 768px;
   --cui-breakpoint-lg: 1024px;
   --cui-breakpoint-xl: 1280px;
+
   /* Focus */
-  --cui-focus-ring: 0 0 0 3px rgba(13, 110, 253, 0.4);
-  --cui-focus-ring-color: rgba(13, 110, 253, 0.4);
+  --cui-focus-ring: 0 0 0 3px rgba(54, 95, 99, 0.35);
+  --cui-focus-ring-color: rgba(54, 95, 99, 0.35);
 }

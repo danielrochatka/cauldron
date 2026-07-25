@@ -1,5 +1,30 @@
-@media (max-width: 768px) {
-  .cui-nav-toggle { display: flex; }
+/* ==========================================================================
+   Cauldron responsive layout
+   Target widths: 320px mobile · 768px tablet · 1024px desktop · 1440px wide
+   ========================================================================== */
+
+/* --- Sidebar backdrop (mobile drawer overlay) --- */
+.cui-sidebar-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  z-index: 49;
+}
+.cui-sidebar-backdrop.is-open {
+  display: block;
+}
+
+/* ==========================================================================
+   Mobile  (up to 767 px)
+   ========================================================================== */
+@media (max-width: 767px) {
+  /* Show the hamburger */
+  .cui-nav-toggle {
+    display: flex;
+  }
+
+  /* Drawer: slide in from the left */
   .cui-sidebar {
     position: fixed;
     top: var(--cui-header-height);
@@ -7,16 +32,139 @@
     bottom: 0;
     z-index: 50;
     transform: translateX(-100%);
-    transition: transform 0.3s ease;
+    transition: transform 0.25s ease;
     width: var(--cui-sidebar-width);
     max-width: 85vw;
+    overflow-y: auto;
   }
-  .cui-sidebar.is-open { transform: translateX(0); }
-  .cui-main { width: 100%; }
-  .cui-page-header { flex-direction: column; }
-  .cui-dashboard-grid { grid-template-columns: 1fr; }
+  .cui-sidebar.is-open {
+    transform: translateX(0);
+  }
+  .cui-sidebar-backdrop.is-open {
+    display: block;
+  }
+
+  /* Full-width main */
+  .cui-main {
+    width: 100%;
+  }
+
+  /* Page header: title and actions stack */
+  .cui-page-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .cui-page-actions {
+    width: 100%;
+  }
+
+  /* Dashboard: single column */
+  .cui-dashboard-grid {
+    grid-template-columns: 1fr;
+  }
+
+  /* Tables scroll horizontally inside their container */
+  .cui-table-container {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* Form labels always above controls on mobile */
+  .cui-form-field label {
+    display: block;
+  }
 }
+
+/* ==========================================================================
+   Tablet  (768 px – 1023 px)
+   ========================================================================== */
+@media (min-width: 768px) and (max-width: 1023px) {
+  /* Hide hamburger — nav is accessible in a sticky column */
+  .cui-nav-toggle {
+    display: none;
+  }
+
+  /* Sidebar sticks below the header */
+  .cui-sidebar {
+    position: sticky;
+    top: var(--cui-header-height);
+    height: calc(100vh - var(--cui-header-height));
+    transform: none;
+    overflow-y: auto;
+  }
+
+  /* Backdrop never needed on tablet */
+  .cui-sidebar-backdrop {
+    display: none !important;
+  }
+
+  /* Dashboard: 1–2 columns depending on available width */
+  .cui-dashboard-grid {
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  }
+
+  /* Page header can share a row when space permits */
+  .cui-page-header {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+}
+
+/* ==========================================================================
+   Small desktop  (1024 px +)
+   ========================================================================== */
+@media (min-width: 1024px) {
+  /* Hamburger never visible */
+  .cui-nav-toggle {
+    display: none;
+  }
+
+  /* Persistent sidebar */
+  .cui-sidebar {
+    position: sticky;
+    top: var(--cui-header-height);
+    height: calc(100vh - var(--cui-header-height));
+    transform: none !important;
+    overflow-y: auto;
+  }
+
+  .cui-sidebar-backdrop {
+    display: none !important;
+  }
+
+  /* Title and actions share one row */
+  .cui-page-header {
+    flex-direction: row;
+    align-items: flex-start;
+  }
+
+  /* Up to three columns on the dashboard */
+  .cui-dashboard-grid {
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  }
+}
+
+/* ==========================================================================
+   Large desktop  (1440 px +)
+   ========================================================================== */
+@media (min-width: 1440px) {
+  .cui-main__inner {
+    padding: var(--cui-space-8) var(--cui-space-8);
+  }
+}
+
+/* ==========================================================================
+   Reduced motion
+   ========================================================================== */
 @media (prefers-reduced-motion: reduce) {
-  .cui-sidebar { transition: none; }
-  .cui-nav-toggle__bar { transition: none; }
+  .cui-sidebar {
+    transition: none;
+  }
+  .cui-nav-toggle__bar {
+    transition: none;
+  }
+  .cui-sidebar-backdrop {
+    transition: none;
+  }
 }

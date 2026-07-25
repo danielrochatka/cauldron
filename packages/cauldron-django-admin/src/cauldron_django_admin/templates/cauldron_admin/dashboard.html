@@ -5,11 +5,17 @@
   {% for card in dashboard_cards %}
   <div class="cui-card">
     <h2 class="cui-card__title">{{ card.label }}</h2>
+    {% if card.status %}
+    <div class="cui-card__status">
+      <span class="cui-card__status-dot cui-card__status-dot--{{ card.status }}" aria-hidden="true"></span>
+      {{ card.status|capfirst }}
+    </div>
+    {% endif %}
     {% if card.description %}<p class="cui-card__description">{{ card.description }}</p>{% endif %}
     {% if card.url %}<a href="{{ card.url }}" class="cui-button">View</a>{% endif %}
   </div>
   {% empty %}
-  <p>Welcome to Cauldron. No modules registered yet.</p>
+  <p class="cui-text-muted">Welcome to Cauldron. No modules registered yet.</p>
   {% endfor %}
 </div>
 {% endblock %}

@@ -1,20 +1,30 @@
-"""Django Admin views for content browser and proposal creation."""
+"""Django Admin views for content browser, proposal creation, and page authoring."""
 from __future__ import annotations
 
 import html
 import json
+import uuid
 from typing import Any
 
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required, permission_required
-from django.http import HttpRequest, HttpResponseRedirect
+from django.core import signing
+from django.http import Http404, HttpRequest, HttpResponseRedirect
 from django.shortcuts import render
 from django.urls import reverse
 from django.views import View
 from django.views.generic import RedirectView
 from django.utils.decorators import method_decorator
 
-from .forms import ContentProposalForm
+from .forms import ContentProposalForm, PageCreateForm, PageEditForm
+
+_EDIT_TOKEN_SALT = "cauldron.page.edit"
+_SUBMIT_TOKEN_SALT = "cauldron.page.submit"
+_TOKEN_MAX_AGE = 3600  # 1 hour
+
+# Schema that PageCreateView/PageEditView handle. Items with other schemas
+# are not exposed through the page form to prevent cross-schema data merging.
+_PAGE_SCHEMA = "page"
 
 
 def _get_service():
@@ -32,6 +42,74 @@ def _handle_config_error(request):
     )
 
 
+def _make_submit_token(item_id: str = "") -> tuple[str, str]:
+    """Return (idempotency_key, signed_token).
+
+    For create flows, item_id is embedded in the token so that the same token
+    always produces the same item_id, keeping the payload hash stable across
+    idempotent retries.
+    """
+    idempotency_key = str(uuid.uuid4())
+    token = signing.dumps(
+        {"key": idempotency_key, "item_id": item_id},
+        salt=_SUBMIT_TOKEN_SALT,
+    )
+    return idempotency_key, token
+
+
+def _extract_submit_token(token: str) -> tuple[str, str]:
+    """Return (idempotency_key, item_id) from a signed submission token.
+
+    Returns ('', '') on any failure — callers proceed without idempotency
+    protection rather than blocking the user.
+    """
+    try:
+        data = signing.loads(token, salt=_SUBMIT_TOKEN_SALT, max_age=_TOKEN_MAX_AGE)
+        if not isinstance(data, dict):
+            return "", ""
+        return data.get("key", ""), data.get("item_id", "")
+    except (signing.BadSignature, signing.SignatureExpired):
+        return "", ""
+
+
+def _make_edit_token(item_id: str, collection: str, expected_hash: str) -> str:
+    return signing.dumps(
+        {"item_id": item_id, "collection": collection, "expected_hash": expected_hash},
+        salt=_EDIT_TOKEN_SALT,
+    )
+
+
+def _load_edit_token(token: str) -> dict | None:
+    try:
+        data = signing.loads(token, salt=_EDIT_TOKEN_SALT, max_age=_TOKEN_MAX_AGE)
+        if not isinstance(data, dict):
+            return None
+        return data
+    except (signing.BadSignature, signing.SignatureExpired):
+        return None
+
+
+def _redirect_after_proposal(request: HttpRequest, request_id: str) -> HttpResponseRedirect:
+    """Redirect to change-request detail when permitted, else content browser.
+
+    Proposal authors hold propose_content_changes, which does not imply
+    view_content_change_requests. Redirecting unconditionally to the detail
+    view would produce a 403 for authors without the broader permission.
+    """
+    if request.user.has_perm("cauldron_content_operations.view_content_change_requests"):
+        return HttpResponseRedirect(
+            reverse(
+                "cauldron_admin_content:change-request-detail",
+                kwargs={"request_id": request_id},
+            )
+        )
+    return HttpResponseRedirect(reverse("cauldron_admin_content:content-browser"))
+
+
+# ---------------------------------------------------------------------------
+# Content Browser
+# ---------------------------------------------------------------------------
+
 @method_decorator([
     login_required,
     permission_required("cauldron_content_operations.view_published_content", raise_exception=True),
@@ -42,15 +120,16 @@ class ContentBrowserView(View):
     template_name = "cauldron_admin_content/content_browser.html"
 
     def get(self, request: HttpRequest) -> Any:
+        from cauldron_content.pages import PAGE_COLLECTION
         collection = request.GET.get("collection", "")
         requested_drafts = request.GET.get("include_drafts", "").lower() in ("1", "true", "yes")
-        # view_draft_content gates access to any drafts. Silently ignore
-        # ?include_drafts=1 when the caller lacks the permission — surfacing
-        # a permission error would leak that drafts exist.
         has_draft_perm = request.user.has_perm(
             "cauldron_content_operations.view_draft_content"
         )
         include_drafts = requested_drafts and has_draft_perm
+        can_propose = request.user.has_perm(
+            "cauldron_content_operations.propose_content_changes"
+        )
         from django.core.exceptions import ImproperlyConfigured
         try:
             service = _get_service()
@@ -62,6 +141,8 @@ class ContentBrowserView(View):
                 "items": [],
                 "include_drafts": False,
                 "can_view_drafts": has_draft_perm,
+                "can_propose": can_propose,
+                "is_pages_collection": False,
                 "error": "Service unavailable",
             })
 
@@ -87,6 +168,10 @@ class ContentBrowserView(View):
             "items": items,
             "include_drafts": include_drafts,
             "can_view_drafts": has_draft_perm,
+            "can_propose": can_propose,
+            "is_pages_collection": collection == PAGE_COLLECTION,
+            "page_collection": PAGE_COLLECTION,
+            "page_schema": _PAGE_SCHEMA,
             "error": error,
         })
 
@@ -97,12 +182,16 @@ class ContentBrowserRedirectView(RedirectView):
     pattern_name = "cauldron_admin_content:content-browser"
 
 
+# ---------------------------------------------------------------------------
+# Generic content proposal (advanced / technical interface)
+# ---------------------------------------------------------------------------
+
 @method_decorator([
     login_required,
     permission_required("cauldron_content_operations.propose_content_changes", raise_exception=True),
 ], name="dispatch")
 class ContentProposalView(View):
-    """Create a content proposal via ContentOperationService."""
+    """Create a content proposal via ContentOperationService. Advanced interface."""
 
     template_name = "cauldron_admin_content/content_proposal.html"
 
@@ -132,8 +221,6 @@ class ContentProposalView(View):
             )
             if result.ok:
                 messages.success(request, f"Proposal created: {result.request_id}")
-                # Redirect to the shell-native change-request list, not the
-                # Django admin changelist — the shell owns the operator UI.
                 return HttpResponseRedirect(
                     reverse("cauldron_admin_content:change-request-list")
                 )
@@ -143,6 +230,341 @@ class ContentProposalView(View):
             messages.error(request, html.escape(str(exc)[:200]))
         return render(request, self.template_name, {"form": form})
 
+
+# ---------------------------------------------------------------------------
+# Page Create
+# ---------------------------------------------------------------------------
+
+@method_decorator([
+    login_required,
+    permission_required("cauldron_content_operations.propose_content_changes", raise_exception=True),
+], name="dispatch")
+class PageCreateView(View):
+    """Create a new page through the standard page content pipeline."""
+
+    template_name = "cauldron_admin_content/page_form.html"
+
+    def _context(self, form, submission_token):
+        return {
+            "form": form,
+            "submission_token": submission_token,
+            "is_edit": False,
+            "form_title": "New Page",
+            "breadcrumbs": [
+                {"label": "Content", "url": reverse("cauldron_admin_content:content-browser")},
+                {"label": "New Page", "url": ""},
+            ],
+        }
+
+    def get(self, request: HttpRequest) -> Any:
+        form = PageCreateForm()
+        # Embed item_id in the submission token so that retries of the same
+        # signed token produce the same item_id, keeping the payload hash stable
+        # for ContentOperationService's idempotency check.
+        item_id = str(uuid.uuid4())
+        _, submission_token = _make_submit_token(item_id=item_id)
+        return render(request, self.template_name, self._context(form, submission_token))
+
+    def post(self, request: HttpRequest) -> Any:
+        form = PageCreateForm(request.POST)
+        submission_token = request.POST.get("submission_token", "")
+
+        # Extract stable item_id and idempotency key from the signed token.
+        idempotency_key, item_id = _extract_submit_token(submission_token)
+        if not item_id:
+            # Fallback: fresh UUID. Idempotency protection is lost on this path
+            # (e.g. tampered token), but the form can still be submitted.
+            item_id = str(uuid.uuid4())
+
+        if not form.is_valid():
+            return render(request, self.template_name, self._context(form, submission_token))
+
+        from cauldron_content.pages import build_page_operation
+        intended = form.cleaned_data["intended_status"]
+        status = "draft" if intended == "draft" else "published"
+
+        operation = build_page_operation(
+            kind="create",
+            item_id=item_id,
+            slug=form.cleaned_data["slug"],
+            status=status,
+            title=form.cleaned_data["title"],
+            body=form.cleaned_data["body"],
+            navigation_title=form.cleaned_data["navigation_title"],
+            summary=form.cleaned_data["summary"],
+            seo_title=form.cleaned_data["seo_title"],
+            meta_description=form.cleaned_data["meta_description"],
+            canonical_url=form.cleaned_data["canonical_url"],
+            robots_index=bool(form.cleaned_data.get("robots_index", True)),
+            robots_follow=bool(form.cleaned_data.get("robots_follow", True)),
+            social_title=form.cleaned_data["social_title"],
+            social_description=form.cleaned_data["social_description"],
+            social_image=form.cleaned_data["social_image"],
+            template=form.cleaned_data["template"],
+        )
+
+        from django.core.exceptions import ImproperlyConfigured
+        try:
+            service = _get_service()
+        except ImproperlyConfigured:
+            _handle_config_error(request)
+            return render(request, self.template_name, self._context(form, submission_token))
+
+        try:
+            result = service.create_change_request(
+                user=request.user,
+                operations=[operation],
+                provider_name="",
+                description=form.cleaned_data.get("change_description", ""),
+                idempotency_key=idempotency_key,
+            )
+        except Exception as exc:
+            messages.error(request, html.escape(str(exc)[:400]))
+            return render(request, self.template_name, self._context(form, submission_token))
+
+        if result.ok:
+            messages.success(
+                request,
+                f"Page proposal created ({result.request_id[:8]}…). "
+                "It will be published once the change request is approved and applied.",
+            )
+            return _redirect_after_proposal(request, result.request_id)
+
+        error_msg = result.error.message if result.error else "An unknown error occurred."
+        messages.error(request, html.escape(error_msg[:400]))
+        return render(request, self.template_name, self._context(form, submission_token))
+
+
+# ---------------------------------------------------------------------------
+# Page Detail
+# ---------------------------------------------------------------------------
+
+@method_decorator([
+    login_required,
+    permission_required("cauldron_content_operations.view_published_content", raise_exception=True),
+], name="dispatch")
+class PageDetailView(View):
+    """Display a page's metadata and Markdown body."""
+
+    template_name = "cauldron_admin_content/page_detail.html"
+
+    def get(self, request: HttpRequest, item_id: str) -> Any:
+        from cauldron_content.pages import PAGE_COLLECTION
+        has_draft_perm = request.user.has_perm("cauldron_content_operations.view_draft_content")
+        can_propose = request.user.has_perm("cauldron_content_operations.propose_content_changes")
+
+        from django.core.exceptions import ImproperlyConfigured
+        try:
+            service = _get_service()
+        except ImproperlyConfigured:
+            _handle_config_error(request)
+            raise Http404
+
+        item = service.get_item(
+            item_id,
+            PAGE_COLLECTION,
+            user=request.user,
+            include_drafts=has_draft_perm,
+        )
+        if item is None:
+            raise Http404
+
+        title = item.data.get("title", item.id)
+        # Only offer the Edit action for schema=="page" items. Items with other
+        # schemas in the pages collection are not safe to edit through this form
+        # because the page schema uses additionalProperties:false.
+        can_edit = can_propose and item.schema == _PAGE_SCHEMA
+        return render(request, self.template_name, {
+            "item": item,
+            "can_propose": can_propose,
+            "can_edit": can_edit,
+            "breadcrumbs": [
+                {"label": "Content", "url": reverse("cauldron_admin_content:content-browser")},
+                {"label": title, "url": ""},
+            ],
+        })
+
+
+# ---------------------------------------------------------------------------
+# Page Edit
+# ---------------------------------------------------------------------------
+
+@method_decorator([
+    login_required,
+    permission_required("cauldron_content_operations.propose_content_changes", raise_exception=True),
+], name="dispatch")
+class PageEditView(View):
+    """Edit an existing page through the standard page content pipeline.
+
+    Only items with schema == "page" are accepted. Items using other schemas
+    must not be presented through this editor because the page schema uses
+    additionalProperties:false and data merging at apply time could produce
+    validation failures for retained legacy fields.
+    """
+
+    template_name = "cauldron_admin_content/page_form.html"
+
+    def _load_item(self, request, item_id):
+        from cauldron_content.pages import PAGE_COLLECTION
+        has_draft_perm = request.user.has_perm("cauldron_content_operations.view_draft_content")
+        from django.core.exceptions import ImproperlyConfigured
+        try:
+            service = _get_service()
+        except ImproperlyConfigured:
+            _handle_config_error(request)
+            return None, None
+        item = service.get_item(
+            item_id,
+            PAGE_COLLECTION,
+            user=request.user,
+            include_drafts=has_draft_perm,
+        )
+        return item, service
+
+    def _render_form(self, request, form, item, edit_token, submission_token):
+        title = item.data.get("title", item.id)
+        return render(request, self.template_name, {
+            "form": form,
+            "item": item,
+            "edit_token": edit_token,
+            "submission_token": submission_token,
+            "is_edit": True,
+            "form_title": f"Edit: {title}",
+            "breadcrumbs": [
+                {"label": "Content", "url": reverse("cauldron_admin_content:content-browser")},
+                {
+                    "label": title,
+                    "url": reverse("cauldron_admin_content:page-detail", kwargs={"item_id": item.id}),
+                },
+                {"label": "Edit", "url": ""},
+            ],
+        })
+
+    def get(self, request: HttpRequest, item_id: str) -> Any:
+        from cauldron_content.pages import PAGE_COLLECTION
+        item, _ = self._load_item(request, item_id)
+        if item is None:
+            raise Http404
+
+        # Guard against editing pages with non-page schemas. Merging page-form
+        # data into an item that uses a different schema (e.g. "pages") could
+        # corrupt existing fields not present in page.schema.json.
+        if item.schema != _PAGE_SCHEMA:
+            raise Http404
+
+        data = item.data
+        form = PageEditForm(initial={
+            "title": data.get("title", ""),
+            "navigation_title": data.get("navigation_title", ""),
+            "summary": data.get("summary", ""),
+            "template": data.get("template", "page"),
+            "seo_title": data.get("seo_title", ""),
+            "meta_description": data.get("meta_description", ""),
+            "canonical_url": data.get("canonical_url", ""),
+            "robots_index": data.get("robots_index", True),
+            "robots_follow": data.get("robots_follow", True),
+            "social_title": data.get("social_title", ""),
+            "social_description": data.get("social_description", ""),
+            "social_image": data.get("social_image", ""),
+            "body": item.body,
+            "intended_status": item.status if item.status in ("draft", "published") else "draft",
+            "change_description": "",
+        })
+
+        edit_token = _make_edit_token(item.id, PAGE_COLLECTION, item.hash)
+        _, submission_token = _make_submit_token()
+        return self._render_form(request, form, item, edit_token, submission_token)
+
+    def post(self, request: HttpRequest, item_id: str) -> Any:
+        from cauldron_content.pages import PAGE_COLLECTION, build_page_operation
+
+        edit_token = request.POST.get("edit_token", "")
+        token_data = _load_edit_token(edit_token)
+        if token_data is None:
+            messages.error(
+                request,
+                "Your editing session has expired or the token is invalid. "
+                "Please reload the page to continue.",
+            )
+            return HttpResponseRedirect(
+                reverse("cauldron_admin_content:page-edit", kwargs={"item_id": item_id})
+            )
+
+        if token_data.get("item_id") != item_id or token_data.get("collection") != PAGE_COLLECTION:
+            messages.error(request, "Invalid edit token. Please try again.")
+            return HttpResponseRedirect(
+                reverse("cauldron_admin_content:page-edit", kwargs={"item_id": item_id})
+            )
+
+        expected_hash = token_data.get("expected_hash", "")
+        submission_token = request.POST.get("submission_token", "")
+        idempotency_key, _ = _extract_submit_token(submission_token)
+
+        form = PageEditForm(request.POST)
+
+        # Load item to get current slug (read-only in Phase 1) and validate schema.
+        item, service = self._load_item(request, item_id)
+        if item is None:
+            raise Http404
+
+        if item.schema != _PAGE_SCHEMA:
+            raise Http404
+
+        if not form.is_valid():
+            return self._render_form(request, form, item, edit_token, submission_token)
+
+        intended = form.cleaned_data["intended_status"]
+        status = "draft" if intended == "draft" else "published"
+
+        operation = build_page_operation(
+            kind="update",
+            item_id=item.id,
+            slug=item.slug,
+            status=status,
+            title=form.cleaned_data["title"],
+            body=form.cleaned_data["body"],
+            expected_hash=expected_hash,
+            navigation_title=form.cleaned_data["navigation_title"],
+            summary=form.cleaned_data["summary"],
+            seo_title=form.cleaned_data["seo_title"],
+            meta_description=form.cleaned_data["meta_description"],
+            canonical_url=form.cleaned_data["canonical_url"],
+            robots_index=bool(form.cleaned_data.get("robots_index", True)),
+            robots_follow=bool(form.cleaned_data.get("robots_follow", True)),
+            social_title=form.cleaned_data["social_title"],
+            social_description=form.cleaned_data["social_description"],
+            social_image=form.cleaned_data["social_image"],
+            template=form.cleaned_data["template"],
+        )
+
+        try:
+            result = service.create_change_request(
+                user=request.user,
+                operations=[operation],
+                provider_name="",
+                description=form.cleaned_data.get("change_description", ""),
+                idempotency_key=idempotency_key,
+            )
+        except Exception as exc:
+            messages.error(request, html.escape(str(exc)[:400]))
+            return self._render_form(request, form, item, edit_token, submission_token)
+
+        if result.ok:
+            messages.success(
+                request,
+                f"Page update proposal created ({result.request_id[:8]}…). "
+                "Changes will go live once the change request is approved and applied.",
+            )
+            return _redirect_after_proposal(request, result.request_id)
+
+        error_msg = result.error.message if result.error else "An unknown error occurred."
+        messages.error(request, html.escape(error_msg[:400]))
+        return self._render_form(request, form, item, edit_token, submission_token)
+
+
+# ---------------------------------------------------------------------------
+# Change Request views
+# ---------------------------------------------------------------------------
 
 @method_decorator([
     login_required,
@@ -185,6 +607,10 @@ class ChangeRequestDetailView(View):
             ],
         })
 
+
+# ---------------------------------------------------------------------------
+# Audit views
+# ---------------------------------------------------------------------------
 
 @method_decorator([
     login_required,

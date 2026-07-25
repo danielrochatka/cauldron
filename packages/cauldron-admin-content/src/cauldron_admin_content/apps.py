@@ -21,8 +21,6 @@ class CauldronAdminContentConfig(AppConfig):
         except ImportError:
             return
         registry = get_navigation_registry()
-        # Exact re-registration is idempotent; a real conflict is a
-        # programming error and MUST propagate.
         registry.register_section(AdminNavigationSection(
             key="content",
             label="Content",
@@ -39,14 +37,15 @@ class CauldronAdminContentConfig(AppConfig):
             description="Browse published and draft content",
         ))
         registry.register_item(AdminNavigationItem(
-            key="cauldron.admin.content.proposal",
-            label="New Proposal",
-            url_name="cauldron_admin_content:content-proposal",
+            key="cauldron.admin.content.page-create",
+            label="New Page",
+            url_name="cauldron_admin_content:page-create",
             section="content",
             order=20,
             permission="cauldron_content_operations.propose_content_changes",
-            url_prefix="/cauldron/content-proposal/",
-            description="Create a new content change proposal",
+            url_prefix="/cauldron/content/pages/new/",
+            url_prefix_exact=True,
+            description="Create a new page proposal",
         ))
         registry.register_item(AdminNavigationItem(
             key="cauldron.admin.content.change-requests",

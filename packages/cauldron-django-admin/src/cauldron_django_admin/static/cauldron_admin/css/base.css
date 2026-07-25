@@ -5,8 +5,8 @@ body {
   color: var(--cui-color-text);
   background-color: var(--cui-color-bg-subtle);
 }
-a { color: var(--cui-color-link); }
-a:hover { color: var(--cui-color-link-hover); }
+:where(a) { color: var(--cui-color-link); }
+:where(a:hover) { color: var(--cui-color-link-hover); }
 code, pre {
   font-family: var(--cui-font-family-mono);
   font-size: 0.9em;

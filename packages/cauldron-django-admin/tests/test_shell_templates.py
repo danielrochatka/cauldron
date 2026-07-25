@@ -245,3 +245,50 @@ def test_action_tokens_defined_in_tokens_css():
     # Primary brand tokens must remain unchanged.
     assert "--cui-color-primary: #365f63" in css
     assert "--cui-color-primary-hover: #294c50" in css
+
+
+# ---------------------------------------------------------------------------
+# base.css specificity — link rules must not override component colors
+# ---------------------------------------------------------------------------
+
+def test_base_link_selectors_use_where():
+    """base.css must use :where(a) so generic link color cannot override
+    component styles like .cui-button that declare their own color."""
+    import os
+    from django.apps import apps
+    app = apps.get_app_config("cauldron_django_admin")
+    base_path = os.path.join(
+        app.path, "static", "cauldron_admin", "css", "base.css"
+    )
+    with open(base_path, encoding="utf-8") as f:
+        css = f.read()
+
+    assert ":where(a)" in css, (
+        "base.css must use :where(a) so the link color rule has zero specificity"
+    )
+    assert ":where(a:hover)" in css, (
+        "base.css must use :where(a:hover) so the hover color rule has zero specificity"
+    )
+    # Bare high-specificity selectors must not be present.
+    import re
+    bare_a = re.search(r'(?<!:where\()(?<!\w)a\s*\{', css)
+    assert bare_a is None, (
+        "bare 'a { }' selector found in base.css — use :where(a) instead"
+    )
+
+
+def test_cui_button_declares_action_text_color():
+    """.cui-button must declare color: var(--cui-color-action-text) so it beats
+    any zero-specificity link rule and the text stays white on hover."""
+    import os
+    from django.apps import apps
+    app = apps.get_app_config("cauldron_django_admin")
+    components_path = os.path.join(
+        app.path, "static", "cauldron_admin", "css", "components.css"
+    )
+    with open(components_path, encoding="utf-8") as f:
+        css = f.read()
+
+    assert "color: var(--cui-color-action-text)" in css, (
+        ".cui-button must declare color: var(--cui-color-action-text)"
+    )

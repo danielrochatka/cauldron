@@ -66,6 +66,9 @@ class AdminDashboardCard:
     url: str
     section: str
     order: int
+    # Optional availability/health indicator shown on the card.
+    # Expected values: "active", "inactive", "error", "pending", or "".
+    status: str = ""
 
 
 class NavigationRegistry:

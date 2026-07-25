@@ -8,6 +8,8 @@
 {{ block.super }}
 <div class="cauldron-admin-back-link">
   {% url 'cauldron:dashboard' as cauldron_dashboard_url %}
-  {% if cauldron_dashboard_url %}<a href="{{ cauldron_dashboard_url }}">&#8592; Return to Cauldron</a>{% endif %}
+  {% if cauldron_dashboard_url %}
+  <a href="{{ cauldron_dashboard_url }}">&#8592; Return to Cauldron</a>
+  {% endif %}
 </div>
 {% endblock %}

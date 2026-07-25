@@ -53,19 +53,4 @@ echo "--> Collecting static files..."
 
 # 10. Start the server
 PORT="${CAULDRON_PORT:-8000}"
-PID_FILE="$CAULDRON_DIR/data/cauldron.pid"
-
-if command -v gunicorn &>/dev/null; then
-  gunicorn \
-    --bind "0.0.0.0:$PORT" \
-    --workers "${CAULDRON_WORKERS:-2}" \
-    --pid "$PID_FILE" \
-    --access-logfile "$CAULDRON_DIR/logs/access.log" \
-    --error-logfile "$CAULDRON_DIR/logs/error.log" \
-    --daemon \
-    cauldron_site.wsgi:application
-  echo "Cauldron started on http://localhost:$PORT (gunicorn)"
-else
-  echo "Cauldron starting on http://localhost:$PORT (press Ctrl+C to stop)"
-  "$CAULDRON_DIR/manage" runserver "0.0.0.0:$PORT"
-fi
+launch_server "$CAULDRON_DIR" "$PORT"

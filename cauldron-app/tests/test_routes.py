@@ -203,7 +203,7 @@ def test_admin_index_url_reverses():
 
 
 # ---------------------------------------------------------------------------
-# Static asset verification
+# Static asset discovery (staticfiles finders)
 # ---------------------------------------------------------------------------
 
 def test_cauldron_admin_static_assets_exist():
@@ -225,3 +225,70 @@ def test_cauldron_admin_static_assets_exist():
 
     missing = [a for a in assets if not finders.find(a)]
     assert not missing, "Static assets not found:\n" + "\n".join(missing)
+
+
+# ---------------------------------------------------------------------------
+# WhiteNoise middleware configuration
+# ---------------------------------------------------------------------------
+
+def test_whitenoise_directly_after_security_middleware():
+    """WhiteNoise must be the second middleware, immediately after Security."""
+    from django.conf import settings
+
+    mw = list(settings.MIDDLEWARE)
+    assert "whitenoise.middleware.WhiteNoiseMiddleware" in mw, (
+        "WhiteNoiseMiddleware not found in MIDDLEWARE"
+    )
+    sec_idx = mw.index("django.middleware.security.SecurityMiddleware")
+    wn_idx = mw.index("whitenoise.middleware.WhiteNoiseMiddleware")
+    assert wn_idx == sec_idx + 1, (
+        f"WhiteNoiseMiddleware is at index {wn_idx} but SecurityMiddleware is at "
+        f"{sec_idx}; WhiteNoise must be directly after Security"
+    )
+
+
+# ---------------------------------------------------------------------------
+# WhiteNoise static-file serving through the WSGI app (DEBUG=False)
+# ---------------------------------------------------------------------------
+
+def test_static_tokens_css_served_via_whitenoise(tmp_path):
+    """
+    /static/cauldron_admin/css/tokens.css returns 200 with a CSS content-type
+    through the full WSGI middleware stack (including WhiteNoiseMiddleware)
+    with DEBUG=False, matching the production Gunicorn configuration.
+    """
+    from django.core.management import call_command
+    from django.test import Client, override_settings
+
+    static_root = str(tmp_path / "staticfiles")
+
+    # Use the simple (non-hashing) backend so collected filenames are
+    # identical to source filenames; the WhiteNoise serving path is the
+    # same regardless of whether hashing is used.
+    with override_settings(
+        DEBUG=False,
+        STATIC_ROOT=static_root,
+        STORAGES={
+            "default": {
+                "BACKEND": "django.core.files.storage.FileSystemStorage",
+            },
+            "staticfiles": {
+                "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+            },
+        },
+        ALLOWED_HOSTS=["*"],
+    ):
+        call_command("collectstatic", "--no-input", verbosity=0, clear=True)
+
+        # Create the client inside the override context so ClientHandler
+        # initialises WhiteNoiseMiddleware with the correct STATIC_ROOT.
+        client = Client()
+        response = client.get("/static/cauldron_admin/css/tokens.css")
+
+    assert response.status_code == 200, (
+        f"Expected 200 for tokens.css, got {response.status_code}"
+    )
+    content_type = response.get("Content-Type", "")
+    assert "css" in content_type, (
+        f"Expected CSS content-type, got {content_type!r}"
+    )

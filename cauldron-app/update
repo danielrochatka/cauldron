@@ -119,19 +119,25 @@ echo "--> Applying database migrations..."
 echo "--> Collecting static assets..."
 "$CAULDRON_DIR/manage" collectstatic --no-input --clear -v 0
 
-# 9. Run system check.
+# 9. Initialize override directory.
+"$CAULDRON_DIR/manage" cauldron_ui_init 2>/dev/null || true
+
+# 10. Run system check.
 echo "--> Running system check..."
 "$CAULDRON_DIR/manage" check
 
-# 10. Restart server.
+# 11. Start server.
 echo "--> Starting server..."
-"$CAULDRON_DIR/start"
+PORT="${CAULDRON_PORT:-8000}"
+launch_server "$CAULDRON_DIR" "$PORT"
 
-# 11. Health check — trigger the ERR trap (and therefore rollback) on failure.
+# 12. Health check — verify the app and static files are reachable.
+#     Triggers the ERR trap (and therefore rollback) on failure.
 echo "--> Verifying server health..."
 HEALTHY=0
 for i in $(seq 1 20); do
-  if curl -sf "http://localhost:$PORT/accounts/login/" -o /dev/null 2>/dev/null; then
+  if curl -sf "http://localhost:$PORT/accounts/login/" -o /dev/null 2>/dev/null && \
+     curl -sf "http://localhost:$PORT/static/cauldron_admin/css/tokens.css" -o /dev/null 2>/dev/null; then
     HEALTHY=1
     break
   fi

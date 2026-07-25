@@ -1,9 +1,22 @@
 #!/usr/bin/env bash
+set -euo pipefail
 # Wrapper so `./manage <command>` always uses the Cauldron virtualenv.
 CAULDRON_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+if [ ! -f "$CAULDRON_DIR/.venv/bin/python" ]; then
+  echo "Cauldron has not been initialized. Run ./start first."
+  exit 1
+fi
+
+source "$CAULDRON_DIR/lib.sh"
+
+# Ensure config.env exists and has a SECRET_KEY before any Django command.
+initialize_config "$CAULDRON_DIR/config.env" "$CAULDRON_DIR/config.env.example"
+
 if [ -f "$CAULDRON_DIR/config.env" ]; then
   set -a
   source "$CAULDRON_DIR/config.env"
   set +a
 fi
+
 exec "$CAULDRON_DIR/.venv/bin/python" "$CAULDRON_DIR/manage.py" "$@"

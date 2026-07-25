@@ -200,3 +200,28 @@ def test_modules_url_reverses():
 
 def test_admin_index_url_reverses():
     assert reverse("admin:index") == "/admin/"
+
+
+# ---------------------------------------------------------------------------
+# Static asset verification
+# ---------------------------------------------------------------------------
+
+def test_cauldron_admin_static_assets_exist():
+    from django.contrib.staticfiles import finders
+
+    assets = [
+        "cauldron_admin/css/tokens.css",
+        "cauldron_admin/css/reset.css",
+        "cauldron_admin/css/base.css",
+        "cauldron_admin/css/layout.css",
+        "cauldron_admin/css/components.css",
+        "cauldron_admin/css/forms.css",
+        "cauldron_admin/css/tables.css",
+        "cauldron_admin/css/utilities.css",
+        "cauldron_admin/css/responsive.css",
+        "cauldron_admin/css/django-admin-bridge.css",
+        "cauldron_admin/js/shell.js",
+    ]
+
+    missing = [a for a in assets if not finders.find(a)]
+    assert not missing, "Static assets not found:\n" + "\n".join(missing)

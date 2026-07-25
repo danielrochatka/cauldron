@@ -26,6 +26,13 @@
   --cui-color-primary-hover: #294c50;
   --cui-color-primary-text: #ffffff;
 
+  /* Action — lighter teal for interactive elements (buttons, controls) */
+  --cui-color-action: #4f7478;
+  --cui-color-action-hover: #365f63;
+  --cui-color-action-text: #ffffff;
+  --cui-color-action-subtle: #e9f0f0;
+  --cui-color-action-border: #9fb3b5;
+
   /* Semantic colours */
   --cui-color-danger: #c0392b;
   --cui-color-danger-text: #ffffff;

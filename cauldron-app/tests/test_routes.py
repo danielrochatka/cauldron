@@ -312,3 +312,66 @@ def test_launch_server_includes_chdir():
         "launch_server() in lib.sh must pass --chdir so Gunicorn imports "
         "cauldron_site.wsgi correctly when called from outside cauldron-app/"
     )
+
+
+# ---------------------------------------------------------------------------
+# Dashboard card HTML structure (integration)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.django_db
+def test_dashboard_cards_render_as_anchors(auth_client):
+    """Dashboard cards that have URLs must render as anchor elements."""
+    response = auth_client.get("/cauldron/")
+    assert response.status_code == 200
+    content = response.content.decode()
+    # The real app has registered navigation items with URLs; at least one
+    # card should be wrapped in an anchor carrying cui-card--link.
+    assert "cui-card--link" in content
+
+
+@pytest.mark.django_db
+def test_dashboard_has_no_view_button(auth_client):
+    """The separate 'View' button must not appear on the dashboard."""
+    response = auth_client.get("/cauldron/")
+    assert response.status_code == 200
+    content = response.content.decode()
+    assert ">View<" not in content
+
+
+@pytest.mark.django_db
+def test_dashboard_template_comment_not_in_response(auth_client):
+    """The template comment text must not appear in the rendered HTML."""
+    response = auth_client.get("/cauldron/")
+    assert response.status_code == 200
+    content = response.content.decode()
+    assert "Site-owned overrides load LAST" not in content
+
+
+# ---------------------------------------------------------------------------
+# Action tokens in CSS source
+# ---------------------------------------------------------------------------
+
+def test_action_tokens_in_tokens_css():
+    """Action color tokens must be defined in the distributed tokens.css."""
+    from django.contrib.staticfiles import finders
+    import re
+
+    path = finders.find("cauldron_admin/css/tokens.css")
+    assert path is not None, "cauldron_admin/css/tokens.css not found via finders"
+
+    with open(path, encoding="utf-8") as f:
+        css = f.read()
+
+    required = [
+        "--cui-color-action:",
+        "--cui-color-action-hover:",
+        "--cui-color-action-text:",
+        "--cui-color-action-subtle:",
+        "--cui-color-action-border:",
+    ]
+    missing = [t for t in required if t not in css]
+    assert not missing, f"Action tokens missing from tokens.css: {missing}"
+
+    # Existing brand teal unchanged.
+    assert "--cui-color-primary: #365f63" in css
+    assert "--cui-color-primary-hover: #294c50" in css

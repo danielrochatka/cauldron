@@ -163,7 +163,7 @@ def _messages_to_input_items(
                     items.append({
                         "type": "function_call",
                         "call_id": tc.id,
-                        "name": tc.name,
+                        "name": _encode_tool_name(tc.name),
                         "arguments": json.dumps(
                             _plain(tc.arguments),
                             ensure_ascii=False,

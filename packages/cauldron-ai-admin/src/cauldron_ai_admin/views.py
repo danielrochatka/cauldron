@@ -30,8 +30,8 @@ def _get_service():
     return get_admin_ai_service()
 
 
-def _get_provider_display() -> tuple[str, str]:
-    """Return ``(display_name, status)`` for the currently effective AI provider.
+def _get_provider_display() -> tuple[str, str, bool]:
+    """Return ``(display_name, status, store_invalid)`` for the current provider.
 
     Resolution mirrors ``service_factory.get_admin_ai_service`` so the
     status header, provider-config form, and Django system checks agree
@@ -43,9 +43,35 @@ def _get_provider_display() -> tuple[str, str]:
     3. Never invoke ``factory.build()`` — the display path must stay pure
        so a misconfigured provider does not break the settings page.
 
+    ``store_invalid`` is ``True`` when the config store cannot be read
+    safely (any ``AIProviderStoreError`` subclass — malformed JSON,
+    unsupported version, symlink, non-regular file, oversized file). In
+    that case CAULDRON_MODULES is *not* used as a fallback for the
+    status; the corrupt-store status wins so the operator is not misled
+    into believing a provider is active while the store is unreadable.
+
     Always safe to call: exceptions become opaque status strings so the
     page still renders when the config store is unreadable.
     """
+    # Import here so a missing/misconfigured cauldron_ai package doesn't
+    # crash the outer view import chain.
+    try:
+        from .provider_config import AIProviderStoreError, get_store
+    except Exception:
+        return "Unknown", "Provider status unavailable", False
+
+    # Probe the store first — a corrupt/unsafe store trumps every other
+    # signal so we never render "Active" over a broken configuration.
+    try:
+        store = get_store()
+        store.load()  # raises AIProviderStoreError on any structural fault
+    except AIProviderStoreError:
+        return "Unknown", "Configuration store invalid", True
+    except Exception:
+        # Anything else (unexpected OS error, etc.) — degrade to a safe
+        # status without claiming the store is invalid.
+        return "Unknown", "Provider status unavailable", False
+
     try:
         from cauldron_ai.providers import (
             descriptor_for,
@@ -54,7 +80,7 @@ def _get_provider_display() -> tuple[str, str]:
         )
 
         from .checks import _admin_ai_config, _resolve_provider
-        from .provider_config import get_store, resolve_provider_name
+        from .provider_config import resolve_provider_name
 
         cfg = _admin_ai_config()
         static_names = set(provider_names())
@@ -62,8 +88,11 @@ def _get_provider_display() -> tuple[str, str]:
         all_names = sorted(static_names | factory_only)
 
         try:
-            store = get_store()
             selected = resolve_provider_name(store)
+        except AIProviderStoreError:
+            # Store went bad between the load() above and now — treat as
+            # invalid rather than falling back silently.
+            return "Unknown", "Configuration store invalid", True
         except Exception:
             selected = ""
 
@@ -72,24 +101,25 @@ def _get_provider_display() -> tuple[str, str]:
             # the display agrees with system checks.
             provider, err_id = _resolve_provider(cfg, all_names)
             if err_id == "admin_ai.E001":
-                return "None", "No AI provider registered"
+                return "None", "No AI provider registered", False
             if err_id == "admin_ai.E002":
                 configured = cfg.get("provider", "") or "Unknown"
-                return configured, "Provider not found — check AI settings"
+                return configured, "Provider not found — check AI settings", False
             if err_id == "admin_ai.E003":
                 return (
                     "Ambiguous",
                     f"Multiple providers registered: {', '.join(all_names)}",
+                    False,
                 )
             if provider is None:
-                return "Unknown", "Provider could not be resolved"
+                return "Unknown", "Provider could not be resolved", False
             selected = getattr(provider, "name", "") or ""
 
         if not selected:
-            return "None", "No AI provider registered"
+            return "None", "No AI provider registered", False
 
         if selected not in (static_names | factory_only):
-            return selected, "Provider not found — check AI settings"
+            return selected, "Provider not found — check AI settings", False
 
         try:
             desc = descriptor_for(selected)
@@ -97,9 +127,9 @@ def _get_provider_display() -> tuple[str, str]:
         except Exception:
             display_name = selected
 
-        return display_name, "Active"
+        return display_name, "Active", False
     except Exception:
-        return "Unknown", "Provider status unavailable"
+        return "Unknown", "Provider status unavailable", False
 
 
 def _get_available_providers() -> list[str]:
@@ -202,6 +232,36 @@ class AdminAISettingsView(View):
 
         from .provider_config import AIProviderStoreError
 
+        provider_name_display, provider_status, store_invalid = (
+            _get_provider_display()
+        )
+
+        # When the store is invalid we render a *degraded* page: the
+        # module section and the status header still show, but every
+        # control that would touch the store is suppressed. We must not
+        # call ``get_store().<anything>`` on the corrupt path because
+        # each accessor would re-raise ``AIProviderStoreError``.
+        if store_invalid:
+            return {
+                "provider_name": provider_name_display,
+                "provider_status": provider_status,
+                "current_provider": "",
+                "available_providers": _get_available_providers(),
+                "spec": None,
+                "form": None,
+                "runtime_form": None,
+                "select_form": None,
+                "test_result": None,
+                "error_message": error_message,
+                "credential_states": {},
+                "supports_connection_test": False,
+                "store_invalid": True,
+                "breadcrumbs": [
+                    {"label": "AI Assistant", "url": reverse("cauldron_ai_admin:ai-page")},
+                    {"label": "Settings", "url": ""},
+                ],
+            }
+
         store = get_store()
         available = _get_available_providers()
         try:
@@ -224,7 +284,6 @@ class AdminAISettingsView(View):
                 clear_keys=True,
             )
 
-        provider_name_display, provider_status = _get_provider_display()
         select_form = ProviderSelectForm(
             available_providers=available,
             initial={"provider": current_provider},
@@ -254,6 +313,7 @@ class AdminAISettingsView(View):
             "supports_connection_test": (
                 spec.supports_connection_test if spec else False
             ),
+            "store_invalid": False,
             "breadcrumbs": [
                 {"label": "AI Assistant", "url": reverse("cauldron_ai_admin:ai-page")},
                 {"label": "Settings", "url": ""},
@@ -275,9 +335,22 @@ class AdminAISettingsView(View):
         )
         from .provider_config import get_store, resolve_provider_name
 
+        settings_url = reverse("cauldron_ai_admin:settings")
+
+        # Guard every write path against a corrupt/unsafe store. Touching
+        # the store in that state would re-raise ``AIProviderStoreError``
+        # and (worse) could partially overwrite a file we can't fully
+        # read.
+        _, _, store_invalid = _get_provider_display()
+        if store_invalid:
+            messages.error(
+                request,
+                "AI settings cannot be saved: the configuration store is invalid.",
+            )
+            return redirect(settings_url)
+
         store = get_store()
         action = request.POST.get("action", "save")
-        settings_url = reverse("cauldron_ai_admin:settings")
 
         if action == "select_provider":
             return self._handle_select_provider(request, store, settings_url)

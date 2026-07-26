@@ -26,7 +26,13 @@
       </dd>
     </dl>
 
-    {% if available_providers %}
+    {% if store_invalid %}
+    <div class="cui-alert cui-alert--error" role="alert" style="margin-top:1rem">
+      The AI configuration store is invalid. Contact your administrator
+      to resolve this before changing settings.
+    </div>
+    {% else %}
+    {% if available_providers and select_form %}
     <form method="post" class="cui-form" style="margin-top:1rem">
       {% csrf_token %}
       <input type="hidden" name="action" value="select_provider">
@@ -37,12 +43,14 @@
       <button type="submit" class="cui-button cui-button--sm">Switch Provider</button>
     </form>
     {% endif %}
+    {% endif %}
   </section>
 
   {% if error_message %}
   <div class="cui-alert cui-alert--error" role="alert">{{ error_message }}</div>
   {% endif %}
 
+  {% if not store_invalid %}
   {% if test_result %}
   <section class="cui-settings-section">
     <h2 class="cui-settings-section__title">Connection Test Result</h2>
@@ -155,6 +163,7 @@
   </section>
   {% endif %}
 
+  {% if runtime_form %}
   <section class="cui-settings-section">
     <h2 class="cui-settings-section__title">Runtime Settings</h2>
     <p class="cui-text-muted">
@@ -184,6 +193,8 @@
       </div>
     </form>
   </section>
+  {% endif %}
+  {% endif %}{# /not store_invalid #}
 
 </div>
 {% endblock %}

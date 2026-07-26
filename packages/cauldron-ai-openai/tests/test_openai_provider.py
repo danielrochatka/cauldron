@@ -30,7 +30,10 @@ from cauldron_ai_openai.provider import (
     OpenAIProvider,
     OpenAIProviderFactory,
     _CONFIGURATION_SPEC,
+    _DOT_ESCAPE,
     _PROVIDER_NAME,
+    _decode_tool_name,
+    _encode_tool_name,
 )
 
 
@@ -753,3 +756,73 @@ def test_provider_incomplete_other_reason_does_not_expose_reason(monkeypatch):
     with pytest.raises(AIProviderResponseError) as exc_info:
         provider.complete(_simple_request())
     assert "some_internal_filter_reason_with_secret" not in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Tool name dot-encoding (OpenAI forbids dots in function names)
+# ---------------------------------------------------------------------------
+
+
+def test_encode_tool_name_replaces_dots():
+    assert _encode_tool_name("content.list_collections") == f"content{_DOT_ESCAPE}list_collections"
+
+
+def test_encode_tool_name_multiple_segments():
+    assert _encode_tool_name("a.b.c") == f"a{_DOT_ESCAPE}b{_DOT_ESCAPE}c"
+
+
+def test_encode_tool_name_no_dots_unchanged():
+    assert _encode_tool_name("nodots") == "nodots"
+
+
+def test_decode_tool_name_restores_dots():
+    assert _decode_tool_name(f"content{_DOT_ESCAPE}list_collections") == "content.list_collections"
+
+
+def test_decode_tool_name_roundtrip():
+    original = "content.list_collections"
+    assert _decode_tool_name(_encode_tool_name(original)) == original
+
+
+def test_provider_dotted_tool_name_encoded_on_wire(monkeypatch):
+    """Dotted tool names are encoded to the OpenAI-safe wire format."""
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response()
+    tool = AIModelToolDefinition(
+        name="content.list_collections",
+        description="List content collections.",
+        parameters={"type": "object", "properties": {}},
+    )
+    provider.complete(AIModelRequest(
+        messages=(AIModelMessage(role="user", content="Q"),),
+        tools=(tool,),
+    ))
+    tools_arg = mock_client.responses.create.call_args[1]["tools"]
+    assert len(tools_arg) == 1
+    assert tools_arg[0]["name"] == f"content{_DOT_ESCAPE}list_collections"
+    assert "." not in tools_arg[0]["name"]
+
+
+def test_provider_dotted_tool_name_decoded_from_response(monkeypatch):
+    """Encoded tool names in function_call responses are decoded back to dotted form."""
+    provider, mock_client = _make_provider(monkeypatch)
+    encoded_name = f"content{_DOT_ESCAPE}list_collections"
+    mock_client.responses.create.return_value = _make_response(
+        output=[_make_function_call_item(
+            call_id="c1", name=encoded_name, arguments="{}",
+        )],
+    )
+    response = provider.complete(_simple_request())
+    assert response.tool_calls[0].name == "content.list_collections"
+
+
+def test_provider_undotted_name_survives_roundtrip(monkeypatch):
+    """A tool name without dots is unchanged across encode/decode."""
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(
+        output=[_make_function_call_item(
+            call_id="c1", name="nodots", arguments="{}",
+        )],
+    )
+    response = provider.complete(_simple_request())
+    assert response.tool_calls[0].name == "nodots"

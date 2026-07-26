@@ -57,6 +57,7 @@ from .models import (
     AdminAIToolInvocation,
     ConcurrentModificationError,
 )
+from .prompt_assembly import PromptAssemblyService
 from .redaction import bound_utf8, redact, redact_exception
 from .tools import (
     AdminAIToolContext,
@@ -111,6 +112,7 @@ class AdminAIService:
         max_argument_bytes: int = 32768,
         max_result_bytes: int = 65536,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        prompt_assembly_service: PromptAssemblyService | None = None,
     ) -> None:
         if max_model_turns <= 0:
             raise ValueError("max_model_turns must be positive")
@@ -135,6 +137,7 @@ class AdminAIService:
         self._max_argument_bytes = int(max_argument_bytes)
         self._max_result_bytes = int(max_result_bytes)
         self._system_prompt = system_prompt
+        self._prompt_assembly = prompt_assembly_service or PromptAssemblyService()
 
     # ------------------------------------------------------------------ public
 
@@ -242,6 +245,33 @@ class AdminAIService:
         tool_defs_for_model = tuple(
             _to_model_tool_definition(d) for d in permitted_defs
         )
+
+        # Assemble permission-aware system instructions from registered templates.
+        try:
+            assembly = self._prompt_assembly.assemble(permitted_defs)
+            effective_system = assembly.system_instructions or self._system_prompt
+        except Exception:
+            logger.exception(
+                "Prompt assembly failed for run %s; falling back to default prompt.",
+                run.run_id,
+            )
+            assembly = None
+            effective_system = self._system_prompt
+
+        # Persist prompt metadata on the run for audit purposes.
+        if assembly is not None:
+            try:
+                AdminAIRun.objects.filter(run_id=run.run_id).update(
+                    prompt_global_version=assembly.global_prompt_version[:64],
+                    prompt_tool_versions=dict(assembly.template_versions),
+                    prompt_included_tools=list(assembly.included_tool_names),
+                )
+                run.refresh_from_db()
+            except Exception:
+                logger.exception(
+                    "Failed to persist prompt metadata for run %s.", run.run_id,
+                )
+
         messages: list[AIModelMessage] = [
             AIModelMessage(role="user", content=request_text)
         ]
@@ -257,7 +287,7 @@ class AdminAIService:
             provider_request = AIModelRequest(
                 messages=tuple(messages),
                 tools=tool_defs_for_model,
-                system=self._system_prompt,
+                system=effective_system,
                 max_tokens=4096,
                 timeout_seconds=self._tool_timeout_seconds,
                 correlation_id=correlation_id or "",

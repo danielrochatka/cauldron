@@ -51,6 +51,7 @@ class AdminAIRunAdmin(admin.ModelAdmin):
         "actor",
         "status",
         "provider_name",
+        "model_name",
         "provider_request_id",
         "user_request",
         "final_response",
@@ -62,6 +63,9 @@ class AdminAIRunAdmin(admin.ModelAdmin):
         "started_at",
         "completed_at",
         "version",
+        "prompt_global_version",
+        "prompt_tool_versions",
+        "prompt_included_tools",
     ]
 
     def has_module_permission(self, request: HttpRequest) -> bool:

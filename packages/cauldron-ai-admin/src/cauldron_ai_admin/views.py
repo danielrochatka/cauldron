@@ -9,7 +9,7 @@ from django.contrib import messages
 from django.contrib.auth.decorators import login_required, permission_required
 from django.core.exceptions import PermissionDenied
 from django.http import HttpRequest, HttpResponse, JsonResponse
-from django.shortcuts import render
+from django.shortcuts import redirect, render
 from django.urls import reverse
 from django.utils.decorators import method_decorator
 from django.views import View
@@ -30,39 +30,106 @@ def _get_service():
     return get_admin_ai_service()
 
 
-def _get_provider_display() -> tuple[str, str]:
-    """Return (display_name, status) for the currently configured AI provider.
+def _get_provider_display() -> tuple[str, str, bool]:
+    """Return ``(display_name, status, store_invalid)`` for the current provider.
 
-    Never raises — falls back to descriptive error strings so the settings
-    page always renders even when the provider is misconfigured.
+    Resolution mirrors ``service_factory.get_admin_ai_service`` so the
+    status header, provider-config form, and Django system checks agree
+    on which provider is active:
+
+    1. If the config store has a saved selection, use it.
+    2. Otherwise fall back to ``CAULDRON_MODULES['cauldron.ai.admin']['provider']``
+       via ``_resolve_provider`` (which surfaces E001/E002/E003).
+    3. Never invoke ``factory.build()`` — the display path must stay pure
+       so a misconfigured provider does not break the settings page.
+
+    ``store_invalid`` is ``True`` when the config store cannot be read
+    safely (any ``AIProviderStoreError`` subclass — malformed JSON,
+    unsupported version, symlink, non-regular file, oversized file). In
+    that case CAULDRON_MODULES is *not* used as a fallback for the
+    status; the corrupt-store status wins so the operator is not misled
+    into believing a provider is active while the store is unreadable.
+
+    Always safe to call: exceptions become opaque status strings so the
+    page still renders when the config store is unreadable.
     """
+    # Import here so a missing/misconfigured cauldron_ai package doesn't
+    # crash the outer view import chain.
     try:
-        from cauldron_ai.providers import descriptor_for, provider_names
+        from .provider_config import AIProviderStoreError, get_store
+    except Exception:
+        return "Unknown", "Provider status unavailable", False
+
+    # Probe the store first — a corrupt/unsafe store trumps every other
+    # signal so we never render "Active" over a broken configuration.
+    try:
+        store = get_store()
+        store.load()  # raises AIProviderStoreError on any structural fault
+    except AIProviderStoreError:
+        return "Unknown", "Configuration store invalid", True
+    except Exception:
+        # Anything else (unexpected OS error, etc.) — degrade to a safe
+        # status without claiming the store is invalid.
+        return "Unknown", "Provider status unavailable", False
+
+    try:
+        from cauldron_ai.providers import (
+            descriptor_for,
+            factory_names,
+            provider_names,
+        )
+
         from .checks import _admin_ai_config, _resolve_provider
+        from .provider_config import resolve_provider_name
 
         cfg = _admin_ai_config()
-        names = provider_names()
-        provider, err_id = _resolve_provider(cfg, names)
-
-        if err_id == "admin_ai.E001":
-            return "None", "No AI provider registered"
-        if err_id == "admin_ai.E002":
-            configured = cfg.get("provider", "")
-            return configured or "Unknown", "Provider not found — check CAULDRON_MODULES"
-        if err_id == "admin_ai.E003":
-            return "Ambiguous", f"Multiple providers registered: {', '.join(names)}"
-        if provider is None:
-            return "Unknown", "Provider could not be resolved"
+        static_names = set(provider_names())
+        factory_only = set(factory_names())
+        all_names = sorted(static_names | factory_only)
 
         try:
-            desc = descriptor_for(provider.name)
-            display_name = desc.display_name or provider.name
+            selected = resolve_provider_name(store)
+        except AIProviderStoreError:
+            # Store went bad between the load() above and now — treat as
+            # invalid rather than falling back silently.
+            return "Unknown", "Configuration store invalid", True
         except Exception:
-            display_name = provider.name
+            selected = ""
 
-        return display_name, "Active"
+        if not selected:
+            # No saved selection — reuse the E001/E002/E003 resolver so
+            # the display agrees with system checks.
+            provider, err_id = _resolve_provider(cfg, all_names)
+            if err_id == "admin_ai.E001":
+                return "None", "No AI provider registered", False
+            if err_id == "admin_ai.E002":
+                configured = cfg.get("provider", "") or "Unknown"
+                return configured, "Provider not found — check AI settings", False
+            if err_id == "admin_ai.E003":
+                return (
+                    "Ambiguous",
+                    f"Multiple providers registered: {', '.join(all_names)}",
+                    False,
+                )
+            if provider is None:
+                return "Unknown", "Provider could not be resolved", False
+            selected = getattr(provider, "name", "") or ""
+
+        if not selected:
+            return "None", "No AI provider registered", False
+
+        if selected not in (static_names | factory_only):
+            return selected, "Provider not found — check AI settings", False
+
+        try:
+            desc = descriptor_for(selected)
+            display_name = desc.display_name or selected
+        except Exception:
+            display_name = selected
+
+        return display_name, "Active", False
     except Exception:
-        return "Unknown", "Provider status unavailable"
+        return "Unknown", "Provider status unavailable", False
 
 
 def _get_available_providers() -> list[str]:
@@ -82,6 +149,39 @@ def _get_provider_spec(provider_name: str):
     return None
 
 
+def _credential_states_for(spec, provider_name: str, store) -> dict[str, str]:
+    """Return a ``{field_name: state}`` mapping for password fields in *spec*."""
+    from cauldron_ai.provider_configuration import FIELD_TYPE_PASSWORD
+    from .forms import get_credential_state
+
+    result: dict[str, str] = {}
+    if spec is None:
+        return result
+    for f in spec.fields:
+        if f.field_type != FIELD_TYPE_PASSWORD:
+            continue
+        result[f.name] = get_credential_state(
+            provider_name, f.name, store, f.environment_variable,
+        )
+    return result
+
+
+def _resolve_runtime_defaults() -> dict[str, Any]:
+    """Return the runtime defaults merged from CAULDRON_MODULES."""
+    from django.conf import settings as django_settings
+    modules = getattr(django_settings, "CAULDRON_MODULES", {}) or {}
+    cfg = modules.get("cauldron.ai.admin") or {}
+    return {
+        "max_model_turns": cfg.get("max_model_turns", 6),
+        "max_tool_calls": cfg.get("max_tool_calls", 10),
+        "tool_timeout_seconds": cfg.get("tool_timeout_seconds", 30.0),
+        "run_timeout_seconds": cfg.get("run_timeout_seconds", 120.0),
+        "max_argument_bytes": cfg.get("max_argument_bytes", 32768),
+        "max_result_bytes": cfg.get("max_result_bytes", 65536),
+        "include_content_tools": cfg.get("include_content_tools", True),
+    }
+
+
 _SETTINGS_TEST_CACHE_KEY = "cauldron_ai_admin.settings.connection_test"
 _SETTINGS_TEST_THROTTLE_SECONDS = 30
 
@@ -93,42 +193,110 @@ _SETTINGS_TEST_THROTTLE_SECONDS = 30
 class AdminAISettingsView(View):
     """Settings page for the Admin AI module.
 
-    GET: Shows the current provider, a dynamic configuration form driven by
-         the provider's ``AIProviderConfigurationSpec``, and a connection test
-         button (when supported). Password fields are never pre-populated.
+    GET renders the provider selector, provider configuration form, runtime
+    tuning form, and (when applicable) the result of the most recent
+    connection test.  Password fields are never pre-populated.
 
-    POST: Saves provider selection and configuration. When ``action=test``
-          is submitted, runs a connection test throttled via Django's cache.
+    POST supports five actions and follows POST/Redirect/GET for every
+    write.  Only ``action=test`` renders directly so the operator can see
+    the outcome without a page reload:
+
+    * ``select_provider`` — persist the chosen provider name, redirect.
+    * ``save`` — validate + persist provider config/secrets, redirect.
+    * ``save_runtime`` — validate + persist runtime settings, redirect.
+    * ``clear_credential`` — delete one stored secret, redirect.
+    * ``test`` — throttled connection test, renders in place.
     """
 
     template_name = "cauldron_ai_admin/settings.html"
+
+    # ------------------------------------------------------------------
+    # Context builder
+    # ------------------------------------------------------------------
 
     def _context(
         self,
         request: HttpRequest,
         *,
         form=None,
+        runtime_form=None,
         test_result=None,
-        success_message: str = "",
         error_message: str = "",
     ) -> dict:
         from .provider_config import get_store, resolve_provider_name
-        from .forms import ProviderConfigForm, ProviderSelectForm
+        from .forms import (
+            ProviderConfigForm,
+            ProviderSelectForm,
+            RuntimeSettingsForm,
+        )
+
+        from .provider_config import AIProviderStoreError
+
+        provider_name_display, provider_status, store_invalid = (
+            _get_provider_display()
+        )
+
+        # When the store is invalid we render a *degraded* page: the
+        # module section and the status header still show, but every
+        # control that would touch the store is suppressed. We must not
+        # call ``get_store().<anything>`` on the corrupt path because
+        # each accessor would re-raise ``AIProviderStoreError``.
+        if store_invalid:
+            return {
+                "provider_name": provider_name_display,
+                "provider_status": provider_status,
+                "current_provider": "",
+                "available_providers": _get_available_providers(),
+                "spec": None,
+                "form": None,
+                "runtime_form": None,
+                "select_form": None,
+                "test_result": None,
+                "error_message": error_message,
+                "credential_states": {},
+                "supports_connection_test": False,
+                "store_invalid": True,
+                "breadcrumbs": [
+                    {"label": "AI Assistant", "url": reverse("cauldron_ai_admin:ai-page")},
+                    {"label": "Settings", "url": ""},
+                ],
+            }
 
         store = get_store()
         available = _get_available_providers()
-        current_provider = resolve_provider_name(store)
+        try:
+            current_provider = resolve_provider_name(store)
+        except AIProviderStoreError:
+            current_provider = ""
         spec = _get_provider_spec(current_provider) if current_provider else None
 
-        if form is None and spec is not None:
-            current_config = store.get_config(current_provider)
-            form = ProviderConfigForm(spec=spec, current_config=current_config)
+        credential_states = _credential_states_for(spec, current_provider, store)
 
-        provider_name_display, provider_status = _get_provider_display()
+        if form is None and spec is not None:
+            try:
+                current_config = store.get_config(current_provider)
+            except AIProviderStoreError:
+                current_config = {}
+            form = ProviderConfigForm(
+                spec=spec,
+                current_config=current_config,
+                credential_states=credential_states,
+                clear_keys=True,
+            )
+
         select_form = ProviderSelectForm(
             available_providers=available,
             initial={"provider": current_provider},
         )
+
+        if runtime_form is None:
+            defaults = _resolve_runtime_defaults()
+            try:
+                saved_runtime = store.get_runtime()
+            except AIProviderStoreError:
+                saved_runtime = {}
+            initial = {**defaults, **saved_runtime}
+            runtime_form = RuntimeSettingsForm(initial=initial)
 
         return {
             "provider_name": provider_name_display,
@@ -137,40 +305,61 @@ class AdminAISettingsView(View):
             "available_providers": available,
             "spec": spec,
             "form": form,
+            "runtime_form": runtime_form,
             "select_form": select_form,
             "test_result": test_result,
-            "success_message": success_message,
             "error_message": error_message,
-            "supports_connection_test": spec.supports_connection_test if spec else False,
+            "credential_states": credential_states,
+            "supports_connection_test": (
+                spec.supports_connection_test if spec else False
+            ),
+            "store_invalid": False,
             "breadcrumbs": [
                 {"label": "AI Assistant", "url": reverse("cauldron_ai_admin:ai-page")},
                 {"label": "Settings", "url": ""},
             ],
         }
 
+    # ------------------------------------------------------------------
+    # HTTP handlers
+    # ------------------------------------------------------------------
+
     def get(self, request: HttpRequest) -> HttpResponse:
         return render(request, self.template_name, self._context(request))
 
     def post(self, request: HttpRequest) -> HttpResponse:
-        from .forms import ProviderConfigForm, ProviderSelectForm
+        from .forms import (
+            ProviderConfigForm,
+            ProviderSelectForm,
+            RuntimeSettingsForm,
+        )
         from .provider_config import get_store, resolve_provider_name
+
+        settings_url = reverse("cauldron_ai_admin:settings")
+
+        # Guard every write path against a corrupt/unsafe store. Touching
+        # the store in that state would re-raise ``AIProviderStoreError``
+        # and (worse) could partially overwrite a file we can't fully
+        # read.
+        _, _, store_invalid = _get_provider_display()
+        if store_invalid:
+            messages.error(
+                request,
+                "AI settings cannot be saved: the configuration store is invalid.",
+            )
+            return redirect(settings_url)
 
         store = get_store()
         action = request.POST.get("action", "save")
 
         if action == "select_provider":
-            available = _get_available_providers()
-            select_form = ProviderSelectForm(
-                request.POST, available_providers=available
-            )
-            if select_form.is_valid():
-                new_provider = select_form.cleaned_data["provider"]
-                store.set_selected_provider(new_provider)
-                messages.success(request, f"Provider changed to {new_provider!r}.")
-            return render(
-                request, self.template_name,
-                self._context(request, success_message="Provider updated."),
-            )
+            return self._handle_select_provider(request, store, settings_url)
+
+        if action == "save_runtime":
+            return self._handle_save_runtime(request, store, settings_url)
+
+        if action == "clear_credential":
+            return self._handle_clear_credential(request, store, settings_url)
 
         current_provider = resolve_provider_name(store)
         spec = _get_provider_spec(current_provider) if current_provider else None
@@ -185,13 +374,21 @@ class AdminAISettingsView(View):
             )
 
         current_config = store.get_config(current_provider)
+        credential_states = _credential_states_for(spec, current_provider, store)
         form = ProviderConfigForm(
-            request.POST, spec=spec, current_config=current_config
+            request.POST,
+            spec=spec,
+            current_config=current_config,
+            credential_states=credential_states,
+            clear_keys=True,
         )
 
         if action == "test":
-            return self._handle_test(request, form, spec, store, current_provider)
+            return self._handle_test(
+                request, form, spec, store, current_provider,
+            )
 
+        # action == "save" (or fall-through)
         if not form.is_valid():
             return render(
                 request, self.template_name,
@@ -199,16 +396,90 @@ class AdminAISettingsView(View):
             )
 
         config, secrets = form.split_config_and_secrets()
+        clear_flags = form.clear_flags()
+
         store.set_config(current_provider, config)
-        if secrets:
-            for key, value in secrets.items():
-                store.set_secret(current_provider, key, value)
+        for key, value in secrets.items():
+            if clear_flags.get(key):
+                # Explicit clear beats an accidentally-submitted new value.
+                continue
+            store.set_secret(current_provider, key, value)
+        for key, wants_clear in clear_flags.items():
+            if wants_clear:
+                store.clear_secret(current_provider, key)
 
         messages.success(request, "AI settings saved.")
-        return render(
-            request, self.template_name,
-            self._context(request, success_message="Settings saved."),
+        return redirect(settings_url)
+
+    # ------------------------------------------------------------------
+    # Action helpers
+    # ------------------------------------------------------------------
+
+    def _handle_select_provider(
+        self, request: HttpRequest, store, settings_url: str,
+    ) -> HttpResponse:
+        from .forms import ProviderSelectForm
+        available = _get_available_providers()
+        select_form = ProviderSelectForm(
+            request.POST, available_providers=available,
         )
+        if select_form.is_valid():
+            new_provider = select_form.cleaned_data["provider"]
+            store.set_selected_provider(new_provider)
+            messages.success(
+                request, f"Provider changed to {new_provider!r}.",
+            )
+        else:
+            messages.error(request, "Invalid provider selection.")
+        return redirect(settings_url)
+
+    def _handle_save_runtime(
+        self, request: HttpRequest, store, settings_url: str,
+    ) -> HttpResponse:
+        from .forms import RuntimeSettingsForm
+        runtime_form = RuntimeSettingsForm(request.POST)
+        if not runtime_form.is_valid():
+            return render(
+                request, self.template_name,
+                self._context(request, runtime_form=runtime_form),
+            )
+        cleaned = {
+            "max_model_turns": runtime_form.cleaned_data["max_model_turns"],
+            "max_tool_calls": runtime_form.cleaned_data["max_tool_calls"],
+            "tool_timeout_seconds": runtime_form.cleaned_data["tool_timeout_seconds"],
+            "run_timeout_seconds": runtime_form.cleaned_data["run_timeout_seconds"],
+            "max_argument_bytes": runtime_form.cleaned_data["max_argument_bytes"],
+            "max_result_bytes": runtime_form.cleaned_data["max_result_bytes"],
+            "include_content_tools": bool(
+                runtime_form.cleaned_data.get("include_content_tools")
+            ),
+        }
+        store.set_runtime(cleaned)
+        messages.success(request, "Runtime settings saved.")
+        return redirect(settings_url)
+
+    def _handle_clear_credential(
+        self, request: HttpRequest, store, settings_url: str,
+    ) -> HttpResponse:
+        from .provider_config import resolve_provider_name
+        provider_name = resolve_provider_name(store)
+        field = request.POST.get("field", "").strip()
+        spec = _get_provider_spec(provider_name) if provider_name else None
+        # Validate the field belongs to the current provider's password fields
+        # so a spoofed action can't nuke arbitrary keys.
+        from cauldron_ai.provider_configuration import FIELD_TYPE_PASSWORD
+        allowed = set()
+        if spec is not None:
+            allowed = {
+                f.name for f in spec.fields
+                if f.field_type == FIELD_TYPE_PASSWORD
+            }
+        if not provider_name or field not in allowed:
+            messages.error(request, "Cannot clear that credential.")
+            return redirect(settings_url)
+        store.clear_secret(provider_name, field)
+        messages.success(request, f"Cleared saved credential {field!r}.")
+        return redirect(settings_url)
 
     def _handle_test(
         self,
@@ -226,7 +497,9 @@ class AdminAISettingsView(View):
                 request, self.template_name,
                 self._context(
                     request, form=form,
-                    error_message="This provider does not support connection testing.",
+                    error_message=(
+                        "This provider does not support connection testing."
+                    ),
                 ),
             )
 
@@ -258,13 +531,23 @@ class AdminAISettingsView(View):
         merged_secrets = {**stored_secrets, **submitted_secrets}
 
         try:
-            result = run_provider_connection_test(current_provider, config, merged_secrets)
-        except Exception as exc:
+            result = run_provider_connection_test(
+                current_provider, config, merged_secrets,
+            )
+        except Exception:
             from cauldron_ai.provider_configuration import AIProviderConnectionResult
+            # Never embed raw exception messages — vendor SDKs echo request
+            # metadata (and occasionally headers) in exception strings.
+            logger.exception(
+                "Admin AI connection test raised an unexpected exception"
+            )
             result = AIProviderConnectionResult(
                 success=False,
                 status="error",
-                message=f"Test failed: {type(exc).__name__}: {exc}",
+                message=(
+                    "Connection test failed with an unexpected error. "
+                    "See server logs for details."
+                ),
             )
 
         return render(

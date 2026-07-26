@@ -28,6 +28,11 @@ class FakeAIModelProvider:
         response = fake.complete(request)
     """
 
+    # Static providers expose ``model`` alongside ``name`` so downstream
+    # consumers (e.g. the AdminAIService audit trail) can record the model
+    # identifier uniformly across static and factory-built providers.
+    model = "fake"
+
     def __init__(self, name: str = "fake") -> None:
         if not isinstance(name, str) or not name:
             raise ValueError("FakeAIModelProvider.name must be a non-empty string")

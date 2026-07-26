@@ -26,7 +26,13 @@
       </dd>
     </dl>
 
-    {% if available_providers %}
+    {% if store_invalid %}
+    <div class="cui-alert cui-alert--error" role="alert" style="margin-top:1rem">
+      The AI configuration store is invalid. Contact your administrator
+      to resolve this before changing settings.
+    </div>
+    {% else %}
+    {% if available_providers and select_form %}
     <form method="post" class="cui-form" style="margin-top:1rem">
       {% csrf_token %}
       <input type="hidden" name="action" value="select_provider">
@@ -37,15 +43,14 @@
       <button type="submit" class="cui-button cui-button--sm">Switch Provider</button>
     </form>
     {% endif %}
+    {% endif %}
   </section>
 
-  {% if success_message %}
-  <div class="cui-alert cui-alert--success" role="status">{{ success_message }}</div>
-  {% endif %}
   {% if error_message %}
   <div class="cui-alert cui-alert--error" role="alert">{{ error_message }}</div>
   {% endif %}
 
+  {% if not store_invalid %}
   {% if test_result %}
   <section class="cui-settings-section">
     <h2 class="cui-settings-section__title">Connection Test Result</h2>
@@ -119,6 +124,34 @@
         {% endif %}
       </div>
     </form>
+
+    {% if credential_states %}
+    <div class="cui-settings-credential-state" style="margin-top:1rem">
+      <h3 class="cui-settings-section__subtitle">Credential state</h3>
+      <ul class="cui-settings-summary">
+        {% for field_name, state in credential_states.items %}
+        <li>
+          <code>{{ field_name }}</code>:
+          {% if state == "managed_storage" %}
+            <span class="cui-badge cui-badge--active">Configured in managed storage</span>
+            <form method="post" style="display:inline;margin-left:0.5rem">
+              {% csrf_token %}
+              <input type="hidden" name="action" value="clear_credential">
+              <input type="hidden" name="field" value="{{ field_name }}">
+              <button type="submit" class="cui-button cui-button--sm cui-button--danger">
+                Clear saved credential
+              </button>
+            </form>
+          {% elif state == "environment" %}
+            <span class="cui-badge">Configured by environment variable</span>
+          {% else %}
+            <span class="cui-badge cui-badge--warning">Not configured</span>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
   </section>
   {% elif not available_providers %}
   <section class="cui-settings-section">
@@ -129,6 +162,39 @@
     </div>
   </section>
   {% endif %}
+
+  {% if runtime_form %}
+  <section class="cui-settings-section">
+    <h2 class="cui-settings-section__title">Runtime Settings</h2>
+    <p class="cui-text-muted">
+      Tune the AdminAIService budgets and safety limits. These values are
+      persisted in the AI config file and take precedence over defaults
+      set in <code>CAULDRON_MODULES</code>.
+    </p>
+    <form method="post" class="cui-form" style="margin-top:1rem">
+      {% csrf_token %}
+      <input type="hidden" name="action" value="save_runtime">
+      {% for field in runtime_form %}
+      <div class="cui-form-field">
+        <label for="{{ field.id_for_label }}">{{ field.label }}</label>
+        {{ field }}
+        {% if field.help_text %}
+        <small class="cui-form-help">{{ field.help_text }}</small>
+        {% endif %}
+        {% if field.errors %}
+        <ul class="cui-form-errors">
+          {% for error in field.errors %}<li>{{ error }}</li>{% endfor %}
+        </ul>
+        {% endif %}
+      </div>
+      {% endfor %}
+      <div class="cui-form-actions" style="margin-top:1.25rem">
+        <button type="submit" class="cui-button">Save Runtime Settings</button>
+      </div>
+    </form>
+  </section>
+  {% endif %}
+  {% endif %}{# /not store_invalid #}
 
 </div>
 {% endblock %}

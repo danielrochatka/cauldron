@@ -133,13 +133,30 @@ class AIModelProviderRegistry:
     def descriptor_for(self, name: str) -> AIModelProviderDescriptor:
         with self._lock:
             descriptor = self._descriptors.get(name)
-        if descriptor is None:
-            raise ProviderRegistryError(
-                f"No AI provider registered with name {name!r}"
+            if descriptor is not None:
+                return descriptor
+            factory = self._factories.get(name)
+        if factory is not None:
+            # Synthesize a descriptor from the factory's configuration spec
+            # so callers see a consistent shape regardless of whether the
+            # provider was registered as a static instance or a factory.
+            spec = factory.configuration_spec
+            return AIModelProviderDescriptor(
+                name=name,
+                display_name=getattr(spec, "display_name", "") or name,
+                version=getattr(spec, "version", "") or "",
             )
-        return descriptor
+        raise ProviderRegistryError(
+            f"No AI provider registered with name {name!r}"
+        )
 
     def names(self) -> list[str]:
+        """Return every provider name — instances AND factories, unified."""
+        with self._lock:
+            return sorted(set(self._providers) | set(self._factories))
+
+    def instance_names(self) -> list[str]:
+        """Return only names registered as pre-built provider instances."""
         with self._lock:
             return sorted(self._providers)
 
@@ -217,7 +234,16 @@ class AIModelProviderRegistry:
         config: dict[str, Any],
         secrets: dict[str, str],
     ) -> AIModelProvider:
-        """Build a provider from its factory using the supplied config/secrets."""
+        """Return a live provider.
+
+        Static registrations return the shared instance directly; factory
+        registrations invoke ``factory.build(config, secrets)``.  Callers
+        can therefore treat every name in ``names()`` uniformly.
+        """
+        with self._lock:
+            provider = self._providers.get(name)
+        if provider is not None:
+            return provider
         factory = self.get_factory(name)
         return factory.build(config, secrets)
 
@@ -227,14 +253,55 @@ class AIModelProviderRegistry:
         config: dict[str, Any],
         secrets: dict[str, str],
     ) -> AIProviderConnectionResult:
-        """Delegate a connection test to the named factory."""
+        """Run a connection test.
+
+        For static instances the result is deterministic success — the
+        provider is already available in-process, no network is involved.
+        For factory-backed providers the call is delegated so the factory
+        can perform its usual vendor-specific probe.
+        """
+        with self._lock:
+            static = self._providers.get(name)
+        if static is not None:
+            return AIProviderConnectionResult(
+                success=True,
+                status="ok",
+                message=(
+                    f"Static provider {name!r} is registered and ready."
+                ),
+            )
         factory = self.get_factory(name)
         return factory.test_connection(config, secrets)
 
     def provider_descriptors(self) -> list[AIModelProviderDescriptor]:
-        """Return descriptors for all registered provider instances."""
+        """Return descriptors for every registered provider.
+
+        Both static instances and factories are included; factory-only
+        entries synthesize a descriptor from ``configuration_spec`` so
+        callers can iterate a single unified list.
+        """
         with self._lock:
-            return list(self._descriptors.values())
+            out: list[AIModelProviderDescriptor] = list(
+                self._descriptors.values()
+            )
+            static_names = set(self._descriptors)
+            factory_items = list(self._factories.items())
+        for name, factory in factory_items:
+            if name in static_names:
+                continue
+            try:
+                spec = factory.configuration_spec
+                out.append(AIModelProviderDescriptor(
+                    name=name,
+                    display_name=getattr(spec, "display_name", "") or name,
+                    version=getattr(spec, "version", "") or "",
+                ))
+            except Exception:
+                # A misbehaving factory shouldn't take out the whole list.
+                out.append(AIModelProviderDescriptor(
+                    name=name, display_name=name, version="",
+                ))
+        return out
 
     def clear(self) -> None:
         """Test helper: remove every registered provider and factory."""

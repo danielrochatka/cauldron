@@ -1,27 +1,35 @@
 """Unit tests for OpenAIProviderFactory and OpenAIProvider.
 
-These tests never make real network calls.  They patch the openai client
-to validate mapping, error handling, and configuration contracts.
+These tests never make real network calls.  The OpenAI SDK client is
+patched so we can assert the exact Responses API shape Cauldron sends,
+and the error-mapping paths never leak vendor-side exception text into
+user-visible surfaces.
 """
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
-from cauldron_ai.contracts import AIModelMessage, AIModelRequest
+from cauldron_ai.contracts import (
+    AIModelMessage,
+    AIModelRequest,
+    AIModelToolCall,
+    AIModelToolDefinition,
+)
 from cauldron_ai.provider_configuration import (
     AIProviderAuthenticationError,
     AIProviderConfigurationError,
     AIProviderConnectionError,
     AIProviderRateLimitError,
+    AIProviderResponseError,
 )
 from cauldron_ai_openai.provider import (
     OpenAIProvider,
     OpenAIProviderFactory,
     _CONFIGURATION_SPEC,
-    _DEFAULT_MODEL,
     _PROVIDER_NAME,
 )
 
@@ -43,12 +51,14 @@ def test_spec_has_api_key_field():
     assert field is not None
     assert field.field_type == "password"
     assert field.required is True
+    assert field.default is None
 
 
-def test_spec_has_model_name_field():
-    field = _CONFIGURATION_SPEC.field_by_name("model_name")
+def test_spec_has_model_field_no_default():
+    field = _CONFIGURATION_SPEC.field_by_name("model")
     assert field is not None
-    assert field.default == _DEFAULT_MODEL
+    assert field.required is True
+    assert field.default is None
 
 
 def test_spec_has_base_url_field():
@@ -57,10 +67,14 @@ def test_spec_has_base_url_field():
     assert field.advanced is True
 
 
-def test_spec_has_organization_field():
+def test_spec_does_not_have_organization_field():
     field = _CONFIGURATION_SPEC.field_by_name("organization")
-    assert field is not None
-    assert field.advanced is True
+    assert field is None
+
+
+def test_spec_model_field_has_env_var_hint():
+    field = _CONFIGURATION_SPEC.field_by_name("model")
+    assert field.environment_variable == "OPENAI_MODEL"
 
 
 # ---------------------------------------------------------------------------
@@ -79,38 +93,31 @@ def test_factory_configuration_spec():
 def test_factory_build_raises_without_api_key():
     factory = OpenAIProviderFactory()
     with pytest.raises(AIProviderConfigurationError, match="api_key"):
-        factory.build({}, {})
+        factory.build({"model": "gpt-4o"}, {})
 
 
 def test_factory_build_raises_with_empty_api_key():
     factory = OpenAIProviderFactory()
     with pytest.raises(AIProviderConfigurationError):
-        factory.build({}, {"api_key": ""})
+        factory.build({"model": "gpt-4o"}, {"api_key": ""})
 
 
-def test_factory_build_succeeds_with_api_key(monkeypatch):
+def test_factory_build_raises_without_model(monkeypatch):
     import openai
     monkeypatch.setattr(openai, "OpenAI", lambda **kw: MagicMock())
     factory = OpenAIProviderFactory()
-    provider = factory.build({}, {"api_key": "sk-test"})
+    with pytest.raises(AIProviderConfigurationError, match="model"):
+        factory.build({}, {"api_key": "sk-test"})
+
+
+def test_factory_build_succeeds_with_api_key_and_model(monkeypatch):
+    import openai
+    monkeypatch.setattr(openai, "OpenAI", lambda **kw: MagicMock())
+    factory = OpenAIProviderFactory()
+    provider = factory.build({"model": "gpt-4o-mini"}, {"api_key": "sk-test"})
     assert isinstance(provider, OpenAIProvider)
     assert provider.name == _PROVIDER_NAME
-
-
-def test_factory_build_uses_custom_model(monkeypatch):
-    import openai
-    monkeypatch.setattr(openai, "OpenAI", lambda **kw: MagicMock())
-    factory = OpenAIProviderFactory()
-    provider = factory.build({"model_name": "gpt-4o-mini"}, {"api_key": "sk-test"})
-    assert provider._model_name == "gpt-4o-mini"
-
-
-def test_factory_build_defaults_to_default_model(monkeypatch):
-    import openai
-    monkeypatch.setattr(openai, "OpenAI", lambda **kw: MagicMock())
-    factory = OpenAIProviderFactory()
-    provider = factory.build({}, {"api_key": "sk-test"})
-    assert provider._model_name == _DEFAULT_MODEL
+    assert provider.model == "gpt-4o-mini"
 
 
 def test_factory_build_reads_api_key_from_env(monkeypatch):
@@ -118,128 +125,397 @@ def test_factory_build_reads_api_key_from_env(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-from-env")
     monkeypatch.setattr(openai, "OpenAI", lambda **kw: MagicMock())
     factory = OpenAIProviderFactory()
-    provider = factory.build({}, {})
+    provider = factory.build({"model": "gpt-4o"}, {})
     assert isinstance(provider, OpenAIProvider)
 
 
+def test_factory_build_reads_model_from_env(monkeypatch):
+    import openai
+    monkeypatch.setenv("OPENAI_MODEL", "gpt-4o-mini")
+    monkeypatch.setattr(openai, "OpenAI", lambda **kw: MagicMock())
+    factory = OpenAIProviderFactory()
+    provider = factory.build({}, {"api_key": "sk-test"})
+    assert provider.model == "gpt-4o-mini"
+
+
+def test_factory_build_config_wins_over_env(monkeypatch):
+    import openai
+    monkeypatch.setenv("OPENAI_MODEL", "env-model")
+    monkeypatch.setattr(openai, "OpenAI", lambda **kw: MagicMock())
+    factory = OpenAIProviderFactory()
+    provider = factory.build({"model": "cfg-model"}, {"api_key": "sk-test"})
+    assert provider.model == "cfg-model"
+
+
 # ---------------------------------------------------------------------------
-# Provider complete()
+# Responses API — helpers
 # ---------------------------------------------------------------------------
 
-def _make_chat_response(content="Hello!", finish_reason="stop", tool_calls=None, request_id="req-1"):
-    msg = SimpleNamespace(
-        content=content,
-        tool_calls=tool_calls,
+def _make_output_text_item(text: str = "Hi!") -> SimpleNamespace:
+    return SimpleNamespace(type="output_text", text=text)
+
+
+def _make_function_call_item(
+    *, call_id: str, name: str, arguments: str,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        type="function_call",
+        call_id=call_id,
+        name=name,
+        arguments=arguments,
     )
-    choice = SimpleNamespace(message=msg, finish_reason=finish_reason)
-    usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5)
-    return SimpleNamespace(id=request_id, choices=[choice], usage=usage)
 
 
-def _make_provider(monkeypatch, model="gpt-4o"):
+def _make_response(
+    *,
+    output=None,
+    request_id: str = "resp-1",
+    status: str = "completed",
+    incomplete_reason: str | None = None,
+    input_tokens: int = 10,
+    output_tokens: int = 5,
+) -> SimpleNamespace:
+    details = None
+    if incomplete_reason is not None:
+        details = SimpleNamespace(reason=incomplete_reason)
+    return SimpleNamespace(
+        id=request_id,
+        output=output or [_make_output_text_item("Hi!")],
+        usage=SimpleNamespace(
+            input_tokens=input_tokens, output_tokens=output_tokens,
+        ),
+        status=status,
+        incomplete_details=details,
+    )
+
+
+def _make_provider(monkeypatch, model: str = "gpt-4o"):
     import openai
     mock_client = MagicMock()
     monkeypatch.setattr(openai, "OpenAI", lambda **kw: mock_client)
-    provider = OpenAIProvider(model_name=model, api_key="sk-test")
+    provider = OpenAIProvider(model=model, api_key="sk-test")
     return provider, mock_client
 
 
-def _simple_request():
+def _simple_request(**overrides) -> AIModelRequest:
     return AIModelRequest(
         messages=(AIModelMessage(role="user", content="Hello"),),
+        **overrides,
     )
 
 
-def test_provider_complete_returns_response(monkeypatch):
+# ---------------------------------------------------------------------------
+# Provider complete() — uses the Responses API
+# ---------------------------------------------------------------------------
+
+def test_provider_uses_responses_api(monkeypatch):
     provider, mock_client = _make_provider(monkeypatch)
-    mock_client.chat.completions.create.return_value = _make_chat_response("Hi!")
-    response = provider.complete(_simple_request())
-    assert response.content == "Hi!"
-    assert response.stop_reason == "end_turn"
-    assert response.provider_request_id == "req-1"
+    mock_client.responses.create.return_value = _make_response()
+    provider.complete(_simple_request())
+    assert mock_client.responses.create.called
+    # chat.completions must NOT be invoked at all.
+    assert not mock_client.chat.completions.create.called
 
 
-def test_provider_complete_maps_stop_to_end_turn(monkeypatch):
+def test_provider_sends_store_false(monkeypatch):
     provider, mock_client = _make_provider(monkeypatch)
-    mock_client.chat.completions.create.return_value = _make_chat_response(finish_reason="stop")
-    response = provider.complete(_simple_request())
-    assert response.stop_reason == "end_turn"
+    mock_client.responses.create.return_value = _make_response()
+    provider.complete(_simple_request())
+    kwargs = mock_client.responses.create.call_args[1]
+    assert kwargs["store"] is False
 
 
-def test_provider_complete_maps_tool_calls_to_tool_use(monkeypatch):
+def test_provider_sends_max_output_tokens(monkeypatch):
     provider, mock_client = _make_provider(monkeypatch)
-    tc = SimpleNamespace(
-        id="tc-1",
-        function=SimpleNamespace(name="my_tool", arguments='{"x": 1}'),
+    mock_client.responses.create.return_value = _make_response()
+    provider.complete(_simple_request(max_tokens=512))
+    kwargs = mock_client.responses.create.call_args[1]
+    assert kwargs["max_output_tokens"] == 512
+
+
+def test_provider_sends_instructions(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response()
+    provider.complete(_simple_request(system="Be brief."))
+    kwargs = mock_client.responses.create.call_args[1]
+    assert kwargs["instructions"] == "Be brief."
+
+
+def test_provider_input_items_user_role(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response()
+    provider.complete(_simple_request())
+    input_items = mock_client.responses.create.call_args[1]["input"]
+    assert input_items == [{"role": "user", "content": "Hello"}]
+
+
+def test_provider_input_items_assistant_output_text(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response()
+    provider.complete(AIModelRequest(messages=(
+        AIModelMessage(role="user", content="Q"),
+        AIModelMessage(role="assistant", content="A"),
+    )))
+    input_items = mock_client.responses.create.call_args[1]["input"]
+    assert input_items[1] == {
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "A"}],
+    }
+
+
+def test_provider_input_items_assistant_tool_call(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response()
+    provider.complete(AIModelRequest(messages=(
+        AIModelMessage(role="user", content="Q"),
+        AIModelMessage(
+            role="assistant", content="",
+            tool_calls=(AIModelToolCall(
+                id="call-1", name="my_tool", arguments={"x": 1},
+            ),),
+        ),
+        AIModelMessage(
+            role="tool", tool_call_id="call-1", content='{"ok": true}',
+        ),
+    )))
+    input_items = mock_client.responses.create.call_args[1]["input"]
+    assert input_items[1]["type"] == "function_call"
+    assert input_items[1]["call_id"] == "call-1"
+    assert input_items[1]["name"] == "my_tool"
+    assert json.loads(input_items[1]["arguments"]) == {"x": 1}
+    assert input_items[2] == {
+        "type": "function_call_output",
+        "call_id": "call-1",
+        "output": '{"ok": true}',
+    }
+
+
+def test_provider_extracts_output_text(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(
+        output=[_make_output_text_item("hello world")],
     )
-    mock_client.chat.completions.create.return_value = _make_chat_response(
-        content="", finish_reason="tool_calls", tool_calls=[tc]
+    response = provider.complete(_simple_request())
+    assert response.content == "hello world"
+    assert response.stop_reason == "end_turn"
+    assert response.provider_request_id == "resp-1"
+
+
+def test_provider_extracts_function_call(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(
+        output=[_make_function_call_item(
+            call_id="call-42", name="do_thing", arguments='{"a": 1}',
+        )],
     )
     response = provider.complete(_simple_request())
     assert response.stop_reason == "tool_use"
     assert len(response.tool_calls) == 1
-    assert response.tool_calls[0].name == "my_tool"
-    assert response.tool_calls[0].arguments["x"] == 1
+    assert response.tool_calls[0].id == "call-42"
+    assert response.tool_calls[0].name == "do_thing"
+    assert response.tool_calls[0].arguments["a"] == 1
 
 
-def test_provider_complete_maps_length_to_max_tokens(monkeypatch):
+def test_provider_maps_max_tokens(monkeypatch):
     provider, mock_client = _make_provider(monkeypatch)
-    mock_client.chat.completions.create.return_value = _make_chat_response(finish_reason="length")
+    mock_client.responses.create.return_value = _make_response(
+        status="incomplete", incomplete_reason="max_output_tokens",
+    )
     response = provider.complete(_simple_request())
     assert response.stop_reason == "max_tokens"
 
 
-def test_provider_complete_includes_token_counts(monkeypatch):
+def test_provider_reports_token_usage(monkeypatch):
     provider, mock_client = _make_provider(monkeypatch)
-    mock_client.chat.completions.create.return_value = _make_chat_response()
+    mock_client.responses.create.return_value = _make_response(
+        input_tokens=123, output_tokens=45,
+    )
     response = provider.complete(_simple_request())
-    assert response.input_tokens == 10
-    assert response.output_tokens == 5
+    assert response.input_tokens == 123
+    assert response.output_tokens == 45
 
 
-def test_provider_complete_store_false(monkeypatch):
+def test_provider_tool_definitions_use_function_shape(monkeypatch):
     provider, mock_client = _make_provider(monkeypatch)
-    mock_client.chat.completions.create.return_value = _make_chat_response()
-    provider.complete(_simple_request())
-    call_kwargs = mock_client.chat.completions.create.call_args[1]
-    assert call_kwargs.get("store") is False
-
-
-def test_provider_raises_auth_error(monkeypatch):
-    import openai
-    provider, mock_client = _make_provider(monkeypatch)
-    mock_client.chat.completions.create.side_effect = openai.AuthenticationError(
-        "invalid key", response=MagicMock(), body={}
+    mock_client.responses.create.return_value = _make_response()
+    tool = AIModelToolDefinition(
+        name="do_thing",
+        description="does a thing",
+        parameters={"type": "object", "properties": {}},
     )
-    with pytest.raises(AIProviderAuthenticationError):
+    provider.complete(AIModelRequest(
+        messages=(AIModelMessage(role="user", content="Q"),),
+        tools=(tool,),
+    ))
+    tools_arg = mock_client.responses.create.call_args[1]["tools"]
+    assert tools_arg == [{
+        "type": "function",
+        "name": "do_thing",
+        "description": "does a thing",
+        "parameters": {"type": "object", "properties": {}},
+        "strict": False,
+    }]
+
+
+# ---------------------------------------------------------------------------
+# Provider complete() — malformed tool arguments
+# ---------------------------------------------------------------------------
+
+def test_provider_malformed_json_arguments_raises(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(
+        output=[_make_function_call_item(
+            call_id="c", name="x", arguments="{invalid json",
+        )],
+    )
+    with pytest.raises(AIProviderResponseError, match="invalid JSON"):
         provider.complete(_simple_request())
 
 
-def test_provider_raises_rate_limit_error(monkeypatch):
-    import openai
+def test_provider_non_object_arguments_raises(monkeypatch):
     provider, mock_client = _make_provider(monkeypatch)
-    mock_client.chat.completions.create.side_effect = openai.RateLimitError(
-        "rate limit", response=MagicMock(), body={}
+    mock_client.responses.create.return_value = _make_response(
+        output=[_make_function_call_item(
+            call_id="c", name="x", arguments='["a", "b"]',
+        )],
     )
-    with pytest.raises(AIProviderRateLimitError):
+    with pytest.raises(AIProviderResponseError, match="non-object"):
         provider.complete(_simple_request())
 
 
-def test_provider_raises_connection_error(monkeypatch):
+# ---------------------------------------------------------------------------
+# Provider complete() — credential-safe error mapping
+# ---------------------------------------------------------------------------
+
+def test_provider_auth_error_message_is_safe(monkeypatch):
     import openai
     provider, mock_client = _make_provider(monkeypatch)
-    mock_client.chat.completions.create.side_effect = openai.APIConnectionError(
-        request=MagicMock()
+    # The SDK exception often contains the API key in str(exc); the
+    # provider must NOT let that leak into the raised message.
+    mock_client.responses.create.side_effect = openai.AuthenticationError(
+        "invalid_api_key sk-supersecret", response=MagicMock(), body={},
+    )
+    with pytest.raises(AIProviderAuthenticationError) as exc_info:
+        provider.complete(_simple_request())
+    assert "sk-supersecret" not in str(exc_info.value)
+    assert "OpenAI rejected the API key" in str(exc_info.value)
+
+
+def test_provider_rate_limit_message_is_safe(monkeypatch):
+    import openai
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.side_effect = openai.RateLimitError(
+        "org-abc exceeded quota", response=MagicMock(), body={},
+    )
+    with pytest.raises(AIProviderRateLimitError) as exc_info:
+        provider.complete(_simple_request())
+    assert "org-abc" not in str(exc_info.value)
+
+
+def test_provider_timeout_message_is_safe(monkeypatch):
+    import openai
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.side_effect = openai.APITimeoutError(
+        request=MagicMock(),
+    )
+    with pytest.raises(AIProviderConnectionError) as exc_info:
+        provider.complete(_simple_request())
+    assert "timed out" in str(exc_info.value).lower()
+
+
+def test_provider_connection_error_message_is_safe(monkeypatch):
+    import openai
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.side_effect = openai.APIConnectionError(
+        request=MagicMock(),
     )
     with pytest.raises(AIProviderConnectionError):
         provider.complete(_simple_request())
+
+
+def test_provider_bad_request_error_message_is_safe(monkeypatch):
+    import openai
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.side_effect = openai.BadRequestError(
+        "malformed prompt org-xxx", response=MagicMock(), body={},
+    )
+    with pytest.raises(AIProviderResponseError) as exc_info:
+        provider.complete(_simple_request())
+    assert "org-xxx" not in str(exc_info.value)
 
 
 def test_provider_empty_api_key_raises_at_init(monkeypatch):
     import openai
     monkeypatch.setattr(openai, "OpenAI", lambda **kw: MagicMock())
     with pytest.raises(AIProviderConfigurationError):
-        OpenAIProvider(api_key="")
+        OpenAIProvider(api_key="", model="gpt-4o")
+
+
+def test_provider_empty_model_raises_at_init(monkeypatch):
+    import openai
+    monkeypatch.setattr(openai, "OpenAI", lambda **kw: MagicMock())
+    with pytest.raises(AIProviderConfigurationError):
+        OpenAIProvider(api_key="sk-test", model="")
+
+
+def test_provider_does_not_set_retries_on_client(monkeypatch):
+    import openai
+    seen_kwargs: dict = {}
+
+    def _capture(**kwargs):
+        seen_kwargs.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(openai, "OpenAI", _capture)
+    OpenAIProvider(api_key="sk-test", model="gpt-4o")
+    assert "retries" not in seen_kwargs
+
+
+def test_openai_client_constructed_with_max_retries_zero(monkeypatch):
+    """Cauldron must own retry policy — the SDK's default 2 retries is off."""
+    import openai
+    captured: dict = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(openai, "OpenAI", _capture)
+    OpenAIProvider(api_key="sk-test", model="gpt-4o")
+    assert captured.get("max_retries") == 0
+
+
+def test_openai_factory_build_passes_max_retries_zero(monkeypatch):
+    """The same guarantee holds when the provider is built via the factory."""
+    import openai
+    captured: dict = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(openai, "OpenAI", _capture)
+    OpenAIProviderFactory().build(
+        {"model": "gpt-4o"}, {"api_key": "sk-test"},
+    )
+    assert captured.get("max_retries") == 0
+
+
+def test_openai_client_with_base_url_still_sets_max_retries_zero(monkeypatch):
+    """base_url must not disturb the max_retries=0 guarantee."""
+    import openai
+    captured: dict = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(openai, "OpenAI", _capture)
+    OpenAIProvider(
+        api_key="sk-test", model="gpt-4o", base_url="https://example.com/v1",
+    )
+    assert captured.get("max_retries") == 0
+    assert captured.get("base_url") == "https://example.com/v1"
 
 
 # ---------------------------------------------------------------------------
@@ -249,30 +525,231 @@ def test_provider_empty_api_key_raises_at_init(monkeypatch):
 def test_factory_test_connection_success(monkeypatch):
     import openai
     mock_client = MagicMock()
-    mock_client.chat.completions.create.return_value = _make_chat_response("OK")
+    mock_client.responses.create.return_value = _make_response()
     monkeypatch.setattr(openai, "OpenAI", lambda **kw: mock_client)
     factory = OpenAIProviderFactory()
-    result = factory.test_connection({}, {"api_key": "sk-test"})
+    result = factory.test_connection(
+        {"model": "gpt-4o"}, {"api_key": "sk-test"},
+    )
     assert result.success is True
     assert result.status == "ok"
     assert result.latency_ms is not None
 
 
-def test_factory_test_connection_auth_error_returns_failure(monkeypatch):
+def test_factory_test_connection_auth_error_returns_safe_failure(monkeypatch):
     import openai
     mock_client = MagicMock()
-    mock_client.chat.completions.create.side_effect = openai.AuthenticationError(
-        "bad key", response=MagicMock(), body={}
+    mock_client.responses.create.side_effect = openai.AuthenticationError(
+        "sk-verybad", response=MagicMock(), body={},
     )
     monkeypatch.setattr(openai, "OpenAI", lambda **kw: mock_client)
     factory = OpenAIProviderFactory()
-    result = factory.test_connection({}, {"api_key": "sk-bad"})
+    result = factory.test_connection(
+        {"model": "gpt-4o"}, {"api_key": "sk-bad"},
+    )
     assert result.success is False
     assert result.status == "authentication_error"
+    assert "sk-verybad" not in result.message
+    assert "sk-bad" not in result.message
 
 
 def test_factory_test_connection_no_api_key_returns_config_error():
     factory = OpenAIProviderFactory()
-    result = factory.test_connection({}, {})
+    result = factory.test_connection({"model": "gpt-4o"}, {})
     assert result.success is False
     assert result.status == "configuration_error"
+
+
+def test_factory_test_connection_no_model_returns_config_error():
+    factory = OpenAIProviderFactory()
+    result = factory.test_connection({}, {"api_key": "sk-test"})
+    assert result.success is False
+    assert result.status == "configuration_error"
+
+
+# ---------------------------------------------------------------------------
+# Legacy model_name compatibility
+# ---------------------------------------------------------------------------
+
+def test_factory_build_reads_legacy_model_name(monkeypatch):
+    """Factory must accept model_name as a backward-compat fallback."""
+    import openai
+    monkeypatch.setattr(openai, "OpenAI", lambda **kw: MagicMock())
+    factory = OpenAIProviderFactory()
+    provider = factory.build({"model_name": "gpt-4o"}, {"api_key": "sk-test"})
+    assert isinstance(provider, OpenAIProvider)
+    assert provider.model == "gpt-4o"
+
+
+def test_factory_build_model_wins_over_model_name(monkeypatch):
+    """Explicit model field takes precedence over legacy model_name."""
+    import openai
+    monkeypatch.setattr(openai, "OpenAI", lambda **kw: MagicMock())
+    factory = OpenAIProviderFactory()
+    provider = factory.build(
+        {"model": "gpt-4o", "model_name": "old-model"},
+        {"api_key": "sk-test"},
+    )
+    assert provider.model == "gpt-4o"
+
+
+def test_factory_build_env_wins_over_empty_model_name(monkeypatch):
+    """OPENAI_MODEL env var fills in when both model and model_name are absent."""
+    import openai
+    monkeypatch.setenv("OPENAI_MODEL", "env-model")
+    monkeypatch.setattr(openai, "OpenAI", lambda **kw: MagicMock())
+    factory = OpenAIProviderFactory()
+    provider = factory.build({}, {"api_key": "sk-test"})
+    assert provider.model == "env-model"
+
+
+# ---------------------------------------------------------------------------
+# Response status validation — strict terminal-status enforcement
+# ---------------------------------------------------------------------------
+
+def test_provider_completed_text_returns_end_turn(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(
+        output=[_make_output_text_item("Hello")], status="completed",
+    )
+    response = provider.complete(_simple_request())
+    assert response.stop_reason == "end_turn"
+    assert response.content == "Hello"
+
+
+def test_provider_completed_single_tool_call(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(
+        output=[_make_function_call_item(
+            call_id="c1", name="my_tool", arguments='{"x": 1}',
+        )],
+        status="completed",
+    )
+    response = provider.complete(_simple_request())
+    assert response.stop_reason == "tool_use"
+    assert len(response.tool_calls) == 1
+    assert response.tool_calls[0].name == "my_tool"
+
+
+def test_provider_completed_multiple_tool_calls(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(
+        output=[
+            _make_function_call_item(call_id="c1", name="tool_a", arguments="{}"),
+            _make_function_call_item(call_id="c2", name="tool_b", arguments="{}"),
+        ],
+        status="completed",
+    )
+    response = provider.complete(_simple_request())
+    assert response.stop_reason == "tool_use"
+    assert len(response.tool_calls) == 2
+    names = {tc.name for tc in response.tool_calls}
+    assert names == {"tool_a", "tool_b"}
+
+
+def test_provider_incomplete_content_filter_raises(monkeypatch):
+    """Content filtering produces an incomplete response — must raise, not succeed."""
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(
+        output=[_make_output_text_item("partial")],
+        status="incomplete",
+        incomplete_reason="content_filter",
+    )
+    with pytest.raises(AIProviderResponseError):
+        provider.complete(_simple_request())
+
+
+def test_provider_incomplete_missing_reason_raises(monkeypatch):
+    """Incomplete with no reason is not a successful response."""
+    provider, mock_client = _make_provider(monkeypatch)
+    resp = _make_response(
+        output=[_make_output_text_item("partial")],
+        status="incomplete",
+        incomplete_reason=None,
+    )
+    # Remove incomplete_details entirely so reason is missing
+    resp.incomplete_details = None
+    mock_client.responses.create.return_value = resp
+    with pytest.raises(AIProviderResponseError):
+        provider.complete(_simple_request())
+
+
+def test_provider_failed_status_raises(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(status="failed")
+    with pytest.raises(AIProviderResponseError, match="failed"):
+        provider.complete(_simple_request())
+
+
+def test_provider_cancelled_status_raises(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(status="cancelled")
+    with pytest.raises(AIProviderResponseError, match="cancelled"):
+        provider.complete(_simple_request())
+
+
+def test_provider_queued_status_raises(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(status="queued")
+    with pytest.raises(AIProviderResponseError):
+        provider.complete(_simple_request())
+
+
+def test_provider_in_progress_status_raises(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(status="in_progress")
+    with pytest.raises(AIProviderResponseError):
+        provider.complete(_simple_request())
+
+
+def test_provider_missing_status_raises(monkeypatch):
+    """A response with no status attribute at all must raise."""
+    provider, mock_client = _make_provider(monkeypatch)
+    resp = _make_response()
+    del resp.status
+    mock_client.responses.create.return_value = resp
+    with pytest.raises(AIProviderResponseError):
+        provider.complete(_simple_request())
+
+
+def test_provider_unknown_status_raises(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(status="superseded")
+    with pytest.raises(AIProviderResponseError):
+        provider.complete(_simple_request())
+
+
+def test_provider_partial_text_on_incomplete_is_rejected(monkeypatch):
+    """Partial text from a non-max_tokens incomplete must not be returned."""
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(
+        output=[_make_output_text_item("this text is partial")],
+        status="incomplete",
+        incomplete_reason="content_filter",
+    )
+    with pytest.raises(AIProviderResponseError):
+        provider.complete(_simple_request())
+
+
+def test_provider_failed_status_does_not_expose_vendor_details(monkeypatch):
+    """Error messages for failed/cancelled responses must be credential-safe."""
+    provider, mock_client = _make_provider(monkeypatch)
+    # Include a fake secret in the response to confirm it is never echoed.
+    resp = _make_response(status="failed")
+    resp.error = "Internal error: sk-supersecret exposed"
+    mock_client.responses.create.return_value = resp
+    with pytest.raises(AIProviderResponseError) as exc_info:
+        provider.complete(_simple_request())
+    assert "sk-supersecret" not in str(exc_info.value)
+
+
+def test_provider_incomplete_other_reason_does_not_expose_reason(monkeypatch):
+    """The raw incomplete reason string must not appear in the exception."""
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(
+        status="incomplete",
+        incomplete_reason="some_internal_filter_reason_with_secret",
+    )
+    with pytest.raises(AIProviderResponseError) as exc_info:
+        provider.complete(_simple_request())
+    assert "some_internal_filter_reason_with_secret" not in str(exc_info.value)

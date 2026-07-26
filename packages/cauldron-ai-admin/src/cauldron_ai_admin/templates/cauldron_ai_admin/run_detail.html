@@ -5,6 +5,8 @@
   <dl class="cui-dl">
     <dt>Run ID</dt><dd><code>{{ run.run_id }}</code></dd>
     <dt>Status</dt><dd>{% include "cauldron_admin/includes/status_badge.html" with status=run.status %}</dd>
+    <dt>Provider</dt><dd>{{ run.provider_name }}</dd>
+    <dt>Model</dt><dd>{% if run.model_name %}<code>{{ run.model_name }}</code>{% else %}<span class="cui-text-muted">—</span>{% endif %}</dd>
     <dt>Request</dt><dd>{{ run.user_request }}</dd>
     <dt>Created</dt><dd>{{ run.created_at }}</dd>
     {% if run.final_response %}<dt>Response</dt><dd><pre class="cui-pre">{{ run.final_response }}</pre></dd>{% endif %}

@@ -227,3 +227,228 @@ def test_select_form_choices_are_sorted():
     )
     choices = [c[0] for c in form.fields["provider"].choices]
     assert choices == sorted(choices)
+
+
+# ---------------------------------------------------------------------------
+# Password fields are always required=False so blank means "retain existing"
+# ---------------------------------------------------------------------------
+
+def test_password_field_required_false_even_when_spec_required():
+    spec = _make_spec(fields=(
+        AIProviderConfigurationField(
+            name="api_key", label="Key",
+            field_type=FIELD_TYPE_PASSWORD, required=True,
+        ),
+    ))
+    form = ProviderConfigForm(spec=spec)
+    # Spec says required=True but the *form* field is required=False so
+    # empty submissions keep the existing stored secret.
+    assert form.fields["api_key"].required is False
+
+
+def test_blank_password_does_not_appear_in_secrets():
+    spec = _make_spec(fields=(
+        AIProviderConfigurationField(
+            name="api_key", label="K", field_type=FIELD_TYPE_PASSWORD,
+        ),
+        AIProviderConfigurationField(
+            name="model", label="M", required=False,
+        ),
+    ))
+    form = ProviderConfigForm(
+        {"api_key": "", "model": "gpt-4o"}, spec=spec,
+    )
+    assert form.is_valid(), form.errors
+    _, secrets = form.split_config_and_secrets()
+    assert "api_key" not in secrets
+
+
+# ---------------------------------------------------------------------------
+# Credential state display
+# ---------------------------------------------------------------------------
+
+def test_credential_state_addendum_added_to_help_text():
+    from cauldron_ai_admin.forms import CREDENTIAL_STATE_MANAGED
+    spec = _make_spec(fields=(
+        AIProviderConfigurationField(
+            name="api_key", label="K",
+            field_type=FIELD_TYPE_PASSWORD,
+            help_text="Original help.",
+        ),
+    ))
+    form = ProviderConfigForm(
+        spec=spec,
+        credential_states={"api_key": CREDENTIAL_STATE_MANAGED},
+    )
+    help_text = form.fields["api_key"].help_text
+    assert "Original help." in help_text
+    assert "Configured in managed storage" in help_text
+    assert "Leave blank" in help_text
+
+
+def test_credential_state_environment_shown():
+    from cauldron_ai_admin.forms import CREDENTIAL_STATE_ENVIRONMENT
+    spec = _make_spec(fields=(
+        AIProviderConfigurationField(
+            name="api_key", label="K", field_type=FIELD_TYPE_PASSWORD,
+        ),
+    ))
+    form = ProviderConfigForm(
+        spec=spec,
+        credential_states={"api_key": CREDENTIAL_STATE_ENVIRONMENT},
+    )
+    assert "environment variable" in form.fields["api_key"].help_text.lower()
+
+
+def test_credential_state_not_configured_shown():
+    from cauldron_ai_admin.forms import CREDENTIAL_STATE_NOT_CONFIGURED
+    spec = _make_spec(fields=(
+        AIProviderConfigurationField(
+            name="api_key", label="K", field_type=FIELD_TYPE_PASSWORD,
+        ),
+    ))
+    form = ProviderConfigForm(
+        spec=spec,
+        credential_states={"api_key": CREDENTIAL_STATE_NOT_CONFIGURED},
+    )
+    assert "Not configured" in form.fields["api_key"].help_text
+
+
+def test_get_credential_state_prefers_managed_storage(monkeypatch):
+    from cauldron_ai_admin.forms import (
+        CREDENTIAL_STATE_MANAGED, get_credential_state,
+    )
+
+    class _Store:
+        def get_secret(self, provider, key):
+            return "sk-stored"
+
+    monkeypatch.setenv("MY_KEY", "sk-env")
+    state = get_credential_state("openai", "api_key", _Store(), "MY_KEY")
+    assert state == CREDENTIAL_STATE_MANAGED
+
+
+def test_get_credential_state_falls_back_to_env(monkeypatch):
+    from cauldron_ai_admin.forms import (
+        CREDENTIAL_STATE_ENVIRONMENT, get_credential_state,
+    )
+
+    class _Store:
+        def get_secret(self, provider, key):
+            return ""
+
+    monkeypatch.setenv("MY_KEY", "sk-env")
+    state = get_credential_state("openai", "api_key", _Store(), "MY_KEY")
+    assert state == CREDENTIAL_STATE_ENVIRONMENT
+
+
+def test_get_credential_state_returns_not_configured(monkeypatch):
+    from cauldron_ai_admin.forms import (
+        CREDENTIAL_STATE_NOT_CONFIGURED, get_credential_state,
+    )
+
+    class _Store:
+        def get_secret(self, provider, key):
+            return ""
+
+    monkeypatch.delenv("MY_KEY", raising=False)
+    state = get_credential_state("openai", "api_key", _Store(), "MY_KEY")
+    assert state == CREDENTIAL_STATE_NOT_CONFIGURED
+
+
+# ---------------------------------------------------------------------------
+# Clear-credential checkboxes
+# ---------------------------------------------------------------------------
+
+def test_clear_credential_checkbox_added_when_enabled():
+    spec = _make_spec(fields=(
+        AIProviderConfigurationField(
+            name="api_key", label="K", field_type=FIELD_TYPE_PASSWORD,
+        ),
+    ))
+    form = ProviderConfigForm(spec=spec, clear_keys=True)
+    assert "clear_api_key" in form.fields
+
+
+def test_clear_credential_checkbox_absent_when_disabled():
+    spec = _make_spec(fields=(
+        AIProviderConfigurationField(
+            name="api_key", label="K", field_type=FIELD_TYPE_PASSWORD,
+        ),
+    ))
+    form = ProviderConfigForm(spec=spec)
+    assert "clear_api_key" not in form.fields
+
+
+def test_clear_flags_reflects_form_state():
+    spec = _make_spec(fields=(
+        AIProviderConfigurationField(
+            name="api_key", label="K", field_type=FIELD_TYPE_PASSWORD,
+        ),
+    ))
+    form = ProviderConfigForm(
+        {"api_key": "", "clear_api_key": "on"},
+        spec=spec, clear_keys=True,
+    )
+    assert form.is_valid(), form.errors
+    assert form.clear_flags()["api_key"] is True
+
+
+# ---------------------------------------------------------------------------
+# RuntimeSettingsForm
+# ---------------------------------------------------------------------------
+
+def test_runtime_form_defaults_are_valid():
+    from cauldron_ai_admin.forms import RuntimeSettingsForm
+    form = RuntimeSettingsForm(data={
+        "max_model_turns": "6",
+        "max_tool_calls": "10",
+        "tool_timeout_seconds": "30",
+        "run_timeout_seconds": "120",
+        "max_argument_bytes": "32768",
+        "max_result_bytes": "65536",
+        "include_content_tools": "on",
+    })
+    assert form.is_valid(), form.errors
+
+
+def test_runtime_form_rejects_tool_timeout_ge_run_timeout():
+    from cauldron_ai_admin.forms import RuntimeSettingsForm
+    form = RuntimeSettingsForm(data={
+        "max_model_turns": "6",
+        "max_tool_calls": "10",
+        "tool_timeout_seconds": "120",
+        "run_timeout_seconds": "60",
+        "max_argument_bytes": "32768",
+        "max_result_bytes": "65536",
+    })
+    assert not form.is_valid()
+    assert "tool_timeout_seconds" in form.errors
+
+
+def test_runtime_form_rejects_out_of_range_values():
+    from cauldron_ai_admin.forms import RuntimeSettingsForm
+    form = RuntimeSettingsForm(data={
+        "max_model_turns": "0",  # below min_value=1
+        "max_tool_calls": "10",
+        "tool_timeout_seconds": "30",
+        "run_timeout_seconds": "120",
+        "max_argument_bytes": "32768",
+        "max_result_bytes": "65536",
+    })
+    assert not form.is_valid()
+
+
+def test_runtime_form_include_content_tools_unchecked_defaults_false():
+    from cauldron_ai_admin.forms import RuntimeSettingsForm
+    form = RuntimeSettingsForm(data={
+        "max_model_turns": "6",
+        "max_tool_calls": "10",
+        "tool_timeout_seconds": "30",
+        "run_timeout_seconds": "120",
+        "max_argument_bytes": "32768",
+        "max_result_bytes": "65536",
+        # include_content_tools omitted → False
+    })
+    assert form.is_valid(), form.errors
+    assert form.cleaned_data["include_content_tools"] is False

@@ -36,6 +36,20 @@ ALLOWED_HOSTS = (
 # Cauldron modules
 # ---------------------------------------------------------------------------
 
+# AI provider selection (fake = built-in demo, openai = OpenAI Responses API).
+# The value is passed as the "provider" key inside CAULDRON_MODULES["cauldron.ai.admin"]
+# below.  Whitespace-only values are treated as unset and fall back to "fake"
+# so the default installation stays functional without external credentials.
+_ai_provider = os.environ.get("CAULDRON_AI_PROVIDER", "fake").strip() or "fake"
+
+# Path to the AI provider configuration file (credentials + runtime overrides).
+# The file is created on first save with mode 0600.  Whitespace-only overrides
+# collapse to the default path so no accidental empty-string path is honoured.
+CAULDRON_AI_CONFIG_PATH = os.environ.get(
+    "CAULDRON_AI_CONFIG_PATH",
+    str(BASE_DIR / "data" / "ai" / "config.json"),
+).strip() or str(BASE_DIR / "data" / "ai" / "config.json")
+
 CAULDRON_MODULES = {
     "cauldron.content": {
         "routing": {
@@ -61,11 +75,15 @@ CAULDRON_MODULES = {
     "cauldron.content.api": {},
     "cauldron.admin.content": {},
     "cauldron.ai": {},
-    # Admin AI: uses the deterministic FakeAIModelProvider that
-    # cauldron_site.admin_ai_bootstrap registers in AppConfig.ready().
-    # Real deployments configure a vendor provider package instead.
+    # OpenAI provider package — factory registered at Django startup by
+    # cauldron_ai_openai.apps.CauldronAIOpenAIConfig.ready().
+    "cauldron.ai.openai": {},
+    # Admin AI: the default "fake" provider is registered by
+    # cauldron_site.admin_ai_bootstrap; setting CAULDRON_AI_PROVIDER=openai
+    # switches to the OpenAI factory (credentials configured via the AI
+    # settings page or OPENAI_* env vars).
     "cauldron.ai.admin": {
-        "provider": "fake",
+        "provider": _ai_provider,
         "max_model_turns": 3,
         "max_tool_calls": 5,
         "tool_timeout_seconds": 10,
@@ -89,6 +107,11 @@ _plan = compose_django_settings(
         "cauldron_site.admin_ai_bootstrap.AdminAIBootstrapConfig",
         # Admin AI models/migrations/checks.
         "cauldron_ai_admin",
+        # OpenAI provider factory — its Django app is normally injected by
+        # the cauldron.ai.openai module manifest, but we list it here
+        # explicitly so the AppConfig.ready() hook that registers the
+        # factory runs even in environments where the module registry has
+        # not yet been populated at process start.
     ],
     middleware=[
         "django.middleware.security.SecurityMiddleware",

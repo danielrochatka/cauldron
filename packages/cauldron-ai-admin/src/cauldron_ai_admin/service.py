@@ -190,10 +190,20 @@ class AdminAIService:
             correlation_id or "", MAX_CORRELATION_ID_BYTES,
         )
 
+        # Record the model identifier for audit purposes.  Providers expose
+        # this via a ``model`` property (preferred) or a ``_model`` private
+        # attribute for the OpenAI-style adapters; static providers such as
+        # the fake test double publish ``model = "fake"``.
+        model_name = (
+            getattr(self._provider, "model", None)
+            or getattr(self._provider, "_model", None)
+            or ""
+        )
         run = AdminAIRun.objects.create(
             actor=actor,
             status="created",
             provider_name=getattr(self._provider, "name", "") or "unknown",
+            model_name=bound_utf8(str(model_name), 128),
             user_request=bounded_request,
             correlation_id=bounded_correlation_id,
         )

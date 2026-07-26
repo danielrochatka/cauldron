@@ -28,21 +28,45 @@ def _admin_ai_config() -> dict:
 
 
 def _resolve_provider(cfg: dict, names: list[str]) -> tuple[Any | None, str | None]:
-    """Return (provider, error_id_or_none).
+    """Return (provider_or_marker, error_id_or_none).
 
     The behaviour mirrors ``service_factory.get_admin_ai_service``:
 
-    * If ``cfg["provider"]`` is set → look it up by name (E002 on miss).
+    * If ``cfg["provider"]`` is set → look it up by name across both
+      static instances and factories (E002 on miss).
     * Otherwise fall back to the single registered provider (E003 when
       ambiguous, E001 when empty).
+
+    When the configured selection resolves to a factory-only registration,
+    the returned "provider" is a synthetic placeholder exposing ``name``,
+    ``display_name``, and ``version`` — enough for the settings page /
+    system-check surfaces without triggering a factory ``build()``.
     """
-    from cauldron_ai.providers import get_provider, get_default_provider
+    from cauldron_ai.providers import (
+        descriptor_for,
+        factory_names,
+        get_default_provider,
+        get_provider,
+    )
 
     configured = cfg.get("provider")
     if configured:
         try:
             return get_provider(configured), None
         except Exception:
+            if configured in set(factory_names()):
+                # Factory-only registration: expose a light-weight placeholder
+                # so callers don't need to distinguish the two backends when
+                # they only want display metadata.
+                try:
+                    desc = descriptor_for(configured)
+                except Exception:
+                    return None, "admin_ai.E002"
+                return _FactoryProviderMarker(
+                    name=configured,
+                    display_name=desc.display_name or configured,
+                    version=desc.version or "",
+                ), None
             return None, "admin_ai.E002"
     if not names:
         return None, "admin_ai.E001"
@@ -50,8 +74,38 @@ def _resolve_provider(cfg: dict, names: list[str]) -> tuple[Any | None, str | No
         return None, "admin_ai.E003"
     try:
         return get_default_provider(), None
-    except Exception:  # pragma: no cover - defensive
+    except Exception:
+        # A single factory-only registration lands here — surface it via
+        # the placeholder so the settings page can render its display name.
+        only_name = names[0]
+        if only_name in set(factory_names()):
+            try:
+                desc = descriptor_for(only_name)
+            except Exception:
+                return None, "admin_ai.E003"
+            return _FactoryProviderMarker(
+                name=only_name,
+                display_name=desc.display_name or only_name,
+                version=desc.version or "",
+            ), None
         return None, "admin_ai.E003"
+
+
+class _FactoryProviderMarker:
+    """Lightweight stand-in used by ``_resolve_provider`` for factory-only providers.
+
+    It exposes just enough surface (``name``, ``display_name``, ``version``)
+    for the settings-page / check-runner to render provider metadata
+    without materialising the underlying provider (which would require
+    valid credentials).
+    """
+
+    __slots__ = ("name", "display_name", "version")
+
+    def __init__(self, *, name: str, display_name: str, version: str) -> None:
+        self.name = name
+        self.display_name = display_name
+        self.version = version
 
 
 @checks.register(checks.Tags.compatibility)
@@ -351,6 +405,277 @@ def check_selected_provider_has_factory_or_instance(app_configs, **kwargs):
     except Exception:
         pass
     return []
+
+
+@checks.register(checks.Tags.compatibility)
+def check_provider_factory_contracts(app_configs, **kwargs):
+    """admin_ai.E011: every registered provider factory implements the required contract."""
+    if not _is_admin_ai_active():
+        return []
+    try:
+        from cauldron_ai.providers import factory_names, get_provider_factory
+    except Exception:
+        return []
+    offenders: list[str] = []
+    try:
+        for name in factory_names():
+            try:
+                factory = get_provider_factory(name)
+            except Exception:
+                offenders.append(name)
+                continue
+            if not callable(getattr(factory, "build", None)):
+                offenders.append(f"{name} (missing build)")
+                continue
+            if not callable(getattr(factory, "test_connection", None)):
+                offenders.append(f"{name} (missing test_connection)")
+                continue
+    except Exception:
+        return []
+    if not offenders:
+        return []
+    return [checks.Error(
+        f"AI provider factories with contract violations: {offenders!r}",
+        id="admin_ai.E011",
+    )]
+
+
+@checks.register(checks.Tags.compatibility)
+def check_configuration_spec_validity(app_configs, **kwargs):
+    """admin_ai.E012: every registered factory exposes a valid configuration spec."""
+    if not _is_admin_ai_active():
+        return []
+    try:
+        from cauldron_ai.provider_configuration import (
+            AIProviderConfigurationSpec,
+        )
+        from cauldron_ai.providers import factory_names, get_configuration_spec
+    except Exception:
+        return []
+    offenders: list[str] = []
+    try:
+        for name in factory_names():
+            try:
+                spec = get_configuration_spec(name)
+            except Exception:
+                offenders.append(f"{name} (spec raise)")
+                continue
+            if not isinstance(spec, AIProviderConfigurationSpec):
+                offenders.append(f"{name} (wrong spec type)")
+                continue
+            if spec.provider_name != name:
+                offenders.append(
+                    f"{name} (spec provider_name={spec.provider_name!r})"
+                )
+    except Exception:
+        return []
+    if not offenders:
+        return []
+    return [checks.Error(
+        f"AI provider factories with invalid configuration specs: {offenders!r}",
+        id="admin_ai.E012",
+    )]
+
+
+@checks.register(checks.Tags.compatibility)
+def check_selected_provider_has_required_config(app_configs, **kwargs):
+    """admin_ai.W003: selected provider has required non-credential config missing."""
+    if not _is_admin_ai_active():
+        return []
+    try:
+        from cauldron_ai.provider_configuration import (
+            FIELD_TYPE_PASSWORD,
+        )
+        from cauldron_ai.providers import factory_names, get_configuration_spec
+        from .provider_config import (
+            AIProviderStoreError,
+            get_store,
+            resolve_provider_config,
+            resolve_provider_name,
+        )
+    except Exception:
+        return []
+    warnings_out: list = []
+    try:
+        store = get_store()
+        provider_name = resolve_provider_name(store)
+        if not provider_name or provider_name not in set(factory_names()):
+            return []
+        spec = get_configuration_spec(provider_name)
+        try:
+            config = resolve_provider_config(provider_name, store)
+        except AIProviderStoreError:
+            return []
+        missing: list[str] = []
+        import os as _os
+        for f in spec.fields:
+            if not f.required:
+                continue
+            if f.field_type == FIELD_TYPE_PASSWORD:
+                continue  # covered by W004
+            has_value = bool(config.get(f.name))
+            if not has_value and f.environment_variable:
+                has_value = bool(
+                    _os.environ.get(f.environment_variable, "").strip()
+                )
+            if not has_value:
+                missing.append(f.name)
+        if missing:
+            warnings_out.append(checks.Warning(
+                f"AI provider {provider_name!r} is missing required config: "
+                f"{missing!r}. Visit the AI settings page to complete setup.",
+                id="admin_ai.W003",
+            ))
+    except Exception:
+        return []
+    return warnings_out
+
+
+@checks.register(checks.Tags.compatibility)
+def check_selected_provider_has_credentials(app_configs, **kwargs):
+    """admin_ai.W004: selected provider is missing a required credential."""
+    if not _is_admin_ai_active():
+        return []
+    try:
+        from cauldron_ai.provider_configuration import FIELD_TYPE_PASSWORD
+        from cauldron_ai.providers import factory_names, get_configuration_spec
+        from .provider_config import (
+            AIProviderStoreError,
+            get_store,
+            resolve_provider_name,
+        )
+    except Exception:
+        return []
+    warnings_out: list = []
+    try:
+        store = get_store()
+        provider_name = resolve_provider_name(store)
+        if not provider_name or provider_name not in set(factory_names()):
+            return []
+        spec = get_configuration_spec(provider_name)
+        try:
+            stored_secrets = store.get_secrets(provider_name)
+        except AIProviderStoreError:
+            return []
+        import os as _os
+        missing: list[str] = []
+        for f in spec.fields:
+            if f.field_type != FIELD_TYPE_PASSWORD or not f.required:
+                continue
+            has_value = bool(stored_secrets.get(f.name))
+            if not has_value and f.environment_variable:
+                has_value = bool(
+                    _os.environ.get(f.environment_variable, "").strip()
+                )
+            if not has_value:
+                # Never emit the secret NAME with any surrounding value —
+                # message stays generic on purpose.
+                missing.append(f.name)
+        if missing:
+            warnings_out.append(checks.Warning(
+                f"AI provider {provider_name!r} is missing required "
+                f"credentials: {missing!r}. Configure them in AI settings "
+                "or via the provider's environment variables.",
+                id="admin_ai.W004",
+            ))
+    except Exception:
+        return []
+    return warnings_out
+
+
+@checks.register(checks.Tags.compatibility)
+def check_config_file_readable(app_configs, **kwargs):
+    """admin_ai.E013/E014/E015/E016/W005/W006: config file health checks.
+
+    Reads the config file (bounded to 64 KB) and surfaces any structural
+    problem as a stable check id.  All messages are credential-safe —
+    contents of the file are never included.
+    """
+    if not _is_admin_ai_active():
+        return []
+    try:
+        from .provider_config import (
+            AIProviderStoreCorruptError,
+            AIProviderStoreUnsafePathError,
+            AIProviderStoreVersionError,
+            get_store,
+        )
+    except Exception:
+        return []
+    out: list = []
+    try:
+        store = get_store()
+    except Exception:
+        return []
+    if not store.file_exists():
+        return []
+    path = store.path
+    # E015: symlink refusal
+    try:
+        if path.is_symlink():
+            return [checks.Error(
+                "AI config path is a symlink — refusing to load. "
+                "Replace with a regular file.",
+                id="admin_ai.E015",
+            )]
+    except OSError:
+        pass
+    # E016: non-regular file
+    try:
+        if path.exists() and not path.is_file():
+            return [checks.Error(
+                "AI config path is not a regular file — refusing to load.",
+                id="admin_ai.E016",
+            )]
+    except OSError:
+        pass
+    # W005: oversized file
+    try:
+        if path.stat().st_size > 64 * 1024:
+            out.append(checks.Warning(
+                "AI config file exceeds 64 KB. Cauldron refuses to load "
+                "oversized files at request time.",
+                id="admin_ai.W005",
+            ))
+    except OSError:
+        pass
+    # W006: parent directory not 0700
+    try:
+        if not store.parent_permissions_ok():
+            out.append(checks.Warning(
+                "AI config parent directory is not mode 0700; other "
+                "users may enumerate credential file names.",
+                hint=f"Run: chmod 0700 {path.parent}",
+                id="admin_ai.W006",
+            ))
+    except Exception:
+        pass
+    # E013 / E014: attempt a controlled load
+    try:
+        store.load()
+    except AIProviderStoreVersionError as exc:
+        return out + [checks.Error(
+            f"AI config file version is not supported: {exc}",
+            id="admin_ai.E014",
+        )]
+    except AIProviderStoreCorruptError as exc:
+        return out + [checks.Error(
+            f"AI config file is corrupt: {exc}",
+            id="admin_ai.E013",
+        )]
+    except AIProviderStoreUnsafePathError as exc:
+        # Symlink / non-regular file — already handled above, but if the
+        # granular checks missed (e.g. race), surface here too.
+        return out + [checks.Error(
+            f"AI config path is unsafe: {exc}",
+            id="admin_ai.E016",
+        )]
+    except Exception:
+        # An unexpected error at load time is not fatal for `check`; the
+        # runtime paths will surface a clearer message when the file is
+        # actually needed.
+        pass
+    return out
 
 
 @checks.register(checks.Tags.compatibility)

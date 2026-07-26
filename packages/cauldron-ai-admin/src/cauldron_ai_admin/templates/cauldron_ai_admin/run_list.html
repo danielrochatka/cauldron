@@ -5,13 +5,23 @@
 <div class="cui-table-container">
   <table class="cui-table">
     <thead>
-      <tr><th>Run ID</th><th>Status</th><th>Request</th><th>Tools</th><th>Created</th></tr>
+      <tr>
+        <th>Run ID</th>
+        <th>Status</th>
+        <th>Provider</th>
+        <th>Model</th>
+        <th>Request</th>
+        <th>Tools</th>
+        <th>Created</th>
+      </tr>
     </thead>
     <tbody>
       {% for run in runs %}
       <tr>
         <td><a href="{% url 'cauldron_ai_admin:run-detail' run.run_id %}"><code>{{ run.run_id|stringformat:"s"|slice:":8" }}…</code></a></td>
         <td>{% include "cauldron_admin/includes/status_badge.html" with status=run.status %}</td>
+        <td class="cui-text-sm">{{ run.provider_name }}</td>
+        <td class="cui-text-sm cui-text-muted">{% if run.model_name %}<code>{{ run.model_name }}</code>{% else %}—{% endif %}</td>
         <td class="cui-text-sm">{{ run.user_request|slice:":100" }}</td>
         <td>{{ run.tool_call_count }}</td>
         <td class="cui-text-sm cui-text-muted">{{ run.created_at }}</td>

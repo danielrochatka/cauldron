@@ -5,11 +5,29 @@ Uses the OpenAI Responses API (``openai.responses.create``) with
 
 The provider is constructed by ``OpenAIProviderFactory.build()``; it
 should never be instantiated directly by application code.
+
+Design notes
+------------
+
+* The provider deliberately raises fixed, credential-safe error messages
+  for every vendor SDK exception.  Raw ``str(exc)`` output from ``openai``
+  can (and does) contain fragments of the failed request — including the
+  API key or partial response bodies.  Cauldron never propagates those
+  strings into user-visible surfaces.
+* We never set ``retries`` on the SDK client — the Cauldron service is
+  the single owner of retry policy so it can enforce deadlines and audit
+  the outcomes.
+* Tool arguments returned by the model are validated as strict JSON
+  objects.  Anything else (malformed JSON, non-object payloads) is a
+  hard ``AIProviderResponseError`` — the caller MUST NOT try to guess
+  what the model meant.
 """
 from __future__ import annotations
 
+import json
+import os
 import time
-import uuid
+from types import MappingProxyType
 from typing import Any
 
 from cauldron_ai.contracts import (
@@ -34,15 +52,13 @@ from cauldron_ai.provider_configuration import (
 )
 
 _PROVIDER_NAME = "openai"
-_DEFAULT_MODEL = "gpt-4o"
-_TEST_MODEL = "gpt-4o-mini"
-_MAX_TOKENS_TEST = 16
+_MAX_TOKENS_TEST = 32
 
 
 _CONFIGURATION_SPEC = AIProviderConfigurationSpec(
     provider_name=_PROVIDER_NAME,
     display_name="OpenAI",
-    version="1.0",
+    version="2.0",
     description=(
         "Connects to OpenAI using the Responses API. "
         "Requires an API key from platform.openai.com."
@@ -50,16 +66,17 @@ _CONFIGURATION_SPEC = AIProviderConfigurationSpec(
     supports_connection_test=True,
     fields=(
         AIProviderConfigurationField(
-            name="model_name",
+            name="model",
             label="Model",
             field_type=FIELD_TYPE_TEXT,
-            required=False,
-            default=_DEFAULT_MODEL,
+            required=True,
+            default=None,
             help_text=(
-                "OpenAI model to use (e.g. gpt-4o, gpt-4o-mini, o3). "
-                "Defaults to gpt-4o."
+                "OpenAI model (e.g. gpt-4o, o3). "
+                "See platform.openai.com/docs/models."
             ),
             max_length=128,
+            environment_variable="OPENAI_MODEL",
         ),
         AIProviderConfigurationField(
             name="api_key",
@@ -69,7 +86,7 @@ _CONFIGURATION_SPEC = AIProviderConfigurationSpec(
             default=None,
             help_text=(
                 "Your OpenAI API key (sk-…). "
-                "Can also be set via the OPENAI_API_KEY environment variable."
+                "Also read from OPENAI_API_KEY when unset here."
             ),
             max_length=256,
             environment_variable="OPENAI_API_KEY",
@@ -81,30 +98,32 @@ _CONFIGURATION_SPEC = AIProviderConfigurationSpec(
             required=False,
             default=None,
             help_text=(
-                "Override the OpenAI API base URL. Leave blank for the default. "
-                "Useful for OpenAI-compatible endpoints."
+                "Override the OpenAI API base URL. Leave blank for the "
+                "default. Useful for OpenAI-compatible endpoints."
             ),
             max_length=512,
-            advanced=True,
-        ),
-        AIProviderConfigurationField(
-            name="organization",
-            label="Organization ID",
-            field_type=FIELD_TYPE_TEXT,
-            required=False,
-            default=None,
-            help_text="OpenAI organization ID (optional).",
-            max_length=256,
+            environment_variable="OPENAI_BASE_URL",
             advanced=True,
         ),
     ),
 )
 
 
-def _build_openai_client(api_key: str, base_url: str | None, organization: str | None):
+def _plain(value: Any) -> Any:
+    """Return a plain dict/list projection of a deep-frozen contract value."""
+    if isinstance(value, MappingProxyType):
+        return {str(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, dict):
+        return {str(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    return value
+
+
+def _build_openai_client(api_key: str, base_url: str | None):
     try:
         import openai
-    except ImportError as exc:  # pragma: no cover
+    except ImportError as exc:  # pragma: no cover - covered by install docs
         raise AIProviderConfigurationError(
             "The 'openai' package is not installed. "
             "Install cauldron-ai-openai to use the OpenAI provider."
@@ -112,88 +131,79 @@ def _build_openai_client(api_key: str, base_url: str | None, organization: str |
     kwargs: dict[str, Any] = {"api_key": api_key}
     if base_url:
         kwargs["base_url"] = base_url
-    if organization:
-        kwargs["organization"] = organization
+    # NOTE: intentionally do NOT set ``retries`` — Cauldron owns retry policy.
     return openai.OpenAI(**kwargs)
 
 
-def _messages_to_openai(messages: tuple[AIModelMessage, ...]) -> list[dict]:
-    result = []
+def _messages_to_input_items(
+    messages: tuple[AIModelMessage, ...],
+) -> list[dict[str, Any]]:
+    """Translate provider-neutral messages into Responses API input items.
+
+    ``system`` messages are dropped here — they are surfaced via the
+    top-level ``instructions`` argument, which is the officially-supported
+    channel for system prompts in the Responses API.
+    """
+    items: list[dict[str, Any]] = []
     for msg in messages:
         if msg.role == "system":
-            continue  # passed via system parameter at the top level
-        if msg.role == "tool":
-            result.append({
-                "role": "tool",
-                "tool_call_id": msg.tool_call_id,
-                "content": msg.content,
+            continue
+        if msg.role == "user":
+            items.append({"role": "user", "content": msg.content})
+        elif msg.role == "assistant":
+            if msg.tool_calls:
+                # One function_call input item per tool call. Text content
+                # from the same assistant turn is dropped intentionally:
+                # the Responses API models an assistant tool-calling turn
+                # as function_call items, not as an output_text sibling.
+                for tc in msg.tool_calls:
+                    items.append({
+                        "type": "function_call",
+                        "call_id": tc.id,
+                        "name": tc.name,
+                        "arguments": json.dumps(
+                            _plain(tc.arguments),
+                            ensure_ascii=False,
+                            allow_nan=False,
+                        ),
+                    })
+            else:
+                items.append({
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": msg.content or ""},
+                    ],
+                })
+        elif msg.role == "tool":
+            items.append({
+                "type": "function_call_output",
+                "call_id": msg.tool_call_id or "",
+                "output": msg.content or "",
             })
-        elif msg.role == "assistant" and msg.tool_calls:
-            result.append({
-                "role": "assistant",
-                "content": msg.content or None,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": _args_to_json(tc.arguments),
-                        },
-                    }
-                    for tc in msg.tool_calls
-                ],
-            })
-        else:
-            result.append({"role": msg.role, "content": msg.content})
-    return result
+    return items
 
 
-def _args_to_json(args: Any) -> str:
-    import json
-    from types import MappingProxyType
-    def _plain(v: Any) -> Any:
-        if isinstance(v, MappingProxyType):
-            return {k: _plain(vv) for k, vv in v.items()}
-        if isinstance(v, tuple):
-            return [_plain(vv) for vv in v]
-        return v
-    return json.dumps(_plain(args))
-
-
-def _tools_to_openai(tools: tuple) -> list[dict]:
-    result = []
+def _tools_to_response_tools(tools: tuple) -> list[dict[str, Any]]:
+    """Translate AIModelToolDefinition tuples into Responses API tool defs."""
+    result: list[dict[str, Any]] = []
     for t in tools:
-        from types import MappingProxyType
-        def _plain(v: Any) -> Any:
-            if isinstance(v, MappingProxyType):
-                return {k: _plain(vv) for k, vv in v.items()}
-            if isinstance(v, tuple):
-                return [_plain(vv) for vv in v]
-            return v
         result.append({
             "type": "function",
-            "function": {
-                "name": t.name,
-                "description": t.description,
-                "parameters": _plain(t.parameters),
-            },
+            "name": t.name,
+            "description": t.description,
+            "parameters": _plain(t.parameters),
+            "strict": False,
         })
     return result
 
 
-def _map_stop_reason(finish_reason: str | None) -> str:
-    if finish_reason == "stop":
-        return "end_turn"
-    if finish_reason == "tool_calls":
-        return "tool_use"
-    if finish_reason == "length":
-        return "max_tokens"
-    return "end_turn"
-
-
 class OpenAIProvider:
-    """Live provider built by ``OpenAIProviderFactory``."""
+    """Live provider built by :class:`OpenAIProviderFactory`.
+
+    Direct construction should be avoided outside of tests — the factory
+    is the single entry point that materialises credentials from the
+    config store or environment.
+    """
 
     name = _PROVIDER_NAME
     display_name = "OpenAI"
@@ -201,100 +211,158 @@ class OpenAIProvider:
     def __init__(
         self,
         *,
-        model_name: str = _DEFAULT_MODEL,
+        model: str,
         api_key: str,
         base_url: str | None = None,
-        organization: str | None = None,
     ) -> None:
         if not api_key:
             raise AIProviderConfigurationError(
                 "OpenAI provider requires a non-empty api_key."
             )
-        self._model_name = model_name or _DEFAULT_MODEL
-        self._client = _build_openai_client(api_key, base_url, organization)
+        if not model:
+            raise AIProviderConfigurationError(
+                "OpenAI provider requires a non-empty model name."
+            )
+        self._model = model
+        self._client = _build_openai_client(api_key, base_url)
+
+    # Publicly-visible aliases so callers (service factory / audit logging)
+    # can record the active model without touching a leading-underscore
+    # attribute.
+    @property
+    def model(self) -> str:
+        return self._model
 
     def complete(self, request: AIModelRequest) -> AIModelResponse:
         import openai
 
+        # System prompt: prefer the explicit ``AIModelRequest.system``
+        # value, falling back to the first ``system``-role message for
+        # backward compatibility.
         system_text = request.system or ""
-        # Extract system messages from the message list and prepend them.
-        for m in request.messages:
-            if m.role == "system" and m.content:
-                system_text = m.content
-                break
+        if not system_text:
+            for m in request.messages:
+                if m.role == "system" and m.content:
+                    system_text = m.content
+                    break
 
-        messages = _messages_to_openai(request.messages)
-        if system_text and (not messages or messages[0].get("role") != "system"):
-            messages.insert(0, {"role": "system", "content": system_text})
+        input_items = _messages_to_input_items(request.messages)
 
         kwargs: dict[str, Any] = {
-            "model": self._model_name,
-            "messages": messages,
-            "max_tokens": request.max_tokens,
+            "model": self._model,
+            "input": input_items,
+            "max_output_tokens": request.max_tokens,
             "store": False,
         }
+        if system_text:
+            kwargs["instructions"] = system_text
         if request.tools:
-            kwargs["tools"] = _tools_to_openai(request.tools)
-            kwargs["tool_choice"] = "auto"
+            kwargs["tools"] = _tools_to_response_tools(request.tools)
+        if request.timeout_seconds:
+            kwargs["timeout"] = request.timeout_seconds
 
         try:
-            response = self._client.chat.completions.create(**kwargs)
-        except openai.AuthenticationError as exc:
+            response = self._client.responses.create(**kwargs)
+        except openai.AuthenticationError:
             raise AIProviderAuthenticationError(
-                f"OpenAI rejected credentials: {exc}"
-            ) from exc
-        except openai.RateLimitError as exc:
+                "OpenAI rejected the API key. "
+                "Check your credentials in AI settings."
+            )
+        except openai.RateLimitError:
             raise AIProviderRateLimitError(
-                f"OpenAI rate limit: {exc}"
-            ) from exc
-        except openai.APIConnectionError as exc:
+                "OpenAI rate limit reached. Please wait before retrying."
+            )
+        except openai.APITimeoutError:
             raise AIProviderConnectionError(
-                f"OpenAI connection error: {exc}"
-            ) from exc
-        except Exception as exc:
+                "OpenAI request timed out. The model may be under load."
+            )
+        except openai.APIConnectionError:
+            raise AIProviderConnectionError(
+                "Could not reach OpenAI. "
+                "Check your network or API base URL."
+            )
+        except openai.BadRequestError:
             raise AIProviderResponseError(
-                f"OpenAI unexpected error: {type(exc).__name__}: {exc}"
-            ) from exc
+                "OpenAI returned a bad request error."
+            )
+        except openai.APIStatusError:
+            raise AIProviderResponseError(
+                "OpenAI returned an unexpected response."
+            )
 
-        choice = response.choices[0] if response.choices else None
-        if choice is None:
-            raise AIProviderResponseError("OpenAI returned no choices")
+        content, tool_calls = _extract_output(response)
 
-        content = ""
-        tool_calls: list[AIModelToolCall] = []
+        usage = getattr(response, "usage", None)
+        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
 
-        msg = choice.message
-        if msg.content:
-            content = msg.content
-        if msg.tool_calls:
-            import json as _json
-            for tc in msg.tool_calls:
-                try:
-                    args = _json.loads(tc.function.arguments or "{}")
-                except Exception:
-                    args = {}
-                tool_calls.append(AIModelToolCall(
-                    id=tc.id or str(uuid.uuid4()),
-                    name=tc.function.name,
-                    arguments=args,
-                ))
-
-        usage = response.usage or None
-        input_tokens = usage.prompt_tokens if usage else 0
-        output_tokens = usage.completion_tokens if usage else 0
+        stop_reason = _map_stop_reason(response, tool_calls)
 
         return AIModelResponse(
-            provider_request_id=response.id or "",
+            provider_request_id=str(getattr(response, "id", "") or ""),
             content=content,
             tool_calls=tuple(tool_calls),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            stop_reason=_map_stop_reason(choice.finish_reason),
+            stop_reason=stop_reason,
         )
 
 
+def _extract_output(response: Any) -> tuple[str, list[AIModelToolCall]]:
+    """Return (aggregated text content, function-call tool calls)."""
+    output = getattr(response, "output", None) or []
+    text_parts: list[str] = []
+    tool_calls: list[AIModelToolCall] = []
+    for item in output:
+        item_type = getattr(item, "type", "")
+        if item_type == "output_text":
+            text_parts.append(str(getattr(item, "text", "") or ""))
+        elif item_type == "message":
+            # Some SDK versions wrap output_text inside a message item.
+            for chunk in getattr(item, "content", None) or []:
+                if getattr(chunk, "type", "") == "output_text":
+                    text_parts.append(str(getattr(chunk, "text", "") or ""))
+        elif item_type == "function_call":
+            call_id = str(getattr(item, "call_id", "") or "")
+            name = str(getattr(item, "name", "") or "")
+            raw_args = getattr(item, "arguments", "") or ""
+            try:
+                args = json.loads(raw_args)
+            except json.JSONDecodeError as exc:
+                raise AIProviderResponseError(
+                    "OpenAI returned a function call with invalid JSON arguments."
+                ) from exc
+            if not isinstance(args, dict):
+                raise AIProviderResponseError(
+                    "OpenAI returned a function call with non-object arguments."
+                )
+            tool_calls.append(AIModelToolCall(
+                id=call_id, name=name, arguments=args,
+            ))
+    return "".join(text_parts), tool_calls
+
+
+def _map_stop_reason(response: Any, tool_calls: list[AIModelToolCall]) -> str:
+    """Map OpenAI response status → AIModelResponse.stop_reason."""
+    status = str(getattr(response, "status", "") or "").lower()
+    if status == "completed":
+        return "tool_use" if tool_calls else "end_turn"
+    if status == "incomplete":
+        details = getattr(response, "incomplete_details", None)
+        reason = str(getattr(details, "reason", "") or "").lower()
+        if reason == "max_output_tokens":
+            return "max_tokens"
+        # Any other incomplete reason surfaces as end_turn without content,
+        # letting the service enforce its own invalid-response policy.
+        return "end_turn"
+    # Unknown status → be conservative and let the service treat this as
+    # a normal (possibly empty) end_turn; the size / stop-reason validators
+    # will reject anything problematic.
+    return "end_turn" if not tool_calls else "tool_use"
+
+
 class OpenAIProviderFactory:
-    """Factory registered at module load time.
+    """Factory registered at Django AppConfig ready() time.
 
     Call ``build(config, secrets)`` to get a live ``OpenAIProvider``.
     """
@@ -310,21 +378,32 @@ class OpenAIProviderFactory:
         config: dict[str, Any],
         secrets: dict[str, str],
     ) -> OpenAIProvider:
-        import os
         api_key = (
-            secrets.get("api_key", "")
+            str(secrets.get("api_key", "") or "")
             or os.environ.get("OPENAI_API_KEY", "")
         ).strip()
         if not api_key:
             raise AIProviderConfigurationError(
                 "OpenAI provider: api_key is required. "
-                "Set it in the AI settings page or via OPENAI_API_KEY."
+                "Configure it in AI settings or set OPENAI_API_KEY."
             )
+        model = (
+            str(config.get("model", "") or "")
+            or os.environ.get("OPENAI_MODEL", "")
+        ).strip()
+        if not model:
+            raise AIProviderConfigurationError(
+                "OpenAI provider: model is required. "
+                "Configure it in AI settings or set OPENAI_MODEL."
+            )
+        base_url = (
+            str(config.get("base_url", "") or "")
+            or os.environ.get("OPENAI_BASE_URL", "")
+        ).strip() or None
         return OpenAIProvider(
-            model_name=str(config.get("model_name", "") or _DEFAULT_MODEL),
+            model=model,
             api_key=api_key,
-            base_url=str(config.get("base_url", "") or "") or None,
-            organization=str(config.get("organization", "") or "") or None,
+            base_url=base_url,
         )
 
     def test_connection(
@@ -332,7 +411,6 @@ class OpenAIProviderFactory:
         config: dict[str, Any],
         secrets: dict[str, str],
     ) -> AIProviderConnectionResult:
-        import openai
         try:
             provider = self.build(config, secrets)
         except AIProviderConfigurationError as exc:
@@ -343,8 +421,11 @@ class OpenAIProviderFactory:
             )
         from cauldron_ai.contracts import AIModelMessage, AIModelRequest
         req = AIModelRequest(
-            messages=(AIModelMessage(role="user", content="Respond with the word OK."),),
+            messages=(AIModelMessage(
+                role="user", content="Respond with the word OK.",
+            ),),
             max_tokens=_MAX_TOKENS_TEST,
+            timeout_seconds=10.0,
         )
         t0 = time.monotonic()
         try:
@@ -353,7 +434,7 @@ class OpenAIProviderFactory:
             return AIProviderConnectionResult(
                 success=True,
                 status="ok",
-                message=f"Connected. Model: {provider._model_name}",
+                message=f"Connected to OpenAI as model {provider.model}.",
                 provider_request_id=response.provider_request_id,
                 latency_ms=latency_ms,
             )
@@ -378,10 +459,19 @@ class OpenAIProviderFactory:
                 message=str(exc),
                 latency_ms=(time.monotonic() - t0) * 1000,
             )
-        except Exception as exc:
+        except AIProviderResponseError as exc:
+            return AIProviderConnectionResult(
+                success=False,
+                status="response_error",
+                message=str(exc),
+                latency_ms=(time.monotonic() - t0) * 1000,
+            )
+        except Exception:
+            # Never surface raw SDK/exception text — the message we return
+            # to the settings page is fixed and credential-safe.
             return AIProviderConnectionResult(
                 success=False,
                 status="error",
-                message=f"{type(exc).__name__}: {exc}",
+                message="OpenAI connection test failed with an unexpected error.",
                 latency_ms=(time.monotonic() - t0) * 1000,
             )

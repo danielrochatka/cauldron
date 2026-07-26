@@ -71,11 +71,12 @@ def _make_factory(name: str = "testprovider"):
                 display_name=self.name.title(),
                 fields=(
                     AIProviderConfigurationField(
-                        name="model_name", label="Model"
+                        name="model", label="Model"
                     ),
                     AIProviderConfigurationField(
                         name="api_key", label="API Key",
                         field_type=FIELD_TYPE_PASSWORD, required=False,
+                        environment_variable="TEST_FACTORY_KEY",
                     ),
                 ),
                 supports_connection_test=True,
@@ -123,7 +124,8 @@ def test_settings_get_shows_config_form_when_provider_selected(store, settings):
     client.force_login(user)
     response = client.get(reverse("cauldron_ai_admin:settings"))
     assert response.status_code == 200
-    assert b"model_name" in response.content
+    # The dynamic form exposes a "model" input for the test factory.
+    assert b'name="model"' in response.content
 
 
 def test_settings_get_no_api_key_prefilled(store, settings):
@@ -153,10 +155,11 @@ def test_settings_post_save_stores_config(store, settings):
     client.force_login(user)
     response = client.post(
         reverse("cauldron_ai_admin:settings"),
-        data={"action": "save", "model_name": "gpt-4o-mini", "api_key": ""},
+        data={"action": "save", "model": "gpt-4o-mini", "api_key": ""},
     )
-    assert response.status_code == 200
-    assert store.get_config("myprovider").get("model_name") == "gpt-4o-mini"
+    # PRG — successful save returns a redirect.
+    assert response.status_code == 302
+    assert store.get_config("myprovider").get("model") == "gpt-4o-mini"
 
 
 def test_settings_post_save_stores_secret_when_nonempty(store, settings):
@@ -167,10 +170,11 @@ def test_settings_post_save_stores_secret_when_nonempty(store, settings):
     user = _settings_user()
     client = Client()
     client.force_login(user)
-    client.post(
+    response = client.post(
         reverse("cauldron_ai_admin:settings"),
-        data={"action": "save", "model_name": "gpt-4o", "api_key": "sk-new"},
+        data={"action": "save", "model": "gpt-4o", "api_key": "sk-new"},
     )
+    assert response.status_code == 302
     assert store.get_secret("myprovider", "api_key") == "sk-new"
 
 
@@ -183,11 +187,126 @@ def test_settings_post_save_leaves_existing_secret_when_empty(store, settings):
     user = _settings_user()
     client = Client()
     client.force_login(user)
-    client.post(
+    response = client.post(
         reverse("cauldron_ai_admin:settings"),
-        data={"action": "save", "model_name": "gpt-4o", "api_key": ""},
+        data={"action": "save", "model": "gpt-4o", "api_key": ""},
     )
+    assert response.status_code == 302
     assert store.get_secret("myprovider", "api_key") == "sk-existing"
+
+
+def test_settings_post_save_clear_credential_removes_stored_secret(store, settings):
+    from cauldron_ai.providers import register_provider_factory
+    settings.CAULDRON_MODULES = {}
+    register_provider_factory(_make_factory("myprovider"))
+    store.set_selected_provider("myprovider")
+    store.set_secret("myprovider", "api_key", "sk-existing")
+    user = _settings_user()
+    client = Client()
+    client.force_login(user)
+    response = client.post(
+        reverse("cauldron_ai_admin:settings"),
+        data={
+            "action": "save",
+            "model": "gpt-4o",
+            "api_key": "",
+            "clear_api_key": "on",
+        },
+    )
+    assert response.status_code == 302
+    assert store.get_secret("myprovider", "api_key") == ""
+
+
+def test_settings_post_clear_credential_action(store, settings):
+    from cauldron_ai.providers import register_provider_factory
+    settings.CAULDRON_MODULES = {}
+    register_provider_factory(_make_factory("myprovider"))
+    store.set_selected_provider("myprovider")
+    store.set_secret("myprovider", "api_key", "sk-existing")
+    user = _settings_user()
+    client = Client()
+    client.force_login(user)
+    response = client.post(
+        reverse("cauldron_ai_admin:settings"),
+        data={"action": "clear_credential", "field": "api_key"},
+    )
+    assert response.status_code == 302
+    assert store.get_secret("myprovider", "api_key") == ""
+
+
+def test_settings_post_clear_credential_rejects_unknown_field(store, settings):
+    from cauldron_ai.providers import register_provider_factory
+    settings.CAULDRON_MODULES = {}
+    register_provider_factory(_make_factory("myprovider"))
+    store.set_selected_provider("myprovider")
+    store.set_secret("myprovider", "api_key", "sk-existing")
+    user = _settings_user()
+    client = Client()
+    client.force_login(user)
+    response = client.post(
+        reverse("cauldron_ai_admin:settings"),
+        data={"action": "clear_credential", "field": "something_else"},
+    )
+    assert response.status_code == 302
+    # Secret must remain — arbitrary fields cannot be nuked.
+    assert store.get_secret("myprovider", "api_key") == "sk-existing"
+
+
+# ---------------------------------------------------------------------------
+# POST: save runtime settings
+# ---------------------------------------------------------------------------
+
+def test_settings_post_save_runtime_stores_values(store, settings):
+    from cauldron_ai.providers import register_provider_factory
+    settings.CAULDRON_MODULES = {}
+    register_provider_factory(_make_factory("myprovider"))
+    store.set_selected_provider("myprovider")
+    user = _settings_user()
+    client = Client()
+    client.force_login(user)
+    response = client.post(
+        reverse("cauldron_ai_admin:settings"),
+        data={
+            "action": "save_runtime",
+            "max_model_turns": "4",
+            "max_tool_calls": "8",
+            "tool_timeout_seconds": "20",
+            "run_timeout_seconds": "60",
+            "max_argument_bytes": "16384",
+            "max_result_bytes": "32768",
+            "include_content_tools": "on",
+        },
+    )
+    assert response.status_code == 302
+    runtime = store.get_runtime()
+    assert runtime["max_model_turns"] == 4
+    assert runtime["max_tool_calls"] == 8
+    assert runtime["include_content_tools"] is True
+
+
+def test_settings_post_save_runtime_rejects_invalid(store, settings):
+    from cauldron_ai.providers import register_provider_factory
+    settings.CAULDRON_MODULES = {}
+    register_provider_factory(_make_factory("myprovider"))
+    store.set_selected_provider("myprovider")
+    user = _settings_user()
+    client = Client()
+    client.force_login(user)
+    response = client.post(
+        reverse("cauldron_ai_admin:settings"),
+        data={
+            "action": "save_runtime",
+            "max_model_turns": "0",  # invalid
+            "max_tool_calls": "8",
+            "tool_timeout_seconds": "20",
+            "run_timeout_seconds": "60",
+            "max_argument_bytes": "16384",
+            "max_result_bytes": "32768",
+        },
+    )
+    # Invalid form rerenders the page instead of redirecting.
+    assert response.status_code == 200
+    assert store.get_runtime() == {}
 
 
 # ---------------------------------------------------------------------------
@@ -202,10 +321,11 @@ def test_settings_post_select_provider(store, settings):
     user = _settings_user()
     client = Client()
     client.force_login(user)
-    client.post(
+    response = client.post(
         reverse("cauldron_ai_admin:settings"),
         data={"action": "select_provider", "provider": "beta"},
     )
+    assert response.status_code == 302
     assert store.get_selected_provider() == "beta"
 
 
@@ -223,10 +343,28 @@ def test_settings_post_test_shows_result(store, settings):
     client.force_login(user)
     response = client.post(
         reverse("cauldron_ai_admin:settings"),
-        data={"action": "test", "model_name": "gpt-4o", "api_key": "sk-test"},
+        data={"action": "test", "model": "gpt-4o", "api_key": "sk-test"},
     )
+    # test action renders directly (no redirect) so the operator sees the outcome.
     assert response.status_code == 200
     assert b"Test OK" in response.content or b"Connected" in response.content
+
+
+def test_settings_post_test_does_not_save_config(store, settings):
+    from cauldron_ai.providers import register_provider_factory
+    settings.CAULDRON_MODULES = {}
+    register_provider_factory(_make_factory("myprovider"))
+    store.set_selected_provider("myprovider")
+    user = _settings_user()
+    client = Client()
+    client.force_login(user)
+    client.post(
+        reverse("cauldron_ai_admin:settings"),
+        data={"action": "test", "model": "gpt-4o", "api_key": "sk-transient"},
+    )
+    # Neither config nor secrets should have been persisted by the test action.
+    assert store.get_config("myprovider") == {}
+    assert store.get_secret("myprovider", "api_key") == ""
 
 
 def test_settings_post_test_throttled_on_second_call(store, settings):
@@ -241,14 +379,89 @@ def test_settings_post_test_throttled_on_second_call(store, settings):
     # First test — sets throttle cache
     client.post(
         reverse("cauldron_ai_admin:settings"),
-        data={"action": "test", "model_name": "gpt-4o", "api_key": "sk-test"},
+        data={"action": "test", "model": "gpt-4o", "api_key": "sk-test"},
     )
     # Second test — should be throttled
     response = client.post(
         reverse("cauldron_ai_admin:settings"),
-        data={"action": "test", "model_name": "gpt-4o", "api_key": "sk-test"},
+        data={"action": "test", "model": "gpt-4o", "api_key": "sk-test"},
     )
-    assert b"throttled" in response.content.lower() or b"wait" in response.content.lower()
+    assert (
+        b"throttled" in response.content.lower()
+        or b"wait" in response.content.lower()
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET does not exercise the vendor SDK (safety)
+# ---------------------------------------------------------------------------
+
+def test_settings_get_does_not_call_factory_build(store, settings):
+    """A GET must not invoke build() or test_connection() on the factory."""
+    from cauldron_ai.provider_configuration import (
+        AIProviderConfigurationField,
+        AIProviderConfigurationSpec,
+        AIProviderConnectionResult,
+        FIELD_TYPE_PASSWORD,
+    )
+    from cauldron_ai.providers import register_provider_factory
+    build_count = [0]
+    test_count = [0]
+
+    class _F:
+        name = "hazardous"
+
+        @property
+        def configuration_spec(self):
+            return AIProviderConfigurationSpec(
+                provider_name="hazardous",
+                display_name="Hazardous",
+                fields=(
+                    AIProviderConfigurationField(
+                        name="model", label="Model",
+                    ),
+                    AIProviderConfigurationField(
+                        name="api_key", label="Key",
+                        field_type=FIELD_TYPE_PASSWORD,
+                    ),
+                ),
+                supports_connection_test=True,
+            )
+
+        def build(self, c, s):
+            build_count[0] += 1
+            raise RuntimeError("would have called vendor SDK")
+
+        def test_connection(self, c, s):
+            test_count[0] += 1
+            return AIProviderConnectionResult(success=True, status="ok")
+
+    settings.CAULDRON_MODULES = {}
+    register_provider_factory(_F())
+    store.set_selected_provider("hazardous")
+    user = _settings_user()
+    client = Client()
+    client.force_login(user)
+    response = client.get(reverse("cauldron_ai_admin:settings"))
+    assert response.status_code == 200
+    assert build_count[0] == 0
+    assert test_count[0] == 0
+
+
+def test_settings_page_shows_credential_state(store, settings, monkeypatch):
+    from cauldron_ai.providers import register_provider_factory
+    settings.CAULDRON_MODULES = {}
+    register_provider_factory(_make_factory("myprovider"))
+    store.set_selected_provider("myprovider")
+    store.set_secret("myprovider", "api_key", "sk-stored")
+    user = _settings_user()
+    client = Client()
+    client.force_login(user)
+    response = client.get(reverse("cauldron_ai_admin:settings"))
+    content = response.content.decode()
+    assert "Configured in managed storage" in content
+    # Stored secret value must never appear on the page.
+    assert "sk-stored" not in content
 
 
 # ---------------------------------------------------------------------------

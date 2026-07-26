@@ -12,6 +12,8 @@ from cauldron_ai.prompt_templates import (
     AIPromptAssemblyResult,
     AIPromptTemplateRegistry,
     AIToolPromptTemplate,
+    PromptAssemblyTooLargeError,
+    PromptTemplateMissingError,
     get_prompt_template_registry,
 )
 
@@ -38,49 +40,78 @@ class PromptAssemblyService:
         permitted_tool_defs: list[Any],
         *,
         task_context: str = "",
+        caller_system_prompt: str = "",
     ) -> AIPromptAssemblyResult:
         """Assemble system instructions for the given permitted tool set.
 
+        Raises ``PromptTemplateMissingError`` if any permitted tool has no
+        registered prompt template (fail-closed; never silently omits).
+
+        Raises ``PromptAssemblyTooLargeError`` if a complete section would
+        push the total past ``_MAX_ASSEMBLY_BYTES``. Sections are never
+        truncated mid-section.
+
         Ordering:
         1. Global operating prompt body
-        2. Separator
-        3. Per-tool sections, sorted by tool name (only for tools with templates)
-        4. task_context if provided (appended after Cauldron instructions)
+        2. Per-tool sections, sorted by tool name
+        3. caller_system_prompt (if non-empty)
+        4. task_context (if non-empty)
 
         Returns an ``AIPromptAssemblyResult`` with the assembled text and
         metadata for audit logging.
         """
         global_prompt = self._registry.get_global_prompt()
-        parts: list[str] = []
-        global_version = ""
-
-        if global_prompt is not None:
-            parts.append(global_prompt.body)
-            global_version = global_prompt.version
-
         included_tool_names: list[str] = []
         template_versions: list[tuple[str, str]] = []
 
-        # Stable ordering: sort by tool name.
+        # Validate all permitted tools have templates before building anything.
         sorted_defs = sorted(permitted_tool_defs, key=lambda d: d.name)
-
         for defn in sorted_defs:
             tmpl = self._registry.get_tool_template(defn.name)
             if tmpl is None:
-                continue  # tool has no template; omit silently (do not fail)
+                raise PromptTemplateMissingError(
+                    f"Permitted tool {defn.name!r} has no registered prompt template."
+                )
+
+        # Build sections incrementally, tracking exact byte counts.
+        # Never truncate; raise if a complete section would exceed the cap.
+        sections: list[str] = []
+        running_bytes = 0
+
+        def _add_section(text: str) -> None:
+            nonlocal running_bytes
+            sep = _SEPARATOR if sections else ""
+            candidate = sep + text
+            candidate_bytes = len(candidate.encode("utf-8"))
+            if running_bytes + candidate_bytes > _MAX_ASSEMBLY_BYTES:
+                raise PromptAssemblyTooLargeError(
+                    f"Assembled prompt would exceed {_MAX_ASSEMBLY_BYTES} bytes "
+                    f"after adding a section ({candidate_bytes} bytes); "
+                    f"currently at {running_bytes} bytes."
+                )
+            sections.append(candidate)
+            running_bytes += candidate_bytes
+
+        global_version = ""
+        if global_prompt is not None:
+            _add_section(global_prompt.body)
+            global_version = global_prompt.version
+
+        for defn in sorted_defs:
+            tmpl = self._registry.get_tool_template(defn.name)
+            # Already validated above — tmpl is never None here.
+            assert tmpl is not None
             included_tool_names.append(defn.name)
             template_versions.append((defn.name, tmpl.template_version))
-            parts.append(_render_tool_section(tmpl))
+            _add_section(_render_tool_section(tmpl))
+
+        if caller_system_prompt:
+            _add_section(caller_system_prompt)
 
         if task_context:
-            parts.append(f"Current task context:\n{task_context}")
+            _add_section(f"Current task context:\n{task_context}")
 
-        instructions = _SEPARATOR.join(parts)
-
-        # Enforce size limit: truncate at UTF-8 byte boundary if oversized.
-        encoded = instructions.encode("utf-8")
-        if len(encoded) > _MAX_ASSEMBLY_BYTES:
-            instructions = encoded[:_MAX_ASSEMBLY_BYTES].decode("utf-8", errors="ignore")
+        instructions = "".join(sections)
 
         return AIPromptAssemblyResult(
             system_instructions=instructions,

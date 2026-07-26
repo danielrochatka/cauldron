@@ -5,6 +5,8 @@ from cauldron_ai.prompt_templates import (
     AIGlobalOperatingPrompt,
     AIToolPromptTemplate,
     AIPromptTemplateRegistry,
+    PromptAssemblyTooLargeError,
+    PromptTemplateMissingError,
     _reset_prompt_registry_for_tests,
 )
 from cauldron_ai_admin.prompt_assembly import PromptAssemblyService, _MAX_ASSEMBLY_BYTES
@@ -201,31 +203,27 @@ def test_assembled_bytes_matches_actual_byte_count():
     assert result.assembled_bytes == len(result.system_instructions.encode("utf-8"))
 
 
-def test_size_limit_truncates_oversized_output():
-    """When the assembled instructions exceed 32 KiB, they are truncated."""
+def test_size_limit_raises_too_large_error():
+    """When a section would push output past 32 KiB, PromptAssemblyTooLargeError is raised."""
     reg = _fresh_registry()
-    # Build a body that is well over 32 KiB.
     big_body = "X" * (_MAX_ASSEMBLY_BYTES + 4096)
     reg.register_global_prompt(AIGlobalOperatingPrompt(
         version="v1", owning_module="m", body=big_body
     ))
     svc = PromptAssemblyService(registry=reg)
-    result = svc.assemble([])
-    assert result.assembled_bytes <= _MAX_ASSEMBLY_BYTES
+    with pytest.raises(PromptAssemblyTooLargeError):
+        svc.assemble([])
 
 
-def test_safe_degradation_tool_without_template_no_exception():
-    """A tool with no registered template is silently omitted; no exception."""
+def test_tool_without_template_raises_missing_error():
+    """A permitted tool with no registered template raises PromptTemplateMissingError."""
     reg = _fresh_registry()
     reg.register_global_prompt(_make_global_prompt())
     # No template for this tool.
     svc = PromptAssemblyService(registry=reg)
     defs = [_make_tool_def("content.list_collections")]
-    result = svc.assemble(defs)
-    # Tool is not in included_tool_names because it has no template.
-    assert "content.list_collections" not in result.included_tool_names
-    # No exception was raised.
-    assert isinstance(result.system_instructions, str)
+    with pytest.raises(PromptTemplateMissingError, match="content.list_collections"):
+        svc.assemble(defs)
 
 
 def test_task_context_appended_after_cauldron_instructions():
@@ -301,3 +299,56 @@ def test_empty_registry_produces_empty_instructions():
     assert result.global_prompt_version == ""
     assert result.included_tool_names == ()
     assert result.assembled_bytes == 0
+
+
+# ---------------------------------------------------------------------------
+# caller_system_prompt
+# ---------------------------------------------------------------------------
+
+
+def test_caller_system_prompt_appended_after_tool_sections():
+    """caller_system_prompt appears after tool sections, before task_context."""
+    reg = _fresh_registry()
+    reg.register_global_prompt(_make_global_prompt("Global."))
+    reg.register_tool_template(_make_template("a.tool", purpose="A purpose."))
+
+    svc = PromptAssemblyService(registry=reg)
+    result = svc.assemble(
+        [_make_tool_def("a.tool")],
+        caller_system_prompt="Caller instructions.",
+        task_context="Task here.",
+    )
+    instr = result.system_instructions
+    tool_pos = instr.index("a.tool")
+    caller_pos = instr.index("Caller instructions.")
+    task_pos = instr.index("Task here.")
+    assert tool_pos < caller_pos < task_pos
+
+
+def test_caller_system_prompt_present_in_output():
+    reg = _fresh_registry()
+    reg.register_global_prompt(_make_global_prompt())
+    svc = PromptAssemblyService(registry=reg)
+    result = svc.assemble([], caller_system_prompt="Custom caller prompt.")
+    assert "Custom caller prompt." in result.system_instructions
+
+
+def test_empty_caller_system_prompt_not_in_output():
+    reg = _fresh_registry()
+    reg.register_global_prompt(_make_global_prompt("Only global."))
+    svc = PromptAssemblyService(registry=reg)
+    result = svc.assemble([], caller_system_prompt="")
+    # No extra separator sections beyond global prompt
+    assert result.system_instructions == "Only global."
+
+
+def test_tool_without_template_raises_before_any_section_is_built():
+    """Missing template error raised before any section is assembled (fail early)."""
+    reg = _fresh_registry()
+    reg.register_global_prompt(_make_global_prompt())
+    reg.register_tool_template(_make_template("a.tool"))
+    # b.tool has no template
+
+    svc = PromptAssemblyService(registry=reg)
+    with pytest.raises(PromptTemplateMissingError, match="b.tool"):
+        svc.assemble([_make_tool_def("a.tool"), _make_tool_def("b.tool")])

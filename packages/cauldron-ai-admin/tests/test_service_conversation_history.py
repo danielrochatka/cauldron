@@ -19,6 +19,7 @@ from cauldron_ai_admin.tools import (
     AdminAIToolResult,
     RiskLevel,
 )
+from helpers import make_assembly_service_for_tools
 
 
 def _defn(name="t.read"):
@@ -65,6 +66,7 @@ def test_second_provider_request_includes_assistant_and_tool_messages():
     svc = AdminAIService(
         provider=fake, tool_registry=reg,
         max_model_turns=3, max_tool_calls=5,
+        prompt_assembly_service=make_assembly_service_for_tools(*[d.name for d in reg.all_definitions()]),
     )
     run = svc.run(_make_user(), "Read something.")
     assert run.status == "completed"

@@ -18,6 +18,7 @@ from cauldron_ai_admin.tools import (
     AdminAIToolResult,
     RiskLevel,
 )
+from helpers import make_assembly_service_for_tools
 
 
 class _CapturingProvider:
@@ -84,6 +85,7 @@ def test_correlation_id_truncated_to_bounded_form_everywhere():
     svc = AdminAIService(
         provider=provider, tool_registry=reg,
         max_model_turns=3, max_tool_calls=5,
+        prompt_assembly_service=make_assembly_service_for_tools("t.corr"),
     )
 
     long_id = "a" * 200  # 200 ASCII bytes
@@ -130,6 +132,7 @@ def test_correlation_id_multibyte_truncation_preserves_utf8():
     svc = AdminAIService(
         provider=provider, tool_registry=reg,
         max_model_turns=3, max_tool_calls=5,
+        prompt_assembly_service=make_assembly_service_for_tools("t.corr"),
     )
     # 40 emoji glyphs = 40 * 4 = 160 bytes — overflows the 128-byte cap.
     corr = "\U0001F600" * 40

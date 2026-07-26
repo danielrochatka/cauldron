@@ -19,6 +19,7 @@ from cauldron_ai_admin.tools import (
     AdminAIToolResult,
     RiskLevel,
 )
+from helpers import make_assembly_service_for_tools
 
 
 def _defn(name="t.read", perm="auth.view_user"):
@@ -79,6 +80,7 @@ def test_pre_handler_deadline_expiry_records_timed_out_and_skips_handler():
         tool_registry=reg,
         max_model_turns=2, max_tool_calls=2,
         run_timeout_seconds=0.05,
+        prompt_assembly_service=make_assembly_service_for_tools(*[d.name for d in reg.all_definitions()]),
     )
     run = svc.run(_make_user(), "Hi.")
     assert run.status == "failed"
@@ -107,6 +109,7 @@ def test_handler_returning_tool_timeout_records_timed_out_not_failed():
         provider=_one_call_provider(),
         tool_registry=reg,
         max_model_turns=3, max_tool_calls=5,
+        prompt_assembly_service=make_assembly_service_for_tools(*[d.name for d in reg.all_definitions()]),
     )
     run = svc.run(_make_user(), "Hi.")
     assert run.status == "failed"
@@ -142,6 +145,7 @@ def test_post_handler_deadline_expiry_forces_timed_out_and_ignores_result():
         tool_registry=reg,
         max_model_turns=2, max_tool_calls=2,
         tool_timeout_seconds=0.01,
+        prompt_assembly_service=make_assembly_service_for_tools(*[d.name for d in reg.all_definitions()]),
     )
     run = svc.run(_make_user(), "Hi.")
     assert run.status == "failed"

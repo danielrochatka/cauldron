@@ -37,6 +37,18 @@ class PromptTemplateRegistryError(RuntimeError):
     """Raised when a registry invariant is violated (e.g. duplicate registration)."""
 
 
+class PromptAssemblyError(RuntimeError):
+    """Base class for errors that occur during prompt assembly."""
+
+
+class PromptAssemblyTooLargeError(PromptAssemblyError):
+    """Raised when a section would push the assembled prompt over the byte limit."""
+
+
+class PromptTemplateMissingError(PromptAssemblyError):
+    """Raised when a permitted tool has no registered prompt template."""
+
+
 # ---------------------------------------------------------------------------
 # Immutable data classes
 # ---------------------------------------------------------------------------

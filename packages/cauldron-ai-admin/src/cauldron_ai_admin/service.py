@@ -52,6 +52,12 @@ from cauldron_ai.contracts import (
 )
 from cauldron_ai.providers import AIModelProvider
 
+from cauldron_ai.prompt_templates import (
+    PromptAssemblyError,
+    PromptAssemblyTooLargeError,
+    PromptTemplateMissingError,
+)
+
 from .models import (
     AdminAIRun,
     AdminAIToolInvocation,
@@ -247,30 +253,78 @@ class AdminAIService:
         )
 
         # Assemble permission-aware system instructions from registered templates.
+        # Pass the caller-supplied system_prompt only when it differs from the
+        # built-in default so that deployments using a custom prompt have it
+        # appended after the Cauldron operating instructions.
+        caller_prompt_arg = (
+            self._system_prompt
+            if self._system_prompt != DEFAULT_SYSTEM_PROMPT
+            else ""
+        )
         try:
-            assembly = self._prompt_assembly.assemble(permitted_defs)
-            effective_system = assembly.system_instructions or self._system_prompt
+            assembly = self._prompt_assembly.assemble(
+                permitted_defs,
+                caller_system_prompt=caller_prompt_arg,
+            )
+        except PromptTemplateMissingError as exc:
+            logger.warning(
+                "Prompt assembly failed (missing template) for run %s: %s",
+                run.run_id, exc,
+            )
+            self._finalize_error(
+                run,
+                "prompt.missing_template",
+                "A permitted tool has no registered prompt template.",
+            )
+            return
+        except PromptAssemblyTooLargeError as exc:
+            logger.warning(
+                "Prompt assembly failed (too large) for run %s: %s",
+                run.run_id, exc,
+            )
+            self._finalize_error(
+                run,
+                "prompt.too_large",
+                "Assembled system prompt exceeds the maximum allowed size.",
+            )
+            return
+        except PromptAssemblyError as exc:
+            logger.warning(
+                "Prompt assembly failed for run %s: %s", run.run_id, exc,
+            )
+            self._finalize_error(
+                run,
+                "prompt.assembly_failed",
+                "Prompt assembly encountered an unexpected error.",
+            )
+            return
         except Exception:
             logger.exception(
-                "Prompt assembly failed for run %s; falling back to default prompt.",
+                "Prompt assembly raised an unexpected error for run %s; "
+                "failing closed.",
                 run.run_id,
             )
-            assembly = None
-            effective_system = self._system_prompt
+            self._finalize_error(
+                run,
+                "prompt.assembly_failed",
+                "Prompt assembly encountered an unexpected error.",
+            )
+            return
+
+        effective_system = assembly.system_instructions or DEFAULT_SYSTEM_PROMPT
 
         # Persist prompt metadata on the run for audit purposes.
-        if assembly is not None:
-            try:
-                AdminAIRun.objects.filter(run_id=run.run_id).update(
-                    prompt_global_version=assembly.global_prompt_version[:64],
-                    prompt_tool_versions=dict(assembly.template_versions),
-                    prompt_included_tools=list(assembly.included_tool_names),
-                )
-                run.refresh_from_db()
-            except Exception:
-                logger.exception(
-                    "Failed to persist prompt metadata for run %s.", run.run_id,
-                )
+        try:
+            AdminAIRun.objects.filter(run_id=run.run_id).update(
+                prompt_global_version=assembly.global_prompt_version[:64],
+                prompt_tool_versions=dict(assembly.template_versions),
+                prompt_included_tools=list(assembly.included_tool_names),
+            )
+            run.refresh_from_db()
+        except Exception:
+            logger.exception(
+                "Failed to persist prompt metadata for run %s.", run.run_id,
+            )
 
         messages: list[AIModelMessage] = [
             AIModelMessage(role="user", content=request_text)

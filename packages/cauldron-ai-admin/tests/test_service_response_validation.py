@@ -15,6 +15,7 @@ from cauldron_ai_admin.tools import (
     AdminAIToolResult,
     RiskLevel,
 )
+from helpers import make_assembly_service_for_tools
 
 
 def _defn(name="t.read"):
@@ -48,6 +49,7 @@ def _service(fake):
     return AdminAIService(
         provider=fake, tool_registry=AdminAIToolRegistry(),
         max_model_turns=2, max_tool_calls=2,
+        prompt_assembly_service=make_assembly_service_for_tools(),
     )
 
 
@@ -98,6 +100,7 @@ def test_tool_calls_without_tool_use_rejected():
     svc = AdminAIService(
         provider=fake, tool_registry=reg,
         max_model_turns=2, max_tool_calls=2,
+        prompt_assembly_service=make_assembly_service_for_tools(*[d.name for d in reg.all_definitions()]),
     )
     run = svc.run(_make_user(), "Bad.")
     assert run.status == "failed"
@@ -113,6 +116,7 @@ def test_response_content_too_large_rejected():
     svc = AdminAIService(
         provider=fake, tool_registry=AdminAIToolRegistry(),
         max_result_bytes=1024,
+        prompt_assembly_service=make_assembly_service_for_tools(),
     )
     run = svc.run(_make_user(), "Hi.")
     assert run.status == "failed"

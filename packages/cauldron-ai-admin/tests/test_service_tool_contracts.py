@@ -18,6 +18,7 @@ from cauldron_ai_admin.tools import (
     AdminAIToolResult,
     RiskLevel,
 )
+from helpers import make_assembly_service_for_tools
 
 
 def _defn(name="t.contract"):
@@ -48,9 +49,11 @@ def _make_user():
 
 
 def _svc(reg, provider):
+    asm = make_assembly_service_for_tools(*[d.name for d in reg.all_definitions()])
     return AdminAIService(
         provider=provider, tool_registry=reg,
         max_model_turns=3, max_tool_calls=5,
+        prompt_assembly_service=asm,
     )
 
 

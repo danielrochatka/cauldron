@@ -9,10 +9,12 @@ from cauldron_ai.prompt_templates import (
     AIGlobalOperatingPrompt,
     AIToolPromptTemplate,
     AIPromptTemplateRegistry,
+    PromptAssemblyTooLargeError,
+    PromptTemplateMissingError,
     _reset_prompt_registry_for_tests,
 )
 from cauldron_ai_admin.models import AdminAIRun
-from cauldron_ai_admin.prompt_assembly import PromptAssemblyService
+from cauldron_ai_admin.prompt_assembly import PromptAssemblyService, _MAX_ASSEMBLY_BYTES
 from cauldron_ai_admin.service import AdminAIService
 from cauldron_ai_admin.tools import (
     AdminAIToolDefinition,
@@ -143,6 +145,9 @@ def test_provider_receives_only_authorized_tool_set(db):
     tmpl_reg.register_global_prompt(AIGlobalOperatingPrompt(
         version="v1", owning_module="m", body="Global."
     ))
+    # Both tools need templates; only the permitted one will be assembled.
+    tmpl_reg.register_tool_template(_make_template("test.allowed"))
+    tmpl_reg.register_tool_template(_make_template("test.restricted"))
     assembly_svc = PromptAssemblyService(registry=tmpl_reg)
 
     fake = FakeAIModelProvider()
@@ -234,3 +239,163 @@ def test_no_direct_file_write_path_introduced(db):
     # Simply running should not raise or write files.
     run = svc.run(user, "Hello.")
     assert run.status == "completed"
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed assembly integration
+# ---------------------------------------------------------------------------
+
+
+def test_service_fails_closed_when_tool_missing_template(db):
+    """Service records prompt.missing_template and does not reach the provider."""
+    user = _make_user(username="fc-user-1")
+
+    tool_reg = AdminAIToolRegistry()
+
+    def _noop(context, **kwargs):
+        return AdminAIToolResult(tool_name="test.tool", success=True, data={})
+
+    tool_reg.register(_make_tool_def("test.tool"), _noop)
+
+    tmpl_reg = AIPromptTemplateRegistry()
+    tmpl_reg.register_global_prompt(AIGlobalOperatingPrompt(
+        version="v1", owning_module="m", body="Global."
+    ))
+    # No template registered for test.tool.
+    assembly_svc = PromptAssemblyService(registry=tmpl_reg)
+
+    fake = FakeAIModelProvider()
+    svc = AdminAIService(
+        provider=fake,
+        tool_registry=tool_reg,
+        prompt_assembly_service=assembly_svc,
+    )
+    run = svc.run(user, "Hello.")
+
+    assert run.status == "failed"
+    assert run.error_code == "prompt.missing_template"
+    assert not fake.was_called(), "Provider should not be invoked on assembly failure"
+
+
+def test_service_fails_closed_when_prompt_too_large(db):
+    """Service records prompt.too_large and does not reach the provider."""
+    user = _make_user(username="fc-user-2")
+
+    tmpl_reg = AIPromptTemplateRegistry()
+    big_body = "X" * (_MAX_ASSEMBLY_BYTES + 4096)
+    tmpl_reg.register_global_prompt(AIGlobalOperatingPrompt(
+        version="v1", owning_module="m", body=big_body
+    ))
+    assembly_svc = PromptAssemblyService(registry=tmpl_reg)
+
+    fake = FakeAIModelProvider()
+    svc = AdminAIService(
+        provider=fake,
+        tool_registry=AdminAIToolRegistry(),
+        prompt_assembly_service=assembly_svc,
+    )
+    run = svc.run(user, "Hello.")
+
+    assert run.status == "failed"
+    assert run.error_code == "prompt.too_large"
+    assert not fake.was_called(), "Provider should not be invoked on assembly failure"
+
+
+def test_audit_metadata_not_written_on_assembly_failure(db):
+    """When assembly fails, prompt metadata fields remain at their defaults."""
+    user = _make_user(username="fc-user-3")
+
+    tool_reg = AdminAIToolRegistry()
+
+    def _noop(context, **kwargs):
+        return AdminAIToolResult(tool_name="test.tool", success=True, data={})
+
+    tool_reg.register(_make_tool_def("test.tool"), _noop)
+
+    tmpl_reg = AIPromptTemplateRegistry()
+    tmpl_reg.register_global_prompt(AIGlobalOperatingPrompt(
+        version="v1", owning_module="m", body="Global."
+    ))
+    # No template: assembly will fail.
+    assembly_svc = PromptAssemblyService(registry=tmpl_reg)
+
+    fake = FakeAIModelProvider()
+    svc = AdminAIService(
+        provider=fake,
+        tool_registry=tool_reg,
+        prompt_assembly_service=assembly_svc,
+    )
+    run = svc.run(user, "Hello.")
+    run.refresh_from_db()
+
+    assert run.prompt_global_version == ""
+    assert run.prompt_tool_versions == {}
+    assert run.prompt_included_tools == []
+
+
+def test_custom_system_prompt_included_in_assembled_output(db):
+    """A non-default system_prompt is appended after Cauldron instructions."""
+    user = _make_user(username="csp-user-1")
+
+    global_body = "Global operating instructions."
+    custom_prompt = "CUSTOM_CALLER_INSTRUCTIONS_XYZ"
+    tmpl_reg = AIPromptTemplateRegistry()
+    tmpl_reg.register_global_prompt(AIGlobalOperatingPrompt(
+        version="v1", owning_module="m", body=global_body
+    ))
+    assembly_svc = PromptAssemblyService(registry=tmpl_reg)
+
+    fake = FakeAIModelProvider()
+    fake.queue_response(AIModelResponse(
+        provider_request_id="r1",
+        content="Done.",
+        stop_reason="end_turn",
+    ))
+
+    svc = AdminAIService(
+        provider=fake,
+        tool_registry=AdminAIToolRegistry(),
+        prompt_assembly_service=assembly_svc,
+        system_prompt=custom_prompt,
+    )
+    svc.run(user, "Hello.")
+
+    system_sent = fake.last_request().system
+    assert global_body in system_sent
+    assert custom_prompt in system_sent
+    # Global prompt must precede the custom caller prompt.
+    assert system_sent.index(global_body) < system_sent.index(custom_prompt)
+
+
+def test_default_system_prompt_not_duplicated_in_assembled_output(db):
+    """When system_prompt is the built-in default, it is not appended twice."""
+    from cauldron_ai_admin.service import DEFAULT_SYSTEM_PROMPT
+
+    user = _make_user(username="csp-user-2")
+
+    global_body = "Global operating instructions."
+    tmpl_reg = AIPromptTemplateRegistry()
+    tmpl_reg.register_global_prompt(AIGlobalOperatingPrompt(
+        version="v1", owning_module="m", body=global_body
+    ))
+    assembly_svc = PromptAssemblyService(registry=tmpl_reg)
+
+    fake = FakeAIModelProvider()
+    fake.queue_response(AIModelResponse(
+        provider_request_id="r1",
+        content="Done.",
+        stop_reason="end_turn",
+    ))
+
+    svc = AdminAIService(
+        provider=fake,
+        tool_registry=AdminAIToolRegistry(),
+        prompt_assembly_service=assembly_svc,
+        # system_prompt is the default — do not pass it explicitly.
+    )
+    svc.run(user, "Hello.")
+
+    system_sent = fake.last_request().system
+    assert system_sent.count(DEFAULT_SYSTEM_PROMPT) == 0, (
+        "Default system prompt must not be duplicated in the assembled output"
+    )

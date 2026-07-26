@@ -20,6 +20,7 @@ from cauldron_ai_admin.tools import (
     AdminAIToolResult,
     RiskLevel,
 )
+from helpers import make_assembly_service_for_tools
 
 
 def _make_user():
@@ -58,6 +59,7 @@ def test_user_request_containing_api_key_is_redacted_on_persistence():
     ))
     svc = AdminAIService(
         provider=fake, tool_registry=AdminAIToolRegistry(),
+        prompt_assembly_service=make_assembly_service_for_tools(),
     )
     user = _make_user()
     request_text = '{"api_key": "secret123", "please": "help"}'
@@ -90,6 +92,7 @@ def test_tool_result_password_value_is_redacted_in_result_summary():
     svc = AdminAIService(
         provider=fake, tool_registry=reg,
         max_model_turns=3, max_tool_calls=5,
+        prompt_assembly_service=make_assembly_service_for_tools(*[d.name for d in reg.all_definitions()]),
     )
     user = _make_user()
     run = svc.run(user, "Read stuff.")
@@ -112,6 +115,7 @@ def test_final_response_containing_json_secret_is_redacted():
     ))
     svc = AdminAIService(
         provider=fake, tool_registry=AdminAIToolRegistry(),
+        prompt_assembly_service=make_assembly_service_for_tools(),
     )
     user = _make_user()
     run = svc.run(user, "Give me a summary.")

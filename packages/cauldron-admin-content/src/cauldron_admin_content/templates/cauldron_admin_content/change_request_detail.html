@@ -39,9 +39,9 @@
         <td>{% include "cauldron_admin/includes/status_badge.html" with status=op.operation_type %}</td>
         <td>{{ op.collection }}</td>
         <td><code>{{ op.item_id }}</code></td>
-        <td>{{ op.proposed_data.slug|default:"—" }}</td>
-        <td>{{ op.proposed_data.status|default:"—" }}</td>
-        <td>{{ op.proposed_data.schema|default:"—" }}</td>
+        <td>{{ op.proposed_slug|default:"—" }}</td>
+        <td>{{ op.proposed_status|default:"—" }}</td>
+        <td>{{ op.proposed_schema|default:"—" }}</td>
         <td>{% if op.has_conflict %}<span class="cui-badge cui-badge--warning">conflict</span>{% else %}—{% endif %}</td>
         <td class="cui-text-sm cui-text-muted">{{ op.diff_summary|default:"—" }}</td>
       </tr>

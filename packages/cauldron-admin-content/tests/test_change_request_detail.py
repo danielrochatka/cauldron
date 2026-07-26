@@ -178,7 +178,10 @@ def test_get_shows_operations_when_preview_available(client):
         provider="flatfile",
         has_conflict=False,
         diff_summary="Body changed",
-        proposed_data={"slug": "home", "status": "draft", "schema": "page"},
+        proposed_slug="home",
+        proposed_status="draft",
+        proposed_schema="page",
+        proposed_data={},
         current_data={},
     )
     changeset = SimpleNamespace(operations=(op,))
@@ -191,6 +194,38 @@ def test_get_shows_operations_when_preview_available(client):
     assert "home-page" in content
     assert "pages" in content
     assert "Body changed" in content
+
+
+def test_get_operations_renders_proposed_slug_status_schema(client):
+    from django.test import override_settings
+    user = _make_user("viewer_op_fields", ["view_content_change_requests"])
+    client.force_login(user)
+    cr = _make_cr()
+    url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
+
+    op = SimpleNamespace(
+        operation_type="create",
+        collection="pages",
+        item_id="my-item",
+        provider="flatfile",
+        has_conflict=False,
+        diff_summary="",
+        proposed_slug="my-slug",
+        proposed_status="published",
+        proposed_schema="article",
+        proposed_data={},
+        current_data={},
+    )
+    changeset = SimpleNamespace(operations=(op,))
+    mock_svc = _make_service(preview_return=changeset)
+
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+            resp = client.get(url)
+    content = resp.content.decode()
+    assert "my-slug" in content
+    assert "published" in content
+    assert "article" in content
 
 
 def test_get_no_operations_section_when_no_preview(client):
@@ -208,6 +243,22 @@ def test_get_no_operations_section_when_no_preview(client):
     assert "Operations" not in content
 
 
+def test_get_degrades_gracefully_when_service_factory_raises(client):
+    from django.test import override_settings
+    from django.core.exceptions import ImproperlyConfigured
+    user = _make_user("viewer_nosvc", ["view_content_change_requests"])
+    client.force_login(user)
+    cr = _make_cr()
+    url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
+
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        with patch("cauldron_admin_content.views._get_service", side_effect=ImproperlyConfigured("no workspace")):
+            resp = client.get(url)
+    assert resp.status_code == 200
+    assert cr.request_id in resp.content.decode()
+    assert "Operations" not in resp.content.decode()
+
+
 def test_get_shows_conflict_badge_when_has_conflict(client):
     from django.test import override_settings
     user = _make_user("viewer_conflict", ["view_content_change_requests"])
@@ -222,7 +273,10 @@ def test_get_shows_conflict_badge_when_has_conflict(client):
         provider="flatfile",
         has_conflict=True,
         diff_summary="",
-        proposed_data={"slug": "about", "status": "draft", "schema": "page"},
+        proposed_slug="about",
+        proposed_status="draft",
+        proposed_schema="page",
+        proposed_data={},
         current_data={},
     )
     changeset = SimpleNamespace(operations=(op,))
@@ -283,6 +337,48 @@ def test_get_shows_apply_button_in_approved_state(client):
     user = _make_user("viewer_approved", ["view_content_change_requests", "apply_content_changes"])
     client.force_login(user)
     cr = _make_cr(lifecycle_state="approved")
+    url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
+    mock_svc = _make_service()
+
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+            resp = client.get(url)
+    assert 'value="apply"' in resp.content.decode()
+
+
+def test_get_no_reject_button_in_approved_state(client):
+    from django.test import override_settings
+    user = _make_user("viewer_noreject_approved", ["view_content_change_requests", "reject_content_changes"])
+    client.force_login(user)
+    cr = _make_cr(lifecycle_state="approved")
+    url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
+    mock_svc = _make_service()
+
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+            resp = client.get(url)
+    assert 'value="reject"' not in resp.content.decode()
+
+
+def test_get_shows_apply_button_in_apply_failed_state(client):
+    from django.test import override_settings
+    user = _make_user("viewer_applyfailed", ["view_content_change_requests", "apply_content_changes"])
+    client.force_login(user)
+    cr = _make_cr(lifecycle_state="apply_failed")
+    url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
+    mock_svc = _make_service()
+
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+            resp = client.get(url)
+    assert 'value="apply"' in resp.content.decode()
+
+
+def test_get_shows_apply_button_in_validated_state(client):
+    from django.test import override_settings
+    user = _make_user("viewer_validated_apply", ["view_content_change_requests", "apply_content_changes"])
+    client.force_login(user)
+    cr = _make_cr(lifecycle_state="validated")
     url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
     mock_svc = _make_service()
 
@@ -642,6 +738,42 @@ def test_post_apply_redirects_to_detail(client):
             resp = client.post(url, {"action": "apply", "expected_version": "3"})
 
     assert cr.request_id in resp["Location"]
+
+
+def test_post_apply_from_apply_failed_calls_service(client):
+    from django.test import override_settings
+    user = _make_user("poster_apply_retry", ["view_content_change_requests", "apply_content_changes"])
+    client.force_login(user)
+    cr = _make_cr(lifecycle_state="apply_failed", request_version=4)
+    url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
+    mock_svc = _make_service()
+
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+            resp = client.post(url, {"action": "apply", "expected_version": "4"})
+
+    assert resp.status_code == 302
+    mock_svc.apply_change_request.assert_called_once_with(
+        cr.request_id, user=user, expected_version=4
+    )
+
+
+def test_post_apply_from_validated_calls_service(client):
+    from django.test import override_settings
+    user = _make_user("poster_apply_validated", ["view_content_change_requests", "apply_content_changes"])
+    client.force_login(user)
+    cr = _make_cr(lifecycle_state="validated", request_version=2)
+    url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
+    mock_svc = _make_service()
+
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+            resp = client.post(url, {"action": "apply", "expected_version": "2"})
+
+    assert resp.status_code == 302
+    mock_svc.apply_change_request.assert_called_once_with(
+        cr.request_id, user=user, expected_version=2
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -596,8 +596,9 @@ _ACTION_PERMISSIONS = {
 
 _VALID_ACTIONS_BY_STATE = {
     "proposed": ("validate", "reject"),
-    "validated": ("approve", "reject"),
-    "approved": ("apply", "reject"),
+    "validated": ("approve", "apply", "reject"),
+    "approved": ("apply",),
+    "apply_failed": ("apply",),
 }
 
 
@@ -611,7 +612,11 @@ class ChangeRequestDetailView(View):
     def _build_context(self, request, cr, audit_events):
         from cauldron_content_operations.config import get_operations_config
 
-        service = _get_service()
+        try:
+            service = _get_service()
+        except Exception:
+            service = None
+
         previews = None
         if service is not None:
             try:

@@ -16,6 +16,7 @@ from cauldron_ai_admin.tools import (
     ToolArgumentValidationError,
     validate_tool_arguments,
 )
+from helpers import make_assembly_service_for_tools
 
 
 def _make_user():
@@ -144,6 +145,7 @@ def test_service_rejects_invalid_arguments_and_records_denied():
     svc = AdminAIService(
         provider=fake, tool_registry=reg,
         max_model_turns=2, max_tool_calls=2,
+        prompt_assembly_service=make_assembly_service_for_tools(*[d.name for d in reg.all_definitions()]),
     )
     run = svc.run(_make_user(), "Do it.")
     assert run.status == "failed"

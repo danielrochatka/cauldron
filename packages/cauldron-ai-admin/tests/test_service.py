@@ -15,6 +15,7 @@ from cauldron_ai_admin.tools import (
     AdminAIToolResult,
     RiskLevel,
 )
+from helpers import make_assembly_service_for_tools
 
 
 def _defn(
@@ -35,11 +36,13 @@ def _defn(
 
 
 def _service(provider, registry) -> AdminAIService:
+    asm = make_assembly_service_for_tools(*[d.name for d in registry.all_definitions()])
     return AdminAIService(
         provider=provider,
         tool_registry=registry,
         max_model_turns=3,
         max_tool_calls=5,
+        prompt_assembly_service=asm,
     )
 
 
@@ -214,6 +217,7 @@ def test_service_oversized_arguments_rejected():
     svc = AdminAIService(
         provider=fake, tool_registry=reg,
         max_argument_bytes=1024, max_model_turns=3, max_tool_calls=5,
+        prompt_assembly_service=make_assembly_service_for_tools(*[d.name for d in reg.all_definitions()]),
     )
     user = _make_user()
     run = svc.run(user, "Try big args.")
@@ -256,6 +260,7 @@ def test_service_max_turns_exceeded():
         ))
     svc = AdminAIService(
         provider=fake, tool_registry=reg, max_model_turns=2, max_tool_calls=100,
+        prompt_assembly_service=make_assembly_service_for_tools(*[d.name for d in reg.all_definitions()]),
     )
     user = _make_user()
     run = svc.run(user, "Loop forever.")
@@ -281,6 +286,7 @@ def test_service_max_tool_calls_exceeded():
     svc = AdminAIService(
         provider=fake, tool_registry=reg,
         max_model_turns=5, max_tool_calls=2,
+        prompt_assembly_service=make_assembly_service_for_tools(*[d.name for d in reg.all_definitions()]),
     )
     user = _make_user()
     run = svc.run(user, "Batch.")

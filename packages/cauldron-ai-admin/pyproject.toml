@@ -30,6 +30,6 @@ cauldron_ai_admin = [
 ]
 
 [tool.pytest.ini_options]
-pythonpath = ["src", "../../src", "../.."]
+pythonpath = ["src", "tests", "../../src", "../.."]
 addopts = "-ra"
 testpaths = ["tests"]

@@ -14,6 +14,9 @@ class CauldronAIAdminConfig(AppConfig):
         # This runs exactly once per process at Django startup.
         from . import builtin_tools
         builtin_tools.register_builtin_tools()
+        # Register the global operating prompt and per-tool prompt templates.
+        from . import builtin_tool_prompts
+        builtin_tool_prompts.register_builtin_tool_prompts()
         # Register navigation items with the admin shell.
         self._register_navigation()
 

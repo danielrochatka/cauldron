@@ -103,8 +103,14 @@ def test_post_execution_deadline_marks_invocation_timed_out():
     """
     import time as _time
     from cauldron_ai.contracts import AIModelResponse, AIModelToolCall
+    from cauldron_ai.prompt_templates import (
+        AIGlobalOperatingPrompt,
+        AIPromptTemplateRegistry,
+        AIToolPromptTemplate,
+    )
     from cauldron_ai.testing import FakeAIModelProvider
     from cauldron_ai_admin.models import AdminAIToolInvocation
+    from cauldron_ai_admin.prompt_assembly import PromptAssemblyService
     from cauldron_ai_admin.service import AdminAIService
     from cauldron_ai_admin.tools import (
         AdminAIToolDefinition,
@@ -147,6 +153,32 @@ def test_post_execution_deadline_marks_invocation_timed_out():
         ),
         _slow_handler,
     )
+
+    tmpl_reg = AIPromptTemplateRegistry()
+    tmpl_reg.register_global_prompt(AIGlobalOperatingPrompt(
+        version="v1", owning_module="cauldron.test", body="Global."
+    ))
+    tmpl_reg.register_tool_template(AIToolPromptTemplate(
+        tool_name="t.slow",
+        template_version="v1",
+        owning_module="cauldron.test",
+        purpose="Slow test tool.",
+        supported_tasks=("task",),
+        required_permission="auth.view_user",
+        risk_level="READ_ONLY",
+        read_scope="scope.",
+        write_scope="None.",
+        preconditions=(),
+        input_expectations="none.",
+        result_behavior="result.",
+        approval_requirements="None; read-only.",
+        clarification_behavior="clarify.",
+        refusal_behavior="refuse.",
+        error_guidance="report.",
+        positive_examples=(),
+        boundary_examples=(),
+    ))
+
     fake = FakeAIModelProvider()
     fake.queue_response(AIModelResponse(
         provider_request_id="r1",
@@ -161,6 +193,7 @@ def test_post_execution_deadline_marks_invocation_timed_out():
         max_model_turns=3, max_tool_calls=5,
         # Tiny per-tool budget so the effective_deadline is what expires.
         tool_timeout_seconds=0.05,
+        prompt_assembly_service=PromptAssemblyService(registry=tmpl_reg),
     )
     run = svc.run(user, "Slow.")
     assert run.status == "failed"

@@ -679,6 +679,151 @@ def check_config_file_readable(app_configs, **kwargs):
 
 
 @checks.register(checks.Tags.compatibility)
+def check_registered_tools_have_prompt_templates(app_configs, **kwargs):
+    """admin_ai.E017: every registered tool must have a prompt template."""
+    if not _is_admin_ai_active():
+        return []
+    try:
+        from .tools import get_tool_registry
+        from cauldron_ai.prompt_templates import get_prompt_template_registry
+        tool_names = {d.name for d in get_tool_registry().all_definitions()}
+        registry = get_prompt_template_registry()
+        missing = sorted(name for name in tool_names
+                         if registry.get_tool_template(name) is None)
+    except Exception:
+        return []
+    if not missing:
+        return []
+    return [checks.Error(
+        f"Admin AI tools missing prompt templates: {missing!r}",
+        hint="Register an AIToolPromptTemplate for each listed tool.",
+        id="admin_ai.E017",
+    )]
+
+
+@checks.register(checks.Tags.compatibility)
+def check_no_orphan_prompt_templates(app_configs, **kwargs):
+    """admin_ai.E018: every prompt template must match a registered tool."""
+    if not _is_admin_ai_active():
+        return []
+    try:
+        from .tools import get_tool_registry
+        from cauldron_ai.prompt_templates import get_prompt_template_registry
+        tool_names = {d.name for d in get_tool_registry().all_definitions()}
+        registry = get_prompt_template_registry()
+        orphans = sorted(
+            t.tool_name for t in registry.all_tool_templates()
+            if t.tool_name not in tool_names
+        )
+    except Exception:
+        return []
+    if not orphans:
+        return []
+    return [checks.Error(
+        f"Prompt templates registered for unknown tools: {orphans!r}",
+        id="admin_ai.E018",
+    )]
+
+
+@checks.register(checks.Tags.compatibility)
+def check_prompt_template_versions_valid(app_configs, **kwargs):
+    """admin_ai.E019: every template version must be non-empty and valid."""
+    if not _is_admin_ai_active():
+        return []
+    try:
+        import re
+        from cauldron_ai.prompt_templates import get_prompt_template_registry
+        VERSION_RE = re.compile(r"^(?:v\d+|\d+\.\d+(?:\.\d+)?(?:[-.][a-z0-9]+)*)$")
+        registry = get_prompt_template_registry()
+        invalid = sorted(
+            t.tool_name for t in registry.all_tool_templates()
+            if not t.template_version or not VERSION_RE.match(t.template_version)
+        )
+    except Exception:
+        return []
+    if not invalid:
+        return []
+    return [checks.Error(
+        f"Prompt templates with invalid version: {invalid!r}",
+        id="admin_ai.E019",
+    )]
+
+
+@checks.register(checks.Tags.compatibility)
+def check_prompt_template_permission_alignment(app_configs, **kwargs):
+    """admin_ai.E021: template required_permission must match tool definition."""
+    if not _is_admin_ai_active():
+        return []
+    try:
+        from .tools import get_tool_registry
+        from cauldron_ai.prompt_templates import get_prompt_template_registry
+        registry = get_prompt_template_registry()
+        tool_registry = get_tool_registry()
+        mismatches = []
+        for defn in tool_registry.all_definitions():
+            tmpl = registry.get_tool_template(defn.name)
+            if tmpl is None:
+                continue
+            if (tmpl.required_permission is not None
+                    and tmpl.required_permission != defn.required_permission):
+                mismatches.append(
+                    f"{defn.name!r}: template has {tmpl.required_permission!r}, "
+                    f"tool has {defn.required_permission!r}"
+                )
+    except Exception:
+        return []
+    if not mismatches:
+        return []
+    return [checks.Error(
+        f"Prompt template permission mismatches: {mismatches!r}",
+        id="admin_ai.E021",
+    )]
+
+
+@checks.register(checks.Tags.compatibility)
+def check_global_operating_prompt_present(app_configs, **kwargs):
+    """admin_ai.W007: global operating prompt should be registered."""
+    if not _is_admin_ai_active():
+        return []
+    try:
+        from cauldron_ai.prompt_templates import get_prompt_template_registry
+        registry = get_prompt_template_registry()
+        if registry.get_global_prompt() is not None:
+            return []
+    except Exception:
+        return []
+    return [checks.Warning(
+        "No global operating prompt is registered. "
+        "AdminAIService will fall back to the default system prompt.",
+        hint="Call register_global_prompt() at app-ready time.",
+        id="admin_ai.W007",
+    )]
+
+
+@checks.register(checks.Tags.compatibility)
+def check_global_prompt_version_valid(app_configs, **kwargs):
+    """admin_ai.W008: global prompt version must be non-empty and valid."""
+    if not _is_admin_ai_active():
+        return []
+    try:
+        import re
+        from cauldron_ai.prompt_templates import get_prompt_template_registry
+        VERSION_RE = re.compile(r"^(?:v\d+|\d+\.\d+(?:\.\d+)?(?:[-.][a-z0-9]+)*)$")
+        registry = get_prompt_template_registry()
+        gp = registry.get_global_prompt()
+        if gp is None:
+            return []
+        if gp.version and VERSION_RE.match(gp.version):
+            return []
+    except Exception:
+        return []
+    return [checks.Warning(
+        "Global operating prompt has an invalid or empty version.",
+        id="admin_ai.W008",
+    )]
+
+
+@checks.register(checks.Tags.compatibility)
 def check_registered_tool_contracts(app_configs, **kwargs):
     """admin_ai.E009: a registered tool has a contract violation.
 

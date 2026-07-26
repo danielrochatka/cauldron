@@ -585,6 +585,22 @@ class ChangeRequestListView(View):
         })
 
 
+_TERMINAL_STATES = frozenset({"applied", "rejected", "rolled_back"})
+
+_ACTION_PERMISSIONS = {
+    "validate": "cauldron_content_operations.validate_content_changes",
+    "approve": "cauldron_content_operations.approve_content_changes",
+    "reject": "cauldron_content_operations.reject_content_changes",
+    "apply": "cauldron_content_operations.apply_content_changes",
+}
+
+_VALID_ACTIONS_BY_STATE = {
+    "proposed": ("validate", "reject"),
+    "validated": ("approve", "reject"),
+    "approved": ("apply", "reject"),
+}
+
+
 @method_decorator([
     login_required,
     permission_required("cauldron_content_operations.view_content_change_requests", raise_exception=True),
@@ -592,20 +608,110 @@ class ChangeRequestListView(View):
 class ChangeRequestDetailView(View):
     template_name = "cauldron_admin_content/change_request_detail.html"
 
+    def _build_context(self, request, cr, audit_events):
+        from cauldron_content_operations.config import get_operations_config
+
+        service = _get_service()
+        previews = None
+        if service is not None:
+            try:
+                changeset = service.get_preview(cr.request_id, user=request.user)
+                if changeset is not None:
+                    previews = changeset.operations
+            except Exception:
+                previews = None
+
+        state = cr.lifecycle_state
+        valid_actions = _VALID_ACTIONS_BY_STATE.get(state, ())
+
+        cfg = get_operations_config()
+        is_self_approval = (
+            not cfg.allow_self_approval
+            and cr.created_by_id is not None
+            and cr.created_by_id == request.user.pk
+        )
+
+        return {
+            "cr": cr,
+            "audit_events": audit_events,
+            "previews": previews,
+            "valid_actions": valid_actions,
+            "is_terminal": state in _TERMINAL_STATES,
+            "is_self_approval": is_self_approval,
+            "can_validate": request.user.has_perm(_ACTION_PERMISSIONS["validate"]),
+            "can_approve": request.user.has_perm(_ACTION_PERMISSIONS["approve"]),
+            "can_reject": request.user.has_perm(_ACTION_PERMISSIONS["reject"]),
+            "can_apply": request.user.has_perm(_ACTION_PERMISSIONS["apply"]),
+            "breadcrumbs": [
+                {"label": "Content", "url": reverse("cauldron_admin_content:content-browser")},
+                {"label": "Change Requests", "url": reverse("cauldron_admin_content:change-request-list")},
+                {"label": cr.request_id[:8] + "…", "url": ""},
+            ],
+        }
+
     def get(self, request, request_id):
         from django.shortcuts import get_object_or_404
         from cauldron_content_operations.models import ContentChangeRequest, ContentAuditEvent
         cr = get_object_or_404(ContentChangeRequest, request_id=request_id)
         audit_events = list(ContentAuditEvent.objects.filter(change_request=cr).order_by("sequence"))
-        return render(request, self.template_name, {
-            "cr": cr,
-            "audit_events": audit_events,
-            "breadcrumbs": [
-                {"label": "Content", "url": reverse("cauldron_admin_content:content-browser")},
-                {"label": "Change Requests", "url": reverse("cauldron_admin_content:change-request-list")},
-                {"label": request_id[:8] + "…", "url": ""},
-            ],
-        })
+        return render(request, self.template_name, self._build_context(request, cr, audit_events))
+
+    def post(self, request, request_id):
+        from django.shortcuts import get_object_or_404
+        from cauldron_content_operations.models import ContentChangeRequest, ContentAuditEvent
+
+        cr = get_object_or_404(ContentChangeRequest, request_id=request_id)
+        action = request.POST.get("action", "")
+        detail_url = reverse("cauldron_admin_content:change-request-detail", kwargs={"request_id": request_id})
+
+        if action not in _ACTION_PERMISSIONS:
+            messages.error(request, "Unknown action.")
+            return HttpResponseRedirect(detail_url)
+
+        required_perm = _ACTION_PERMISSIONS[action]
+        if not request.user.has_perm(required_perm):
+            messages.error(request, "You do not have permission to perform this action.")
+            return HttpResponseRedirect(detail_url)
+
+        valid_actions = _VALID_ACTIONS_BY_STATE.get(cr.lifecycle_state, ())
+        if action not in valid_actions:
+            messages.error(request, f"Action '{action}' is not allowed in state '{cr.lifecycle_state}'.")
+            return HttpResponseRedirect(detail_url)
+
+        if action == "approve":
+            from cauldron_content_operations.config import get_operations_config
+            cfg = get_operations_config()
+            if not cfg.allow_self_approval and cr.created_by_id is not None and cr.created_by_id == request.user.pk:
+                messages.error(request, "Self-approval is not permitted.")
+                return HttpResponseRedirect(detail_url)
+
+        try:
+            expected_version = int(request.POST.get("expected_version", "0"))
+        except (ValueError, TypeError):
+            expected_version = 0
+
+        service = _get_service()
+        if service is None:
+            _handle_config_error(request)
+            return HttpResponseRedirect(detail_url)
+
+        if action == "validate":
+            result = service.validate_change_request(request_id, user=request.user, expected_version=expected_version)
+        elif action == "approve":
+            result = service.approve_change_request(request_id, user=request.user, expected_version=expected_version)
+        elif action == "reject":
+            reason = request.POST.get("rejection_reason", "").strip()[:500]
+            result = service.reject_change_request(request_id, user=request.user, reason=reason, expected_version=expected_version)
+        elif action == "apply":
+            result = service.apply_change_request(request_id, user=request.user, expected_version=expected_version)
+
+        if result.ok:
+            messages.success(request, f"Change request {action}d successfully.")
+        else:
+            error_msg = result.error.message if result.error else "An unknown error occurred."
+            messages.error(request, html.escape(error_msg[:400]))
+
+        return HttpResponseRedirect(detail_url)
 
 
 # ---------------------------------------------------------------------------

@@ -128,10 +128,13 @@ def _build_openai_client(api_key: str, base_url: str | None):
             "The 'openai' package is not installed. "
             "Install cauldron-ai-openai to use the OpenAI provider."
         ) from exc
-    kwargs: dict[str, Any] = {"api_key": api_key}
+    # Retries are disabled — Cauldron controls retry and deadline behavior.
+    # Leaving the SDK's default of 2 retries in place would let a single
+    # ``complete()`` call quietly issue three requests and consume the
+    # caller's deadline before we ever hear about it.
+    kwargs: dict[str, Any] = {"api_key": api_key, "max_retries": 0}
     if base_url:
         kwargs["base_url"] = base_url
-    # NOTE: intentionally do NOT set ``retries`` — Cauldron owns retry policy.
     return openai.OpenAI(**kwargs)
 
 

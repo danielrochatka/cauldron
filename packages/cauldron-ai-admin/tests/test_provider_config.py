@@ -374,6 +374,100 @@ def test_failed_write_preserves_original(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Inter-process lock — stable sibling file semantics
+# ---------------------------------------------------------------------------
+
+def test_lock_file_uses_stable_sibling_name(tmp_path):
+    """The advisory lock target must be the same for every writer."""
+    from cauldron_ai_admin.provider_config import AIProviderSettingsStore
+    store_a = AIProviderSettingsStore(tmp_path / "ai.json")
+    store_b = AIProviderSettingsStore(tmp_path / "ai.json")
+    # Both stores compute the same, sibling-named lock path.
+    assert store_a._lock_path == store_b._lock_path
+    assert store_a._lock_path.name == "ai.json.lock"
+    assert store_a._lock_path.parent == store_a.path.parent
+
+
+def test_concurrent_set_config_both_preserved(tmp_path):
+    """Two stores writing different provider configs both survive.
+
+    With the old per-write temp-file lock the two writers could each
+    read the same old document, mutate independently, and race to
+    ``os.replace`` — silently dropping one update. The stable lock file
+    serialises them so both entries end up on disk.
+    """
+    from cauldron_ai_admin.provider_config import AIProviderSettingsStore
+    store_a = AIProviderSettingsStore(tmp_path / "ai.json")
+    store_b = AIProviderSettingsStore(tmp_path / "ai.json")
+    store_a.set_config("alpha", {"model": "a"})
+    store_b.set_config("beta", {"model": "b"})
+    # A third instance bypasses any in-process caching.
+    store_c = AIProviderSettingsStore(tmp_path / "ai.json")
+    assert store_c.get_config("alpha") == {"model": "a"}
+    assert store_c.get_config("beta") == {"model": "b"}
+
+
+def test_concurrent_clear_secret_only_removes_target(tmp_path):
+    """clear_secret on one key leaves sibling keys intact across instances."""
+    from cauldron_ai_admin.provider_config import AIProviderSettingsStore
+    s = AIProviderSettingsStore(tmp_path / "ai.json")
+    s.set_secrets("openai", {"api_key": "sk-1", "org": "org-1"})
+    s2 = AIProviderSettingsStore(tmp_path / "ai.json")
+    s2.clear_secret("openai", "api_key")
+    s3 = AIProviderSettingsStore(tmp_path / "ai.json")
+    assert s3.get_secret("openai", "api_key") == ""
+    assert s3.get_secret("openai", "org") == "org-1"
+
+
+def test_write_failure_via_write_raw_preserves_original(tmp_path, monkeypatch):
+    """A crash inside ``_write_document`` must not corrupt the existing file."""
+    from cauldron_ai_admin.provider_config import AIProviderSettingsStore
+    s = AIProviderSettingsStore(tmp_path / "ai.json")
+    s.set_selected_provider("openai")
+    original_text = s.path.read_text(encoding="utf-8")
+
+    def _explode(doc):  # pragma: no cover - exercised by monkeypatch
+        raise OSError("disk full")
+
+    monkeypatch.setattr(s, "_write_document", _explode)
+    with pytest.raises(OSError):
+        s.set_selected_provider("fake")
+
+    s2 = AIProviderSettingsStore(tmp_path / "ai.json")
+    assert s2.get_selected_provider() == "openai"
+    assert s2.path.read_text(encoding="utf-8") == original_text
+
+
+def test_lock_path_symlink_refused(tmp_path):
+    """A symlinked lock path is refused just like the config file."""
+    from cauldron_ai_admin.provider_config import (
+        AIProviderSettingsStore,
+        AIProviderStoreUnsafePathError,
+    )
+    target = tmp_path / "real.lock"
+    target.write_text("", encoding="utf-8")
+    link = tmp_path / "ai.json.lock"
+    link.symlink_to(target)
+    s = AIProviderSettingsStore(tmp_path / "ai.json")
+    with pytest.raises(AIProviderStoreUnsafePathError):
+        s.set_selected_provider("openai")
+
+
+def test_concurrent_set_secrets_serialized_across_instances(tmp_path):
+    """Repeated writes across two store instances must preserve every mutation."""
+    from cauldron_ai_admin.provider_config import AIProviderSettingsStore
+    s1 = AIProviderSettingsStore(tmp_path / "ai.json")
+    s2 = AIProviderSettingsStore(tmp_path / "ai.json")
+    s1.set_selected_provider("openai")
+    s1.set_secret("openai", "api_key", "sk-first")
+    s2.set_secret("openai", "org", "org-second")
+    s3 = AIProviderSettingsStore(tmp_path / "ai.json")
+    secrets = s3.get_secrets("openai")
+    assert secrets["api_key"] == "sk-first"
+    assert secrets["org"] == "org-second"
+
+
+# ---------------------------------------------------------------------------
 # File existence and permissions
 # ---------------------------------------------------------------------------
 

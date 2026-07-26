@@ -4,8 +4,14 @@ The store persists to a single JSON file (default:
 ``BASE_DIR/data/ai/config.json``).  Writes are atomic (write-to-unique-
 temp → fsync → rename) and both the file (0600) and its parent
 directory (0700) are locked down so credentials are not world-readable.
-Inter-process safety is provided by ``fcntl.flock`` on POSIX systems,
-with a graceful no-op fallback elsewhere.
+
+Inter-process safety uses a stable sibling lock file
+(``config.json.lock``) held across the entire read-modify-write cycle.
+Using a stable name — rather than the per-write temp path — is what
+gives us actual contention between workers: two processes that both
+target the sibling lock actually block each other, whereas the unique
+temp files never collide.  On non-POSIX platforms the lock is a
+best-effort no-op.
 
 Versioned document format (version 1)::
 
@@ -38,13 +44,14 @@ is the primary protection.  Never commit this file.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import stat
 import threading
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from django.conf import settings as django_settings
 
@@ -72,6 +79,15 @@ class AIProviderStoreUnsafePathError(AIProviderStoreError):
 
 class AIProviderStoreVersionError(AIProviderStoreError):
     """Raised when the stored document version is not supported."""
+
+
+class _NoMutation(Exception):
+    """Internal sentinel: raise from a ``_mutate`` callback to skip the write.
+
+    Used by ``clear_secret`` (and any other conditional mutator) to avoid
+    a write when the target does not exist, without letting the lock file
+    accidentally trigger an atomic no-op replace.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +152,72 @@ class _FileLock:
             except OSError:
                 pass
             self._locked = False
+
+
+@contextlib.contextmanager
+def _sibling_file_lock(lock_path: Path):
+    """POSIX advisory lock on a stable sibling file.
+
+    Unlike ``_FileLock`` (which locks the per-write unique temp file, and
+    therefore never contends), this context manager acquires a POSIX
+    advisory lock on a *stable* sibling path shared by every writer.
+    That gives us actual inter-process serialisation of the
+    read-modify-write cycle.
+
+    The lock file itself is created lazily with mode 0600 — its contents
+    are irrelevant, only the flock matters.  Symlinks are refused so a
+    malicious sibling cannot redirect the lock target.  Non-POSIX
+    platforms and NFS mounts without a lock daemon degrade to a no-op
+    (in-process locking still applies).
+    """
+    if _fcntl is None:
+        yield
+        return
+    try:
+        if lock_path.is_symlink():
+            raise AIProviderStoreUnsafePathError(
+                "AI config lock path is a symlink — refusing to load."
+            )
+        if not lock_path.parent.exists():
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            # Match the store's tightened directory mode so the lock
+            # file can't accidentally widen the parent to 0755.
+            try:
+                os.chmod(str(lock_path.parent), 0o700)
+            except OSError:
+                pass
+        fd = os.open(
+            str(lock_path),
+            os.O_WRONLY | os.O_CREAT,
+            stat.S_IRUSR | stat.S_IWUSR,  # 0600
+        )
+    except AIProviderStoreUnsafePathError:
+        raise
+    except OSError:
+        # If we can't even open the lock file (permissions, read-only fs,
+        # etc.) fall back to intra-process locking only rather than
+        # refusing writes outright.
+        yield
+        return
+    try:
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_EX)
+            locked = True
+        except OSError:
+            locked = False
+        try:
+            yield
+        finally:
+            if locked:
+                try:
+                    _fcntl.flock(fd, _fcntl.LOCK_UN)
+                except OSError:
+                    pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +340,32 @@ class AIProviderSettingsStore:
             self._path = _default_config_path()
         return self._path
 
+    @property
+    def _lock_path(self) -> Path:
+        """Stable sibling path used for inter-process advisory locking.
+
+        A single shared name (``<config>.lock``) is what actually gives
+        us contention between workers — using a unique-per-write path
+        would leave concurrent readers/writers to serialise on nothing.
+        """
+        return self.path.parent / (self.path.name + ".lock")
+
+    def _mutate(self, fn: Callable[[dict[str, Any]], None]) -> None:
+        """Serialise a read-modify-write cycle across processes.
+
+        ``fn`` receives the freshly-read normalised document and mutates
+        it in place; ``_write_document`` then persists the result.  The
+        inter-process advisory lock is held for the entire critical
+        section so two workers cannot both read the same old document,
+        each apply their change locally, and race to write — that pattern
+        silently loses one of the updates.
+        """
+        with self._lock:  # in-process (thread) exclusion
+            with _sibling_file_lock(self._lock_path):  # inter-process exclusion
+                doc = self._read_document()
+                fn(doc)
+                self._write_document(doc)
+
     # ------------------------------------------------------------------
     # Low-level read / write
     # ------------------------------------------------------------------
@@ -366,8 +474,13 @@ class AIProviderSettingsStore:
 
     def save(self, data: dict[str, Any]) -> None:
         """Overwrite the config file with ``data`` (normalised, atomic, 0600)."""
-        with self._lock:
-            self._write_document(dict(data or {}))
+        payload = dict(data or {})
+
+        def _apply(doc: dict[str, Any]) -> None:
+            doc.clear()
+            doc.update(payload)
+
+        self._mutate(_apply)
 
     # ---- selection ---------------------------------------------------
 
@@ -377,10 +490,12 @@ class AIProviderSettingsStore:
             return str(doc.get("selected_provider", "") or "")
 
     def set_selected_provider(self, name: str) -> None:
-        with self._lock:
-            doc = self._read_document()
-            doc["selected_provider"] = str(name or "")
-            self._write_document(doc)
+        value = str(name or "")
+
+        def _apply(doc: dict[str, Any]) -> None:
+            doc["selected_provider"] = value
+
+        self._mutate(_apply)
 
     # ---- provider config --------------------------------------------
 
@@ -391,14 +506,16 @@ class AIProviderSettingsStore:
             return dict(slot.get("config") or {})
 
     def set_config(self, provider_name: str, config: dict[str, Any]) -> None:
-        with self._lock:
-            doc = self._read_document()
+        new_config = dict(config or {})
+
+        def _apply(doc: dict[str, Any]) -> None:
             slot = doc.setdefault("providers", {}).setdefault(
                 provider_name, {"config": {}, "secrets": {}},
             )
-            slot["config"] = dict(config or {})
+            slot["config"] = new_config
             slot.setdefault("secrets", {})
-            self._write_document(doc)
+
+        self._mutate(_apply)
 
     # ---- provider secrets -------------------------------------------
 
@@ -410,14 +527,16 @@ class AIProviderSettingsStore:
             return str(secrets.get(key, "") or "")
 
     def set_secret(self, provider_name: str, key: str, value: str) -> None:
-        with self._lock:
-            doc = self._read_document()
+        stringified = str(value)
+
+        def _apply(doc: dict[str, Any]) -> None:
             slot = doc.setdefault("providers", {}).setdefault(
                 provider_name, {"config": {}, "secrets": {}},
             )
-            slot.setdefault("secrets", {})[key] = str(value)
+            slot.setdefault("secrets", {})[key] = stringified
             slot.setdefault("config", {})
-            self._write_document(doc)
+
+        self._mutate(_apply)
 
     def get_secrets(self, provider_name: str) -> dict[str, str]:
         with self._lock:
@@ -430,25 +549,33 @@ class AIProviderSettingsStore:
     def set_secrets(
         self, provider_name: str, secrets: dict[str, str],
     ) -> None:
-        with self._lock:
-            doc = self._read_document()
+        new_secrets = {str(k): str(v) for k, v in (secrets or {}).items()}
+
+        def _apply(doc: dict[str, Any]) -> None:
             slot = doc.setdefault("providers", {}).setdefault(
                 provider_name, {"config": {}, "secrets": {}},
             )
-            slot["secrets"] = {str(k): str(v) for k, v in (secrets or {}).items()}
+            slot["secrets"] = new_secrets
             slot.setdefault("config", {})
-            self._write_document(doc)
+
+        self._mutate(_apply)
 
     def clear_secret(self, provider_name: str, key: str) -> None:
         """Remove a single secret entry; no-op if it isn't set."""
-        with self._lock:
-            doc = self._read_document()
+        def _apply(doc: dict[str, Any]) -> None:
             slot = doc.get("providers", {}).get(provider_name)
             if not slot or not isinstance(slot.get("secrets"), dict):
-                return
-            if key in slot["secrets"]:
-                del slot["secrets"][key]
-                self._write_document(doc)
+                # Signal a no-op by raising a sentinel exception; the
+                # mutation wrapper will convert it to "no write".
+                raise _NoMutation
+            if key not in slot["secrets"]:
+                raise _NoMutation
+            del slot["secrets"][key]
+
+        try:
+            self._mutate(_apply)
+        except _NoMutation:
+            return
 
     # ---- runtime settings -------------------------------------------
 
@@ -458,10 +585,12 @@ class AIProviderSettingsStore:
             return dict(doc.get("runtime") or {})
 
     def set_runtime(self, runtime: dict[str, Any]) -> None:
-        with self._lock:
-            doc = self._read_document()
-            doc["runtime"] = dict(runtime or {})
-            self._write_document(doc)
+        new_runtime = dict(runtime or {})
+
+        def _apply(doc: dict[str, Any]) -> None:
+            doc["runtime"] = new_runtime
+
+        self._mutate(_apply)
 
     # ---- file inspection --------------------------------------------
 

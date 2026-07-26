@@ -493,3 +493,149 @@ def test_settings_page_shows_module_slug():
     client.force_login(user)
     response = client.get(reverse("cauldron_ai_admin:settings"))
     assert b"cauldron.ai.admin" in response.content
+
+
+# ---------------------------------------------------------------------------
+# Effective-provider display header
+# ---------------------------------------------------------------------------
+
+class _StaticFake:
+    name = "fake-static"
+    display_name = "Fake Static"
+
+    def complete(self, req):  # pragma: no cover
+        return None
+
+
+def test_display_shows_saved_selection_over_cauldron_modules(store, settings):
+    """Store selection wins over CAULDRON_MODULES when both point at a provider."""
+    from cauldron_ai.providers import register_provider, register_provider_factory
+    settings.CAULDRON_MODULES = {
+        "cauldron.ai.admin": {"provider": "fake-static"},
+    }
+    register_provider(_StaticFake())
+    register_provider_factory(_make_factory("myprovider"))
+    store.set_selected_provider("myprovider")
+    user = _settings_user()
+    client = Client()
+    client.force_login(user)
+    response = client.get(reverse("cauldron_ai_admin:settings"))
+    assert response.status_code == 200
+    # Header must reflect the STORE selection, not CAULDRON_MODULES.
+    assert b"Myprovider" in response.content
+    assert b"Active" in response.content
+
+
+def test_display_falls_back_to_cauldron_modules_when_store_empty(store, settings):
+    """Without a store selection the display uses CAULDRON_MODULES."""
+    from cauldron_ai.providers import register_provider
+    settings.CAULDRON_MODULES = {
+        "cauldron.ai.admin": {"provider": "fake-static"},
+    }
+    register_provider(_StaticFake())
+    user = _settings_user()
+    client = Client()
+    client.force_login(user)
+    response = client.get(reverse("cauldron_ai_admin:settings"))
+    assert response.status_code == 200
+    assert b"Fake Static" in response.content
+    assert b"Active" in response.content
+
+
+def test_display_handles_unknown_saved_provider(store, settings):
+    """A stale store selection surfaces a safe warning without crashing."""
+    settings.CAULDRON_MODULES = {}
+    store.set_selected_provider("nonexistent")
+    user = _settings_user()
+    client = Client()
+    client.force_login(user)
+    response = client.get(reverse("cauldron_ai_admin:settings"))
+    assert response.status_code == 200
+    assert b"nonexistent" in response.content
+    assert b"Provider not found" in response.content
+
+
+def test_display_handles_corrupt_store(tmp_path, settings):
+    """A corrupt config file must not break the settings page."""
+    from cauldron_ai_admin.provider_config import _reset_store_for_tests
+    p = tmp_path / "ai.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("{not-json", encoding="utf-8")
+    import os
+    os.chmod(str(p), 0o600)
+    _reset_store_for_tests(path=p)
+    try:
+        settings.CAULDRON_MODULES = {}
+        user = _settings_user()
+        client = Client()
+        client.force_login(user)
+        response = client.get(reverse("cauldron_ai_admin:settings"))
+        # The page renders — the header may report an opaque status but the
+        # user isn't blocked from re-configuring.
+        assert response.status_code == 200
+    finally:
+        _reset_store_for_tests(path=None)
+
+
+def test_display_get_does_not_build_provider(store, settings):
+    """A GET on the settings page must not invoke factory.build()."""
+    from cauldron_ai.provider_configuration import (
+        AIProviderConfigurationField,
+        AIProviderConfigurationSpec,
+        AIProviderConnectionResult,
+        FIELD_TYPE_PASSWORD,
+    )
+    from cauldron_ai.providers import register_provider_factory
+    build_count = [0]
+
+    class _F:
+        name = "no-build"
+
+        @property
+        def configuration_spec(self):
+            return AIProviderConfigurationSpec(
+                provider_name="no-build",
+                display_name="No Build",
+                fields=(
+                    AIProviderConfigurationField(name="model", label="Model"),
+                    AIProviderConfigurationField(
+                        name="api_key", label="Key",
+                        field_type=FIELD_TYPE_PASSWORD,
+                    ),
+                ),
+                supports_connection_test=True,
+            )
+
+        def build(self, c, s):
+            build_count[0] += 1
+            raise RuntimeError("would have called vendor SDK")
+
+        def test_connection(self, c, s):
+            return AIProviderConnectionResult(success=True, status="ok")
+
+    settings.CAULDRON_MODULES = {}
+    register_provider_factory(_F())
+    store.set_selected_provider("no-build")
+    user = _settings_user()
+    client = Client()
+    client.force_login(user)
+    response = client.get(reverse("cauldron_ai_admin:settings"))
+    assert response.status_code == 200
+    assert b"No Build" in response.content
+    assert build_count[0] == 0
+
+
+def test_display_shows_factory_display_name_from_spec(store, settings):
+    """Factory-only providers surface via ``descriptor_for`` synthesis."""
+    from cauldron_ai.providers import register_provider_factory
+    settings.CAULDRON_MODULES = {}
+    register_provider_factory(_make_factory("openai"))
+    store.set_selected_provider("openai")
+    user = _settings_user()
+    client = Client()
+    client.force_login(user)
+    response = client.get(reverse("cauldron_ai_admin:settings"))
+    assert response.status_code == 200
+    # ``_make_factory("openai")`` reports display_name="Openai" (title-cased).
+    assert b"Openai" in response.content
+    assert b"Active" in response.content

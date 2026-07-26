@@ -471,6 +471,53 @@ def test_provider_does_not_set_retries_on_client(monkeypatch):
     assert "retries" not in seen_kwargs
 
 
+def test_openai_client_constructed_with_max_retries_zero(monkeypatch):
+    """Cauldron must own retry policy — the SDK's default 2 retries is off."""
+    import openai
+    captured: dict = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(openai, "OpenAI", _capture)
+    OpenAIProvider(api_key="sk-test", model="gpt-4o")
+    assert captured.get("max_retries") == 0
+
+
+def test_openai_factory_build_passes_max_retries_zero(monkeypatch):
+    """The same guarantee holds when the provider is built via the factory."""
+    import openai
+    captured: dict = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(openai, "OpenAI", _capture)
+    OpenAIProviderFactory().build(
+        {"model": "gpt-4o"}, {"api_key": "sk-test"},
+    )
+    assert captured.get("max_retries") == 0
+
+
+def test_openai_client_with_base_url_still_sets_max_retries_zero(monkeypatch):
+    """base_url must not disturb the max_retries=0 guarantee."""
+    import openai
+    captured: dict = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(openai, "OpenAI", _capture)
+    OpenAIProvider(
+        api_key="sk-test", model="gpt-4o", base_url="https://example.com/v1",
+    )
+    assert captured.get("max_retries") == 0
+    assert captured.get("base_url") == "https://example.com/v1"
+
+
 # ---------------------------------------------------------------------------
 # Factory test_connection
 # ---------------------------------------------------------------------------

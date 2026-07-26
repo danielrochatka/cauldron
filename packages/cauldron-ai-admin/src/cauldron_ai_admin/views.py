@@ -31,34 +31,71 @@ def _get_service():
 
 
 def _get_provider_display() -> tuple[str, str]:
-    """Return (display_name, status) for the currently configured AI provider.
+    """Return ``(display_name, status)`` for the currently effective AI provider.
 
-    Never raises — falls back to descriptive error strings so the settings
-    page always renders even when the provider is misconfigured.
+    Resolution mirrors ``service_factory.get_admin_ai_service`` so the
+    status header, provider-config form, and Django system checks agree
+    on which provider is active:
+
+    1. If the config store has a saved selection, use it.
+    2. Otherwise fall back to ``CAULDRON_MODULES['cauldron.ai.admin']['provider']``
+       via ``_resolve_provider`` (which surfaces E001/E002/E003).
+    3. Never invoke ``factory.build()`` — the display path must stay pure
+       so a misconfigured provider does not break the settings page.
+
+    Always safe to call: exceptions become opaque status strings so the
+    page still renders when the config store is unreadable.
     """
     try:
-        from cauldron_ai.providers import descriptor_for, provider_names
+        from cauldron_ai.providers import (
+            descriptor_for,
+            factory_names,
+            provider_names,
+        )
+
         from .checks import _admin_ai_config, _resolve_provider
+        from .provider_config import get_store, resolve_provider_name
 
         cfg = _admin_ai_config()
-        names = provider_names()
-        provider, err_id = _resolve_provider(cfg, names)
-
-        if err_id == "admin_ai.E001":
-            return "None", "No AI provider registered"
-        if err_id == "admin_ai.E002":
-            configured = cfg.get("provider", "")
-            return configured or "Unknown", "Provider not found — check CAULDRON_MODULES"
-        if err_id == "admin_ai.E003":
-            return "Ambiguous", f"Multiple providers registered: {', '.join(names)}"
-        if provider is None:
-            return "Unknown", "Provider could not be resolved"
+        static_names = set(provider_names())
+        factory_only = set(factory_names())
+        all_names = sorted(static_names | factory_only)
 
         try:
-            desc = descriptor_for(provider.name)
-            display_name = desc.display_name or provider.name
+            store = get_store()
+            selected = resolve_provider_name(store)
         except Exception:
-            display_name = provider.name
+            selected = ""
+
+        if not selected:
+            # No saved selection — reuse the E001/E002/E003 resolver so
+            # the display agrees with system checks.
+            provider, err_id = _resolve_provider(cfg, all_names)
+            if err_id == "admin_ai.E001":
+                return "None", "No AI provider registered"
+            if err_id == "admin_ai.E002":
+                configured = cfg.get("provider", "") or "Unknown"
+                return configured, "Provider not found — check AI settings"
+            if err_id == "admin_ai.E003":
+                return (
+                    "Ambiguous",
+                    f"Multiple providers registered: {', '.join(all_names)}",
+                )
+            if provider is None:
+                return "Unknown", "Provider could not be resolved"
+            selected = getattr(provider, "name", "") or ""
+
+        if not selected:
+            return "None", "No AI provider registered"
+
+        if selected not in (static_names | factory_only):
+            return selected, "Provider not found — check AI settings"
+
+        try:
+            desc = descriptor_for(selected)
+            display_name = desc.display_name or selected
+        except Exception:
+            display_name = selected
 
         return display_name, "Active"
     except Exception:
@@ -163,15 +200,23 @@ class AdminAISettingsView(View):
             RuntimeSettingsForm,
         )
 
+        from .provider_config import AIProviderStoreError
+
         store = get_store()
         available = _get_available_providers()
-        current_provider = resolve_provider_name(store)
+        try:
+            current_provider = resolve_provider_name(store)
+        except AIProviderStoreError:
+            current_provider = ""
         spec = _get_provider_spec(current_provider) if current_provider else None
 
         credential_states = _credential_states_for(spec, current_provider, store)
 
         if form is None and spec is not None:
-            current_config = store.get_config(current_provider)
+            try:
+                current_config = store.get_config(current_provider)
+            except AIProviderStoreError:
+                current_config = {}
             form = ProviderConfigForm(
                 spec=spec,
                 current_config=current_config,
@@ -187,7 +232,10 @@ class AdminAISettingsView(View):
 
         if runtime_form is None:
             defaults = _resolve_runtime_defaults()
-            saved_runtime = store.get_runtime()
+            try:
+                saved_runtime = store.get_runtime()
+            except AIProviderStoreError:
+                saved_runtime = {}
             initial = {**defaults, **saved_runtime}
             runtime_form = RuntimeSettingsForm(initial=initial)
 

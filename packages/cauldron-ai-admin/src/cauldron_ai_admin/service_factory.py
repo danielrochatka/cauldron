@@ -9,7 +9,6 @@ from django.core.exceptions import ImproperlyConfigured
 from cauldron_ai.providers import (
     build_provider,
     factory_names,
-    get_provider,
     provider_names,
 )
 
@@ -24,34 +23,50 @@ def _admin_ai_config() -> dict:
     return cfg if isinstance(cfg, dict) else {}
 
 
-def _resolve_provider_with_factory(provider_name: str):
-    """Try to resolve a provider: first as a registered instance, then as a factory.
+def _resolve_provider_with_factory(provider_name: str, store=None):
+    """Return a live provider for ``provider_name``.
 
-    Returns the resolved ``AIModelProvider`` or raises ``ImproperlyConfigured``.
+    ``build_provider`` unifies dispatch across static instance and factory
+    registrations: if the name is registered as an instance the shared
+    instance is returned as-is; if it is registered as a factory the
+    factory's ``build(config, secrets)`` is invoked with values pulled from
+    the config store.  Callers therefore never need to distinguish between
+    the two backends.
+
+    Exceptions raised while constructing the provider are collapsed into a
+    fixed, credential-safe ``ImproperlyConfigured`` message —
+    ``AIProviderConfigurationError`` is re-raised untouched because its
+    message is already scrubbed for user display.
     """
-    # 1. Pre-built registered instance.
-    if provider_name in provider_names():
-        return get_provider(provider_name)
+    from cauldron_ai.provider_configuration import AIProviderConfigurationError
 
-    # 2. Factory — build from stored config and secrets.
-    if provider_name in factory_names():
-        from .provider_config import get_store, resolve_provider_config
+    from .provider_config import get_store, resolve_provider_config
+
+    if store is None:
         store = get_store()
+
+    try:
         config = resolve_provider_config(provider_name, store)
         secrets = store.get_secrets(provider_name)
-        try:
-            return build_provider(provider_name, config, secrets)
-        except Exception as exc:
-            raise ImproperlyConfigured(
-                f"Failed to build AI provider {provider_name!r} from factory: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
+    except Exception:
+        # Reading the config store must never expose credentials in errors.
+        raise ImproperlyConfigured(
+            f"AI provider {provider_name!r} could not be constructed. "
+            "Check your AI settings."
+        )
 
-    raise ImproperlyConfigured(
-        f"AI provider {provider_name!r} is not registered as an instance or factory. "
-        f"Registered instances: {provider_names()!r}. "
-        f"Registered factories: {factory_names()!r}."
-    )
+    try:
+        return build_provider(provider_name, config, secrets)
+    except AIProviderConfigurationError:
+        # Already carries a fixed, credential-safe message.
+        raise
+    except Exception:
+        # Never embed raw exception strings — SDKs echo request metadata
+        # (and occasionally credentials) into their exception messages.
+        raise ImproperlyConfigured(
+            f"AI provider {provider_name!r} could not be constructed. "
+            "Check your AI settings."
+        )
 
 
 def _resolve_runtime(store, cfg: dict) -> dict[str, Any]:
@@ -105,7 +120,7 @@ def get_admin_ai_service() -> AdminAIService:
     provider_name = resolve_provider_name(store)
 
     if provider_name:
-        provider = _resolve_provider_with_factory(provider_name)
+        provider = _resolve_provider_with_factory(provider_name, store)
     else:
         # Fall back to the single-provider check (existing E001/E003 path).
         # ``_resolve_provider`` now returns a lightweight marker for
@@ -123,7 +138,7 @@ def get_admin_ai_service() -> AdminAIService:
             )
         # If we got a factory marker, materialise the real provider now.
         if isinstance(provider, _FactoryProviderMarker):
-            provider = _resolve_provider_with_factory(provider.name)
+            provider = _resolve_provider_with_factory(provider.name, store)
 
     runtime = _resolve_runtime(store, cfg)
 

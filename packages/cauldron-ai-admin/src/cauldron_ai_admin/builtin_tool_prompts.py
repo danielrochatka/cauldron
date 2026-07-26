@@ -413,7 +413,7 @@ _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
         read_scope="None.",
         write_scope=(
             "Creates a non-canonical UIStyleChangeRequest proposal. The proposal "
-            "is staged only and has no effect on live styles until validated and "
+            "is staged only and has no effect on live styles until approved and "
             "applied by an authorized user. Never writes CSS files directly."
         ),
         preconditions=(
@@ -427,15 +427,14 @@ _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
             "Optional: 'base_hash' (SHA-256 of the current file for optimistic lock)."
         ),
         result_behavior=(
-            "Returns a request_id and status='proposed'. The proposal requires "
-            "validation before it can be applied by an authorized user."
+            "Returns a request_id and status='proposed'. An authorized user must "
+            "approve the proposal before it can be applied."
         ),
         approval_requirements=(
-            "Proposals always require validation. Whether a separate approval step "
-            "is required depends on the installation's require_approval setting. "
-            "Who may approve is determined by Django permissions and group membership. "
-            "Applying style changes is always a deliberate action by an authorized "
-            "user. Inform the user that the proposal is pending review."
+            "UI style proposals always require approval before they can be applied. "
+            "The lifecycle is proposed → approved → applied; there is no validation "
+            "step. Who may approve is determined by Django permissions and group "
+            "membership. Inform the user that the proposal is pending review."
         ),
         clarification_behavior=(
             "Confirm the proposed changes with the user before submitting. "

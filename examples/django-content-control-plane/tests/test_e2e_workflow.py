@@ -108,7 +108,6 @@ def e2e_env(tmp_path):
 
     cfg = ContentOperationsConfig(
         require_approval=True,
-        allow_self_approval=False,
         max_operations_per_change_set=10,
     )
     service = ContentOperationService(

@@ -565,3 +565,191 @@ def test_factory_test_connection_no_model_returns_config_error():
     result = factory.test_connection({}, {"api_key": "sk-test"})
     assert result.success is False
     assert result.status == "configuration_error"
+
+
+# ---------------------------------------------------------------------------
+# Legacy model_name compatibility
+# ---------------------------------------------------------------------------
+
+def test_factory_build_reads_legacy_model_name(monkeypatch):
+    """Factory must accept model_name as a backward-compat fallback."""
+    import openai
+    monkeypatch.setattr(openai, "OpenAI", lambda **kw: MagicMock())
+    factory = OpenAIProviderFactory()
+    provider = factory.build({"model_name": "gpt-4o"}, {"api_key": "sk-test"})
+    assert isinstance(provider, OpenAIProvider)
+    assert provider.model == "gpt-4o"
+
+
+def test_factory_build_model_wins_over_model_name(monkeypatch):
+    """Explicit model field takes precedence over legacy model_name."""
+    import openai
+    monkeypatch.setattr(openai, "OpenAI", lambda **kw: MagicMock())
+    factory = OpenAIProviderFactory()
+    provider = factory.build(
+        {"model": "gpt-4o", "model_name": "old-model"},
+        {"api_key": "sk-test"},
+    )
+    assert provider.model == "gpt-4o"
+
+
+def test_factory_build_env_wins_over_empty_model_name(monkeypatch):
+    """OPENAI_MODEL env var fills in when both model and model_name are absent."""
+    import openai
+    monkeypatch.setenv("OPENAI_MODEL", "env-model")
+    monkeypatch.setattr(openai, "OpenAI", lambda **kw: MagicMock())
+    factory = OpenAIProviderFactory()
+    provider = factory.build({}, {"api_key": "sk-test"})
+    assert provider.model == "env-model"
+
+
+# ---------------------------------------------------------------------------
+# Response status validation — strict terminal-status enforcement
+# ---------------------------------------------------------------------------
+
+def test_provider_completed_text_returns_end_turn(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(
+        output=[_make_output_text_item("Hello")], status="completed",
+    )
+    response = provider.complete(_simple_request())
+    assert response.stop_reason == "end_turn"
+    assert response.content == "Hello"
+
+
+def test_provider_completed_single_tool_call(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(
+        output=[_make_function_call_item(
+            call_id="c1", name="my_tool", arguments='{"x": 1}',
+        )],
+        status="completed",
+    )
+    response = provider.complete(_simple_request())
+    assert response.stop_reason == "tool_use"
+    assert len(response.tool_calls) == 1
+    assert response.tool_calls[0].name == "my_tool"
+
+
+def test_provider_completed_multiple_tool_calls(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(
+        output=[
+            _make_function_call_item(call_id="c1", name="tool_a", arguments="{}"),
+            _make_function_call_item(call_id="c2", name="tool_b", arguments="{}"),
+        ],
+        status="completed",
+    )
+    response = provider.complete(_simple_request())
+    assert response.stop_reason == "tool_use"
+    assert len(response.tool_calls) == 2
+    names = {tc.name for tc in response.tool_calls}
+    assert names == {"tool_a", "tool_b"}
+
+
+def test_provider_incomplete_content_filter_raises(monkeypatch):
+    """Content filtering produces an incomplete response — must raise, not succeed."""
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(
+        output=[_make_output_text_item("partial")],
+        status="incomplete",
+        incomplete_reason="content_filter",
+    )
+    with pytest.raises(AIProviderResponseError):
+        provider.complete(_simple_request())
+
+
+def test_provider_incomplete_missing_reason_raises(monkeypatch):
+    """Incomplete with no reason is not a successful response."""
+    provider, mock_client = _make_provider(monkeypatch)
+    resp = _make_response(
+        output=[_make_output_text_item("partial")],
+        status="incomplete",
+        incomplete_reason=None,
+    )
+    # Remove incomplete_details entirely so reason is missing
+    resp.incomplete_details = None
+    mock_client.responses.create.return_value = resp
+    with pytest.raises(AIProviderResponseError):
+        provider.complete(_simple_request())
+
+
+def test_provider_failed_status_raises(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(status="failed")
+    with pytest.raises(AIProviderResponseError, match="failed"):
+        provider.complete(_simple_request())
+
+
+def test_provider_cancelled_status_raises(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(status="cancelled")
+    with pytest.raises(AIProviderResponseError, match="cancelled"):
+        provider.complete(_simple_request())
+
+
+def test_provider_queued_status_raises(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(status="queued")
+    with pytest.raises(AIProviderResponseError):
+        provider.complete(_simple_request())
+
+
+def test_provider_in_progress_status_raises(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(status="in_progress")
+    with pytest.raises(AIProviderResponseError):
+        provider.complete(_simple_request())
+
+
+def test_provider_missing_status_raises(monkeypatch):
+    """A response with no status attribute at all must raise."""
+    provider, mock_client = _make_provider(monkeypatch)
+    resp = _make_response()
+    del resp.status
+    mock_client.responses.create.return_value = resp
+    with pytest.raises(AIProviderResponseError):
+        provider.complete(_simple_request())
+
+
+def test_provider_unknown_status_raises(monkeypatch):
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(status="superseded")
+    with pytest.raises(AIProviderResponseError):
+        provider.complete(_simple_request())
+
+
+def test_provider_partial_text_on_incomplete_is_rejected(monkeypatch):
+    """Partial text from a non-max_tokens incomplete must not be returned."""
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(
+        output=[_make_output_text_item("this text is partial")],
+        status="incomplete",
+        incomplete_reason="content_filter",
+    )
+    with pytest.raises(AIProviderResponseError):
+        provider.complete(_simple_request())
+
+
+def test_provider_failed_status_does_not_expose_vendor_details(monkeypatch):
+    """Error messages for failed/cancelled responses must be credential-safe."""
+    provider, mock_client = _make_provider(monkeypatch)
+    # Include a fake secret in the response to confirm it is never echoed.
+    resp = _make_response(status="failed")
+    resp.error = "Internal error: sk-supersecret exposed"
+    mock_client.responses.create.return_value = resp
+    with pytest.raises(AIProviderResponseError) as exc_info:
+        provider.complete(_simple_request())
+    assert "sk-supersecret" not in str(exc_info.value)
+
+
+def test_provider_incomplete_other_reason_does_not_expose_reason(monkeypatch):
+    """The raw incomplete reason string must not appear in the exception."""
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(
+        status="incomplete",
+        incomplete_reason="some_internal_filter_reason_with_secret",
+    )
+    with pytest.raises(AIProviderResponseError) as exc_info:
+        provider.complete(_simple_request())
+    assert "some_internal_filter_reason_with_secret" not in str(exc_info.value)

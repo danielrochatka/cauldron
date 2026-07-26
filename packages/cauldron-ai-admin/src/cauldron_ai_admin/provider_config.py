@@ -285,6 +285,17 @@ def _normalise_document(data: dict[str, Any]) -> dict[str, Any]:
                 slot["secrets"] = (
                     dict(secrets) if isinstance(secrets, dict) else {}
                 )
+        # Legacy OpenAI: the old spec stored the model under "model_name";
+        # the current spec uses "model".  Migrate on first read so the
+        # factory does not need to handle both spellings at runtime.
+        openai_slot = migrated["providers"].get("openai")
+        if isinstance(openai_slot, dict):
+            openai_cfg = openai_slot.get("config") or {}
+            if "model_name" in openai_cfg:
+                if "model" not in openai_cfg:
+                    openai_cfg["model"] = openai_cfg["model_name"]
+                del openai_cfg["model_name"]
+                openai_slot["config"] = openai_cfg
         return migrated
 
     # Version validation.

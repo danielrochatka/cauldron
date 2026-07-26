@@ -596,3 +596,139 @@ def test_resolve_provider_config_modules_used_when_no_file(tmp_path, settings):
     store = AIProviderSettingsStore(tmp_path / "ai.json")
     cfg = resolve_provider_config("openai", store)
     assert cfg["model"] == "gpt-3.5"
+
+
+# ---------------------------------------------------------------------------
+# Legacy OpenAI model_name → model migration
+# ---------------------------------------------------------------------------
+
+def _write_legacy(path, *, provider="openai", config=None, secrets=None):
+    """Write a pre-Phase-2 (un-versioned) document to *path*."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"provider": provider}
+    if config is not None:
+        payload["config"] = config
+    if secrets is not None:
+        payload["secrets"] = secrets
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    os.chmod(str(path), 0o600)
+
+
+def test_legacy_model_name_migrates_to_model(tmp_path):
+    """model_name in a legacy OpenAI config must be renamed to model."""
+    from cauldron_ai_admin.provider_config import AIProviderSettingsStore
+    p = tmp_path / "cfg.json"
+    _write_legacy(p, config={"openai": {"model_name": "gpt-4o"}})
+
+    store = AIProviderSettingsStore(p)
+    cfg = store.get_config("openai")
+    assert cfg.get("model") == "gpt-4o"
+    assert "model_name" not in cfg
+
+
+def test_legacy_existing_model_wins_over_model_name(tmp_path):
+    """When both model and model_name are present, model is never overwritten."""
+    from cauldron_ai_admin.provider_config import AIProviderSettingsStore
+    p = tmp_path / "cfg.json"
+    _write_legacy(
+        p,
+        config={"openai": {"model": "gpt-4o", "model_name": "old-model"}},
+    )
+
+    store = AIProviderSettingsStore(p)
+    cfg = store.get_config("openai")
+    assert cfg.get("model") == "gpt-4o"
+    assert "model_name" not in cfg
+
+
+def test_legacy_api_key_remains_unchanged(tmp_path):
+    """Migration must not discard or modify secrets."""
+    from cauldron_ai_admin.provider_config import AIProviderSettingsStore
+    p = tmp_path / "cfg.json"
+    _write_legacy(
+        p,
+        config={"openai": {"model_name": "gpt-4o"}},
+        secrets={"openai": {"api_key": "sk-important"}},
+    )
+
+    store = AIProviderSettingsStore(p)
+    assert store.get_secret("openai", "api_key") == "sk-important"
+
+
+def test_legacy_unrelated_provider_unchanged(tmp_path):
+    """Migration must not alter configuration belonging to other providers."""
+    from cauldron_ai_admin.provider_config import AIProviderSettingsStore
+    p = tmp_path / "cfg.json"
+    _write_legacy(
+        p,
+        config={
+            "openai": {"model_name": "gpt-4o"},
+            "anthropic": {"model": "claude-3", "custom_key": "keep"},
+        },
+    )
+
+    store = AIProviderSettingsStore(p)
+    # OpenAI: migrated
+    assert store.get_config("openai").get("model") == "gpt-4o"
+    # Anthropic: untouched
+    anthropic_cfg = store.get_config("anthropic")
+    assert anthropic_cfg.get("model") == "claude-3"
+    assert anthropic_cfg.get("custom_key") == "keep"
+
+
+def test_already_versioned_document_model_unchanged(tmp_path):
+    """A v1 document that already uses model must pass through unmodified."""
+    from cauldron_ai_admin.provider_config import AIProviderSettingsStore
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({
+        "version": 1,
+        "selected_provider": "openai",
+        "runtime": {},
+        "providers": {
+            "openai": {
+                "config": {"model": "gpt-4o"},
+                "secrets": {"api_key": "sk-abc"},
+            },
+        },
+    }), encoding="utf-8")
+    os.chmod(str(p), 0o600)
+
+    store = AIProviderSettingsStore(p)
+    cfg = store.get_config("openai")
+    assert cfg.get("model") == "gpt-4o"
+    assert "model_name" not in cfg
+
+
+def test_migration_is_idempotent(tmp_path):
+    """Reading a legacy document twice must produce the same result."""
+    from cauldron_ai_admin.provider_config import AIProviderSettingsStore
+    p = tmp_path / "cfg.json"
+    _write_legacy(
+        p,
+        config={"openai": {"model_name": "gpt-4o"}},
+        secrets={"openai": {"api_key": "sk-abc"}},
+    )
+
+    s1 = AIProviderSettingsStore(p)
+    cfg_first = s1.get_config("openai")
+    # Trigger a write that canonicalises the document.
+    s1.set_selected_provider("openai")
+
+    s2 = AIProviderSettingsStore(p)
+    cfg_second = s2.get_config("openai")
+    assert cfg_first == cfg_second
+    assert cfg_second.get("model") == "gpt-4o"
+    assert "model_name" not in cfg_second
+
+
+def test_new_saves_contain_model_not_model_name(tmp_path):
+    """Saves via set_config must write model, not model_name."""
+    from cauldron_ai_admin.provider_config import AIProviderSettingsStore
+    p = tmp_path / "cfg.json"
+    store = AIProviderSettingsStore(p)
+    store.set_config("openai", {"model": "gpt-4o"})
+
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    openai_cfg = raw["providers"]["openai"]["config"]
+    assert openai_cfg.get("model") == "gpt-4o"
+    assert "model_name" not in openai_cfg

@@ -293,13 +293,20 @@ class OpenAIProvider:
                 "OpenAI returned an unexpected response."
             )
 
+        # Validate terminal status before touching output; raises for
+        # failed, cancelled, queued, in-progress, or unknown responses so
+        # partial content can never be surfaced as a successful run.
+        status_tag = _validate_response_status(response)
         content, tool_calls = _extract_output(response)
 
         usage = getattr(response, "usage", None)
         input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
         output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
 
-        stop_reason = _map_stop_reason(response, tool_calls)
+        if status_tag == "max_tokens":
+            stop_reason = "max_tokens"
+        else:  # "completed"
+            stop_reason = "tool_use" if tool_calls else "end_turn"
 
         return AIModelResponse(
             provider_request_id=str(getattr(response, "id", "") or ""),
@@ -345,23 +352,54 @@ def _extract_output(response: Any) -> tuple[str, list[AIModelToolCall]]:
     return "".join(text_parts), tool_calls
 
 
-def _map_stop_reason(response: Any, tool_calls: list[AIModelToolCall]) -> str:
-    """Map OpenAI response status → AIModelResponse.stop_reason."""
+def _validate_response_status(response: Any) -> str:
+    """Validate the OpenAI response status and return a terminal tag.
+
+    Returns ``"completed"`` or ``"max_tokens"`` for responses that can be
+    safely surfaced to the caller.  Raises ``AIProviderResponseError`` for
+    every other status so that failed, cancelled, filtered, or incomplete
+    responses never appear as successful Admin AI runs.
+
+    No vendor error details are embedded in the raised message.
+    """
     status = str(getattr(response, "status", "") or "").lower()
+
     if status == "completed":
-        return "tool_use" if tool_calls else "end_turn"
+        return "completed"
+
     if status == "incomplete":
         details = getattr(response, "incomplete_details", None)
         reason = str(getattr(details, "reason", "") or "").lower()
         if reason == "max_output_tokens":
             return "max_tokens"
-        # Any other incomplete reason surfaces as end_turn without content,
-        # letting the service enforce its own invalid-response policy.
-        return "end_turn"
-    # Unknown status → be conservative and let the service treat this as
-    # a normal (possibly empty) end_turn; the size / stop-reason validators
-    # will reject anything problematic.
-    return "end_turn" if not tool_calls else "tool_use"
+        # Content filtering, safety blocking, truncation, or any other
+        # non-token-limit reason means the response is partial.
+        raise AIProviderResponseError(
+            "OpenAI returned an incomplete response."
+        )
+
+    if status == "failed":
+        raise AIProviderResponseError(
+            "OpenAI returned a failed response."
+        )
+
+    if status == "cancelled":
+        raise AIProviderResponseError(
+            "OpenAI response was cancelled."
+        )
+
+    if status in ("queued", "in_progress"):
+        # A synchronous responses.create call should never return these;
+        # receiving one means something unexpected happened server-side.
+        raise AIProviderResponseError(
+            "OpenAI returned an unexpected non-terminal response "
+            "from a synchronous call."
+        )
+
+    # Empty string (no status attribute) or any unrecognised value.
+    raise AIProviderResponseError(
+        "OpenAI returned a response with an unrecognised status."
+    )
 
 
 class OpenAIProviderFactory:
@@ -392,6 +430,7 @@ class OpenAIProviderFactory:
             )
         model = (
             str(config.get("model", "") or "")
+            or str(config.get("model_name", "") or "")  # legacy compat
             or os.environ.get("OPENAI_MODEL", "")
         ).strip()
         if not model:

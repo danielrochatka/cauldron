@@ -22,9 +22,10 @@ _GLOBAL_PROMPT = AIGlobalOperatingPrompt(
         "Content model: Cauldron stores content as flat files and state in SQL. "
         "Never write files directly. All content changes must go through the "
         "create_change_request pipeline, which creates a non-canonical proposal. "
-        "Proposals always require validation. Whether approval by a separate user "
+        "Proposals always require validation. Whether a separate approval step "
         "is required depends on the installation's configuration — do not assume "
-        "a fixed approval requirement. Applying content is always a deliberate "
+        "a fixed approval requirement. Who may approve is determined by Django "
+        "permissions and group membership. Applying content is always a deliberate "
         "action by an authorized user; the AI never writes canonical content "
         "directly.\n\n"
         "Permission model: Django enforces permissions server-side on every tool "
@@ -188,6 +189,7 @@ _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
         approval_requirements=(
             "Proposals always require validation. Whether a separate approval step "
             "is required depends on the installation's require_approval setting. "
+            "Who may approve is determined by Django permissions and group membership. "
             "Applying content is always a deliberate action by an authorized user. "
             "Inform the user that their proposal is pending review."
         ),
@@ -431,6 +433,7 @@ _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
         approval_requirements=(
             "Proposals always require validation. Whether a separate approval step "
             "is required depends on the installation's require_approval setting. "
+            "Who may approve is determined by Django permissions and group membership. "
             "Applying style changes is always a deliberate action by an authorized "
             "user. Inform the user that the proposal is pending review."
         ),

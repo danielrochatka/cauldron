@@ -610,7 +610,7 @@ _SUCCESS_LABELS = {
 
 def _valid_actions_for_state(state: str, require_approval: bool) -> tuple[str, ...]:
     if state == "validated":
-        return ("approve", "reject") if require_approval else ("approve", "apply", "reject")
+        return ("approve", "reject") if require_approval else ("apply", "reject")
     return _VALID_ACTIONS_BY_STATE.get(state, ())
 
 

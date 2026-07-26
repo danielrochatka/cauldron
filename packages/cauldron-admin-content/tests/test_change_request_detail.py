@@ -326,7 +326,8 @@ def test_get_shows_approve_button_in_validated_state(client):
     url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
     mock_svc = _make_service()
 
-    with override_settings(ROOT_URLCONF="tests.urls"):
+    approval_on = {"cauldron.content.operations": {"require_approval": True, "max_operations_per_change_set": 100}}
+    with override_settings(ROOT_URLCONF="tests.urls", CAULDRON_MODULES=approval_on):
         with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
             resp = client.get(url)
     assert 'value="approve"' in resp.content.decode()
@@ -382,11 +383,26 @@ def test_get_shows_apply_button_in_validated_state_when_approval_not_required(cl
     url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
     mock_svc = _make_service()
 
-    no_approval = {"cauldron.content.operations": {"require_approval": False, "allow_self_approval": False}}
+    no_approval = {"cauldron.content.operations": {"require_approval": False, "max_operations_per_change_set": 100}}
     with override_settings(ROOT_URLCONF="tests.urls", CAULDRON_MODULES=no_approval):
         with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
             resp = client.get(url)
     assert 'value="apply"' in resp.content.decode()
+
+
+def test_get_hides_approve_button_when_approval_disabled(client):
+    from django.test import override_settings
+    user = _make_user("viewer_no_approve_btn", ["view_content_change_requests", "approve_content_changes"])
+    client.force_login(user)
+    cr = _make_cr(lifecycle_state="validated")
+    url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
+    mock_svc = _make_service()
+
+    no_approval = {"cauldron.content.operations": {"require_approval": False, "max_operations_per_change_set": 100}}
+    with override_settings(ROOT_URLCONF="tests.urls", CAULDRON_MODULES=no_approval):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+            resp = client.get(url)
+    assert 'value="approve"' not in resp.content.decode()
 
 
 def test_get_hides_apply_button_in_validated_state_when_approval_required(client):
@@ -637,7 +653,8 @@ def test_post_approve_calls_service(client):
     url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
     mock_svc = _make_service()
 
-    with override_settings(ROOT_URLCONF="tests.urls"):
+    approval_on = {"cauldron.content.operations": {"require_approval": True, "max_operations_per_change_set": 100}}
+    with override_settings(ROOT_URLCONF="tests.urls", CAULDRON_MODULES=approval_on):
         with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
             resp = client.post(url, {"action": "approve", "expected_version": "2"})
 
@@ -784,7 +801,7 @@ def test_post_apply_from_validated_calls_service_when_approval_not_required(clie
     url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
     mock_svc = _make_service()
 
-    no_approval = {"cauldron.content.operations": {"require_approval": False, "allow_self_approval": False}}
+    no_approval = {"cauldron.content.operations": {"require_approval": False, "max_operations_per_change_set": 100}}
     with override_settings(ROOT_URLCONF="tests.urls", CAULDRON_MODULES=no_approval):
         with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
             resp = client.post(url, {"action": "apply", "expected_version": "2"})
@@ -793,6 +810,23 @@ def test_post_apply_from_validated_calls_service_when_approval_not_required(clie
     mock_svc.apply_change_request.assert_called_once_with(
         cr.request_id, user=user, expected_version=2
     )
+
+
+def test_post_approve_rejected_when_approval_disabled(client):
+    from django.test import override_settings
+    user = _make_user("poster_approve_disabled", ["view_content_change_requests", "approve_content_changes"])
+    client.force_login(user)
+    cr = _make_cr(lifecycle_state="validated", request_version=2)
+    url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
+    mock_svc = _make_service()
+
+    no_approval = {"cauldron.content.operations": {"require_approval": False, "max_operations_per_change_set": 100}}
+    with override_settings(ROOT_URLCONF="tests.urls", CAULDRON_MODULES=no_approval):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+            resp = client.post(url, {"action": "approve", "expected_version": "2"})
+
+    assert resp.status_code == 302
+    mock_svc.approve_change_request.assert_not_called()
 
 
 def test_post_apply_from_validated_blocked_when_approval_required(client):

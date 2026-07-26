@@ -7,16 +7,13 @@ from typing import Any
 
 @dataclass(frozen=True)
 class ContentOperationsConfig:
-    require_approval: bool = True
-    allow_self_approval: bool = False
+    require_approval: bool = False
     max_operations_per_change_set: int = 100
     lock_timeout: int = 30
 
     def __post_init__(self) -> None:
         if not isinstance(self.require_approval, bool):
             raise TypeError("require_approval must be a bool")
-        if not isinstance(self.allow_self_approval, bool):
-            raise TypeError("allow_self_approval must be a bool")
         if isinstance(self.max_operations_per_change_set, bool) or not isinstance(
             self.max_operations_per_change_set, int
         ) or self.max_operations_per_change_set < 1:
@@ -61,10 +58,7 @@ def get_operations_config() -> ContentOperationsConfig:
         cfg = {}
     return ContentOperationsConfig(
         require_approval=_strict_bool(
-            cfg.get("require_approval"), "require_approval", True
-        ),
-        allow_self_approval=_strict_bool(
-            cfg.get("allow_self_approval"), "allow_self_approval", False
+            cfg.get("require_approval"), "require_approval", False
         ),
         max_operations_per_change_set=_strict_positive_int(
             cfg.get("max_operations_per_change_set"),

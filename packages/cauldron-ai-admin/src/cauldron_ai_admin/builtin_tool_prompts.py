@@ -15,23 +15,26 @@ from cauldron_ai.prompt_templates import (
 # ---------------------------------------------------------------------------
 
 _GLOBAL_PROMPT = AIGlobalOperatingPrompt(
-    version="v1",
+    version="v2",
     owning_module="cauldron.ai.admin",
     body=(
         "You are a cautious Cauldron admin assistant with a restricted tool set.\n\n"
         "Content model: Cauldron stores content as flat files and state in SQL. "
         "Never write files directly. All content changes must go through the "
-        "create_change_request pipeline, which creates a non-canonical proposal "
-        "that a human must approve before it is published.\n\n"
+        "create_change_request pipeline, which creates a non-canonical proposal. "
+        "Proposals always require validation. Whether approval by a separate user "
+        "is required depends on the installation's configuration — do not assume "
+        "a fixed approval requirement. Applying content is always a deliberate "
+        "action by an authorized user; the AI never writes canonical content "
+        "directly.\n\n"
         "Permission model: Django enforces permissions server-side on every tool "
         "call. Do not assume you have broader access than what is listed in your "
         "available tools. If a tool returns a permission-denied error, report it "
         "clearly rather than attempting workarounds.\n\n"
         "Tool discipline: Use read-only tools first to understand the current "
         "state. Use PROPOSE-level tools only when the user explicitly asks you to "
-        "make a change. Every proposal must be reviewed and approved by a human "
-        "before it is applied — never claim a change has been made until approval "
-        "is confirmed.\n\n"
+        "make a change. Never claim a change has been applied until the apply "
+        "step is confirmed complete.\n\n"
         "Capabilities and limits: If you are asked about a tool or capability not "
         "in your available set, clarify the limitation rather than guessing. "
         "Schema validation is enforced server-side; respect required fields and "
@@ -164,8 +167,8 @@ _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
         read_scope="None.",
         write_scope=(
             "Creates a non-canonical change-request proposal. The proposal is "
-            "staged only; it has no effect on live content until a human approves "
-            "and publishes it. Never writes files directly."
+            "staged only; it has no effect on live content until validated and "
+            "applied by an authorized user. Never writes files directly."
         ),
         preconditions=(
             "Actor has propose_content_changes permission.",
@@ -178,12 +181,15 @@ _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
             "'description', 'provider_name'."
         ),
         result_behavior=(
-            "Returns a proposal ID and status='proposed'. The proposal awaits "
-            "human review; no content is changed until approved."
+            "Returns a proposal ID and status='proposed'. The proposal always "
+            "requires validation before it can be applied. Whether a separate "
+            "approval step is required depends on the installation configuration."
         ),
         approval_requirements=(
-            "Human approval is mandatory before the proposal has any effect. "
-            "Always inform the user that their change is pending review."
+            "Proposals always require validation. Whether a separate approval step "
+            "is required depends on the installation's require_approval setting. "
+            "Applying content is always a deliberate action by an authorized user. "
+            "Inform the user that their proposal is pending review."
         ),
         clarification_behavior=(
             "Before creating a proposal, confirm the intended operations with the "
@@ -203,7 +209,7 @@ _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
         ),
         boundary_examples=(
             "Do not propose changes the user has not explicitly requested.",
-            "Do not claim changes are live — they require human approval first.",
+            "Do not claim changes are live until the apply step is confirmed.",
             "Never write files directly; always use this proposal pipeline.",
         ),
     ),
@@ -405,8 +411,8 @@ _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
         read_scope="None.",
         write_scope=(
             "Creates a non-canonical UIStyleChangeRequest proposal. The proposal "
-            "is staged only and has no effect on live styles until a human "
-            "approves and applies it. Never writes CSS files directly."
+            "is staged only and has no effect on live styles until validated and "
+            "applied by an authorized user. Never writes CSS files directly."
         ),
         preconditions=(
             "Actor has propose_ui_style_changes permission.",
@@ -419,12 +425,14 @@ _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
             "Optional: 'base_hash' (SHA-256 of the current file for optimistic lock)."
         ),
         result_behavior=(
-            "Returns a request_id and status='proposed'. The proposal awaits "
-            "human review and approval before any file is written."
+            "Returns a request_id and status='proposed'. The proposal requires "
+            "validation before it can be applied by an authorized user."
         ),
         approval_requirements=(
-            "Human approval is mandatory before any style change is applied. "
-            "Always inform the user that the proposal is pending review."
+            "Proposals always require validation. Whether a separate approval step "
+            "is required depends on the installation's require_approval setting. "
+            "Applying style changes is always a deliberate action by an authorized "
+            "user. Inform the user that the proposal is pending review."
         ),
         clarification_behavior=(
             "Confirm the proposed changes with the user before submitting. "
@@ -441,7 +449,7 @@ _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
             "Propose changing the primary button colour in 'admin/custom.css'.",
         ),
         boundary_examples=(
-            "Do not claim the style is live — it requires human approval first.",
+            "Do not claim the style is live until the apply step is confirmed.",
             "Never write files directly; always use this proposal pipeline.",
             "Do not include secrets or credentials in the proposed CSS content.",
         ),

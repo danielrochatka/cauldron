@@ -397,7 +397,8 @@ def test_get_hides_apply_button_in_validated_state_when_approval_required(client
     url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
     mock_svc = _make_service()
 
-    with override_settings(ROOT_URLCONF="tests.urls"):
+    approval_on = {"cauldron.content.operations": {"require_approval": True, "max_operations_per_change_set": 100}}
+    with override_settings(ROOT_URLCONF="tests.urls", CAULDRON_MODULES=approval_on):
         with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
             resp = client.get(url)
     assert 'value="apply"' not in resp.content.decode()
@@ -433,7 +434,8 @@ def test_get_hides_action_buttons_when_lacking_permission(client):
     assert 'value="reject"' not in content
 
 
-def test_get_shows_self_approval_notice(client):
+def test_get_no_self_approval_notice_for_creator(client):
+    """Creator who has approve_content_changes sees the Approve button with no warning."""
     from django.test import override_settings
     user = _make_user("proposer_self", ["view_content_change_requests", "approve_content_changes"])
     client.force_login(user)
@@ -441,29 +443,29 @@ def test_get_shows_self_approval_notice(client):
     url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
     mock_svc = _make_service()
 
-    with override_settings(ROOT_URLCONF="tests.urls"):
-        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
-            resp = client.get(url)
-    content = resp.content.decode()
-    assert "Self-approval is not permitted" in content
-    assert 'value="approve"' not in content
-
-
-def test_get_hides_self_approval_notice_for_other_user(client):
-    from django.test import override_settings
-    proposer = _make_user("proposer_other", [])
-    approver = _make_user("approver_other", ["view_content_change_requests", "approve_content_changes"])
-    client.force_login(approver)
-    cr = _make_cr(lifecycle_state="validated", created_by=proposer)
-    url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
-    mock_svc = _make_service()
-
-    with override_settings(ROOT_URLCONF="tests.urls"):
+    approval_on = {"cauldron.content.operations": {"require_approval": True, "max_operations_per_change_set": 100}}
+    with override_settings(ROOT_URLCONF="tests.urls", CAULDRON_MODULES=approval_on):
         with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
             resp = client.get(url)
     content = resp.content.decode()
     assert "Self-approval is not permitted" not in content
     assert 'value="approve"' in content
+
+
+def test_get_approve_button_shown_to_any_user_with_permission(client):
+    from django.test import override_settings
+    proposer = _make_user("proposer_other2", [])
+    approver = _make_user("approver_other2", ["view_content_change_requests", "approve_content_changes"])
+    client.force_login(approver)
+    cr = _make_cr(lifecycle_state="validated", created_by=proposer)
+    url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
+    mock_svc = _make_service()
+
+    approval_on = {"cauldron.content.operations": {"require_approval": True, "max_operations_per_change_set": 100}}
+    with override_settings(ROOT_URLCONF="tests.urls", CAULDRON_MODULES=approval_on):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+            resp = client.get(url)
+    assert 'value="approve"' in resp.content.decode()
 
 
 def test_get_expected_version_in_form(client):
@@ -645,20 +647,22 @@ def test_post_approve_calls_service(client):
     )
 
 
-def test_post_approve_blocked_by_self_approval_policy(client):
+def test_post_creator_with_approve_permission_can_approve(client):
+    """Creator who has approve_content_changes is not blocked from approving."""
     from django.test import override_settings
-    user = _make_user("self_approver", ["view_content_change_requests", "approve_content_changes"])
+    user = _make_user("self_approver2", ["view_content_change_requests", "approve_content_changes"])
     client.force_login(user)
     cr = _make_cr(lifecycle_state="validated", request_version=2, created_by=user)
     url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
     mock_svc = _make_service()
 
-    with override_settings(ROOT_URLCONF="tests.urls"):
+    approval_on = {"cauldron.content.operations": {"require_approval": True, "max_operations_per_change_set": 100}}
+    with override_settings(ROOT_URLCONF="tests.urls", CAULDRON_MODULES=approval_on):
         with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
             resp = client.post(url, {"action": "approve", "expected_version": "2"})
 
     assert resp.status_code == 302
-    mock_svc.approve_change_request.assert_not_called()
+    mock_svc.approve_change_request.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -799,7 +803,8 @@ def test_post_apply_from_validated_blocked_when_approval_required(client):
     url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
     mock_svc = _make_service()
 
-    with override_settings(ROOT_URLCONF="tests.urls"):
+    approval_on = {"cauldron.content.operations": {"require_approval": True, "max_operations_per_change_set": 100}}
+    with override_settings(ROOT_URLCONF="tests.urls", CAULDRON_MODULES=approval_on):
         with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
             resp = client.post(url, {"action": "apply", "expected_version": "2"})
 

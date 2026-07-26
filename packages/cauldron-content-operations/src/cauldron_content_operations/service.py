@@ -2497,6 +2497,9 @@ class ContentOperationService:
                 validation_result=None,
                 has_conflict=has_conflict,
                 diff_summary=diff_summary,
+                proposed_slug=proposed_slug,
+                proposed_status=status_str,
+                proposed_schema=op.schema or "",
             ))
 
         return ChangeSetPreview(request_id=request_id, operations=tuple(previews))

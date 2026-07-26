@@ -206,6 +206,9 @@ class OperationPreview:
     validation_result: Optional[dict[str, Any]]
     has_conflict: bool
     diff_summary: str = ""
+    proposed_slug: str = ""
+    proposed_status: str = ""
+    proposed_schema: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "current_data", dict(self.current_data))
@@ -226,4 +229,7 @@ class OperationPreview:
             "validation_result": self.validation_result,
             "has_conflict": self.has_conflict,
             "diff_summary": self.diff_summary,
+            "proposed_slug": self.proposed_slug,
+            "proposed_status": self.proposed_status,
+            "proposed_schema": self.proposed_schema,
         }

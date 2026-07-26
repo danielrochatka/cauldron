@@ -163,7 +163,7 @@ def _messages_to_input_items(
                     items.append({
                         "type": "function_call",
                         "call_id": tc.id,
-                        "name": tc.name,
+                        "name": _encode_tool_name(tc.name),
                         "arguments": json.dumps(
                             _plain(tc.arguments),
                             ensure_ascii=False,
@@ -186,13 +186,34 @@ def _messages_to_input_items(
     return items
 
 
+_DOT_ESCAPE = "__DOT__"
+
+
+def _encode_tool_name(name: str) -> str:
+    """Encode a dotted Cauldron tool name for the OpenAI Responses API.
+
+    OpenAI function names must match ``^[a-zA-Z0-9_-]+$`` — dots are
+    forbidden.  Cauldron tool names use dotted segments
+    (``content.list_collections``).  We replace each ``.`` with the
+    fixed sentinel ``__DOT__``, which cannot appear in a valid Cauldron
+    name (segments are lowercase ``[a-z][a-z0-9_]*`` and the sentinel
+    is uppercase).
+    """
+    return name.replace(".", _DOT_ESCAPE)
+
+
+def _decode_tool_name(wire_name: str) -> str:
+    """Reverse ``_encode_tool_name``: restore dots from the wire sentinel."""
+    return wire_name.replace(_DOT_ESCAPE, ".")
+
+
 def _tools_to_response_tools(tools: tuple) -> list[dict[str, Any]]:
     """Translate AIModelToolDefinition tuples into Responses API tool defs."""
     result: list[dict[str, Any]] = []
     for t in tools:
         result.append({
             "type": "function",
-            "name": t.name,
+            "name": _encode_tool_name(t.name),
             "description": t.description,
             "parameters": _plain(t.parameters),
             "strict": False,
@@ -334,7 +355,7 @@ def _extract_output(response: Any) -> tuple[str, list[AIModelToolCall]]:
                     text_parts.append(str(getattr(chunk, "text", "") or ""))
         elif item_type == "function_call":
             call_id = str(getattr(item, "call_id", "") or "")
-            name = str(getattr(item, "name", "") or "")
+            name = _decode_tool_name(str(getattr(item, "name", "") or ""))
             raw_args = getattr(item, "arguments", "") or ""
             try:
                 args = json.loads(raw_args)

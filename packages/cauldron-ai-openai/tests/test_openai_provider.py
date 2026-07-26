@@ -30,7 +30,10 @@ from cauldron_ai_openai.provider import (
     OpenAIProvider,
     OpenAIProviderFactory,
     _CONFIGURATION_SPEC,
+    _DOT_ESCAPE,
     _PROVIDER_NAME,
+    _decode_tool_name,
+    _encode_tool_name,
 )
 
 
@@ -753,3 +756,284 @@ def test_provider_incomplete_other_reason_does_not_expose_reason(monkeypatch):
     with pytest.raises(AIProviderResponseError) as exc_info:
         provider.complete(_simple_request())
     assert "some_internal_filter_reason_with_secret" not in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Tool name dot-encoding (OpenAI forbids dots in function names)
+# ---------------------------------------------------------------------------
+
+
+def test_encode_tool_name_replaces_dots():
+    assert _encode_tool_name("content.list_collections") == f"content{_DOT_ESCAPE}list_collections"
+
+
+def test_encode_tool_name_multiple_segments():
+    assert _encode_tool_name("a.b.c") == f"a{_DOT_ESCAPE}b{_DOT_ESCAPE}c"
+
+
+def test_encode_tool_name_no_dots_unchanged():
+    assert _encode_tool_name("nodots") == "nodots"
+
+
+def test_decode_tool_name_restores_dots():
+    assert _decode_tool_name(f"content{_DOT_ESCAPE}list_collections") == "content.list_collections"
+
+
+def test_decode_tool_name_roundtrip():
+    original = "content.list_collections"
+    assert _decode_tool_name(_encode_tool_name(original)) == original
+
+
+def test_provider_dotted_tool_name_encoded_on_wire(monkeypatch):
+    """Dotted tool names are encoded to the OpenAI-safe wire format."""
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response()
+    tool = AIModelToolDefinition(
+        name="content.list_collections",
+        description="List content collections.",
+        parameters={"type": "object", "properties": {}},
+    )
+    provider.complete(AIModelRequest(
+        messages=(AIModelMessage(role="user", content="Q"),),
+        tools=(tool,),
+    ))
+    tools_arg = mock_client.responses.create.call_args[1]["tools"]
+    assert len(tools_arg) == 1
+    assert tools_arg[0]["name"] == f"content{_DOT_ESCAPE}list_collections"
+    assert "." not in tools_arg[0]["name"]
+
+
+def test_provider_dotted_tool_name_decoded_from_response(monkeypatch):
+    """Encoded tool names in function_call responses are decoded back to dotted form."""
+    provider, mock_client = _make_provider(monkeypatch)
+    encoded_name = f"content{_DOT_ESCAPE}list_collections"
+    mock_client.responses.create.return_value = _make_response(
+        output=[_make_function_call_item(
+            call_id="c1", name=encoded_name, arguments="{}",
+        )],
+    )
+    response = provider.complete(_simple_request())
+    assert response.tool_calls[0].name == "content.list_collections"
+
+
+def test_provider_undotted_name_survives_roundtrip(monkeypatch):
+    """A tool name without dots is unchanged across encode/decode."""
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response(
+        output=[_make_function_call_item(
+            call_id="c1", name="nodots", arguments="{}",
+        )],
+    )
+    response = provider.complete(_simple_request())
+    assert response.tool_calls[0].name == "nodots"
+
+
+def test_historical_assistant_function_call_name_encoded(monkeypatch):
+    """Historical function_call items (from assistant turns) are re-encoded on follow-up requests."""
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.return_value = _make_response()
+    # Simulate a follow-up request that includes a previous assistant tool call
+    # stored with the canonical (dotted) name.
+    provider.complete(AIModelRequest(messages=(
+        AIModelMessage(role="user", content="List content."),
+        AIModelMessage(
+            role="assistant", content="",
+            tool_calls=(AIModelToolCall(
+                id="call-1", name="content.list_collections", arguments={},
+            ),),
+        ),
+        AIModelMessage(
+            role="tool", tool_call_id="call-1", content='{"items": []}',
+        ),
+    )))
+    input_items = mock_client.responses.create.call_args[1]["input"]
+    # The function_call item must carry the wire-safe encoded name.
+    fc_item = next(i for i in input_items if i.get("type") == "function_call")
+    assert fc_item["name"] == f"content{_DOT_ESCAPE}list_collections"
+    assert "." not in fc_item["name"]
+    # The function_call_output must use the same unmodified call_id.
+    fco_item = next(i for i in input_items if i.get("type") == "function_call_output")
+    assert fco_item["call_id"] == "call-1"
+
+
+# ---------------------------------------------------------------------------
+# Full provider loop: encode → execute → re-encode → final response
+# ---------------------------------------------------------------------------
+
+
+def test_full_single_tool_loop(monkeypatch):
+    """Integration: full single-tool request/response cycle through the provider.
+
+    Turn 1: Cauldron sends encoded tool definition.
+            OpenAI returns an encoded function_call.
+            Provider decodes → AIModelToolCall with canonical dotted name.
+
+    Turn 2: Cauldron re-encodes the historical function_call name.
+            Tool output uses the same call_id.
+            OpenAI returns final text.
+    """
+    provider, mock_client = _make_provider(monkeypatch)
+
+    tool = AIModelToolDefinition(
+        name="content.list_collections",
+        description="List content collections.",
+        parameters={"type": "object", "properties": {}},
+    )
+    encoded_name = f"content{_DOT_ESCAPE}list_collections"
+
+    # --- Turn 1 setup --------------------------------------------------------
+    mock_client.responses.create.return_value = _make_response(
+        request_id="resp-1",
+        output=[_make_function_call_item(
+            call_id="call-abc", name=encoded_name, arguments="{}",
+        )],
+    )
+    turn1_req = AIModelRequest(
+        messages=(AIModelMessage(role="user", content="List my collections."),),
+        tools=(tool,),
+    )
+    resp1 = provider.complete(turn1_req)
+
+    # Provider decoded the encoded name back to the canonical dotted form.
+    assert len(resp1.tool_calls) == 1
+    assert resp1.tool_calls[0].name == "content.list_collections"
+    assert resp1.tool_calls[0].id == "call-abc"
+
+    # OpenAI received the encoded (dot-free) tool definition.
+    tools_sent = mock_client.responses.create.call_args[1]["tools"]
+    assert tools_sent[0]["name"] == encoded_name
+
+    # --- Turn 2 setup --------------------------------------------------------
+    mock_client.responses.create.return_value = _make_response(
+        request_id="resp-2",
+        output=[_make_output_text_item("Found 3 collections.")],
+    )
+    turn2_req = AIModelRequest(
+        messages=(
+            AIModelMessage(role="user", content="List my collections."),
+            AIModelMessage(
+                role="assistant", content="",
+                tool_calls=(AIModelToolCall(
+                    id="call-abc",
+                    name="content.list_collections",  # canonical
+                    arguments={},
+                ),),
+            ),
+            AIModelMessage(
+                role="tool",
+                tool_call_id="call-abc",
+                content='{"collections": ["pages", "posts", "products"]}',
+            ),
+        ),
+        tools=(tool,),
+    )
+    resp2 = provider.complete(turn2_req)
+
+    assert resp2.content == "Found 3 collections."
+    assert resp2.stop_reason == "end_turn"
+
+    # The historical function_call item must be re-encoded for the follow-up.
+    input2 = mock_client.responses.create.call_args[1]["input"]
+    fc_items = [i for i in input2 if i.get("type") == "function_call"]
+    assert len(fc_items) == 1
+    assert fc_items[0]["name"] == encoded_name
+    assert fc_items[0]["call_id"] == "call-abc"
+
+    # The tool output item uses the same call_id, unchanged.
+    fco_items = [i for i in input2 if i.get("type") == "function_call_output"]
+    assert len(fco_items) == 1
+    assert fco_items[0]["call_id"] == "call-abc"
+
+
+def test_full_multiple_tool_turns(monkeypatch):
+    """Integration: two sequential tool calls before the final response.
+
+    Turn 1: OpenAI calls content.list_collections.
+    Turn 2: OpenAI calls content.list_items.
+    Turn 3: OpenAI returns final text.
+
+    All historical function_call names must be re-encoded on each follow-up.
+    """
+    provider, mock_client = _make_provider(monkeypatch)
+
+    tools = (
+        AIModelToolDefinition(
+            name="content.list_collections",
+            description="List collections.",
+            parameters={"type": "object", "properties": {}},
+        ),
+        AIModelToolDefinition(
+            name="content.list_items",
+            description="List items in a collection.",
+            parameters={"type": "object", "properties": {}},
+        ),
+    )
+    enc_list = f"content{_DOT_ESCAPE}list_collections"
+    enc_items = f"content{_DOT_ESCAPE}list_items"
+
+    # Turn 1: model calls list_collections.
+    mock_client.responses.create.return_value = _make_response(
+        request_id="r1",
+        output=[_make_function_call_item(call_id="c1", name=enc_list, arguments="{}")]
+    )
+    resp1 = provider.complete(AIModelRequest(
+        messages=(AIModelMessage(role="user", content="What items are in pages?"),),
+        tools=tools,
+    ))
+    assert resp1.tool_calls[0].name == "content.list_collections"
+
+    # Turn 2: model calls list_items, history includes turn-1 function_call.
+    mock_client.responses.create.return_value = _make_response(
+        request_id="r2",
+        output=[_make_function_call_item(call_id="c2", name=enc_items, arguments='{"collection":"pages"}')]
+    )
+    resp2 = provider.complete(AIModelRequest(
+        messages=(
+            AIModelMessage(role="user", content="What items are in pages?"),
+            AIModelMessage(
+                role="assistant", content="",
+                tool_calls=(AIModelToolCall(id="c1", name="content.list_collections", arguments={}),),
+            ),
+            AIModelMessage(role="tool", tool_call_id="c1", content='["pages","posts"]'),
+        ),
+        tools=tools,
+    ))
+    assert resp2.tool_calls[0].name == "content.list_items"
+
+    # Turn-1 historical function_call re-encoded in the follow-up.
+    input2 = mock_client.responses.create.call_args[1]["input"]
+    fc2 = [i for i in input2 if i.get("type") == "function_call"]
+    assert len(fc2) == 1
+    assert fc2[0]["name"] == enc_list
+
+    # Turn 3: final text, history includes both tool turns.
+    mock_client.responses.create.return_value = _make_response(
+        request_id="r3",
+        output=[_make_output_text_item("The pages collection has 12 items.")],
+    )
+    resp3 = provider.complete(AIModelRequest(
+        messages=(
+            AIModelMessage(role="user", content="What items are in pages?"),
+            AIModelMessage(
+                role="assistant", content="",
+                tool_calls=(AIModelToolCall(id="c1", name="content.list_collections", arguments={}),),
+            ),
+            AIModelMessage(role="tool", tool_call_id="c1", content='["pages","posts"]'),
+            AIModelMessage(
+                role="assistant", content="",
+                tool_calls=(AIModelToolCall(id="c2", name="content.list_items", arguments={"collection": "pages"}),),
+            ),
+            AIModelMessage(role="tool", tool_call_id="c2", content='{"items":["home","about"]}'),
+        ),
+        tools=tools,
+    ))
+    assert resp3.content == "The pages collection has 12 items."
+    assert resp3.stop_reason == "end_turn"
+
+    # Both historical function_call items must be encoded in the final request.
+    input3 = mock_client.responses.create.call_args[1]["input"]
+    fc3 = [i for i in input3 if i.get("type") == "function_call"]
+    assert len(fc3) == 2
+    names3 = {i["name"] for i in fc3}
+    assert names3 == {enc_list, enc_items}
+    assert all("." not in n for n in names3)

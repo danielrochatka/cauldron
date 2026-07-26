@@ -596,10 +596,22 @@ _ACTION_PERMISSIONS = {
 
 _VALID_ACTIONS_BY_STATE = {
     "proposed": ("validate", "reject"),
-    "validated": ("approve", "apply", "reject"),
     "approved": ("apply",),
     "apply_failed": ("apply",),
 }
+
+_SUCCESS_LABELS = {
+    "validate": "validated",
+    "approve": "approved",
+    "reject": "rejected",
+    "apply": "applied",
+}
+
+
+def _valid_actions_for_state(state: str, require_approval: bool) -> tuple[str, ...]:
+    if state == "validated":
+        return ("approve", "reject") if require_approval else ("approve", "apply", "reject")
+    return _VALID_ACTIONS_BY_STATE.get(state, ())
 
 
 @method_decorator([
@@ -627,9 +639,9 @@ class ChangeRequestDetailView(View):
                 previews = None
 
         state = cr.lifecycle_state
-        valid_actions = _VALID_ACTIONS_BY_STATE.get(state, ())
-
         cfg = get_operations_config()
+        valid_actions = _valid_actions_for_state(state, cfg.require_approval)
+
         is_self_approval = (
             not cfg.allow_self_approval
             and cr.created_by_id is not None
@@ -678,14 +690,15 @@ class ChangeRequestDetailView(View):
             messages.error(request, "You do not have permission to perform this action.")
             return HttpResponseRedirect(detail_url)
 
-        valid_actions = _VALID_ACTIONS_BY_STATE.get(cr.lifecycle_state, ())
+        from cauldron_content_operations.config import get_operations_config
+        cfg = get_operations_config()
+
+        valid_actions = _valid_actions_for_state(cr.lifecycle_state, cfg.require_approval)
         if action not in valid_actions:
             messages.error(request, f"Action '{action}' is not allowed in state '{cr.lifecycle_state}'.")
             return HttpResponseRedirect(detail_url)
 
         if action == "approve":
-            from cauldron_content_operations.config import get_operations_config
-            cfg = get_operations_config()
             if not cfg.allow_self_approval and cr.created_by_id is not None and cr.created_by_id == request.user.pk:
                 messages.error(request, "Self-approval is not permitted.")
                 return HttpResponseRedirect(detail_url)
@@ -695,7 +708,11 @@ class ChangeRequestDetailView(View):
         except (ValueError, TypeError):
             expected_version = 0
 
-        service = _get_service()
+        try:
+            service = _get_service()
+        except Exception:
+            service = None
+
         if service is None:
             _handle_config_error(request)
             return HttpResponseRedirect(detail_url)
@@ -711,7 +728,7 @@ class ChangeRequestDetailView(View):
             result = service.apply_change_request(request_id, user=request.user, expected_version=expected_version)
 
         if result.ok:
-            messages.success(request, f"Change request {action}d successfully.")
+            messages.success(request, f"Change request {_SUCCESS_LABELS[action]} successfully.")
         else:
             error_msg = result.error.message if result.error else "An unknown error occurred."
             messages.error(request, html.escape(error_msg[:400]))

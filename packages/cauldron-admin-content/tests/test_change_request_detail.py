@@ -374,9 +374,24 @@ def test_get_shows_apply_button_in_apply_failed_state(client):
     assert 'value="apply"' in resp.content.decode()
 
 
-def test_get_shows_apply_button_in_validated_state(client):
+def test_get_shows_apply_button_in_validated_state_when_approval_not_required(client):
     from django.test import override_settings
     user = _make_user("viewer_validated_apply", ["view_content_change_requests", "apply_content_changes"])
+    client.force_login(user)
+    cr = _make_cr(lifecycle_state="validated")
+    url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
+    mock_svc = _make_service()
+
+    no_approval = {"cauldron.content.operations": {"require_approval": False, "allow_self_approval": False}}
+    with override_settings(ROOT_URLCONF="tests.urls", CAULDRON_MODULES=no_approval):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+            resp = client.get(url)
+    assert 'value="apply"' in resp.content.decode()
+
+
+def test_get_hides_apply_button_in_validated_state_when_approval_required(client):
+    from django.test import override_settings
+    user = _make_user("viewer_validated_noapply", ["view_content_change_requests", "apply_content_changes"])
     client.force_login(user)
     cr = _make_cr(lifecycle_state="validated")
     url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
@@ -385,7 +400,7 @@ def test_get_shows_apply_button_in_validated_state(client):
     with override_settings(ROOT_URLCONF="tests.urls"):
         with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
             resp = client.get(url)
-    assert 'value="apply"' in resp.content.decode()
+    assert 'value="apply"' not in resp.content.decode()
 
 
 def test_get_shows_reject_button_when_permitted(client):
@@ -589,8 +604,7 @@ def test_post_validate_shows_success_message(client):
         with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
             resp = client.post(url, {"action": "validate", "expected_version": "1"}, follow=True)
 
-    content = resp.content.decode()
-    assert "validate" in content.lower() or "success" in content.lower() or "validated" in content.lower()
+    assert "validated successfully" in resp.content.decode()
 
 
 def test_post_validate_failure_shows_error_message(client):
@@ -758,9 +772,28 @@ def test_post_apply_from_apply_failed_calls_service(client):
     )
 
 
-def test_post_apply_from_validated_calls_service(client):
+def test_post_apply_from_validated_calls_service_when_approval_not_required(client):
     from django.test import override_settings
     user = _make_user("poster_apply_validated", ["view_content_change_requests", "apply_content_changes"])
+    client.force_login(user)
+    cr = _make_cr(lifecycle_state="validated", request_version=2)
+    url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
+    mock_svc = _make_service()
+
+    no_approval = {"cauldron.content.operations": {"require_approval": False, "allow_self_approval": False}}
+    with override_settings(ROOT_URLCONF="tests.urls", CAULDRON_MODULES=no_approval):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+            resp = client.post(url, {"action": "apply", "expected_version": "2"})
+
+    assert resp.status_code == 302
+    mock_svc.apply_change_request.assert_called_once_with(
+        cr.request_id, user=user, expected_version=2
+    )
+
+
+def test_post_apply_from_validated_blocked_when_approval_required(client):
+    from django.test import override_settings
+    user = _make_user("poster_apply_validated_blocked", ["view_content_change_requests", "apply_content_changes"])
     client.force_login(user)
     cr = _make_cr(lifecycle_state="validated", request_version=2)
     url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
@@ -771,9 +804,7 @@ def test_post_apply_from_validated_calls_service(client):
             resp = client.post(url, {"action": "apply", "expected_version": "2"})
 
     assert resp.status_code == 302
-    mock_svc.apply_change_request.assert_called_once_with(
-        cr.request_id, user=user, expected_version=2
-    )
+    mock_svc.apply_change_request.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -797,10 +828,29 @@ def test_post_version_conflict_shows_error(client):
 
 
 # ---------------------------------------------------------------------------
+# POST — success label
+# ---------------------------------------------------------------------------
+
+def test_post_apply_success_message_says_applied(client):
+    from django.test import override_settings
+    user = _make_user("poster_apply_label", ["view_content_change_requests", "apply_content_changes"])
+    client.force_login(user)
+    cr = _make_cr(lifecycle_state="approved", request_version=3)
+    url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
+    mock_svc = _make_service()
+
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+            resp = client.post(url, {"action": "apply", "expected_version": "3"}, follow=True)
+
+    assert "applied successfully" in resp.content.decode()
+
+
+# ---------------------------------------------------------------------------
 # POST — service unavailable
 # ---------------------------------------------------------------------------
 
-def test_post_service_unavailable_shows_error(client):
+def test_post_service_returns_none_shows_error(client):
     from django.test import override_settings
     user = _make_user("poster_nosvc", ["view_content_change_requests", "validate_content_changes"])
     client.force_login(user)
@@ -809,6 +859,21 @@ def test_post_service_unavailable_shows_error(client):
 
     with override_settings(ROOT_URLCONF="tests.urls"):
         with patch("cauldron_admin_content.views._get_service", return_value=None):
+            resp = client.post(url, {"action": "validate", "expected_version": "1"}, follow=True)
+
+    assert resp.status_code == 200
+
+
+def test_post_service_factory_raises_shows_error(client):
+    from django.test import override_settings
+    from django.core.exceptions import ImproperlyConfigured
+    user = _make_user("poster_factoryraise", ["view_content_change_requests", "validate_content_changes"])
+    client.force_login(user)
+    cr = _make_cr(lifecycle_state="proposed", request_version=1)
+    url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
+
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        with patch("cauldron_admin_content.views._get_service", side_effect=ImproperlyConfigured("no workspace")):
             resp = client.post(url, {"action": "validate", "expected_version": "1"}, follow=True)
 
     assert resp.status_code == 200

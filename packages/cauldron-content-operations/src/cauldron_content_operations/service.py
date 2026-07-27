@@ -418,12 +418,12 @@ class ContentOperationService:
     # Read operations
     # -------------------------------------------------------------------------
 
-    def list_collections(self, *, user: Any) -> list[str]:
+    def list_collections(self, *, user: Any):
+        from cauldron_content.router import CollectionInfo, RouterError  # noqa: F401
         _check_permission(user, "view_published_content")
         try:
             return self._router.list_collections()
         except Exception as exc:
-            from cauldron_content.router import RouterError
             if isinstance(exc, RouterError):
                 raise
             return []

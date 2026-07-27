@@ -51,21 +51,31 @@ _GLOBAL_PROMPT = AIGlobalOperatingPrompt(
 _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
     AIToolPromptTemplate(
         tool_name="content.list_collections",
-        template_version="v1",
+        template_version="v2",
         owning_module="cauldron.ai.admin",
         purpose="Discover available content collections.",
         supported_tasks=("content discovery", "initial exploration"),
         required_permission="cauldron_content_operations.view_published_content",
         risk_level="READ_ONLY",
-        read_scope="Collection names only; no item data.",
+        read_scope="Collection names, schemas, providers, and item counts only; no item data.",
         write_scope="None.",
         preconditions=("Actor has view_published_content permission.",),
         input_expectations="No arguments required.",
-        result_behavior="Returns a list of collection name strings.",
+        result_behavior=(
+            "Returns a list of collection objects, each with: name (string), "
+            "schema (string or null), provider (string or null), item_count "
+            "(integer or null). Registered collections always appear even when "
+            "their backing directory is empty or has not yet been created — "
+            "item_count is null in that case. The 'pages' collection is always "
+            "registered and is valid for creating the first page."
+        ),
         approval_requirements="None; read-only.",
         clarification_behavior=(
             "If the actor asks about a collection that does not appear in the "
-            "list, state that it is not accessible with their current permissions."
+            "list, state that it is not accessible with their current permissions. "
+            "A registered collection with item_count null or 0 is empty but "
+            "valid — direct the actor to use content.create_proposal to add "
+            "the first item rather than assuming the collection is unavailable."
         ),
         refusal_behavior="Refuse if no content service is available.",
         error_guidance=(
@@ -73,7 +83,11 @@ _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
             "retrying or checking permissions."
         ),
         positive_examples=("List all content collections.",),
-        boundary_examples=("Do not infer collection contents from the names alone.",),
+        boundary_examples=(
+            "Do not infer collection contents from the names alone.",
+            "An empty 'pages' collection is expected on a fresh installation "
+            "— treat it as ready for first-content creation.",
+        ),
     ),
     AIToolPromptTemplate(
         tool_name="content.list_items",

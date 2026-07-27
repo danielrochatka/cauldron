@@ -10,7 +10,13 @@ from cauldron_content.contracts import (
     ContentStatus,
 )
 from cauldron_content.registry import RepositoryRegistry
-from cauldron_content.router import ContentRouter, RouterConfig, RouterError
+from cauldron_content.router import (
+    CollectionInfo,
+    ContentRouter,
+    RegisteredCollection,
+    RouterConfig,
+    RouterError,
+)
 
 
 class _RecordingRepo:
@@ -341,3 +347,126 @@ def test_item11_protocol_type_check():
     # method's presence, so this is a structural fit — the router uses signature
     # inspection to distinguish them.
     assert callable(getattr(kwargs_only, "get_by_id", None))
+
+
+# ---------------------------------------------------------------------------
+# list_collections — registered collections
+# ---------------------------------------------------------------------------
+
+def test_registered_collection_appears_with_no_provider_registered():
+    """A registered collection must appear even when no provider is in the registry."""
+    reg = RepositoryRegistry()
+    router = ContentRouter(
+        reg,
+        RouterConfig(
+            registered_collections={"pages": RegisteredCollection(schema="page", provider="flatfile")},
+        ),
+    )
+    result = router.list_collections()
+    assert len(result) == 1
+    info = result[0]
+    assert info.name == "pages"
+    assert info.schema == "page"
+    assert info.provider == "flatfile"
+    assert info.item_count is None
+
+
+def test_registered_collection_schema_and_provider_preserved():
+    reg = RepositoryRegistry()
+    router = ContentRouter(
+        reg,
+        RouterConfig(
+            registered_collections={
+                "articles": RegisteredCollection(schema="article", provider="sql"),
+            },
+        ),
+    )
+    result = router.list_collections()
+    assert result == [CollectionInfo(name="articles", schema="article", provider="sql", item_count=None)]
+
+
+def test_provider_discovered_collections_still_returned():
+    """Provider-discovered collections that are not registered also appear."""
+    class _DiscoveryRepo:
+        def describe(self): ...
+        def list_collections(self): return ["posts", "drafts"]
+        def list_items(self, c, *, include_drafts=False): return []
+        def get_by_id(self, i, *, include_drafts=False): return None
+        def get_by_slug(self, c, s, *, include_drafts=False): return None
+        def validate(self, item): ...
+        def apply(self, cs): ...
+        def health(self): ...
+
+    reg = RepositoryRegistry()
+    reg.register("flatfile", _DiscoveryRepo())
+    router = ContentRouter(reg, RouterConfig(default_provider="flatfile"))
+    names = [c.name for c in router.list_collections()]
+    assert "posts" in names
+    assert "drafts" in names
+
+
+def test_registered_collection_deduplicates_with_provider_discovery():
+    """A collection in both registered config and provider discovery must appear once."""
+    class _PagesRepo:
+        def describe(self): ...
+        def list_collections(self): return ["pages", "posts"]
+        def list_items(self, c, *, include_drafts=False): return []
+        def get_by_id(self, i, *, include_drafts=False): return None
+        def get_by_slug(self, c, s, *, include_drafts=False): return None
+        def validate(self, item): ...
+        def apply(self, cs): ...
+        def health(self): ...
+
+    reg = RepositoryRegistry()
+    reg.register("flatfile", _PagesRepo())
+    router = ContentRouter(
+        reg,
+        RouterConfig(
+            default_provider="flatfile",
+            registered_collections={"pages": RegisteredCollection(schema="page", provider="flatfile")},
+        ),
+    )
+    result = router.list_collections()
+    names = [c.name for c in result]
+    assert names.count("pages") == 1
+    assert "posts" in names
+    # Registered metadata wins for pages (schema is known).
+    pages_info = next(c for c in result if c.name == "pages")
+    assert pages_info.schema == "page"
+
+
+def test_list_collections_returns_sorted_by_name():
+    reg = RepositoryRegistry()
+    router = ContentRouter(
+        reg,
+        RouterConfig(
+            registered_collections={
+                "zebra": RegisteredCollection(schema="z", provider="p"),
+                "apple": RegisteredCollection(schema="a", provider="p"),
+                "mango": RegisteredCollection(schema="m", provider="p"),
+            },
+        ),
+    )
+    result = router.list_collections()
+    assert [c.name for c in result] == ["apple", "mango", "zebra"]
+
+
+def test_empty_registry_and_no_registered_returns_empty():
+    reg = RepositoryRegistry()
+    router = ContentRouter(reg, RouterConfig())
+    assert router.list_collections() == []
+
+
+def test_registered_collection_missing_directory_still_listed():
+    """Registered collection appears even when no provider is installed (missing dir scenario)."""
+    reg = RepositoryRegistry()
+    router = ContentRouter(
+        reg,
+        RouterConfig(
+            registered_collections={
+                "pages": RegisteredCollection(schema="page", provider="flatfile"),
+            },
+        ),
+    )
+    result = router.list_collections()
+    assert any(c.name == "pages" for c in result)

@@ -50,6 +50,47 @@ def test_list_collections_returns_service_unavailable_when_content_service_none(
     assert result.error_code == "tool.service_unavailable"
 
 
+def test_list_collections_returns_rich_metadata():
+    from cauldron_content.router import CollectionInfo
+    fake_service = MagicMock(spec=["list_collections"])
+    fake_service.list_collections.return_value = [
+        CollectionInfo(name="pages", schema="page", provider="flatfile", item_count=None),
+        CollectionInfo(name="posts", schema="", provider="flatfile", item_count=None),
+    ]
+    ctx = _ctx(
+        content_service=fake_service,
+        with_perms=("cauldron_content_operations.view_published_content",),
+    )
+    result = _handle_list_collections(ctx)
+    assert isinstance(result, AdminAIToolResult)
+    collections = result.data["collections"]
+    assert len(collections) == 2
+    pages = next(c for c in collections if c["name"] == "pages")
+    assert pages["schema"] == "page"
+    assert pages["provider"] == "flatfile"
+    assert pages["item_count"] is None
+    # Unknown schema becomes None in output.
+    posts = next(c for c in collections if c["name"] == "posts")
+    assert posts["schema"] is None
+
+
+def test_list_collections_includes_pages_on_fresh_install():
+    """AI tool must expose pages even when the collection has no items."""
+    from cauldron_content.router import CollectionInfo
+    fake_service = MagicMock(spec=["list_collections"])
+    fake_service.list_collections.return_value = [
+        CollectionInfo(name="pages", schema="page", provider="flatfile", item_count=None),
+    ]
+    ctx = _ctx(
+        content_service=fake_service,
+        with_perms=("cauldron_content_operations.view_published_content",),
+    )
+    result = _handle_list_collections(ctx)
+    assert isinstance(result, AdminAIToolResult)
+    names = [c["name"] for c in result.data["collections"]]
+    assert "pages" in names
+
+
 def test_list_items_returns_service_unavailable_when_content_service_none():
     ctx = _ctx(content_service=None)
     result = _handle_list_items(ctx, collection="pages")

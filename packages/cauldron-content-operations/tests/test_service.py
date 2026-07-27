@@ -1709,3 +1709,113 @@ def test_item13_absolute_slug_rejected_at_proposal():
     )
     assert not r.ok
     assert r.error.code == "operations.invalid_slug"
+
+
+# ---------------------------------------------------------------------------
+# list_collections
+# ---------------------------------------------------------------------------
+
+def test_list_collections_requires_view_permission():
+    from cauldron_content_operations.service import PermissionDenied
+    service = _make_service()
+    user = _make_user(username="lc_no_perm")
+    with pytest.raises(PermissionDenied):
+        service.list_collections(user=user)
+
+
+def test_list_collections_returns_registered_pages_on_fresh_install():
+    """A fresh installation with no content files must still return pages."""
+    from cauldron_content.registry import RepositoryRegistry
+    from cauldron_content.router import ContentRouter, RouterConfig, RegisteredCollection, CollectionInfo
+    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.config import ContentOperationsConfig
+
+    reg = RepositoryRegistry()  # no providers registered
+    router = ContentRouter(
+        reg,
+        RouterConfig(
+            registered_collections={"pages": RegisteredCollection(schema="page", provider="flatfile")},
+        ),
+    )
+    cfg = ContentOperationsConfig()
+    service = ContentOperationService(router=router, workspace=MagicMock(), config=cfg)
+    user = _make_user(is_superuser=True, username="lc_fresh")
+
+    result = service.list_collections(user=user)
+    assert any(c.name == "pages" for c in result), "pages must appear on a fresh install"
+    pages = next(c for c in result if c.name == "pages")
+    assert pages.schema == "page"
+    assert pages.provider == "flatfile"
+
+
+def test_list_collections_includes_provider_discovered_collections():
+    """Provider-discovered collections supplement registered ones."""
+    from cauldron_content.registry import RepositoryRegistry
+    from cauldron_content.router import ContentRouter, RouterConfig, RegisteredCollection
+
+    class _FakeRepo:
+        def describe(self): ...
+        def list_collections(self): return ["posts"]
+        def list_items(self, c, *, include_drafts=False): return []
+        def get_by_id(self, i, *, include_drafts=False): return None
+        def get_by_slug(self, c, s, *, include_drafts=False): return None
+        def validate(self, item): ...
+        def apply(self, cs): ...
+        def health(self): ...
+
+    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.config import ContentOperationsConfig
+
+    reg = RepositoryRegistry()
+    reg.register("flatfile", _FakeRepo())
+    router = ContentRouter(
+        reg,
+        RouterConfig(
+            default_provider="flatfile",
+            registered_collections={"pages": RegisteredCollection(schema="page", provider="flatfile")},
+        ),
+    )
+    cfg = ContentOperationsConfig()
+    service = ContentOperationService(router=router, workspace=MagicMock(), config=cfg)
+    user = _make_user(is_superuser=True, username="lc_combined")
+
+    result = service.list_collections(user=user)
+    names = [c.name for c in result]
+    assert "pages" in names
+    assert "posts" in names
+
+
+def test_list_collections_deduplicates():
+    """A collection in both config and provider discovery appears exactly once."""
+    from cauldron_content.registry import RepositoryRegistry
+    from cauldron_content.router import ContentRouter, RouterConfig, RegisteredCollection
+
+    class _DiscoverPagesRepo:
+        def describe(self): ...
+        def list_collections(self): return ["pages"]
+        def list_items(self, c, *, include_drafts=False): return []
+        def get_by_id(self, i, *, include_drafts=False): return None
+        def get_by_slug(self, c, s, *, include_drafts=False): return None
+        def validate(self, item): ...
+        def apply(self, cs): ...
+        def health(self): ...
+
+    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.config import ContentOperationsConfig
+
+    reg = RepositoryRegistry()
+    reg.register("flatfile", _DiscoverPagesRepo())
+    router = ContentRouter(
+        reg,
+        RouterConfig(
+            default_provider="flatfile",
+            registered_collections={"pages": RegisteredCollection(schema="page", provider="flatfile")},
+        ),
+    )
+    cfg = ContentOperationsConfig()
+    service = ContentOperationService(router=router, workspace=MagicMock(), config=cfg)
+    user = _make_user(is_superuser=True, username="lc_dedup")
+
+    result = service.list_collections(user=user)
+    names = [c.name for c in result]
+    assert names.count("pages") == 1

@@ -52,12 +52,23 @@ def test_register_builtin_tools_is_idempotent():
 
 
 def test_list_collections_success():
+    from cauldron_content.router import CollectionInfo
     fake_service = MagicMock()
-    fake_service.list_collections.return_value = ["pages", "posts"]
+    fake_service.list_collections.return_value = [
+        CollectionInfo(name="pages", schema="page", provider="flatfile", item_count=None),
+        CollectionInfo(name="posts", schema="", provider="flatfile", item_count=None),
+    ]
     ctx, _ = _ctx(content_service=fake_service)
     result = _handle_list_collections(ctx)
     assert isinstance(result, AdminAIToolResult)
-    assert result.data == {"collections": [{"name": "pages"}, {"name": "posts"}]}
+    collections = result.data["collections"]
+    assert len(collections) == 2
+    pages = next(c for c in collections if c["name"] == "pages")
+    assert pages["schema"] == "page"
+    assert pages["provider"] == "flatfile"
+    assert pages["item_count"] is None
+    posts = next(c for c in collections if c["name"] == "posts")
+    assert posts["schema"] is None  # empty string becomes None
     fake_service.list_collections.assert_called_once()
 
 

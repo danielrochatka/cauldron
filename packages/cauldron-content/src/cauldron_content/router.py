@@ -9,10 +9,69 @@ from .contracts import ApplyResult, ContentChangeSet, ContentItem, ContentReposi
 from .registry import RepositoryRegistry
 
 
+@dataclass(frozen=True)
+class RegisteredCollection:
+    """A collection declared in routing configuration with a known schema and provider."""
+    schema: str
+    provider: str
+
+
+@dataclass(frozen=True)
+class CollectionInfo:
+    """Rich collection descriptor returned by :meth:`ContentRouter.list_collections`."""
+    name: str
+    schema: str
+    provider: str
+    item_count: Optional[int]
+
+
+def build_registered_collections(
+    routing_cfg: dict,
+    default_provider: str,
+) -> "dict[str, RegisteredCollection]":
+    """Build the registered_collections dict from a routing configuration block.
+
+    Always seeds the standard ``pages`` collection unless the operator has
+    already declared it.  When seeding pages, the per-collection routing map
+    is consulted first so the descriptor matches what ``_resolve_provider``
+    would return.
+    """
+    from .pages import PAGE_COLLECTION, PAGE_SCHEMA
+
+    registered: dict[str, RegisteredCollection] = {}
+    registered_raw = routing_cfg.get("registered_collections") or {}
+    per_collection: dict = routing_cfg.get("collections") or {}
+
+    if isinstance(registered_raw, dict):
+        for coll_name, coll_cfg in registered_raw.items():
+            if not isinstance(coll_cfg, dict):
+                continue
+            registered[coll_name] = RegisteredCollection(
+                schema=coll_cfg.get("schema", "") or "",
+                provider=coll_cfg.get("provider", "")
+                    or per_collection.get(coll_name, "")
+                    or default_provider,
+            )
+
+    if PAGE_COLLECTION not in registered:
+        pages_provider = (
+            per_collection.get(PAGE_COLLECTION, "")
+            or default_provider
+            or "flatfile"
+        )
+        registered[PAGE_COLLECTION] = RegisteredCollection(
+            schema=PAGE_SCHEMA,
+            provider=pages_provider,
+        )
+
+    return registered
+
+
 @dataclass
 class RouterConfig:
     default_provider: str = ""
     collections: dict[str, str] = field(default_factory=dict)
+    registered_collections: dict[str, RegisteredCollection] = field(default_factory=dict)
 
 
 class RouterError(Exception):
@@ -25,6 +84,7 @@ class ContentRouter:
         self._config = RouterConfig(
             default_provider=config.default_provider,
             collections=dict(config.collections),
+            registered_collections=dict(config.registered_collections),
         )
 
     def _resolve_provider(self, collection: str) -> str:
@@ -43,19 +103,44 @@ class ContentRouter:
         """
         return self._resolve_provider(collection)
 
-    def list_collections(self) -> list[str]:
-        """Return all collections visible across all registered providers."""
-        collections: set[str] = set()
-        for name in self._registry.names():
-            repo = self._registry.get(name)
+    def list_collections(self) -> list[CollectionInfo]:
+        """Return all collections visible across registered configuration and providers.
+
+        Registered collections always appear even when their backing store is empty
+        or has not yet been created. Provider-discovered collections that are not
+        already registered appear with empty schema and the provider name.
+        """
+        result: dict[str, CollectionInfo] = {}
+
+        # Registered collections always appear regardless of backing-store state.
+        for coll_name, reg in self._config.registered_collections.items():
+            result[coll_name] = CollectionInfo(
+                name=coll_name,
+                schema=reg.schema,
+                provider=reg.provider,
+                item_count=None,
+            )
+
+        # Union with provider-discovered collections.
+        for prov_name in self._registry.names():
+            repo = self._registry.get(prov_name)
             if repo is None:
                 continue
             try:
-                collections.update(repo.list_collections())
+                discovered = repo.list_collections()
             except Exception:
                 # A single misbehaving provider must not break enumeration.
                 continue
-        return sorted(collections)
+            for coll_name in discovered:
+                if coll_name not in result:
+                    result[coll_name] = CollectionInfo(
+                        name=coll_name,
+                        schema="",
+                        provider=prov_name,
+                        item_count=None,
+                    )
+
+        return sorted(result.values(), key=lambda c: c.name)
 
     def _get_repo(self, provider_name: str) -> ContentRepository:
         repo = self._registry.get(provider_name)

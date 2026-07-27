@@ -46,8 +46,12 @@ class TestCollectionsView:
         user = _make_user(is_superuser=True, username="coluser")
         req = _make_request("get", "/collections/", user=user)
         with patch("cauldron_content_api.views.get_service") as mock_svc_fn:
+            from cauldron_content.router import CollectionInfo
             mock_svc = MagicMock()
-            mock_svc.list_collections.return_value = ["pages", "posts"]
+            mock_svc.list_collections.return_value = [
+                CollectionInfo(name="pages", schema="page", provider="flatfile", item_count=None),
+                CollectionInfo(name="posts", schema="", provider="flatfile", item_count=None),
+            ]
             mock_svc_fn.return_value = mock_svc
             view = CollectionsView.as_view()
             response = view(req)
@@ -55,6 +59,11 @@ class TestCollectionsView:
         body = json.loads(response.content)
         assert "data" in body
         assert "collections" in body["data"]
+        names = [c["name"] for c in body["data"]["collections"]]
+        assert "pages" in names
+        assert "posts" in names
+        pages = next(c for c in body["data"]["collections"] if c["name"] == "pages")
+        assert pages["schema"] == "page"
 
 
 class TestChangeRequestListView:

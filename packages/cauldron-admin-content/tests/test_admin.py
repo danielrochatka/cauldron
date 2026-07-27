@@ -522,3 +522,81 @@ def _perms(user):
     """Return a dict-like object matching Django admin ``perms`` template var."""
     from django.contrib.auth.context_processors import PermWrapper
     return PermWrapper(user)
+
+
+# ---------------------------------------------------------------------------
+# Registered collections — _build_registered_collections helper
+# ---------------------------------------------------------------------------
+
+
+def test_build_registered_collections_seeds_pages_by_default():
+    """pages is seeded automatically when not in operator routing config."""
+    from cauldron_admin_content.service_factory import _build_registered_collections
+    result = _build_registered_collections(
+        {"default_provider": "flatfile", "collections": {}},
+        default_provider="flatfile",
+    )
+    assert "pages" in result
+    assert result["pages"].schema == "page"
+    assert result["pages"].provider == "flatfile"
+
+
+def test_build_registered_collections_includes_custom_collections():
+    """Operator-declared registered_collections are present alongside pages."""
+    from cauldron_admin_content.service_factory import _build_registered_collections
+    routing_cfg = {
+        "default_provider": "flatfile",
+        "registered_collections": {
+            "guides": {"schema": "guide", "provider": "flatfile"},
+        },
+    }
+    result = _build_registered_collections(routing_cfg, default_provider="flatfile")
+    assert "pages" in result, "pages default must always be present"
+    assert "guides" in result
+    assert result["guides"].schema == "guide"
+    assert result["guides"].provider == "flatfile"
+
+
+def test_build_registered_collections_operator_pages_config_wins():
+    """If the operator explicitly declares pages, their config takes precedence."""
+    from cauldron_admin_content.service_factory import _build_registered_collections
+    routing_cfg = {
+        "registered_collections": {
+            "pages": {"schema": "custom-page", "provider": "sql"},
+        },
+    }
+    result = _build_registered_collections(routing_cfg, default_provider="sql")
+    assert result["pages"].schema == "custom-page"
+    assert result["pages"].provider == "sql"
+
+
+def test_build_registered_collections_provider_defaults_to_default_provider():
+    """A registered collection without an explicit provider inherits default_provider."""
+    from cauldron_admin_content.service_factory import _build_registered_collections
+    routing_cfg = {
+        "registered_collections": {
+            "articles": {"schema": "article"},
+        },
+    }
+    result = _build_registered_collections(routing_cfg, default_provider="flatfile")
+    assert result["articles"].provider == "flatfile"
+
+
+def test_build_registered_collections_empty_routing_still_seeds_pages():
+    """No routing config at all must still produce pages."""
+    from cauldron_admin_content.service_factory import _build_registered_collections
+    result = _build_registered_collections({}, default_provider="")
+    assert "pages" in result
+    assert result["pages"].provider == "flatfile"  # falls back to "flatfile"
+
+
+def test_build_registered_collections_pages_uses_per_collection_route():
+    """When collections map routes pages to a specific provider, the seeded
+    descriptor must reflect that provider, not the default."""
+    from cauldron_admin_content.service_factory import _build_registered_collections
+    routing_cfg = {
+        "default_provider": "flatfile",
+        "collections": {"pages": "sql"},
+    }
+    result = _build_registered_collections(routing_cfg, default_provider="flatfile")
+    assert result["pages"].provider == "sql"

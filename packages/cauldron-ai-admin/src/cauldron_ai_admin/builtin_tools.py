@@ -134,14 +134,22 @@ def _handle_list_collections(context: AdminAIToolContext, **kwargs) -> Any:
     if deadline_err is not None:
         return deadline_err
     try:
-        names = svc.list_collections(user=context.actor)
+        infos = svc.list_collections(user=context.actor)
     except Exception as exc:
         return AdminAIToolError(
             tool_name="content.list_collections",
             error_code="content.list_collections_failed",
             message=redact_exception(exc, max_bytes=200),
         )
-    collections = [{"name": n} for n in (names or [])]
+    collections = [
+        {
+            "name": info.name,
+            "schema": info.schema or None,
+            "provider": info.provider or None,
+            "item_count": info.item_count,
+        }
+        for info in (infos or [])
+    ]
     return AdminAIToolResult(
         tool_name="content.list_collections",
         success=True,

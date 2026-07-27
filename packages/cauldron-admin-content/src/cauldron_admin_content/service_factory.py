@@ -36,6 +36,11 @@ def _flatfile_is_routed(settings) -> bool:
     return "flatfile" in providers
 
 
+def _build_registered_collections(routing_cfg: dict, default_provider: str) -> dict:
+    from cauldron_content.router import build_registered_collections
+    return build_registered_collections(routing_cfg, default_provider)
+
+
 def get_service():
     """Return a configured ContentOperationService from current Django settings.
 
@@ -52,9 +57,13 @@ def get_service():
     modules = getattr(settings, "CAULDRON_MODULES", {}) or {}
     routing_cfg = _routing_config(settings)
 
+    default_provider = routing_cfg.get("default_provider", "") or ""
+    registered = _build_registered_collections(routing_cfg, default_provider)
+
     router_config = RouterConfig(
-        default_provider=routing_cfg.get("default_provider", ""),
+        default_provider=default_provider,
         collections=routing_cfg.get("collections", {}),
+        registered_collections=registered,
     )
     router = ContentRouter(registry, router_config)
 

@@ -1,0 +1,140 @@
+{% extends "cauldron_admin/base.html" %}
+{% block page_title %}Homepage{% endblock %}
+
+{% block page_description %}
+<p class="cui-text-muted">The Homepage is the root page of your public site (<code>/</code>).</p>
+{% endblock %}
+
+{% block page_actions %}
+{% if build_exists %}
+<a href="/" class="cui-button cui-button--secondary" target="_blank" rel="noopener">View Site</a>
+{% endif %}
+{% endblock %}
+
+{% block content %}
+
+{# Status summary card #}
+<div class="cui-card">
+  <dl class="cui-dl">
+    {% if item %}
+    <dt>Current status</dt>
+    <dd>{% include "cauldron_admin/includes/status_badge.html" with status=item.status %}</dd>
+    <dt>Item ID</dt>
+    <dd><code>{{ item.id|escape }}</code></dd>
+    <dt>URL slug</dt>
+    <dd><code>{{ item.slug|escape }}</code></dd>
+    {% else %}
+    <dt>Current status</dt>
+    <dd><span class="cui-badge cui-badge--neutral">Not created</span></dd>
+    {% endif %}
+    <dt>Published URL</dt>
+    <dd>
+      {% if build_exists %}
+      <a href="/" target="_blank" rel="noopener"><code>/</code></a>
+      {% else %}
+      <code>/</code> <span class="cui-text-muted">(build not available)</span>
+      {% endif %}
+    </dd>
+  </dl>
+</div>
+
+<form method="post" novalidate>
+  {% csrf_token %}
+
+  {% if is_edit %}
+  <input type="hidden" name="edit_token" value="{{ edit_token|escape }}">
+  {% endif %}
+  <input type="hidden" name="submission_token" value="{{ submission_token|escape }}">
+
+  {# Page section #}
+  <div class="cui-card">
+    <h2 class="cui-card__heading">Page</h2>
+    <div class="cui-form">
+      {% include "cauldron_admin/includes/form_field.html" with field=form.title %}
+      {% include "cauldron_admin/includes/form_field.html" with field=form.navigation_title %}
+      {% include "cauldron_admin/includes/form_field.html" with field=form.summary %}
+    </div>
+  </div>
+
+  {# Search metadata section #}
+  <div class="cui-card">
+    <h2 class="cui-card__heading">Search metadata</h2>
+    <div class="cui-form">
+      {% include "cauldron_admin/includes/form_field.html" with field=form.seo_title %}
+      {% include "cauldron_admin/includes/form_field.html" with field=form.meta_description %}
+      {% include "cauldron_admin/includes/form_field.html" with field=form.canonical_url %}
+      {% include "cauldron_admin/includes/form_field.html" with field=form.robots_index %}
+      {% include "cauldron_admin/includes/form_field.html" with field=form.robots_follow %}
+    </div>
+  </div>
+
+  {# Social metadata section #}
+  <div class="cui-card">
+    <h2 class="cui-card__heading">Social metadata</h2>
+    <div class="cui-form">
+      {% include "cauldron_admin/includes/form_field.html" with field=form.social_title %}
+      {% include "cauldron_admin/includes/form_field.html" with field=form.social_description %}
+      {% include "cauldron_admin/includes/form_field.html" with field=form.social_image %}
+    </div>
+  </div>
+
+  {# Content section #}
+  <div class="cui-card">
+    <h2 class="cui-card__heading">Content</h2>
+    <div class="cui-form">
+      <div class="cui-form-field{% if form.body.errors %} cui-form-field--error{% endif %}">
+        {{ form.body.label_tag }}
+        {{ form.body }}
+        <p class="cui-form-field__help">
+          Markdown reference: <code># Heading</code>, <code>**bold**</code>, <code>_italic_</code>,
+          <code>[link text](url)</code>, <code>- item</code> (list).
+          Content is displayed as escaped text until a renderer is configured.
+        </p>
+        {% for error in form.body.errors %}
+        <p class="cui-form-field__error" role="alert">{{ error }}</p>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+  {# Workflow section #}
+  <div class="cui-card">
+    <h2 class="cui-card__heading">Workflow</h2>
+    <div class="cui-form">
+      <div class="cui-alert cui-alert--info" role="note">
+        <strong>Save Draft</strong> saves a draft for later.
+        {% if not require_approval %}
+        <strong>Publish</strong> validates and applies it immediately.
+        {% else %}
+        <strong>Submit for Review</strong> validates and queues it for approval.
+        {% endif %}
+        No file is written until the request is applied.
+      </div>
+      {% include "cauldron_admin/includes/form_field.html" with field=form.change_description %}
+    </div>
+  </div>
+
+  {% if validation_issues %}
+  <div class="cui-alert cui-alert--error" role="alert">
+    <strong>Validation failed — {{ validation_issues|length }} issue(s)</strong>
+    <ul class="cui-list">
+      {% for issue in validation_issues %}
+      <li>
+        <code>{{ issue.code }}</code>{% if issue.collection %} in <strong>{{ issue.collection }}</strong>{% endif %}{% if issue.item_id %} ({{ issue.item_id }}){% endif %}{% if issue.message %}: {{ issue.message }}{% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
+  <div class="cui-form-actions">
+    {% if can_publish %}
+    <button type="submit" name="action" value="publish" class="cui-button">
+      {% if require_approval %}Submit for Review{% else %}Publish{% endif %}
+    </button>
+    {% endif %}
+    <button type="submit" name="action" value="save_draft" class="cui-button cui-button--secondary">Save Draft</button>
+  </div>
+
+</form>
+{% endblock %}

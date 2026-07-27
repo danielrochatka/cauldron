@@ -1954,6 +1954,13 @@ class ContentOperationService:
                 lifecycle_state=LifecycleState.RECONCILIATION_REQUIRED.value,
             )
 
+        from cauldron_content_operations.signals import content_change_applied
+        content_change_applied.send_robust(
+            sender=self.__class__,
+            request_id=request_id,
+            provider_name=cr2.provider_name,
+            applied_by=user,
+        )
         return ChangeRequestResult(ok=True, request_id=request_id, lifecycle_state=LifecycleState.APPLIED.value, request_version=cr2.request_version)
 
     def rollback_change_request(

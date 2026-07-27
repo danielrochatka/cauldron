@@ -87,6 +87,12 @@ CAULDRON_MODULES = {
         "max_argument_bytes": 4096,
         "max_result_bytes": 8192,
     },
+    # Astro static-site builder — generates public HTML from published pages.
+    # output_root is served by Django at / and /<slug>/.
+    "cauldron.site.astro": {
+        "frontend_root": str(BASE_DIR / "frontend"),
+        "output_root": str(BASE_DIR / "data" / "public"),
+    },
 }
 
 # ---------------------------------------------------------------------------

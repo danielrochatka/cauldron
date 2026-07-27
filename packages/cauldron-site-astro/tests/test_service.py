@@ -1,0 +1,494 @@
+"""Tests for SiteBuildService."""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from cauldron_site_astro.service import BuildResult, SiteBuildService
+from cauldron_site_astro.config import SiteAstroConfig
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_config(tmp_path: Path, **overrides) -> SiteAstroConfig:
+    frontend = tmp_path / "frontend"
+    frontend.mkdir(exist_ok=True)
+    output = tmp_path / "output"
+    defaults = dict(
+        frontend_root=str(frontend),
+        output_root=str(output),
+        npm_command="npm",
+        build_timeout=30,
+    )
+    defaults.update(overrides)
+    return SiteAstroConfig(**defaults)
+
+
+def _make_item(
+    item_id: str,
+    slug: str,
+    status: str = "published",
+    data: dict | None = None,
+    body: str = "",
+) -> SimpleNamespace:
+    """Create a duck-typed ContentItem substitute."""
+    return SimpleNamespace(
+        id=item_id,
+        slug=slug,
+        status=status,
+        data=data or {},
+        body=body,
+    )
+
+
+def _make_router(items: list) -> MagicMock:
+    router = MagicMock()
+    router.list_items.return_value = items
+    return router
+
+
+def _ok_proc(stdout: str = "Build complete.\n", stderr: str = "") -> MagicMock:
+    proc = MagicMock()
+    proc.returncode = 0
+    proc.stdout = stdout
+    proc.stderr = stderr
+    return proc
+
+
+def _fail_proc(returncode: int = 1, stdout: str = "", stderr: str = "Error!") -> MagicMock:
+    proc = MagicMock()
+    proc.returncode = returncode
+    proc.stdout = stdout
+    proc.stderr = stderr
+    return proc
+
+
+# ---------------------------------------------------------------------------
+# No-pages path
+# ---------------------------------------------------------------------------
+
+
+def test_build_no_published_pages_skips_astro(tmp_path: Path):
+    """When router returns no published pages, build returns ok=True, pages_built=0."""
+    config = _make_config(tmp_path)
+    router = _make_router([])
+    svc = SiteBuildService(config, router)
+
+    with patch("subprocess.run") as mock_run:
+        result = svc.build()
+
+    assert result.ok is True
+    assert result.pages_built == 0
+    mock_run.assert_not_called()
+
+
+def test_build_only_draft_pages_skips_astro(tmp_path: Path):
+    """Draft pages are excluded; if that leaves nothing, Astro is not invoked."""
+    draft = _make_item("page.draft", "draft", status="draft")
+    config = _make_config(tmp_path)
+    router = _make_router([draft])
+    svc = SiteBuildService(config, router)
+
+    with patch("subprocess.run") as mock_run:
+        result = svc.build()
+
+    assert result.ok is True
+    assert result.pages_built == 0
+    mock_run.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Homepage route
+# ---------------------------------------------------------------------------
+
+
+def test_homepage_route_is_slash(tmp_path: Path):
+    """Homepage item always gets route '/' regardless of its slug."""
+    homepage = _make_item(
+        "homepage",
+        "homepage",
+        data={"title": "Home", "template": "homepage"},
+        body="# Welcome",
+    )
+    config = _make_config(tmp_path)
+    router = _make_router([homepage])
+    svc = SiteBuildService(config, router)
+
+    captured_manifest = {}
+
+    def fake_run(cmd, **kwargs):
+        manifest_path = kwargs["env"]["CAULDRON_MANIFEST"]
+        tmp_out = kwargs["env"]["CAULDRON_OUTDIR"]
+        # Write a fake output dir so the copy succeeds
+        Path(tmp_out).mkdir(parents=True, exist_ok=True)
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            captured_manifest.update(json.load(f))
+        return _ok_proc()
+
+    with patch("subprocess.run", side_effect=fake_run):
+        result = svc.build()
+
+    assert result.ok is True
+    assert captured_manifest["pages"][0]["route"] == "/"
+
+
+# ---------------------------------------------------------------------------
+# Non-homepage slug routing
+# ---------------------------------------------------------------------------
+
+
+def test_non_homepage_gets_slug_route(tmp_path: Path):
+    """Non-homepage items get route /<slug>/."""
+    about = _make_item(
+        "page.about",
+        "about",
+        data={"title": "About"},
+        body="About us.",
+    )
+    config = _make_config(tmp_path)
+    router = _make_router([about])
+    svc = SiteBuildService(config, router)
+
+    captured_manifest = {}
+
+    def fake_run(cmd, **kwargs):
+        manifest_path = kwargs["env"]["CAULDRON_MANIFEST"]
+        tmp_out = kwargs["env"]["CAULDRON_OUTDIR"]
+        Path(tmp_out).mkdir(parents=True, exist_ok=True)
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            captured_manifest.update(json.load(f))
+        return _ok_proc()
+
+    with patch("subprocess.run", side_effect=fake_run):
+        result = svc.build()
+
+    assert result.ok is True
+    assert captured_manifest["pages"][0]["route"] == "/about/"
+
+
+# ---------------------------------------------------------------------------
+# Manifest contents
+# ---------------------------------------------------------------------------
+
+
+def test_manifest_contains_all_page_fields(tmp_path: Path):
+    """All expected fields are present in the manifest JSON."""
+    item = _make_item(
+        "homepage",
+        "homepage",
+        data={
+            "title": "Home",
+            "navigation_title": "Home",
+            "summary": "Welcome page",
+            "template": "homepage",
+            "seo_title": "SEO Home",
+            "meta_description": "Meta desc",
+            "canonical_url": "https://example.com/",
+            "robots_index": True,
+            "robots_follow": False,
+            "social_title": "Social Home",
+            "social_description": "Social desc",
+            "social_image": "/img/home.png",
+        },
+        body="# Welcome\n\nWelcome.",
+    )
+    config = _make_config(tmp_path)
+    router = _make_router([item])
+    svc = SiteBuildService(config, router)
+
+    captured_page = {}
+
+    def fake_run(cmd, **kwargs):
+        manifest_path = kwargs["env"]["CAULDRON_MANIFEST"]
+        tmp_out = kwargs["env"]["CAULDRON_OUTDIR"]
+        Path(tmp_out).mkdir(parents=True, exist_ok=True)
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        captured_page.update(data["pages"][0])
+        return _ok_proc()
+
+    with patch("subprocess.run", side_effect=fake_run):
+        svc.build()
+
+    expected_keys = {
+        "id", "route", "title", "navigation_title", "summary", "body",
+        "template", "seo_title", "meta_description", "canonical_url",
+        "robots_index", "robots_follow", "social_title", "social_description",
+        "social_image",
+    }
+    assert expected_keys <= set(captured_page.keys())
+    assert captured_page["title"] == "Home"
+    assert captured_page["body"] == "# Welcome\n\nWelcome."
+    assert captured_page["robots_follow"] is False
+
+
+# ---------------------------------------------------------------------------
+# Successful build — output directory
+# ---------------------------------------------------------------------------
+
+
+def test_successful_build_creates_output_dir(tmp_path: Path):
+    """A successful build copies the Astro output to output_root."""
+    homepage = _make_item("homepage", "homepage", data={"title": "Home"}, body="Hello")
+    config = _make_config(tmp_path)
+    router = _make_router([homepage])
+    svc = SiteBuildService(config, router)
+
+    def fake_run(cmd, **kwargs):
+        tmp_out = kwargs["env"]["CAULDRON_OUTDIR"]
+        # Simulate Astro writing output files
+        out_dir = Path(tmp_out)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "index.html").write_text("<html>Home</html>", encoding="utf-8")
+        return _ok_proc()
+
+    with patch("subprocess.run", side_effect=fake_run):
+        result = svc.build()
+
+    assert result.ok is True
+    assert result.pages_built == 1
+    output_root = Path(config.output_root)
+    assert output_root.exists()
+    assert (output_root / "index.html").exists()
+
+
+# ---------------------------------------------------------------------------
+# Failed build — leaves existing output untouched
+# ---------------------------------------------------------------------------
+
+
+def test_failed_build_leaves_existing_output_untouched(tmp_path: Path):
+    """On Astro build failure, the existing output_root must not be modified."""
+    homepage = _make_item("homepage", "homepage", data={"title": "Home"}, body="Hello")
+
+    # Pre-create existing output
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    existing_file = output_root / "index.html"
+    existing_file.write_text("<html>Old</html>", encoding="utf-8")
+
+    config = _make_config(tmp_path)
+    router = _make_router([homepage])
+    svc = SiteBuildService(config, router)
+
+    with patch("subprocess.run", return_value=_fail_proc(returncode=1)):
+        result = svc.build()
+
+    assert result.ok is False
+    assert "exited 1" in result.error
+    # Existing output must still be intact
+    assert existing_file.exists()
+    assert existing_file.read_text(encoding="utf-8") == "<html>Old</html>"
+
+
+# ---------------------------------------------------------------------------
+# Timeout
+# ---------------------------------------------------------------------------
+
+
+def test_build_timeout_returns_ok_false(tmp_path: Path):
+    """subprocess.TimeoutExpired causes BuildResult(ok=False) with timeout message."""
+    homepage = _make_item("homepage", "homepage", data={"title": "Home"}, body="Hello")
+    config = _make_config(tmp_path, build_timeout=5)
+    router = _make_router([homepage])
+    svc = SiteBuildService(config, router)
+
+    def raise_timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=["npm", "run", "build"], timeout=5)
+
+    with patch("subprocess.run", side_effect=raise_timeout):
+        result = svc.build()
+
+    assert result.ok is False
+    assert "timed out" in result.error
+    assert "5s" in result.error
+
+
+# ---------------------------------------------------------------------------
+# Missing config
+# ---------------------------------------------------------------------------
+
+
+def test_build_missing_frontend_root_returns_error(tmp_path: Path):
+    """Empty frontend_root short-circuits before any subprocess call."""
+    config = SiteAstroConfig(
+        frontend_root="",
+        output_root=str(tmp_path / "out"),
+    )
+    router = _make_router([])
+    svc = SiteBuildService(config, router)
+
+    with patch("subprocess.run") as mock_run:
+        result = svc.build()
+
+    assert result.ok is False
+    assert "frontend_root" in result.error
+    mock_run.assert_not_called()
+
+
+def test_build_missing_output_root_returns_error(tmp_path: Path):
+    """Empty output_root short-circuits before any subprocess call."""
+    config = SiteAstroConfig(
+        frontend_root=str(tmp_path / "frontend"),
+        output_root="",
+    )
+    router = _make_router([])
+    svc = SiteBuildService(config, router)
+
+    with patch("subprocess.run") as mock_run:
+        result = svc.build()
+
+    assert result.ok is False
+    assert "output_root" in result.error
+    mock_run.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Router failure
+# ---------------------------------------------------------------------------
+
+
+def test_router_exception_returns_error(tmp_path: Path):
+    """When the router raises, build returns ok=False with the error message."""
+    config = _make_config(tmp_path)
+    router = MagicMock()
+    router.list_items.side_effect = RuntimeError("connection refused")
+    svc = SiteBuildService(config, router)
+
+    with patch("subprocess.run") as mock_run:
+        result = svc.build()
+
+    assert result.ok is False
+    assert "connection refused" in result.error
+    mock_run.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Temp file cleanup
+# ---------------------------------------------------------------------------
+
+
+def test_manifest_temp_files_cleaned_up_after_success(tmp_path: Path):
+    """After a successful build, the temp directory is removed."""
+    homepage = _make_item("homepage", "homepage", data={"title": "Home"}, body="Hello")
+    config = _make_config(tmp_path)
+    router = _make_router([homepage])
+    svc = SiteBuildService(config, router)
+
+    created_tmp_dirs: list[str] = []
+    original_mkdtemp = __import__("tempfile").mkdtemp
+
+    def tracking_mkdtemp(**kwargs):
+        d = original_mkdtemp(**kwargs)
+        created_tmp_dirs.append(d)
+        return d
+
+    def fake_run(cmd, **kwargs):
+        tmp_out = kwargs["env"]["CAULDRON_OUTDIR"]
+        Path(tmp_out).mkdir(parents=True, exist_ok=True)
+        return _ok_proc()
+
+    with patch("tempfile.mkdtemp", side_effect=tracking_mkdtemp):
+        with patch("subprocess.run", side_effect=fake_run):
+            result = svc.build()
+
+    assert result.ok is True
+    for d in created_tmp_dirs:
+        assert not Path(d).exists(), f"Temp dir {d!r} was not cleaned up"
+
+
+def test_manifest_temp_files_cleaned_up_after_failure(tmp_path: Path):
+    """After a failed build, the temp directory is still removed."""
+    homepage = _make_item("homepage", "homepage", data={"title": "Home"}, body="Hello")
+    config = _make_config(tmp_path)
+    router = _make_router([homepage])
+    svc = SiteBuildService(config, router)
+
+    created_tmp_dirs: list[str] = []
+    original_mkdtemp = __import__("tempfile").mkdtemp
+
+    def tracking_mkdtemp(**kwargs):
+        d = original_mkdtemp(**kwargs)
+        created_tmp_dirs.append(d)
+        return d
+
+    with patch("tempfile.mkdtemp", side_effect=tracking_mkdtemp):
+        with patch("subprocess.run", return_value=_fail_proc(returncode=2)):
+            result = svc.build()
+
+    assert result.ok is False
+    for d in created_tmp_dirs:
+        assert not Path(d).exists(), f"Temp dir {d!r} was not cleaned up"
+
+
+# ---------------------------------------------------------------------------
+# pages_built count
+# ---------------------------------------------------------------------------
+
+
+def test_pages_built_count_is_correct(tmp_path: Path):
+    """pages_built reflects the number of published items passed to Astro."""
+    items = [
+        _make_item("homepage", "homepage", data={"title": "Home"}, body="Hello"),
+        _make_item("page.about", "about", data={"title": "About"}, body="About"),
+        _make_item("page.contact", "contact", data={"title": "Contact"}, body="Contact"),
+    ]
+    config = _make_config(tmp_path)
+    router = _make_router(items)
+    svc = SiteBuildService(config, router)
+
+    def fake_run(cmd, **kwargs):
+        tmp_out = kwargs["env"]["CAULDRON_OUTDIR"]
+        Path(tmp_out).mkdir(parents=True, exist_ok=True)
+        return _ok_proc()
+
+    with patch("subprocess.run", side_effect=fake_run):
+        result = svc.build()
+
+    assert result.ok is True
+    assert result.pages_built == 3
+
+
+# ---------------------------------------------------------------------------
+# build_log is propagated
+# ---------------------------------------------------------------------------
+
+
+def test_build_log_included_in_success(tmp_path: Path):
+    homepage = _make_item("homepage", "homepage", data={"title": "Home"}, body="Hello")
+    config = _make_config(tmp_path)
+    router = _make_router([homepage])
+    svc = SiteBuildService(config, router)
+
+    def fake_run(cmd, **kwargs):
+        tmp_out = kwargs["env"]["CAULDRON_OUTDIR"]
+        Path(tmp_out).mkdir(parents=True, exist_ok=True)
+        return _ok_proc(stdout="Astro output\n", stderr="")
+
+    with patch("subprocess.run", side_effect=fake_run):
+        result = svc.build()
+
+    assert result.ok is True
+    assert "Astro output" in result.build_log
+
+
+def test_build_log_included_in_failure(tmp_path: Path):
+    homepage = _make_item("homepage", "homepage", data={"title": "Home"}, body="Hello")
+    config = _make_config(tmp_path)
+    router = _make_router([homepage])
+    svc = SiteBuildService(config, router)
+
+    with patch("subprocess.run", return_value=_fail_proc(stderr="Build error!\n")):
+        result = svc.build()
+
+    assert result.ok is False
+    assert "Build error!" in result.build_log

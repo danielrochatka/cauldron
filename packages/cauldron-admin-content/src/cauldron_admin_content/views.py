@@ -753,6 +753,302 @@ class PageEditView(View):
 
 
 # ---------------------------------------------------------------------------
+# Homepage (singleton)
+# ---------------------------------------------------------------------------
+
+@method_decorator([
+    login_required,
+    permission_required("cauldron_content_operations.view_published_content", raise_exception=True),
+], name="dispatch")
+class HomepageView(View):
+    """Combined create/edit view for the Homepage singleton content item."""
+
+    template_name = "cauldron_admin_content/homepage.html"
+
+    def _build_exists(self) -> bool:
+        """Return True if the Astro build has produced an index.html."""
+        from django.conf import settings
+        modules = getattr(settings, "CAULDRON_MODULES", {}) or {}
+        output_root = (modules.get("cauldron.site.astro") or {}).get("output_root", "")
+        if not output_root:
+            return False
+        from pathlib import Path
+        return (Path(output_root) / "index.html").exists()
+
+    def _render(
+        self,
+        request: HttpRequest,
+        *,
+        form,
+        item=None,
+        edit_token="",
+        submission_token="",
+        validation_issues=None,
+    ) -> Any:
+        from cauldron_content_operations.config import get_operations_config
+        cfg = get_operations_config()
+        can_propose = request.user.has_perm(
+            "cauldron_content_operations.propose_content_changes"
+        )
+        status = item.status if item else "not_created"
+        return render(request, self.template_name, {
+            "form": form,
+            "item": item,
+            "status": status,
+            "edit_token": edit_token,
+            "submission_token": submission_token,
+            "is_edit": item is not None,
+            "build_exists": self._build_exists(),
+            "can_publish": _can_publish(request, cfg.require_approval),
+            "require_approval": cfg.require_approval,
+            "can_propose": can_propose,
+            "validation_issues": validation_issues or [],
+            "breadcrumbs": [
+                {"label": "Content", "url": reverse("cauldron_admin_content:content-browser")},
+                {"label": "Homepage", "url": ""},
+            ],
+        })
+
+    def _load_homepage(self, request: HttpRequest):
+        """Return (item, service) for the homepage singleton, or (None, service) if not found."""
+        from cauldron_content.homepage import HOMEPAGE_ITEM_ID, HOMEPAGE_COLLECTION
+        from django.core.exceptions import ImproperlyConfigured
+        try:
+            service = _get_service()
+        except ImproperlyConfigured:
+            _handle_config_error(request)
+            return None, None
+        item = service.get_item(
+            HOMEPAGE_ITEM_ID,
+            HOMEPAGE_COLLECTION,
+            user=request.user,
+            include_drafts=True,
+        )
+        return item, service
+
+    def get(self, request: HttpRequest) -> Any:
+        item, service = self._load_homepage(request)
+        if service is None:
+            return self._render(request, form=PageEditForm())
+
+        if item is not None:
+            data = item.data
+            form = PageEditForm(initial={
+                "title": data.get("title", ""),
+                "navigation_title": data.get("navigation_title", ""),
+                "summary": data.get("summary", ""),
+                "template": data.get("template", "homepage"),
+                "seo_title": data.get("seo_title", ""),
+                "meta_description": data.get("meta_description", ""),
+                "canonical_url": data.get("canonical_url", ""),
+                "robots_index": data.get("robots_index", True),
+                "robots_follow": data.get("robots_follow", True),
+                "social_title": data.get("social_title", ""),
+                "social_description": data.get("social_description", ""),
+                "social_image": data.get("social_image", ""),
+                "body": item.body,
+                "change_description": "",
+            })
+            from cauldron_content.homepage import HOMEPAGE_COLLECTION
+            edit_token = _make_edit_token(item.id, HOMEPAGE_COLLECTION, item.hash)
+            _, submission_token = _make_submit_token()
+            return self._render(
+                request,
+                form=form,
+                item=item,
+                edit_token=edit_token,
+                submission_token=submission_token,
+            )
+
+        # Homepage does not exist yet — show create form
+        form = PageCreateForm()
+        _, submission_token = _make_submit_token()
+        return self._render(request, form=form, submission_token=submission_token)
+
+    def post(self, request: HttpRequest) -> Any:
+        from cauldron_content.homepage import (
+            HOMEPAGE_COLLECTION,
+            build_homepage_operation,
+        )
+        from django.core.exceptions import ImproperlyConfigured
+
+        action = request.POST.get("action", "save_draft")
+        homepage_url = reverse("cauldron_admin_content:homepage")
+
+        item, service = self._load_homepage(request)
+        if service is None:
+            return HttpResponseRedirect(homepage_url)
+
+        status = "published" if action == "publish" else "draft"
+
+        if item is None:
+            # ---- CREATE path ----
+            form = PageCreateForm(request.POST)
+            submission_token = request.POST.get("submission_token", "")
+            idempotency_key, _ = _extract_submit_token(submission_token)
+
+            if not form.is_valid():
+                return self._render(request, form=form, submission_token=submission_token)
+
+            operation = build_homepage_operation(
+                kind="create",
+                status=status,
+                title=form.cleaned_data["title"],
+                body=form.cleaned_data["body"],
+                navigation_title=form.cleaned_data["navigation_title"],
+                summary=form.cleaned_data["summary"],
+                seo_title=form.cleaned_data["seo_title"],
+                meta_description=form.cleaned_data["meta_description"],
+                canonical_url=form.cleaned_data["canonical_url"],
+                robots_index=bool(form.cleaned_data.get("robots_index", True)),
+                robots_follow=bool(form.cleaned_data.get("robots_follow", True)),
+                social_title=form.cleaned_data["social_title"],
+                social_description=form.cleaned_data["social_description"],
+                social_image=form.cleaned_data["social_image"],
+            )
+
+            try:
+                result = service.create_change_request(
+                    user=request.user,
+                    operations=[operation],
+                    provider_name="",
+                    description=form.cleaned_data.get("change_description", ""),
+                    idempotency_key=idempotency_key,
+                )
+            except Exception as exc:
+                messages.error(request, html.escape(str(exc)[:400]))
+                return self._render(request, form=form, submission_token=submission_token)
+
+            if not result.ok:
+                error_msg = result.error.message if result.error else "An unknown error occurred."
+                messages.error(request, html.escape(error_msg[:400]))
+                return self._render(request, form=form, submission_token=submission_token)
+
+        else:
+            # ---- UPDATE path ----
+            edit_token_str = request.POST.get("edit_token", "")
+            token_data = _load_edit_token(edit_token_str)
+            if token_data is None:
+                messages.error(
+                    request,
+                    "Your editing session has expired or the token is invalid. "
+                    "Please reload the page to continue.",
+                )
+                return HttpResponseRedirect(homepage_url)
+
+            if (
+                token_data.get("item_id") != item.id
+                or token_data.get("collection") != HOMEPAGE_COLLECTION
+            ):
+                messages.error(request, "Invalid edit token. Please try again.")
+                return HttpResponseRedirect(homepage_url)
+
+            expected_hash = token_data.get("expected_hash", "")
+            submission_token = request.POST.get("submission_token", "")
+            idempotency_key, _ = _extract_submit_token(submission_token)
+
+            form = PageEditForm(request.POST)
+            if not form.is_valid():
+                edit_token_str = _make_edit_token(item.id, HOMEPAGE_COLLECTION, item.hash)
+                return self._render(
+                    request,
+                    form=form,
+                    item=item,
+                    edit_token=edit_token_str,
+                    submission_token=submission_token,
+                )
+
+            operation = build_homepage_operation(
+                kind="update",
+                status=status,
+                title=form.cleaned_data["title"],
+                body=form.cleaned_data["body"],
+                expected_hash=expected_hash,
+                navigation_title=form.cleaned_data["navigation_title"],
+                summary=form.cleaned_data["summary"],
+                seo_title=form.cleaned_data["seo_title"],
+                meta_description=form.cleaned_data["meta_description"],
+                canonical_url=form.cleaned_data["canonical_url"],
+                robots_index=bool(form.cleaned_data.get("robots_index", True)),
+                robots_follow=bool(form.cleaned_data.get("robots_follow", True)),
+                social_title=form.cleaned_data["social_title"],
+                social_description=form.cleaned_data["social_description"],
+                social_image=form.cleaned_data["social_image"],
+            )
+
+            try:
+                result = service.create_change_request(
+                    user=request.user,
+                    operations=[operation],
+                    provider_name="",
+                    description=form.cleaned_data.get("change_description", ""),
+                    idempotency_key=idempotency_key,
+                )
+            except Exception as exc:
+                messages.error(request, html.escape(str(exc)[:400]))
+                edit_token_str = _make_edit_token(item.id, HOMEPAGE_COLLECTION, item.hash)
+                return self._render(
+                    request,
+                    form=form,
+                    item=item,
+                    edit_token=edit_token_str,
+                    submission_token=submission_token,
+                )
+
+            if not result.ok:
+                error_msg = result.error.message if result.error else "An unknown error occurred."
+                messages.error(request, html.escape(error_msg[:400]))
+                edit_token_str = _make_edit_token(item.id, HOMEPAGE_COLLECTION, item.hash)
+                return self._render(
+                    request,
+                    form=form,
+                    item=item,
+                    edit_token=edit_token_str,
+                    submission_token=submission_token,
+                )
+
+        # ---- Shared publish/draft redirect ----
+        if action == "publish":
+            def _form_error(issues, fresh_token):
+                if item is None:
+                    return self._render(
+                        request,
+                        form=form,
+                        submission_token=fresh_token,
+                        validation_issues=issues,
+                    )
+                edit_token_str = _make_edit_token(item.id, HOMEPAGE_COLLECTION, item.hash)
+                return self._render(
+                    request,
+                    form=form,
+                    item=item,
+                    edit_token=edit_token_str,
+                    submission_token=fresh_token,
+                    validation_issues=issues,
+                )
+
+            publish_result = _handle_publish_flow(
+                request, service, result.request_id, result.request_version,
+                on_form_error=_form_error,
+            )
+            # Override the generic "Page published/submitted" message with
+            # Homepage-specific wording.
+            from django.contrib.messages import get_messages as _get_msgs
+            storage = messages.get_messages(request)
+            storage.used = True  # mark so next render won't double-show
+            from cauldron_content_operations.config import get_operations_config
+            cfg = get_operations_config()
+            if cfg.require_approval:
+                messages.success(request, "Homepage submitted for review.")
+            else:
+                messages.success(request, "Homepage published successfully.")
+            return publish_result
+
+        messages.success(request, "Homepage draft saved.")
+        return HttpResponseRedirect(homepage_url)
+
+
+# ---------------------------------------------------------------------------
 # Change Request views
 # ---------------------------------------------------------------------------
 

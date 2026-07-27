@@ -37,6 +37,17 @@ class CauldronAdminContentConfig(AppConfig):
             description="Browse published and draft content",
         ))
         registry.register_item(AdminNavigationItem(
+            key="cauldron.admin.content.homepage",
+            label="Homepage",
+            url_name="cauldron_admin_content:homepage",
+            section="content",
+            order=15,
+            permission="cauldron_content_operations.view_published_content",
+            url_prefix="/cauldron/content/homepage/",
+            url_prefix_exact=True,
+            description="Edit the Homepage singleton",
+        ))
+        registry.register_item(AdminNavigationItem(
             key="cauldron.admin.content.page-create",
             label="New Page",
             url_name="cauldron_admin_content:page-create",

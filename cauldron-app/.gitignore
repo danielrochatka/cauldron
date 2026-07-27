@@ -12,3 +12,12 @@ __pycache__/
 .env
 
 config.env
+
+# Astro frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/.astro/
+frontend/src/env.d.ts
+
+# Generated public site output
+data/public/

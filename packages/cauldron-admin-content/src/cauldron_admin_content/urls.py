@@ -9,6 +9,9 @@ urlpatterns = [
     path("content/", views.ContentBrowserView.as_view(), name="content-browser"),
     path("content-browser/", views.ContentBrowserRedirectView.as_view()),  # compat redirect
 
+    # Homepage singleton — must be before generic page routes
+    path("content/homepage/", views.HomepageView.as_view(), name="homepage"),
+
     # Page authoring (primary interface)
     path("content/pages/new/", views.PageCreateView.as_view(), name="page-create"),
     path("content/pages/<str:item_id>/", views.PageDetailView.as_view(), name="page-detail"),

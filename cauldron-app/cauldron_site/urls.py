@@ -1,8 +1,10 @@
 """URL configuration for the Cauldron self-hosted instance."""
 from django.contrib import admin
-from django.urls import include, path
+from django.urls import include, path, re_path
+from django.views.generic import RedirectView
 
 from cauldron_django_admin.urls import get_admin_urls, get_cauldron_urls
+from cauldron_site.views.public_site import serve_index, serve_page
 
 urlpatterns = [
     # Technical admin interface (keep available)
@@ -17,4 +19,9 @@ urlpatterns = [
     path("cauldron/", include("cauldron_ai_admin.urls", namespace="cauldron_ai_admin")),
     # Content API
     path("cauldron/api/v1/", include("cauldron_content_api.urls")),
+    # Public site — MUST be last
+    # Trailing-slash redirect for slugs: /about → /about/
+    re_path(r'^(?P<slug>[^/]+)$', RedirectView.as_view(url='/%(slug)s/', permanent=False)),
+    path("<slug:slug>/", serve_page, name="public-page"),
+    path("", serve_index, name="public-index"),
 ]

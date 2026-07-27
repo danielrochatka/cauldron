@@ -87,13 +87,12 @@
   <div class="cui-card">
     <h2 class="cui-card__heading">Workflow</h2>
     <div class="cui-form">
-      {% include "cauldron_admin/includes/form_field.html" with field=form.intended_status %}
       <div class="cui-alert cui-alert--info" role="note">
-        <strong>Save Draft</strong> creates a change request for later review.
+        <strong>Save Draft</strong> saves a draft for later.
         {% if not require_approval %}
         <strong>Publish</strong> validates and applies it immediately.
         {% else %}
-        <strong>Submit for Review</strong> validates the draft and queues it for approval.
+        <strong>Submit for Review</strong> validates and queues it for approval.
         {% endif %}
         No file is written until the request is applied.
       </div>

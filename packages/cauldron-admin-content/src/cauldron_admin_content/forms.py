@@ -206,19 +206,6 @@ class _PageBaseForm(forms.Form):
     )
 
     # Workflow section
-    STATUS_CHOICES = [
-        ("draft", "Draft"),
-        ("published", "Published after approval"),
-    ]
-    intended_status = forms.ChoiceField(
-        choices=STATUS_CHOICES,
-        initial="draft",
-        label="Intended page status",
-        help_text=(
-            '"Published after approval" means the page will be set to published '
-            "once the change request completes the full approval and application workflow."
-        ),
-    )
     change_description = forms.CharField(
         max_length=_MAX_DESCRIPTION,
         required=False,
@@ -313,7 +300,6 @@ class PageCreateForm(_PageBaseForm):
         "social_description",
         "social_image",
         "body",
-        "intended_status",
         "change_description",
     ]
 
@@ -356,6 +342,5 @@ class PageEditForm(_PageBaseForm):
         "social_description",
         "social_image",
         "body",
-        "intended_status",
         "change_description",
     ]

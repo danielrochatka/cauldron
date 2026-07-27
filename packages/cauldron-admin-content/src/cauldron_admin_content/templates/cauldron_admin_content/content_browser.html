@@ -71,7 +71,16 @@
         <td>{{ item.schema|escape }}</td>
         <td><code>{{ item.hash|escape|slice:":12" }}…</code></td>
         {% if can_propose and item.schema == page_schema %}
-        <td><a href="{% url 'cauldron_admin_content:page-edit' item.id %}" class="cui-button cui-button--sm">Edit</a></td>
+        <td>
+          <a href="{% url 'cauldron_admin_content:page-edit' item.id %}" class="cui-button cui-button--sm">Edit</a>
+          {% if item.status == "draft" and can_publish %}
+          <form method="post" action="{% url 'cauldron_admin_content:page-detail' item.id %}" style="display:inline">
+            {% csrf_token %}
+            <input type="hidden" name="action" value="publish">
+            <button type="submit" class="cui-button cui-button--sm">Publish</button>
+          </form>
+          {% endif %}
+        </td>
         {% elif can_propose %}
         <td></td>
         {% endif %}

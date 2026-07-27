@@ -979,6 +979,7 @@ def test_publish_action_validates_and_applies_when_approval_not_required(client)
     from django.test import override_settings
     user = _make_user("cr_pub1", [
         "view_content_change_requests",
+        "propose_content_changes",
         "validate_content_changes",
         "apply_content_changes",
     ])
@@ -1007,6 +1008,7 @@ def test_publish_action_validates_only_when_approval_required(client):
     from django.test import override_settings
     user = _make_user("cr_pub2", [
         "view_content_change_requests",
+        "propose_content_changes",
         "validate_content_changes",
         "apply_content_changes",
     ])
@@ -1031,6 +1033,7 @@ def test_publish_action_rerenders_with_issues_on_validation_failure(client):
     from django.test import override_settings
     user = _make_user("cr_pub3", [
         "view_content_change_requests",
+        "propose_content_changes",
         "validate_content_changes",
         "apply_content_changes",
     ])
@@ -1103,6 +1106,7 @@ def test_cr_detail_shows_publish_button_in_proposed_state(client):
     from django.test import override_settings
     user = _make_user("cr_pub6", [
         "view_content_change_requests",
+        "propose_content_changes",
         "validate_content_changes",
         "apply_content_changes",
     ])

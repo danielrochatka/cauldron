@@ -247,12 +247,12 @@ def test_item14_ok_registration_replaces_stale_adapter(tmp_path):
     stale.supports_rollback = True
     register_adapter("flatfile", stale)
     try:
-        (tmp_path / "content").mkdir()
+        (tmp_path / "site" / "content").mkdir(parents=True)
         with override_settings(
             CAULDRON_MODULES={
                 "cauldron.content": {},
                 "cauldron.workspace.flatfile": {"workspace_root": str(tmp_path / "ws")},
-                "cauldron.cms.flatfile": {"content_root": str(tmp_path / "content")},
+                "cauldron.cms.flatfile": {"site_root": str(tmp_path / "site")},
                 "cauldron.admin.content": {},
             }
         ):

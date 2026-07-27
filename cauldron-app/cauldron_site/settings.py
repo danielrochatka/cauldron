@@ -6,8 +6,6 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Content and workspace paths
-CONTENT_DIR = BASE_DIR / "content"
-SCHEMAS_DIR = BASE_DIR / "schemas"
 WORKSPACE_DIR = BASE_DIR / "data" / "workspace"
 
 # ---------------------------------------------------------------------------
@@ -61,8 +59,7 @@ CAULDRON_MODULES = {
         "workspace_root": str(WORKSPACE_DIR),
     },
     "cauldron.cms.flatfile": {
-        "content_root": str(CONTENT_DIR),
-        "schemas_root": str(SCHEMAS_DIR),
+        "site_root": str(BASE_DIR / "site"),
     },
     "cauldron.django.state": {},
     "cauldron.django.auth": {},

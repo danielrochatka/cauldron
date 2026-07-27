@@ -2,11 +2,21 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from django.core.exceptions import ImproperlyConfigured
 
 
 logger = logging.getLogger(__name__)
+
+
+def _cms_content_dir(cms_cfg: dict) -> str:
+    """Return absolute content directory from a flatfile cms config dict."""
+    site_root = (cms_cfg or {}).get("site_root", "")
+    if not site_root:
+        return ""
+    content_root_rel = (cms_cfg or {}).get("content_root", "content")
+    return str(Path(site_root) / content_root_rel)
 
 
 def _routing_config(settings) -> dict:
@@ -94,10 +104,10 @@ def get_service():
                 "Routing selects 'flatfile' but CAULDRON_MODULES["
                 "'cauldron.cms.flatfile'] is not configured."
             )
-        content_root = (cms_cfg or {}).get("content_root", "")
+        content_root = _cms_content_dir(cms_cfg)
         if not content_root:
             raise ImproperlyConfigured(
-                "content_root is required for cauldron.content.api when "
+                "site_root is required for cauldron.content.api when "
                 "routing selects 'flatfile'."
             )
         installed = list(getattr(settings, "INSTALLED_APPS", []))
@@ -144,12 +154,12 @@ def get_service():
         # declared.
         cms_cfg = modules.get("cauldron.cms.flatfile")
         if cms_cfg is not None:
-            content_root = (cms_cfg or {}).get("content_root", "")
+            content_root = _cms_content_dir(cms_cfg)
             if not content_root:
                 raise ImproperlyConfigured(
-                    "content_root is required for cauldron.content.api when "
+                    "site_root is required for cauldron.content.api when "
                     "cauldron.cms.flatfile is configured; configure "
-                    "CAULDRON_MODULES['cauldron.cms.flatfile']['content_root']."
+                    "CAULDRON_MODULES['cauldron.cms.flatfile']['site_root']."
                 )
             try:
                 from cauldron_workspace_flatfile.reversible import (

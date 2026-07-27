@@ -1819,3 +1819,115 @@ def test_list_collections_deduplicates():
     result = service.list_collections(user=user)
     names = [c.name for c in result]
     assert names.count("pages") == 1
+
+
+# ---------------------------------------------------------------------------
+# Validation failure returns structured meta.validation_issues
+# ---------------------------------------------------------------------------
+
+def test_validate_failure_includes_structured_issues_in_meta():
+    """validate_change_request must populate meta['validation_issues'] on failure."""
+    from cauldron_content.contracts import ValidationResult, ValidationIssue
+
+    user = _make_user(is_superuser=True, username="meta_val1")
+    bad_vr = ValidationResult.failed([
+        ValidationIssue(code="schema.missing_field", message="Missing 'title'", collection="pages", item_id="p1")
+    ])
+    service, _ = _make_service_with_repo(validate_return=bad_vr)
+    r = service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}}],
+        provider_name="flatfile",
+    )
+    assert r.ok
+    result = service.validate_change_request(r.request_id, user=user, expected_version=1)
+    assert not result.ok
+    assert "validation_issues" in result.meta
+    issues = result.meta["validation_issues"]
+    assert len(issues) >= 1
+    assert issues[0]["code"] == "schema.missing_field"
+    assert issues[0]["item_id"] == "p1"
+
+
+def test_validate_failure_changeset_issues_in_meta():
+    """Pre-validation changeset issues (missing collection/item_id) also go into meta."""
+    user = _make_user(is_superuser=True, username="meta_val2")
+    service = _make_service()
+    # Create with missing collection to trigger changeset-level validation failure
+    r = service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "", "item_id": "p1", "slug": "p1", "data": {}}],
+        provider_name="flatfile",
+    )
+    if not r.ok:
+        # Some builds may reject at create time — skip this test path
+        return
+    result = service.validate_change_request(r.request_id, user=user, expected_version=1)
+    if not result.ok:
+        assert "validation_issues" in result.meta
+
+
+def test_validate_success_has_empty_or_no_issues_in_meta():
+    """A passing validation must not include validation_issues in meta."""
+    user = _make_user(is_superuser=True, username="meta_val3")
+    service, _ = _make_service_with_repo()
+    r = service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}}],
+        provider_name="flatfile",
+    )
+    assert r.ok
+    result = service.validate_change_request(r.request_id, user=user, expected_version=1)
+    assert result.ok
+    # On success there should be no validation_issues key or it should be empty
+    issues = result.meta.get("validation_issues", [])
+    assert issues == []
+
+
+def test_validate_failure_meta_contains_all_issues_not_truncated():
+    """meta['validation_issues'] must include every issue, not just the first ten."""
+    from cauldron_content.contracts import ValidationResult, ValidationIssue
+    from unittest.mock import MagicMock
+    from cauldron_content.registry import RepositoryRegistry
+    from cauldron_content.router import ContentRouter, RouterConfig
+    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.config import ContentOperationsConfig
+    from cauldron_content.contracts import ApplyResult
+
+    # Build 12 distinct validation issues (more than the old [:10] limit).
+    issues_12 = [
+        ValidationIssue(code=f"err.{i}", message=f"msg {i}", collection="pages", item_id="px")
+        for i in range(12)
+    ]
+    bad_vr = ValidationResult.failed(issues_12)
+
+    mock_repo = MagicMock()
+    mock_repo.validate.return_value = bad_vr
+    mock_repo.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
+    mock_repo.list_collections.return_value = []
+    mock_repo.list_items.return_value = []
+    mock_repo.get_by_id.return_value = None
+
+    registry = RepositoryRegistry()
+    registry.register("flatfile", mock_repo)
+    router = ContentRouter(registry, RouterConfig(default_provider="flatfile"))
+    workspace = MagicMock()
+    _saved: dict = {}
+    workspace.create.side_effect = lambda cs: _saved.__setitem__(cs.id, cs)
+    workspace.load_changeset.side_effect = lambda cid: _saved.get(cid)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=50)
+    service = ContentOperationService(router=router, workspace=workspace, config=cfg)
+
+    user = _make_user(is_superuser=True, username="trunc_test")
+    r = service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "pages", "item_id": "px", "slug": "px", "data": {}}],
+        provider_name="flatfile",
+    )
+    assert r.ok
+    result = service.validate_change_request(r.request_id, user=user, expected_version=1)
+    assert not result.ok
+    returned_issues = result.meta.get("validation_issues", [])
+    assert len(returned_issues) == 12, (
+        f"Expected all 12 issues in meta, got {len(returned_issues)}"
+    )

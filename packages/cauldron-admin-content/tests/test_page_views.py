@@ -781,3 +781,399 @@ def test_create_submission_token_contains_stable_item_id(client):
     if captured_ops:
         op = captured_ops[0][0]
         assert op["item_id"] == known_item_id
+
+
+# ---------------------------------------------------------------------------
+# Publish workflow — PageCreateView
+# ---------------------------------------------------------------------------
+
+def _make_full_result(ok=True, request_id=None, lifecycle_state="proposed", request_version=1, error_msg=None, meta=None):
+    """Build a ChangeRequestResult-like MagicMock."""
+    result = MagicMock()
+    result.ok = ok
+    result.request_id = request_id or str(uuid.uuid4())
+    result.lifecycle_state = lifecycle_state
+    result.request_version = request_version
+    result.meta = meta or {}
+    if error_msg:
+        result.error = MagicMock()
+        result.error.message = error_msg
+    else:
+        result.error = None
+    return result
+
+
+def _post_create_with_action(client, user, action="save_draft", overrides=None):
+    from django.test import override_settings
+    from django.core import signing
+    item_id = str(uuid.uuid4())
+    token = signing.dumps({"key": str(uuid.uuid4()), "item_id": item_id}, salt="cauldron.page.submit")
+    data = {
+        "title": "Test Page",
+        "slug": "test-page",
+        "navigation_title": "",
+        "summary": "",
+        "template": "page",
+        "seo_title": "",
+        "meta_description": "",
+        "canonical_url": "",
+        "robots_index": True,
+        "robots_follow": True,
+        "social_title": "",
+        "social_description": "",
+        "social_image": "",
+        "body": "# Hello",
+        "intended_status": "draft",
+        "change_description": "",
+        "submission_token": token,
+        "action": action,
+    }
+    if overrides:
+        data.update(overrides)
+    client.force_login(user)
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        return client.post("/cauldron-admin/content/pages/new/", data=data)
+
+
+def test_save_draft_action_creates_proposal_and_redirects(client):
+    """action=save_draft behaves like the old single-button flow."""
+    from django.test import override_settings
+    user = _make_user("savdraft1", ["propose_content_changes", "view_content_change_requests"])
+    req_id = str(uuid.uuid4())
+    mock_service = MagicMock()
+    mock_service.create_change_request.return_value = _make_full_result(ok=True, request_id=req_id)
+
+    with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+        response = _post_create_with_action(client, user, action="save_draft")
+
+    assert response.status_code == 302
+    # Redirects to CR detail when user has view_content_change_requests
+    assert req_id in response["Location"]
+    # Does NOT call validate or apply
+    mock_service.validate_change_request.assert_not_called()
+    mock_service.apply_change_request.assert_not_called()
+
+
+def test_publish_action_validates_and_applies_when_approval_not_required(client):
+    """action=publish calls validate then apply when require_approval=False."""
+    from django.test import override_settings
+    user = _make_user("publisher1", [
+        "propose_content_changes",
+        "validate_content_changes",
+        "apply_content_changes",
+        "view_content_change_requests",
+    ])
+    req_id = str(uuid.uuid4())
+    mock_service = MagicMock()
+    mock_service.create_change_request.return_value = _make_full_result(
+        ok=True, request_id=req_id, request_version=1,
+    )
+    mock_service.validate_change_request.return_value = _make_full_result(
+        ok=True, request_id=req_id, lifecycle_state="validated", request_version=2,
+    )
+    mock_service.apply_change_request.return_value = _make_full_result(
+        ok=True, request_id=req_id, lifecycle_state="applied", request_version=3,
+    )
+
+    # require_approval=False is the default in conftest
+    with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+        response = _post_create_with_action(client, user, action="publish")
+
+    assert response.status_code == 302
+    mock_service.validate_change_request.assert_called_once()
+    mock_service.apply_change_request.assert_called_once()
+    # After publish, redirects to content browser
+    assert "content" in response["Location"] or response.status_code == 302
+
+
+def test_publish_action_shows_validation_errors_on_failure(client):
+    """action=publish stays on the form and shows validation issues when validation fails."""
+    from django.test import override_settings
+    user = _make_user("publisher2", [
+        "propose_content_changes",
+        "validate_content_changes",
+        "apply_content_changes",
+    ])
+    req_id = str(uuid.uuid4())
+    mock_service = MagicMock()
+    mock_service.create_change_request.return_value = _make_full_result(
+        ok=True, request_id=req_id, request_version=1,
+    )
+    mock_service.validate_change_request.return_value = _make_full_result(
+        ok=False, error_msg="Validation failed: 1 issue(s).",
+        meta={"validation_issues": [{"code": "schema.missing_field", "collection": "pages", "item_id": req_id, "message": "Missing required field 'title'"}]},
+    )
+
+    with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+        response = _post_create_with_action(client, user, action="publish")
+
+    assert response.status_code == 200
+    content = response.content.decode()
+    # Validation issue details must appear on the page
+    assert "schema.missing_field" in content
+    assert "Missing required field" in content or "title" in content
+    # Apply was never called
+    mock_service.apply_change_request.assert_not_called()
+
+
+def test_publish_action_submits_for_review_when_approval_required(client):
+    """action=publish validates but does not apply when require_approval=True."""
+    from django.test import override_settings
+    from django.test import override_settings as os2
+    user = _make_user("reviewer1", [
+        "propose_content_changes",
+        "validate_content_changes",
+        "view_content_change_requests",
+    ])
+    req_id = str(uuid.uuid4())
+    mock_service = MagicMock()
+    mock_service.create_change_request.return_value = _make_full_result(
+        ok=True, request_id=req_id, request_version=1,
+    )
+    mock_service.validate_change_request.return_value = _make_full_result(
+        ok=True, request_id=req_id, lifecycle_state="validated", request_version=2,
+    )
+
+    approval_on = {"cauldron.content.operations": {"require_approval": True, "max_operations_per_change_set": 100}}
+    with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+        with override_settings(CAULDRON_MODULES=approval_on):
+            response = _post_create_with_action(client, user, action="publish")
+
+    assert response.status_code == 302
+    mock_service.validate_change_request.assert_called_once()
+    mock_service.apply_change_request.assert_not_called()
+
+
+def test_page_form_shows_publish_button_when_user_has_permissions(client):
+    """The Publish button appears when the user has validate+apply permissions."""
+    from django.test import override_settings
+    user = _make_user("pubshow1", [
+        "propose_content_changes",
+        "validate_content_changes",
+        "apply_content_changes",
+    ])
+    client.force_login(user)
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        response = client.get("/cauldron-admin/content/pages/new/")
+    content = response.content.decode()
+    assert 'value="publish"' in content
+
+
+def test_page_form_hides_publish_button_when_user_lacks_permissions(client):
+    """The Publish button is absent when the user lacks validate+apply permissions."""
+    from django.test import override_settings
+    user = _make_user("pubhide1", ["propose_content_changes"])
+    client.force_login(user)
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        response = client.get("/cauldron-admin/content/pages/new/")
+    content = response.content.decode()
+    assert 'value="publish"' not in content
+
+
+def test_save_draft_button_always_present(client):
+    """The Save Draft button appears regardless of permissions."""
+    from django.test import override_settings
+    user = _make_user("savdraft2", ["propose_content_changes"])
+    client.force_login(user)
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        response = client.get("/cauldron-admin/content/pages/new/")
+    content = response.content.decode()
+    assert 'value="save_draft"' in content
+
+
+# ---------------------------------------------------------------------------
+# Publish workflow — PageEditView
+# ---------------------------------------------------------------------------
+
+def _post_edit_with_action(client, user, item_id, edit_token, action="save_draft", overrides=None):
+    from django.test import override_settings
+    from django.core import signing
+    submit_token = signing.dumps({"key": str(uuid.uuid4()), "item_id": ""}, salt="cauldron.page.submit")
+    data = {
+        "title": "Updated Title",
+        "navigation_title": "",
+        "summary": "",
+        "template": "page",
+        "seo_title": "",
+        "meta_description": "",
+        "canonical_url": "",
+        "robots_index": True,
+        "robots_follow": True,
+        "social_title": "",
+        "social_description": "",
+        "social_image": "",
+        "body": "# Updated",
+        "intended_status": "draft",
+        "change_description": "",
+        "edit_token": edit_token,
+        "submission_token": submit_token,
+        "action": action,
+    }
+    if overrides:
+        data.update(overrides)
+    client.force_login(user)
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        return client.post(f"/cauldron-admin/content/pages/{item_id}/edit/", data=data)
+
+
+def test_edit_publish_action_validates_and_applies(client):
+    """action=publish on edit calls validate+apply when require_approval=False."""
+    user = _make_user("editpub1", [
+        "propose_content_changes",
+        "validate_content_changes",
+        "apply_content_changes",
+        "view_published_content",
+    ])
+    item = _make_item()
+    edit_token = _make_edit_token(item.id)
+    req_id = str(uuid.uuid4())
+    mock_service = MagicMock()
+    mock_service.get_item.return_value = item
+    mock_service.create_change_request.return_value = _make_full_result(
+        ok=True, request_id=req_id, request_version=1,
+    )
+    mock_service.validate_change_request.return_value = _make_full_result(
+        ok=True, request_id=req_id, lifecycle_state="validated", request_version=2,
+    )
+    mock_service.apply_change_request.return_value = _make_full_result(
+        ok=True, request_id=req_id, lifecycle_state="applied", request_version=3,
+    )
+
+    with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+        response = _post_edit_with_action(client, user, item.id, edit_token, action="publish")
+
+    assert response.status_code == 302
+    mock_service.validate_change_request.assert_called_once()
+    mock_service.apply_change_request.assert_called_once()
+
+
+def test_edit_publish_shows_validation_errors(client):
+    """action=publish on edit stays on form and shows validation issues on failure."""
+    user = _make_user("editpub2", [
+        "propose_content_changes",
+        "validate_content_changes",
+        "apply_content_changes",
+        "view_published_content",
+    ])
+    item = _make_item()
+    edit_token = _make_edit_token(item.id)
+    req_id = str(uuid.uuid4())
+    mock_service = MagicMock()
+    mock_service.get_item.return_value = item
+    mock_service.create_change_request.return_value = _make_full_result(
+        ok=True, request_id=req_id, request_version=1,
+    )
+    mock_service.validate_change_request.return_value = _make_full_result(
+        ok=False, error_msg="Validation failed: 1 issue(s).",
+        meta={"validation_issues": [{"code": "schema.required", "collection": "pages", "item_id": item.id, "message": "title is required"}]},
+    )
+
+    with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+        response = _post_edit_with_action(client, user, item.id, edit_token, action="publish")
+
+    assert response.status_code == 200
+    content = response.content.decode()
+    assert "schema.required" in content
+    mock_service.apply_change_request.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# P1 fix: fresh submission token on validation failure
+# ---------------------------------------------------------------------------
+
+def test_publish_failure_returns_fresh_submission_token(client):
+    """After a validation failure the re-rendered form carries a NEW submission token
+    so the next POST gets a fresh idempotency key and does not hit payload_mismatch."""
+    from django.test import override_settings
+    from django.core import signing
+
+    user = _make_user("freshtoken1", [
+        "propose_content_changes",
+        "validate_content_changes",
+        "apply_content_changes",
+    ])
+    original_item_id = str(uuid.uuid4())
+    original_token = signing.dumps(
+        {"key": str(uuid.uuid4()), "item_id": original_item_id},
+        salt="cauldron.page.submit",
+    )
+    req_id = str(uuid.uuid4())
+    mock_service = MagicMock()
+    mock_service.create_change_request.return_value = _make_full_result(
+        ok=True, request_id=req_id, request_version=1,
+    )
+    mock_service.validate_change_request.return_value = _make_full_result(
+        ok=False, error_msg="Validation failed: 1 issue(s).",
+        meta={"validation_issues": [{"code": "schema.bad", "collection": "pages", "item_id": req_id, "message": "bad"}]},
+    )
+
+    from django.test import override_settings as _os
+    with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+        client.force_login(user)
+        with _os(ROOT_URLCONF="tests.urls"):
+            response = client.post("/cauldron-admin/content/pages/new/", data={
+                "title": "My Page",
+                "slug": "my-page",
+                "navigation_title": "",
+                "summary": "",
+                "template": "page",
+                "seo_title": "",
+                "meta_description": "",
+                "canonical_url": "",
+                "robots_index": True,
+                "robots_follow": True,
+                "social_title": "",
+                "social_description": "",
+                "social_image": "",
+                "body": "# Hello",
+                "intended_status": "draft",
+                "change_description": "",
+                "submission_token": original_token,
+                "action": "publish",
+            })
+
+    assert response.status_code == 200
+    content = response.content.decode()
+    # The form must contain a submission_token that differs from the original
+    assert original_token not in content, "Stale submission token must not appear after validation failure"
+    assert "submission_token" in content
+
+
+# ---------------------------------------------------------------------------
+# P2b fix: publish success redirects to CR detail when user lacks view perm
+# ---------------------------------------------------------------------------
+
+def test_publish_success_redirects_to_cr_detail_without_view_perm(client):
+    """A user with propose+validate+apply but NOT view_published_content must not
+    land on a 403 after publishing — they should go to the CR detail instead."""
+    from django.test import override_settings
+    user = _make_user("nview_pub1", [
+        "propose_content_changes",
+        "validate_content_changes",
+        "apply_content_changes",
+        "view_content_change_requests",
+    ])
+    # Note: NO view_published_content
+    req_id = str(uuid.uuid4())
+    mock_service = MagicMock()
+    mock_service.create_change_request.return_value = _make_full_result(
+        ok=True, request_id=req_id, request_version=1,
+    )
+    mock_service.validate_change_request.return_value = _make_full_result(
+        ok=True, request_id=req_id, lifecycle_state="validated", request_version=2,
+    )
+    mock_service.apply_change_request.return_value = _make_full_result(
+        ok=True, request_id=req_id, lifecycle_state="applied", request_version=3,
+    )
+
+    with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+        response = _post_create_with_action(client, user, action="publish")
+
+    assert response.status_code == 302
+    # Must redirect somewhere accessible — content browser is forbidden, so CR detail
+    assert "content/" in response["Location"] or req_id in response["Location"]
+    # Specifically, must NOT redirect to /content/ which requires view_published_content
+    # when user lacks that permission — confirm it goes to CR detail instead
+    assert req_id in response["Location"], (
+        "Expected redirect to CR detail for user without view_published_content"
+    )

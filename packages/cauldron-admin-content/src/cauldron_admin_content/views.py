@@ -89,6 +89,15 @@ def _load_edit_token(token: str) -> dict | None:
         return None
 
 
+def _can_publish(request: HttpRequest, require_approval: bool) -> bool:
+    """True when the user has the permissions needed for the publish flow."""
+    if not request.user.has_perm("cauldron_content_operations.validate_content_changes"):
+        return False
+    if not require_approval:
+        return request.user.has_perm("cauldron_content_operations.apply_content_changes")
+    return True
+
+
 def _redirect_after_proposal(request: HttpRequest, request_id: str) -> HttpResponseRedirect:
     """Redirect to change-request detail when permitted, else content browser.
 
@@ -104,6 +113,68 @@ def _redirect_after_proposal(request: HttpRequest, request_id: str) -> HttpRespo
             )
         )
     return HttpResponseRedirect(reverse("cauldron_admin_content:content-browser"))
+
+
+def _redirect_after_publish(request: HttpRequest, request_id: str) -> HttpResponseRedirect:
+    """After a successful apply, go to content browser if permitted else CR detail."""
+    if request.user.has_perm("cauldron_content_operations.view_published_content"):
+        return HttpResponseRedirect(reverse("cauldron_admin_content:content-browser"))
+    return _redirect_after_proposal(request, request_id)
+
+
+def _handle_publish_flow(
+    request: HttpRequest,
+    service,
+    request_id: str,
+    request_version: int,
+    *,
+    on_form_error,
+):
+    """Shared publish flow: validate → (if no approval needed) apply.
+
+    ``on_form_error(issues, fresh_submission_token)`` is called with structured
+    validation issue dicts and a new submission token when validation fails.
+    The fresh token prevents idempotency.payload_mismatch on the next retry
+    because the previous proposal was already created under the old key.
+    """
+    from cauldron_content_operations.config import get_operations_config
+    cfg = get_operations_config()
+
+    try:
+        validate_result = service.validate_change_request(
+            request_id, user=request.user, expected_version=request_version,
+        )
+    except Exception as exc:
+        messages.error(request, html.escape(str(exc)[:400]))
+        _, fresh_token = _make_submit_token()
+        return on_form_error([], fresh_token)
+
+    if not validate_result.ok:
+        issues = validate_result.meta.get("validation_issues", [])
+        error_msg = validate_result.error.message if validate_result.error else "Validation failed."
+        messages.error(request, html.escape(error_msg[:400]))
+        _, fresh_token = _make_submit_token()
+        return on_form_error(issues, fresh_token)
+
+    if cfg.require_approval:
+        messages.success(request, "Page submitted for review.")
+        return _redirect_after_proposal(request, request_id)
+
+    try:
+        apply_result = service.apply_change_request(
+            request_id, user=request.user, expected_version=validate_result.request_version,
+        )
+    except Exception as exc:
+        messages.error(request, html.escape(str(exc)[:400]))
+        return _redirect_after_proposal(request, request_id)
+
+    if apply_result.ok:
+        messages.success(request, "Page published successfully.")
+        return _redirect_after_publish(request, request_id)
+
+    error_msg = apply_result.error.message if apply_result.error else "Apply failed."
+    messages.error(request, html.escape(error_msg[:400]))
+    return _redirect_after_proposal(request, request_id)
 
 
 # ---------------------------------------------------------------------------
@@ -244,12 +315,17 @@ class PageCreateView(View):
 
     template_name = "cauldron_admin_content/page_form.html"
 
-    def _context(self, form, submission_token):
+    def _context(self, request, form, submission_token, *, validation_issues=None):
+        from cauldron_content_operations.config import get_operations_config
+        cfg = get_operations_config()
         return {
             "form": form,
             "submission_token": submission_token,
             "is_edit": False,
             "form_title": "New Page",
+            "require_approval": cfg.require_approval,
+            "can_publish": _can_publish(request, cfg.require_approval),
+            "validation_issues": validation_issues or [],
             "breadcrumbs": [
                 {"label": "Content", "url": reverse("cauldron_admin_content:content-browser")},
                 {"label": "New Page", "url": ""},
@@ -263,9 +339,10 @@ class PageCreateView(View):
         # for ContentOperationService's idempotency check.
         item_id = str(uuid.uuid4())
         _, submission_token = _make_submit_token(item_id=item_id)
-        return render(request, self.template_name, self._context(form, submission_token))
+        return render(request, self.template_name, self._context(request, form, submission_token))
 
     def post(self, request: HttpRequest) -> Any:
+        action = request.POST.get("action", "save_draft")
         form = PageCreateForm(request.POST)
         submission_token = request.POST.get("submission_token", "")
 
@@ -277,7 +354,7 @@ class PageCreateView(View):
             item_id = str(uuid.uuid4())
 
         if not form.is_valid():
-            return render(request, self.template_name, self._context(form, submission_token))
+            return render(request, self.template_name, self._context(request, form, submission_token))
 
         from cauldron_content.pages import build_page_operation
         intended = form.cleaned_data["intended_status"]
@@ -308,7 +385,7 @@ class PageCreateView(View):
             service = _get_service()
         except ImproperlyConfigured:
             _handle_config_error(request)
-            return render(request, self.template_name, self._context(form, submission_token))
+            return render(request, self.template_name, self._context(request, form, submission_token))
 
         try:
             result = service.create_change_request(
@@ -320,19 +397,28 @@ class PageCreateView(View):
             )
         except Exception as exc:
             messages.error(request, html.escape(str(exc)[:400]))
-            return render(request, self.template_name, self._context(form, submission_token))
+            return render(request, self.template_name, self._context(request, form, submission_token))
 
-        if result.ok:
-            messages.success(
-                request,
-                f"Page proposal created ({result.request_id[:8]}…). "
-                "It will be published once the change request is approved and applied.",
+        if not result.ok:
+            error_msg = result.error.message if result.error else "An unknown error occurred."
+            messages.error(request, html.escape(error_msg[:400]))
+            return render(request, self.template_name, self._context(request, form, submission_token))
+
+        if action == "publish":
+            return _handle_publish_flow(
+                request, service, result.request_id, result.request_version,
+                on_form_error=lambda issues, fresh_token: render(
+                    request, self.template_name,
+                    self._context(request, form, fresh_token, validation_issues=issues),
+                ),
             )
-            return _redirect_after_proposal(request, result.request_id)
 
-        error_msg = result.error.message if result.error else "An unknown error occurred."
-        messages.error(request, html.escape(error_msg[:400]))
-        return render(request, self.template_name, self._context(form, submission_token))
+        messages.success(
+            request,
+            f"Page proposal created ({result.request_id[:8]}…). "
+            "It will be published once the change request is approved and applied.",
+        )
+        return _redirect_after_proposal(request, result.request_id)
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +507,9 @@ class PageEditView(View):
         )
         return item, service
 
-    def _render_form(self, request, form, item, edit_token, submission_token):
+    def _render_form(self, request, form, item, edit_token, submission_token, *, validation_issues=None):
+        from cauldron_content_operations.config import get_operations_config
+        cfg = get_operations_config()
         title = item.data.get("title", item.id)
         return render(request, self.template_name, {
             "form": form,
@@ -430,6 +518,9 @@ class PageEditView(View):
             "submission_token": submission_token,
             "is_edit": True,
             "form_title": f"Edit: {title}",
+            "require_approval": cfg.require_approval,
+            "can_publish": _can_publish(request, cfg.require_approval),
+            "validation_issues": validation_issues or [],
             "breadcrumbs": [
                 {"label": "Content", "url": reverse("cauldron_admin_content:content-browser")},
                 {
@@ -478,6 +569,7 @@ class PageEditView(View):
     def post(self, request: HttpRequest, item_id: str) -> Any:
         from cauldron_content.pages import PAGE_COLLECTION, build_page_operation
 
+        action = request.POST.get("action", "save_draft")
         edit_token = request.POST.get("edit_token", "")
         token_data = _load_edit_token(edit_token)
         if token_data is None:
@@ -549,17 +641,26 @@ class PageEditView(View):
             messages.error(request, html.escape(str(exc)[:400]))
             return self._render_form(request, form, item, edit_token, submission_token)
 
-        if result.ok:
-            messages.success(
-                request,
-                f"Page update proposal created ({result.request_id[:8]}…). "
-                "Changes will go live once the change request is approved and applied.",
-            )
-            return _redirect_after_proposal(request, result.request_id)
+        if not result.ok:
+            error_msg = result.error.message if result.error else "An unknown error occurred."
+            messages.error(request, html.escape(error_msg[:400]))
+            return self._render_form(request, form, item, edit_token, submission_token)
 
-        error_msg = result.error.message if result.error else "An unknown error occurred."
-        messages.error(request, html.escape(error_msg[:400]))
-        return self._render_form(request, form, item, edit_token, submission_token)
+        if action == "publish":
+            return _handle_publish_flow(
+                request, service, result.request_id, result.request_version,
+                on_form_error=lambda issues, fresh_token: self._render_form(
+                    request, form, item, edit_token, fresh_token,
+                    validation_issues=issues,
+                ),
+            )
+
+        messages.success(
+            request,
+            f"Page update proposal created ({result.request_id[:8]}…). "
+            "Changes will go live once the change request is approved and applied.",
+        )
+        return _redirect_after_proposal(request, result.request_id)
 
 
 # ---------------------------------------------------------------------------
@@ -595,7 +696,7 @@ _ACTION_PERMISSIONS = {
 }
 
 _VALID_ACTIONS_BY_STATE = {
-    "proposed": ("validate", "reject"),
+    "proposed": ("validate", "reject", "publish"),
     "approved": ("apply",),
     "apply_failed": ("apply",),
 }
@@ -621,7 +722,7 @@ def _valid_actions_for_state(state: str, require_approval: bool) -> tuple[str, .
 class ChangeRequestDetailView(View):
     template_name = "cauldron_admin_content/change_request_detail.html"
 
-    def _build_context(self, request, cr, audit_events):
+    def _build_context(self, request, cr, audit_events, *, validation_issues=None):
         from cauldron_content_operations.config import get_operations_config
 
         try:
@@ -648,10 +749,13 @@ class ChangeRequestDetailView(View):
             "previews": previews,
             "valid_actions": valid_actions,
             "is_terminal": state in _TERMINAL_STATES,
+            "require_approval": cfg.require_approval,
             "can_validate": request.user.has_perm(_ACTION_PERMISSIONS["validate"]),
             "can_approve": request.user.has_perm(_ACTION_PERMISSIONS["approve"]),
             "can_reject": request.user.has_perm(_ACTION_PERMISSIONS["reject"]),
             "can_apply": request.user.has_perm(_ACTION_PERMISSIONS["apply"]),
+            "can_publish": _can_publish(request, cfg.require_approval),
+            "validation_issues": validation_issues or [],
             "breadcrumbs": [
                 {"label": "Content", "url": reverse("cauldron_admin_content:content-browser")},
                 {"label": "Change Requests", "url": reverse("cauldron_admin_content:change-request-list")},
@@ -674,15 +778,6 @@ class ChangeRequestDetailView(View):
         action = request.POST.get("action", "")
         detail_url = reverse("cauldron_admin_content:change-request-detail", kwargs={"request_id": request_id})
 
-        if action not in _ACTION_PERMISSIONS:
-            messages.error(request, "Unknown action.")
-            return HttpResponseRedirect(detail_url)
-
-        required_perm = _ACTION_PERMISSIONS[action]
-        if not request.user.has_perm(required_perm):
-            messages.error(request, "You do not have permission to perform this action.")
-            return HttpResponseRedirect(detail_url)
-
         from cauldron_content_operations.config import get_operations_config
         cfg = get_operations_config()
 
@@ -703,6 +798,52 @@ class ChangeRequestDetailView(View):
 
         if service is None:
             _handle_config_error(request)
+            return HttpResponseRedirect(detail_url)
+
+        if action == "publish":
+            if not _can_publish(request, cfg.require_approval):
+                messages.error(request, "You do not have permission to perform this action.")
+                return HttpResponseRedirect(detail_url)
+            try:
+                validate_result = service.validate_change_request(
+                    request_id, user=request.user, expected_version=expected_version,
+                )
+            except Exception as exc:
+                messages.error(request, html.escape(str(exc)[:400]))
+                return HttpResponseRedirect(detail_url)
+            if not validate_result.ok:
+                issues = validate_result.meta.get("validation_issues", [])
+                error_msg = validate_result.error.message if validate_result.error else "Validation failed."
+                messages.error(request, html.escape(error_msg[:400]))
+                cr.refresh_from_db()
+                audit_events = list(ContentAuditEvent.objects.filter(change_request=cr).order_by("sequence"))
+                return render(request, self.template_name, self._build_context(
+                    request, cr, audit_events, validation_issues=issues,
+                ))
+            if cfg.require_approval:
+                messages.success(request, "Change request submitted for review.")
+                return HttpResponseRedirect(detail_url)
+            try:
+                apply_result = service.apply_change_request(
+                    request_id, user=request.user, expected_version=validate_result.request_version,
+                )
+            except Exception as exc:
+                messages.error(request, html.escape(str(exc)[:400]))
+                return HttpResponseRedirect(detail_url)
+            if apply_result.ok:
+                messages.success(request, "Change request published successfully.")
+            else:
+                error_msg = apply_result.error.message if apply_result.error else "An unknown error occurred."
+                messages.error(request, html.escape(error_msg[:400]))
+            return HttpResponseRedirect(detail_url)
+
+        if action not in _ACTION_PERMISSIONS:
+            messages.error(request, "Unknown action.")
+            return HttpResponseRedirect(detail_url)
+
+        required_perm = _ACTION_PERMISSIONS[action]
+        if not request.user.has_perm(required_perm):
+            messages.error(request, "You do not have permission to perform this action.")
             return HttpResponseRedirect(detail_url)
 
         if action == "validate":

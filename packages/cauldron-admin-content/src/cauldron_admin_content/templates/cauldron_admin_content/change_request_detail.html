@@ -51,16 +51,31 @@
 </div>
 {% endif %}
 
+{% if validation_issues %}
+<div class="cui-alert cui-alert--error" role="alert">
+  <strong>Validation failed — {{ validation_issues|length }} issue(s)</strong>
+  <ul class="cui-list">
+    {% for issue in validation_issues %}
+    <li>
+      <code>{{ issue.code }}</code>{% if issue.collection %} in <strong>{{ issue.collection }}</strong>{% endif %}{% if issue.item_id %} ({{ issue.item_id }}){% endif %}{% if issue.message %}: {{ issue.message }}{% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
 {% if not is_terminal %}
 <h2>Actions</h2>
 
 <div class="cui-action-group">
-  {% if "validate" in valid_actions and can_validate %}
+  {% if "publish" in valid_actions and can_publish %}
   <form method="post">
     {% csrf_token %}
-    <input type="hidden" name="action" value="validate">
+    <input type="hidden" name="action" value="publish">
     <input type="hidden" name="expected_version" value="{{ cr.request_version }}">
-    <button type="submit" class="cui-button cui-button--primary">Validate</button>
+    <button type="submit" class="cui-button cui-button--primary">
+      {% if require_approval %}Submit for Review{% else %}Publish{% endif %}
+    </button>
   </form>
   {% endif %}
 
@@ -78,7 +93,7 @@
     {% csrf_token %}
     <input type="hidden" name="action" value="apply">
     <input type="hidden" name="expected_version" value="{{ cr.request_version }}">
-    <button type="submit" class="cui-button cui-button--primary">Apply</button>
+    <button type="submit" class="cui-button cui-button--primary">Publish</button>
   </form>
   {% endif %}
 
@@ -91,10 +106,24 @@
       <label for="rejection_reason">Rejection reason</label>
       <textarea id="rejection_reason" name="rejection_reason" class="cui-input" rows="2" maxlength="500"></textarea>
     </div>
-    <button type="submit" class="cui-button cui-button--danger">Reject</button>
+    <button type="submit" class="cui-button cui-button--danger">Discard</button>
   </form>
   {% endif %}
 </div>
+
+<details class="cui-details">
+  <summary>Advanced actions</summary>
+  <div class="cui-action-group">
+    {% if "validate" in valid_actions and can_validate %}
+    <form method="post">
+      {% csrf_token %}
+      <input type="hidden" name="action" value="validate">
+      <input type="hidden" name="expected_version" value="{{ cr.request_version }}">
+      <button type="submit" class="cui-button cui-button--secondary">Validate only</button>
+    </form>
+    {% endif %}
+  </div>
+</details>
 {% endif %}
 
 {% if audit_events %}

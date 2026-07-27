@@ -988,7 +988,7 @@ class ContentOperationService:
                         f"Validation failed: {len(validation_issues)} issue(s).",
                         details=tuple(str(i) for i in validation_issues[:5]),
                     ),
-                    meta={"validation_issues": validation_issues[:10]},
+                    meta={"validation_issues": list(validation_issues)},
                 )
 
             # Repository validation: call repo.validate() per operation via the routed repository.
@@ -1088,7 +1088,7 @@ class ContentOperationService:
                         f"Validation failed: {len(repo_issues)} issue(s).",
                         details=tuple(str(i) for i in repo_issues[:5]),
                     ),
-                    meta={"validation_issues": repo_issues[:10]},
+                    meta={"validation_issues": list(repo_issues)},
                 )
 
             cr.lifecycle_state = LifecycleState.VALIDATED.value

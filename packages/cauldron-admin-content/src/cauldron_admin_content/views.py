@@ -115,6 +115,13 @@ def _redirect_after_proposal(request: HttpRequest, request_id: str) -> HttpRespo
     return HttpResponseRedirect(reverse("cauldron_admin_content:content-browser"))
 
 
+def _redirect_after_publish(request: HttpRequest, request_id: str) -> HttpResponseRedirect:
+    """After a successful apply, go to content browser if permitted else CR detail."""
+    if request.user.has_perm("cauldron_content_operations.view_published_content"):
+        return HttpResponseRedirect(reverse("cauldron_admin_content:content-browser"))
+    return _redirect_after_proposal(request, request_id)
+
+
 def _handle_publish_flow(
     request: HttpRequest,
     service,
@@ -125,8 +132,10 @@ def _handle_publish_flow(
 ):
     """Shared publish flow: validate → (if no approval needed) apply.
 
-    ``on_form_error(issues)`` is called with structured validation issue dicts
-    when validation fails, and must return an HttpResponse to show the user.
+    ``on_form_error(issues, fresh_submission_token)`` is called with structured
+    validation issue dicts and a new submission token when validation fails.
+    The fresh token prevents idempotency.payload_mismatch on the next retry
+    because the previous proposal was already created under the old key.
     """
     from cauldron_content_operations.config import get_operations_config
     cfg = get_operations_config()
@@ -137,13 +146,15 @@ def _handle_publish_flow(
         )
     except Exception as exc:
         messages.error(request, html.escape(str(exc)[:400]))
-        return on_form_error([])
+        _, fresh_token = _make_submit_token()
+        return on_form_error([], fresh_token)
 
     if not validate_result.ok:
         issues = validate_result.meta.get("validation_issues", [])
         error_msg = validate_result.error.message if validate_result.error else "Validation failed."
         messages.error(request, html.escape(error_msg[:400]))
-        return on_form_error(issues)
+        _, fresh_token = _make_submit_token()
+        return on_form_error(issues, fresh_token)
 
     if cfg.require_approval:
         messages.success(request, "Page submitted for review.")
@@ -159,7 +170,7 @@ def _handle_publish_flow(
 
     if apply_result.ok:
         messages.success(request, "Page published successfully.")
-        return HttpResponseRedirect(reverse("cauldron_admin_content:content-browser"))
+        return _redirect_after_publish(request, request_id)
 
     error_msg = apply_result.error.message if apply_result.error else "Apply failed."
     messages.error(request, html.escape(error_msg[:400]))
@@ -396,9 +407,9 @@ class PageCreateView(View):
         if action == "publish":
             return _handle_publish_flow(
                 request, service, result.request_id, result.request_version,
-                on_form_error=lambda issues: render(
+                on_form_error=lambda issues, fresh_token: render(
                     request, self.template_name,
-                    self._context(request, form, submission_token, validation_issues=issues),
+                    self._context(request, form, fresh_token, validation_issues=issues),
                 ),
             )
 
@@ -638,8 +649,8 @@ class PageEditView(View):
         if action == "publish":
             return _handle_publish_flow(
                 request, service, result.request_id, result.request_version,
-                on_form_error=lambda issues: self._render_form(
-                    request, form, item, edit_token, submission_token,
+                on_form_error=lambda issues, fresh_token: self._render_form(
+                    request, form, item, edit_token, fresh_token,
                     validation_issues=issues,
                 ),
             )

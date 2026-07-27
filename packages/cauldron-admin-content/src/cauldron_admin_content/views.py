@@ -610,7 +610,7 @@ _SUCCESS_LABELS = {
 
 def _valid_actions_for_state(state: str, require_approval: bool) -> tuple[str, ...]:
     if state == "validated":
-        return ("approve", "reject") if require_approval else ("approve", "apply", "reject")
+        return ("approve", "reject") if require_approval else ("apply", "reject")
     return _VALID_ACTIONS_BY_STATE.get(state, ())
 
 
@@ -642,19 +642,12 @@ class ChangeRequestDetailView(View):
         cfg = get_operations_config()
         valid_actions = _valid_actions_for_state(state, cfg.require_approval)
 
-        is_self_approval = (
-            not cfg.allow_self_approval
-            and cr.created_by_id is not None
-            and cr.created_by_id == request.user.pk
-        )
-
         return {
             "cr": cr,
             "audit_events": audit_events,
             "previews": previews,
             "valid_actions": valid_actions,
             "is_terminal": state in _TERMINAL_STATES,
-            "is_self_approval": is_self_approval,
             "can_validate": request.user.has_perm(_ACTION_PERMISSIONS["validate"]),
             "can_approve": request.user.has_perm(_ACTION_PERMISSIONS["approve"]),
             "can_reject": request.user.has_perm(_ACTION_PERMISSIONS["reject"]),
@@ -697,11 +690,6 @@ class ChangeRequestDetailView(View):
         if action not in valid_actions:
             messages.error(request, f"Action '{action}' is not allowed in state '{cr.lifecycle_state}'.")
             return HttpResponseRedirect(detail_url)
-
-        if action == "approve":
-            if not cfg.allow_self_approval and cr.created_by_id is not None and cr.created_by_id == request.user.pk:
-                messages.error(request, "Self-approval is not permitted.")
-                return HttpResponseRedirect(detail_url)
 
         try:
             expected_version = int(request.POST.get("expected_version", "0"))

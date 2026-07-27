@@ -1253,19 +1253,6 @@ class ContentOperationService:
                 )
                 return ChangeRequestResult(ok=False, error=route_err)
 
-            # Self-approval check
-            if not cfg.allow_self_approval and hasattr(user, "pk") and cr.created_by_id == user.pk:
-                append_audit_event(
-                    change_request=cr,
-                    event_type=AuditEventType.APPROVAL_DENIED,
-                    actor=user,
-                    previous_state=cr.lifecycle_state,
-                    resulting_state=cr.lifecycle_state,
-                    correlation_id=correlation_id,
-                    detail={"reason": "self_approval_not_allowed"},
-                )
-                return ChangeRequestResult(ok=False, error=OperationError("approval.self_approval_denied", "Self-approval is not permitted."))
-
             current_state = cr.current_state
             try:
                 assert_transition(current_state, LifecycleState.APPROVED)

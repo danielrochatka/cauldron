@@ -61,7 +61,7 @@ def _make_service(workspace_root=None):
     from cauldron_content.contracts import ApplyResult
     router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
 
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     return ContentOperationService(router=router, workspace=workspace, snapshots=None, config=cfg)
 
 
@@ -144,7 +144,8 @@ def test_idempotency_key_prevents_duplicate():
     assert r1.request_id == r2.request_id
 
 
-def test_self_approval_denied():
+def test_creator_can_approve_own_proposal():
+    """Approval depends only on approve_content_changes; no creator-based block."""
     user = _make_user(is_superuser=True)
     service = _make_service()
     r = service.create_change_request(
@@ -152,7 +153,6 @@ def test_self_approval_denied():
         operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}}],
         provider_name="flatfile",
     )
-    # Move to validated state directly to allow approval attempt
     from cauldron_content_operations.models import ContentChangeRequest
     cr = ContentChangeRequest.objects.get(request_id=r.request_id)
     cr.lifecycle_state = "validated"
@@ -160,8 +160,8 @@ def test_self_approval_denied():
     result = service.approve_change_request(
         r.request_id, user=user, expected_version=cr.request_version
     )
-    assert not result.ok
-    assert "self_approval" in result.error.code
+    assert result.ok
+    assert result.lifecycle_state == "approved"
 
 
 def test_get_change_request():
@@ -284,7 +284,6 @@ def test_mixed_provider_proposal_rejected():
     workspace.create.return_value = None
     cfg = ContentOperationsConfig(
         require_approval=True,
-        allow_self_approval=False,
         max_operations_per_change_set=10,
     )
     service = ContentOperationService(
@@ -407,7 +406,7 @@ def test_invalid_status_no_workspace_artifact():
     router = MagicMock()
     router.resolve_provider.return_value = "flatfile"
     router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=ws, config=cfg)
     service.create_change_request(
         user=user,
@@ -529,7 +528,7 @@ def _make_service_with_repo(validate_return=None, get_by_id_return=None):
     workspace.load_changeset.side_effect = _ws_load
     workspace.save_application_result.return_value = None
 
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     return ContentOperationService(router=router, workspace=workspace, config=cfg), mock_repo
 
 
@@ -665,7 +664,7 @@ def test_adapter_prepare_failure_prevents_mutation(tmp_path):
         workspace.load_changeset.return_value = cs
         workspace.locks_dir = str(locks_dir)
 
-        cfg = ContentOperationsConfig(require_approval=False, allow_self_approval=True, max_operations_per_change_set=10)
+        cfg = ContentOperationsConfig(require_approval=False, max_operations_per_change_set=10)
         service = ContentOperationService(router=router, workspace=workspace, config=cfg)
 
         request_id = str(uuid.uuid4())
@@ -731,7 +730,7 @@ def test_result_persistence_failure_enters_reconciliation_required(tmp_path):
         workspace.load_changeset.return_value = cs
         workspace.locks_dir = str(locks_dir)
 
-        cfg = ContentOperationsConfig(require_approval=False, allow_self_approval=True, max_operations_per_change_set=10)
+        cfg = ContentOperationsConfig(require_approval=False, max_operations_per_change_set=10)
         service = ContentOperationService(router=router, workspace=workspace, config=cfg)
 
         request_id = str(uuid.uuid4())
@@ -816,7 +815,7 @@ def test_item2_unroutable_collection_rejected():
     router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
     workspace = MagicMock()
     workspace.create.return_value = None
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=workspace, config=cfg)
     result = service.create_change_request(
         user=user,
@@ -853,7 +852,7 @@ def test_item3_no_workspace_rejects_proposal():
     user = _make_user(is_superuser=True, username="item3none")
     router = MagicMock()
     router.resolve_provider.return_value = "flatfile"
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=None, config=cfg)
 
     cr_before = ContentChangeRequest.objects.count()
@@ -892,7 +891,7 @@ def test_item1_payload_integrity_mismatch_blocks_apply(tmp_path):
     router.resolve_provider.return_value = "flatfile"
     from cauldron_content.contracts import ApplyResult
     router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
-    cfg = ContentOperationsConfig(require_approval=False, allow_self_approval=True, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=False, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=workspace, config=cfg)
 
     result = service.create_change_request(
@@ -934,7 +933,7 @@ def test_item1_force_persisted_blocks_apply(tmp_path):
     router.resolve_provider.return_value = "flatfile"
     from cauldron_content.contracts import ApplyResult
     router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
-    cfg = ContentOperationsConfig(require_approval=False, allow_self_approval=True, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=False, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=workspace, config=cfg)
 
     result = service.create_change_request(
@@ -977,7 +976,7 @@ def test_item6_force_rollback_requires_superuser():
     router = MagicMock()
     router.resolve_provider.return_value = "flatfile"
     ws = MagicMock()
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=ws, config=cfg)
 
     result = service.rollback_change_request(
@@ -1071,7 +1070,7 @@ def test_item13_concurrent_create_returns_winner(tmp_path):
     router.resolve_provider.return_value = "flatfile"
     from cauldron_content.contracts import ApplyResult
     router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=ws, config=cfg)
 
     # First create wins.
@@ -1127,7 +1126,7 @@ def test_item14_validate_transitions_workspace_state(tmp_path):
     from cauldron_content.contracts import ApplyResult
     router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
     router.get_by_id.return_value = None
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=ws, config=cfg)
 
     r = service.create_change_request(
@@ -1169,7 +1168,7 @@ def test_item8_reconcile_applying_finalizes_with_verified(tmp_path):
     ws = ChangeSetStore(WorkspaceConfig(workspace_root=tmp_path / "ws"))
     router = MagicMock()
     router.resolve_provider.return_value = "flatfile"
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=ws, config=cfg)
 
     cs_id = "cs-item8-1"
@@ -1225,7 +1224,7 @@ def test_item8_reconcile_applying_leaves_when_verify_fails(tmp_path):
     ws = ChangeSetStore(WorkspaceConfig(workspace_root=tmp_path / "ws"))
     router = MagicMock()
     router.resolve_provider.return_value = "flatfile"
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=ws, config=cfg)
 
     cr = ContentChangeRequest.objects.create(
@@ -1273,7 +1272,7 @@ def test_item8_reconcile_rolling_back_never_finalizes_as_applied(tmp_path):
     ws = ChangeSetStore(WorkspaceConfig(workspace_root=tmp_path / "ws"))
     router = MagicMock()
     router.resolve_provider.return_value = "flatfile"
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=ws, config=cfg)
 
     cr = ContentChangeRequest.objects.create(
@@ -1325,7 +1324,7 @@ def test_item1_approval_blocks_on_payload_tampering(tmp_path):
     router.resolve_provider.return_value = "flatfile"
     from cauldron_content.contracts import ApplyResult
     router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=True, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=workspace, config=cfg)
 
     r = service.create_change_request(
@@ -1367,7 +1366,7 @@ def test_item1_approval_blocks_on_force_persisted(tmp_path):
     router.resolve_provider.return_value = "flatfile"
     from cauldron_content.contracts import ApplyResult
     router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=True, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=workspace, config=cfg)
 
     r = service.create_change_request(
@@ -1411,7 +1410,7 @@ def test_item2_router_drift_between_proposal_and_apply(tmp_path):
     router = MagicMock()
     router.resolve_provider.return_value = "flatfile"
     router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
-    cfg = ContentOperationsConfig(require_approval=False, allow_self_approval=True, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=False, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=ws, config=cfg)
 
     r = service.create_change_request(
@@ -1468,7 +1467,7 @@ def test_item17_lock_timeout_returns_busy(tmp_path):
     router = MagicMock()
     router.resolve_provider.return_value = "flatfile"
     router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
-    cfg = ContentOperationsConfig(require_approval=False, allow_self_approval=True, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=False, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=ws, config=cfg)
 
     r = service.create_change_request(
@@ -1511,7 +1510,7 @@ def test_item18_audit_insert_failure_cleans_workspace(tmp_path):
     router.resolve_provider.return_value = "flatfile"
     from cauldron_content.contracts import ApplyResult
     router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=ws, config=cfg)
 
     # Patch audit append to raise on every call to simulate failure after
@@ -1546,7 +1545,7 @@ def test_item14_reject_transitions_workspace_state(tmp_path):
     ws = ChangeSetStore(WorkspaceConfig(workspace_root=tmp_path / "ws"))
     router = MagicMock()
     router.resolve_provider.return_value = "flatfile"
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=ws, config=cfg)
 
     r = service.create_change_request(
@@ -1576,7 +1575,7 @@ def test_item1_approval_without_workspace_denied(tmp_path):
     user = _make_user(is_superuser=True, username="item1_appr_noworkspace")
     router = MagicMock()
     router.resolve_provider.return_value = "flatfile"
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=True, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=None, config=cfg)
 
     cr = ContentChangeRequest.objects.create(
@@ -1615,7 +1614,7 @@ def test_item1_approval_missing_payload_hash_denied(tmp_path):
     ws = ChangeSetStore(WorkspaceConfig(workspace_root=tmp_path / "ws"))
     router = MagicMock()
     router.resolve_provider.return_value = "flatfile"
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=True, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=ws, config=cfg)
 
     cr = ContentChangeRequest.objects.create(
@@ -1645,7 +1644,7 @@ def test_item1_approval_invalid_payload_hash_denied(tmp_path):
     ws = ChangeSetStore(WorkspaceConfig(workspace_root=tmp_path / "ws"))
     router = MagicMock()
     router.resolve_provider.return_value = "flatfile"
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=True, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=ws, config=cfg)
 
     cr = ContentChangeRequest.objects.create(
@@ -1676,7 +1675,7 @@ def test_item13_traversal_collection_rejected_at_proposal():
     workspace = MagicMock()
     router = MagicMock()
     router.resolve_provider.return_value = "flatfile"
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=True, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=workspace, config=cfg)
 
     cr_before = ContentChangeRequest.objects.count()
@@ -1700,7 +1699,7 @@ def test_item13_absolute_slug_rejected_at_proposal():
     workspace = MagicMock()
     router = MagicMock()
     router.resolve_provider.return_value = "flatfile"
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=True, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=workspace, config=cfg)
 
     r = service.create_change_request(

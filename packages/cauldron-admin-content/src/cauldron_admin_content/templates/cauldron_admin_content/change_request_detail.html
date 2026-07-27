@@ -54,12 +54,6 @@
 {% if not is_terminal %}
 <h2>Actions</h2>
 
-{% if is_self_approval %}
-<div class="cui-alert cui-alert--warning">
-  You created this change request. Self-approval is not permitted; another user must approve it.
-</div>
-{% endif %}
-
 <div class="cui-action-group">
   {% if "validate" in valid_actions and can_validate %}
   <form method="post">
@@ -70,7 +64,7 @@
   </form>
   {% endif %}
 
-  {% if "approve" in valid_actions and can_approve and not is_self_approval %}
+  {% if "approve" in valid_actions and can_approve %}
   <form method="post">
     {% csrf_token %}
     <input type="hidden" name="action" value="approve">

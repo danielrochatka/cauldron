@@ -71,18 +71,11 @@ def check_operations_config(app_configs, **kwargs):
             id="cauldron.content.operations.E703",
         ))
 
-    require_approval = cfg.get("require_approval", True)
+    require_approval = cfg.get("require_approval", False)
     if not isinstance(require_approval, bool):
         errors.append(checks.Error(
             "require_approval must be a boolean.",
             id="cauldron.content.operations.E704",
-        ))
-
-    allow_self_approval = cfg.get("allow_self_approval", False)
-    if not isinstance(allow_self_approval, bool):
-        errors.append(checks.Error(
-            "allow_self_approval must be a boolean.",
-            id="cauldron.content.operations.E705",
         ))
 
     if not errors:

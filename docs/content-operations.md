@@ -55,14 +55,15 @@ Transitional states: `APPLYING`, `ROLLING_BACK`. These require reconciliation if
 ```python
 CAULDRON_MODULES = {
     "cauldron.content.operations": {
-        "require_approval": True,       # VALIDATED must reach APPROVED before applying
-        "allow_self_approval": False,   # The proposer cannot also approve
+        "require_approval": False,      # default: VALIDATED → APPLYING directly
         "max_operations_per_change_set": 100,
     },
 }
 ```
 
-When `require_approval` is `False`, a `VALIDATED` change request may be applied directly.
+When `require_approval` is `True`, a `VALIDATED` change request must reach `APPROVED`
+state before it can be applied. Authorization to approve is determined by the
+`approve_content_changes` Django permission, not by who created the request.
 
 ## Optimistic concurrency
 

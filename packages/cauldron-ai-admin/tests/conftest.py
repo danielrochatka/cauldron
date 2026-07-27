@@ -39,8 +39,7 @@ def pytest_configure(config):
             AUTH_USER_MODEL="auth.User",
             CAULDRON_MODULES={
                 "cauldron.content.operations": {
-                    "require_approval": True,
-                    "allow_self_approval": False,
+                    "require_approval": False,
                     "max_operations_per_change_set": 100,
                 },
                 "cauldron.ai.admin": {},

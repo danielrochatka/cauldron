@@ -29,7 +29,7 @@ def _make_service_with_ws(tmp_path):
     router = MagicMock()
     router.resolve_provider.return_value = "flatfile"
     ws = ChangeSetStore(WorkspaceConfig(workspace_root=tmp_path / "ws"))
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=ws, config=cfg)
     return service, ws, router
 
@@ -180,7 +180,7 @@ def _prep_test_setup(tmp_path, prep_evidence):
     workspace.load_changeset.return_value = cs
     workspace.locks_dir = str(locks_dir)
 
-    cfg = ContentOperationsConfig(require_approval=False, allow_self_approval=True, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=False, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=workspace, config=cfg)
     request_id = str(uuid.uuid4())
     ContentChangeRequest.objects.create(
@@ -269,7 +269,7 @@ def _rollback_test_setup(tmp_path, *, rollback_artifact_digest, entry_count):
     workspace = MagicMock()
     workspace.locks_dir = str(locks_dir)
 
-    cfg = ContentOperationsConfig(require_approval=False, allow_self_approval=True, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=False, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=workspace, config=cfg)
     request_id = str(uuid.uuid4())
     cr = ContentChangeRequest.objects.create(
@@ -343,7 +343,7 @@ def test_item1_missing_payload_hash_cannot_reconcile_to_applied(tmp_path):
     ws = ChangeSetStore(WorkspaceConfig(workspace_root=tmp_path / "ws"))
     router = MagicMock()
     router.resolve_provider.return_value = "flatfile"
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=ws, config=cfg)
 
     cr = ContentChangeRequest.objects.create(
@@ -393,7 +393,7 @@ def test_item1_workspace_load_failure_cannot_reconcile_to_applied(tmp_path):
     ws.locks_dir = str(locks)
     router = MagicMock()
     router.resolve_provider.return_value = "flatfile"
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=ws, config=cfg)
 
     cr = ContentChangeRequest.objects.create(
@@ -438,7 +438,7 @@ def test_item1_dry_run_and_mutating_agree_on_missing_hash(tmp_path):
     ws = ChangeSetStore(WorkspaceConfig(workspace_root=tmp_path / "ws"))
     router = MagicMock()
     router.resolve_provider.return_value = "flatfile"
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=ws, config=cfg)
     cr = ContentChangeRequest.objects.create(
         request_id="rid-i1-dr",
@@ -582,7 +582,7 @@ def test_item8_workspace_sync_must_be_repaired(tmp_path):
     ws = ChangeSetStore(WorkspaceConfig(workspace_root=tmp_path / "ws"))
     router = MagicMock()
     router.resolve_provider.return_value = "flatfile"
-    cfg = ContentOperationsConfig(require_approval=True, allow_self_approval=False, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=True, max_operations_per_change_set=10)
     service = ContentOperationService(router=router, workspace=ws, config=cfg)
 
     cs_id = "cs-i8-fail"
@@ -679,7 +679,7 @@ def test_frozen_incompatible_registered_adapter_rejects_apply(tmp_path):
         workspace = MagicMock()
         workspace.load_changeset.return_value = cs
         workspace.locks_dir = str(locks_dir)
-        cfg = ContentOperationsConfig(require_approval=False, allow_self_approval=True, max_operations_per_change_set=10)
+        cfg = ContentOperationsConfig(require_approval=False, max_operations_per_change_set=10)
         service = ContentOperationService(router=router, workspace=workspace, config=cfg)
         request_id = str(uuid.uuid4())
         ContentChangeRequest.objects.create(
@@ -728,7 +728,7 @@ def test_frozen_required_reversible_missing_adapter(tmp_path):
     workspace = MagicMock()
     workspace.load_changeset.return_value = cs
     workspace.locks_dir = str(locks_dir)
-    cfg = ContentOperationsConfig(require_approval=False, allow_self_approval=True, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=False, max_operations_per_change_set=10)
     service = ContentOperationService(
         router=router, workspace=workspace, config=cfg,
         required_reversible_providers=frozenset({"flatfile"}),
@@ -778,7 +778,7 @@ def test_frozen_non_required_provider_no_adapter_proceeds(tmp_path):
     workspace = MagicMock()
     workspace.load_changeset.return_value = cs
     workspace.locks_dir = str(locks_dir)
-    cfg = ContentOperationsConfig(require_approval=False, allow_self_approval=True, max_operations_per_change_set=10)
+    cfg = ContentOperationsConfig(require_approval=False, max_operations_per_change_set=10)
     service = ContentOperationService(
         router=router, workspace=workspace, config=cfg,
         required_reversible_providers=frozenset({"flatfile"}),

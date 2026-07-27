@@ -2,11 +2,21 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from django.core.exceptions import ImproperlyConfigured
 
 
 logger = logging.getLogger(__name__)
+
+
+def _cms_content_dir(cms_cfg: dict) -> str:
+    """Return absolute content directory from a flatfile cms config dict."""
+    site_root = (cms_cfg or {}).get("site_root", "")
+    if not site_root:
+        return ""
+    content_root_rel = (cms_cfg or {}).get("content_root", "content")
+    return str(Path(site_root) / content_root_rel)
 
 
 def _routing_config(settings) -> dict:
@@ -99,10 +109,10 @@ def get_service():
                 "Routing selects 'flatfile' but CAULDRON_MODULES["
                 "'cauldron.cms.flatfile'] is not configured."
             )
-        content_root = (cms_cfg or {}).get("content_root", "")
+        content_root = _cms_content_dir(cms_cfg)
         if not content_root:
             raise ImproperlyConfigured(
-                "content_root is required for cauldron.admin.content when "
+                "site_root is required for cauldron.admin.content when "
                 "routing selects 'flatfile'."
             )
         # Repository availability: prefer runtime registration, but accept
@@ -158,12 +168,12 @@ def get_service():
             # register its adapter opportunistically so that pre-routing
             # setups continue to work. Absent module config means no adapter
             # is required or registered.
-            content_root = (cms_cfg or {}).get("content_root", "")
+            content_root = _cms_content_dir(cms_cfg)
             if not content_root:
                 raise ImproperlyConfigured(
-                    "content_root is required for cauldron.admin.content when "
+                    "site_root is required for cauldron.admin.content when "
                     "cauldron.cms.flatfile is configured; configure "
-                    "CAULDRON_MODULES['cauldron.cms.flatfile']['content_root']."
+                    "CAULDRON_MODULES['cauldron.cms.flatfile']['site_root']."
                 )
             try:
                 from cauldron_workspace_flatfile.reversible import (

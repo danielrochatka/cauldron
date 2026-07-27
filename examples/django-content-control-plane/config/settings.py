@@ -3,8 +3,6 @@ import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-CONTENT_DIR = BASE_DIR / "site" / "content"
-SCHEMAS_DIR = BASE_DIR / "site" / "schemas"
 WORKSPACE_DIR = BASE_DIR / "site" / ".cauldron" / "workspace"
 
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-only-insecure-secret-key-change-in-production")
@@ -24,8 +22,7 @@ CAULDRON_MODULES = {
         "workspace_root": str(WORKSPACE_DIR),
     },
     "cauldron.cms.flatfile": {
-        "content_root": str(CONTENT_DIR),
-        "schemas_root": str(SCHEMAS_DIR),
+        "site_root": str(BASE_DIR / "site"),
     },
     "cauldron.django.state": {},
     "cauldron.django.auth": {},

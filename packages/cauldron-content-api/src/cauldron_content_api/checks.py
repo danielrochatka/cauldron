@@ -6,6 +6,15 @@ from pathlib import Path
 from django.core import checks
 
 
+def _cms_content_dir(cms_cfg: dict) -> str:
+    """Return the absolute content directory for a flatfile cms config dict."""
+    site_root = (cms_cfg or {}).get("site_root", "")
+    if not site_root:
+        return ""
+    content_root_rel = (cms_cfg or {}).get("content_root", "content")
+    return str(Path(site_root) / content_root_rel)
+
+
 def _is_api_active() -> bool:
     try:
         from django.conf import settings
@@ -87,10 +96,10 @@ def check_api_configuration(app_configs, **kwargs):
     cms_cfg = modules.get("cauldron.cms.flatfile")
     if cms_cfg is None:
         return errors
-    content_root = (cms_cfg or {}).get("content_root", "")
+    content_root = _cms_content_dir(cms_cfg)
     if not content_root:
         errors.append(checks.Error(
-            "cauldron.cms.flatfile.content_root is required for cauldron.content.api.",
+            "cauldron.cms.flatfile.site_root is required for cauldron.content.api.",
             id="content_api.E002",
         ))
     if errors:
@@ -165,10 +174,10 @@ def check_api_flatfile_routing(app_configs, **kwargs):
             id="content_api.E020",
         ))
         return errors
-    content_root = (cms_cfg or {}).get("content_root", "")
+    content_root = _cms_content_dir(cms_cfg)
     if not content_root:
         errors.append(checks.Error(
-            "Routing selects 'flatfile' but 'content_root' is missing.",
+            "Routing selects 'flatfile' but 'site_root' is missing.",
             id="content_api.E021",
         ))
         return errors

@@ -101,44 +101,67 @@ class TestFlatfileProviderRegistration:
         assert registry.get("flatfile") is repo_first
 
     def test_content_dir_readable_after_provider_reconstruction(self, tmp_path):
-        """An existing content file in content/ remains readable after repo reconstruction."""
+        """Content written before a registry reset is readable after provider reconstruction.
+
+        Uses an isolated tmp_path site root so no real checkout files are touched.
+        """
+        import json
+        import shutil
+        from django.test import override_settings
         from cauldron_cms_flatfile.apps import _register_provider
         from cauldron_content.registry import registry
-        from django.test import override_settings
-
-        # Write a sentinel file into the real content/pages directory.
-        pages_dir = _site_root() / "content" / "pages"
-        pages_dir.mkdir(parents=True, exist_ok=True)
-        sentinel = pages_dir / "_regression_test_sentinel.md"
-        sentinel.write_text(
-            "---\n"
-            "id: _regression-sentinel\n"
-            "slug: regression-sentinel\n"
-            "status: draft\n"
-            "schema: page\n"
-            "title: Regression Sentinel\n"
-            "---\n"
-            "Regression sentinel.\n"
+        from cauldron_content.contracts import (
+            ContentChangeSet,
+            ContentOperation,
+            ContentOperationKind,
+            ContentStatus,
         )
-        try:
+
+        # Build a minimal temporary site root with the same layout as the real
+        # self-hosted checkout: content/ and schemas/page.schema.json.
+        real_schema = _site_root() / "schemas" / "page.schema.json"
+        tmp_schemas = tmp_path / "schemas"
+        tmp_schemas.mkdir()
+        shutil.copy(real_schema, tmp_schemas / "page.schema.json")
+        (tmp_path / "content" / "pages").mkdir(parents=True)
+
+        from django.conf import settings as djsettings
+        tmp_modules = {
+            **getattr(djsettings, "CAULDRON_MODULES", {}),
+            "cauldron.cms.flatfile": {"site_root": str(tmp_path)},
+        }
+        with override_settings(CAULDRON_MODULES=tmp_modules):
             _register_provider()
             repo = registry.get("flatfile")
-            assert repo is not None
+            assert repo is not None, "Provider did not register with temporary site_root"
 
-            # Rebuild the registry (simulates service restart) and confirm
-            # the sentinel is still visible to a fresh repository instance.
+            # Write a content item through the repository API.
+            op = ContentOperation(
+                kind=ContentOperationKind.CREATE,
+                provider="flatfile",
+                collection="pages",
+                item_id="reconstruction-sentinel",
+                slug="reconstruction-sentinel",
+                status=ContentStatus.DRAFT,
+                schema="page",
+                data={"title": "Reconstruction Sentinel"},
+                body="Sentinel body.",
+            )
+            result = repo.apply(ContentChangeSet(id="cs-reconstruction-001", operations=(op,)))
+            assert result.success, f"apply failed: {result.validation_errors}"
+
+            # Simulate a service restart: rebuild the registry from the same settings.
             registry.reset()
             _register_provider()
             repo2 = registry.get("flatfile")
             assert repo2 is not None
+
             items = repo2.list_items("pages", include_drafts=True)
             ids = [item.id for item in items]
-            assert any("sentinel" in iid for iid in ids), (
-                "Content file written before provider reconstruction was not visible "
-                "after rebuilding the registry. site_root may be pointing at the wrong path."
+            assert "reconstruction-sentinel" in ids, (
+                "Item written before registry reset was not visible after provider "
+                "reconstruction. site_root may not be persisting to the right path."
             )
-        finally:
-            sentinel.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------

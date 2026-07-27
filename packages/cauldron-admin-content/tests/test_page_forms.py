@@ -43,18 +43,18 @@ def test_create_form_valid_full():
     assert form.is_valid(), form.errors
 
 
-def test_create_form_status_draft():
+def test_create_form_has_no_intended_status_field():
     from cauldron_admin_content.forms import PageCreateForm
     form = PageCreateForm(data=_create_data(intended_status="draft"))
     assert form.is_valid()
-    assert form.cleaned_data["intended_status"] == "draft"
+    assert "intended_status" not in form.cleaned_data
 
 
-def test_create_form_status_published():
+def test_create_form_extra_intended_status_ignored():
     from cauldron_admin_content.forms import PageCreateForm
     form = PageCreateForm(data=_create_data(intended_status="published"))
     assert form.is_valid()
-    assert form.cleaned_data["intended_status"] == "published"
+    assert "intended_status" not in form.cleaned_data
 
 
 # ---------------------------------------------------------------------------

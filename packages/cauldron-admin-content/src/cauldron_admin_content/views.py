@@ -201,6 +201,9 @@ class ContentBrowserView(View):
         can_propose = request.user.has_perm(
             "cauldron_content_operations.propose_content_changes"
         )
+        from cauldron_content_operations.config import get_operations_config
+        cfg = get_operations_config()
+        require_approval = cfg.require_approval
         from django.core.exceptions import ImproperlyConfigured
         try:
             service = _get_service()
@@ -213,6 +216,7 @@ class ContentBrowserView(View):
                 "include_drafts": False,
                 "can_view_drafts": has_draft_perm,
                 "can_propose": can_propose,
+                "can_publish": _can_publish(request, require_approval),
                 "is_pages_collection": False,
                 "error": "Service unavailable",
             })
@@ -240,6 +244,7 @@ class ContentBrowserView(View):
             "include_drafts": include_drafts,
             "can_view_drafts": has_draft_perm,
             "can_propose": can_propose,
+            "can_publish": _can_publish(request, require_approval),
             "is_pages_collection": collection == PAGE_COLLECTION,
             "page_collection": PAGE_COLLECTION,
             "page_schema": _PAGE_SCHEMA,
@@ -357,8 +362,7 @@ class PageCreateView(View):
             return render(request, self.template_name, self._context(request, form, submission_token))
 
         from cauldron_content.pages import build_page_operation
-        intended = form.cleaned_data["intended_status"]
-        status = "draft" if intended == "draft" else "published"
+        status = "published" if action == "publish" else "draft"
 
         operation = build_page_operation(
             kind="create",
@@ -415,8 +419,7 @@ class PageCreateView(View):
 
         messages.success(
             request,
-            f"Page proposal created ({result.request_id[:8]}…). "
-            "It will be published once the change request is approved and applied.",
+            f"Draft saved ({result.request_id[:8]}…).",
         )
         return _redirect_after_proposal(request, result.request_id)
 
@@ -460,15 +463,98 @@ class PageDetailView(View):
         # schemas in the pages collection are not safe to edit through this form
         # because the page schema uses additionalProperties:false.
         can_edit = can_propose and item.schema == _PAGE_SCHEMA
+        from cauldron_content_operations.config import get_operations_config
+        cfg = get_operations_config()
         return render(request, self.template_name, {
             "item": item,
             "can_propose": can_propose,
             "can_edit": can_edit,
+            "can_publish": _can_publish(request, cfg.require_approval),
+            "require_approval": cfg.require_approval,
             "breadcrumbs": [
                 {"label": "Content", "url": reverse("cauldron_admin_content:content-browser")},
                 {"label": title, "url": ""},
             ],
         })
+
+    def post(self, request: HttpRequest, item_id: str) -> Any:
+        """Publish an existing draft page directly from the detail view."""
+        from cauldron_content.pages import PAGE_COLLECTION, build_page_operation
+        from cauldron_content_operations.config import get_operations_config
+        from django.core.exceptions import ImproperlyConfigured
+
+        detail_url = reverse("cauldron_admin_content:page-detail", kwargs={"item_id": item_id})
+        action = request.POST.get("action", "")
+        if action != "publish":
+            return HttpResponseRedirect(detail_url)
+
+        cfg = get_operations_config()
+        if not _can_publish(request, cfg.require_approval):
+            messages.error(request, "You do not have permission to publish content.")
+            return HttpResponseRedirect(detail_url)
+
+        has_draft_perm = request.user.has_perm("cauldron_content_operations.view_draft_content")
+        try:
+            service = _get_service()
+        except ImproperlyConfigured:
+            _handle_config_error(request)
+            return HttpResponseRedirect(detail_url)
+
+        item = service.get_item(
+            item_id, PAGE_COLLECTION, user=request.user, include_drafts=has_draft_perm,
+        )
+        if item is None:
+            raise Http404
+
+        if item.schema != _PAGE_SCHEMA:
+            raise Http404
+
+        if item.status == "published":
+            messages.info(request, "This page is already published.")
+            return HttpResponseRedirect(detail_url)
+
+        data = item.data
+        operation = build_page_operation(
+            kind="update",
+            item_id=item.id,
+            slug=item.slug,
+            status="published",
+            title=data.get("title", ""),
+            body=item.body,
+            expected_hash=item.hash,
+            navigation_title=data.get("navigation_title", ""),
+            summary=data.get("summary", ""),
+            seo_title=data.get("seo_title", ""),
+            meta_description=data.get("meta_description", ""),
+            canonical_url=data.get("canonical_url", ""),
+            robots_index=bool(data.get("robots_index", True)),
+            robots_follow=bool(data.get("robots_follow", True)),
+            social_title=data.get("social_title", ""),
+            social_description=data.get("social_description", ""),
+            social_image=data.get("social_image", ""),
+            template=data.get("template", "page"),
+        )
+
+        try:
+            result = service.create_change_request(
+                user=request.user,
+                operations=[operation],
+                provider_name="",
+                description=f"Publish draft: {data.get('title', item.id)}",
+            )
+        except Exception as exc:
+            messages.error(request, html.escape(str(exc)[:400]))
+            return HttpResponseRedirect(detail_url)
+
+        if not result.ok:
+            error_msg = result.error.message if result.error else "An unknown error occurred."
+            messages.error(request, html.escape(error_msg[:400]))
+            return HttpResponseRedirect(detail_url)
+
+        return _handle_publish_flow(
+            request, service, result.request_id, result.request_version,
+            on_form_error=lambda issues, fresh_token: HttpResponseRedirect(detail_url),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -558,7 +644,6 @@ class PageEditView(View):
             "social_description": data.get("social_description", ""),
             "social_image": data.get("social_image", ""),
             "body": item.body,
-            "intended_status": item.status if item.status in ("draft", "published") else "draft",
             "change_description": "",
         })
 
@@ -605,8 +690,7 @@ class PageEditView(View):
         if not form.is_valid():
             return self._render_form(request, form, item, edit_token, submission_token)
 
-        intended = form.cleaned_data["intended_status"]
-        status = "draft" if intended == "draft" else "published"
+        status = "published" if action == "publish" else "draft"
 
         operation = build_page_operation(
             kind="update",
@@ -657,8 +741,7 @@ class PageEditView(View):
 
         messages.success(
             request,
-            f"Page update proposal created ({result.request_id[:8]}…). "
-            "Changes will go live once the change request is approved and applied.",
+            f"Draft update saved ({result.request_id[:8]}…).",
         )
         return _redirect_after_proposal(request, result.request_id)
 

@@ -135,7 +135,16 @@ class CollectionsView(View):
             return err
         try:
             service = get_service()
-            collections = service.list_collections(user=request.user)
+            infos = service.list_collections(user=request.user)
+            collections = [
+                {
+                    "name": c.name,
+                    "schema": c.schema or None,
+                    "provider": c.provider or None,
+                    "item_count": c.item_count,
+                }
+                for c in (infos or [])
+            ]
             return success_response({"collections": collections})
         except Exception as exc:
             from django.core.exceptions import ImproperlyConfigured

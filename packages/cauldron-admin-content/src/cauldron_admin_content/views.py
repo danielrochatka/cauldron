@@ -151,7 +151,7 @@ class ContentBrowserView(View):
         error = ""
 
         try:
-            collections = service.list_collections(user=request.user)
+            collections = [c.name for c in service.list_collections(user=request.user)]
         except Exception as exc:
             error = html.escape(str(exc)[:200])
 

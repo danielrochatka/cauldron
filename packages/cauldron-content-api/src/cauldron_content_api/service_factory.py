@@ -46,16 +46,18 @@ def get_service():
     """
     from django.conf import settings
     from cauldron_content.registry import registry
-    from cauldron_content.router import ContentRouter, RouterConfig
+    from cauldron_content.router import ContentRouter, RouterConfig, build_registered_collections
     from cauldron_content_operations.service import ContentOperationService
     from cauldron_content_operations.config import get_operations_config
 
     modules = getattr(settings, "CAULDRON_MODULES", {}) or {}
     routing_cfg = _routing_config(settings)
 
+    default_provider = routing_cfg.get("default_provider", "") or ""
     router_config = RouterConfig(
-        default_provider=routing_cfg.get("default_provider", ""),
+        default_provider=default_provider,
         collections=routing_cfg.get("collections", {}),
+        registered_collections=build_registered_collections(routing_cfg, default_provider),
     )
     router = ContentRouter(registry, router_config)
 

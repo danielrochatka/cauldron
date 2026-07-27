@@ -588,3 +588,15 @@ def test_build_registered_collections_empty_routing_still_seeds_pages():
     result = _build_registered_collections({}, default_provider="")
     assert "pages" in result
     assert result["pages"].provider == "flatfile"  # falls back to "flatfile"
+
+
+def test_build_registered_collections_pages_uses_per_collection_route():
+    """When collections map routes pages to a specific provider, the seeded
+    descriptor must reflect that provider, not the default."""
+    from cauldron_admin_content.service_factory import _build_registered_collections
+    routing_cfg = {
+        "default_provider": "flatfile",
+        "collections": {"pages": "sql"},
+    }
+    result = _build_registered_collections(routing_cfg, default_provider="flatfile")
+    assert result["pages"].provider == "sql"

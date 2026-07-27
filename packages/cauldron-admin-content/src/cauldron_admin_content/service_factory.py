@@ -37,30 +37,8 @@ def _flatfile_is_routed(settings) -> bool:
 
 
 def _build_registered_collections(routing_cfg: dict, default_provider: str) -> dict:
-    """Return the registered_collections dict for RouterConfig.
-
-    Always seeds the standard ``pages`` collection unless the operator has
-    already declared it in routing configuration.
-    """
-    from cauldron_content.router import RegisteredCollection
-    from cauldron_content.pages import PAGE_COLLECTION, PAGE_SCHEMA
-
-    registered_raw = routing_cfg.get("registered_collections") or {}
-    registered: dict[str, RegisteredCollection] = {}
-    if isinstance(registered_raw, dict):
-        for coll_name, coll_cfg in registered_raw.items():
-            if not isinstance(coll_cfg, dict):
-                continue
-            registered[coll_name] = RegisteredCollection(
-                schema=coll_cfg.get("schema", "") or "",
-                provider=coll_cfg.get("provider", "") or default_provider,
-            )
-    if PAGE_COLLECTION not in registered:
-        registered[PAGE_COLLECTION] = RegisteredCollection(
-            schema=PAGE_SCHEMA,
-            provider=default_provider or "flatfile",
-        )
-    return registered
+    from cauldron_content.router import build_registered_collections
+    return build_registered_collections(routing_cfg, default_provider)
 
 
 def get_service():

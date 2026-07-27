@@ -25,6 +25,48 @@ class CollectionInfo:
     item_count: Optional[int]
 
 
+def build_registered_collections(
+    routing_cfg: dict,
+    default_provider: str,
+) -> "dict[str, RegisteredCollection]":
+    """Build the registered_collections dict from a routing configuration block.
+
+    Always seeds the standard ``pages`` collection unless the operator has
+    already declared it.  When seeding pages, the per-collection routing map
+    is consulted first so the descriptor matches what ``_resolve_provider``
+    would return.
+    """
+    from .pages import PAGE_COLLECTION, PAGE_SCHEMA
+
+    registered: dict[str, RegisteredCollection] = {}
+    registered_raw = routing_cfg.get("registered_collections") or {}
+    per_collection: dict = routing_cfg.get("collections") or {}
+
+    if isinstance(registered_raw, dict):
+        for coll_name, coll_cfg in registered_raw.items():
+            if not isinstance(coll_cfg, dict):
+                continue
+            registered[coll_name] = RegisteredCollection(
+                schema=coll_cfg.get("schema", "") or "",
+                provider=coll_cfg.get("provider", "")
+                    or per_collection.get(coll_name, "")
+                    or default_provider,
+            )
+
+    if PAGE_COLLECTION not in registered:
+        pages_provider = (
+            per_collection.get(PAGE_COLLECTION, "")
+            or default_provider
+            or "flatfile"
+        )
+        registered[PAGE_COLLECTION] = RegisteredCollection(
+            schema=PAGE_SCHEMA,
+            provider=pages_provider,
+        )
+
+    return registered
+
+
 @dataclass
 class RouterConfig:
     default_provider: str = ""

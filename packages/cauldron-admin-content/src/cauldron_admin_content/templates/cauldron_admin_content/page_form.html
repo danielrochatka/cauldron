@@ -89,17 +89,42 @@
     <div class="cui-form">
       {% include "cauldron_admin/includes/form_field.html" with field=form.intended_status %}
       <div class="cui-alert cui-alert--info" role="note">
-        This creates a <strong>change request</strong> that must be approved and applied
-        before the page is visible. No file is written until the request is applied.
+        <strong>Save Draft</strong> creates a change request for later review.
+        {% if not require_approval %}
+        <strong>Publish</strong> validates and applies it immediately.
+        {% else %}
+        <strong>Submit for Review</strong> validates the draft and queues it for approval.
+        {% endif %}
+        No file is written until the request is applied.
       </div>
       {% include "cauldron_admin/includes/form_field.html" with field=form.change_description %}
     </div>
   </div>
 
+  {% if validation_issues %}
+  <div class="cui-alert cui-alert--error" role="alert">
+    <strong>Validation failed — {{ validation_issues|length }} issue(s)</strong>
+    <ul class="cui-list">
+      {% for issue in validation_issues %}
+      <li>
+        <code>{{ issue.code }}</code>{% if issue.collection %} in <strong>{{ issue.collection }}</strong>{% endif %}{% if issue.item_id %} ({{ issue.item_id }}){% endif %}{% if issue.message %}: {{ issue.message }}{% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
   <div class="cui-form-actions">
-    <button type="submit" class="cui-button">
-      {% if is_edit %}Submit Update Proposal{% else %}Submit Page Proposal{% endif %}
+    {% if can_publish %}
+    <button type="submit" name="action" value="publish" class="cui-button">
+      {% if is_edit %}
+        {% if require_approval %}Submit Update for Review{% else %}Update Page{% endif %}
+      {% else %}
+        {% if require_approval %}Submit for Review{% else %}Publish{% endif %}
+      {% endif %}
     </button>
+    {% endif %}
+    <button type="submit" name="action" value="save_draft" class="cui-button cui-button--secondary">Save Draft</button>
     <a href="{% url 'cauldron_admin_content:content-browser' %}" class="cui-button cui-button--secondary">Cancel</a>
   </div>
 

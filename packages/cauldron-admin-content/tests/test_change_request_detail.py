@@ -968,3 +968,152 @@ def test_get_shows_audit_events(client):
 
     content = resp.content.decode()
     assert "proposal_created" in content or "Audit History" in content
+
+
+# ---------------------------------------------------------------------------
+# Publish action from change request detail
+# ---------------------------------------------------------------------------
+
+def test_publish_action_validates_and_applies_when_approval_not_required(client):
+    """POST action=publish from proposed state validates then applies."""
+    from django.test import override_settings
+    user = _make_user("cr_pub1", [
+        "view_content_change_requests",
+        "validate_content_changes",
+        "apply_content_changes",
+    ])
+    client.force_login(user)
+    cr = _make_cr(lifecycle_state="proposed", request_version=1)
+    url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
+
+    validate_result = _ok_result(request_id=cr.request_id, state="validated", version=2)
+    apply_result = _ok_result(request_id=cr.request_id, state="applied", version=3)
+    mock_svc = _make_service(
+        validate_return=validate_result,
+        apply_return=apply_result,
+    )
+
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+            resp = client.post(url, data={"action": "publish", "expected_version": "1"})
+
+    assert resp.status_code == 302
+    mock_svc.validate_change_request.assert_called_once()
+    mock_svc.apply_change_request.assert_called_once()
+
+
+def test_publish_action_validates_only_when_approval_required(client):
+    """POST action=publish submits for review when require_approval=True."""
+    from django.test import override_settings
+    user = _make_user("cr_pub2", [
+        "view_content_change_requests",
+        "validate_content_changes",
+        "apply_content_changes",
+    ])
+    client.force_login(user)
+    cr = _make_cr(lifecycle_state="proposed", request_version=1)
+    url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
+
+    mock_svc = _make_service()
+    approval_on = {"cauldron.content.operations": {"require_approval": True, "max_operations_per_change_set": 100}}
+
+    with override_settings(ROOT_URLCONF="tests.urls", CAULDRON_MODULES=approval_on):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+            resp = client.post(url, data={"action": "publish", "expected_version": "1"})
+
+    assert resp.status_code == 302
+    mock_svc.validate_change_request.assert_called_once()
+    mock_svc.apply_change_request.assert_not_called()
+
+
+def test_publish_action_rerenders_with_issues_on_validation_failure(client):
+    """POST action=publish re-renders the CR detail with validation issues on failure."""
+    from django.test import override_settings
+    user = _make_user("cr_pub3", [
+        "view_content_change_requests",
+        "validate_content_changes",
+        "apply_content_changes",
+    ])
+    client.force_login(user)
+    cr = _make_cr(lifecycle_state="proposed", request_version=1)
+    url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
+
+    fail_result = _fail_result(code="validation.failed", message="Validation failed: 1 issue(s).")
+    fail_result.meta = {"validation_issues": [
+        {"code": "schema.missing_field", "collection": "pages", "item_id": "pid", "message": "title required"},
+    ]}
+    mock_svc = _make_service(validate_return=fail_result)
+
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+            resp = client.post(url, data={"action": "publish", "expected_version": "1"})
+
+    assert resp.status_code == 200
+    content = resp.content.decode()
+    assert "schema.missing_field" in content
+    assert "title required" in content
+    mock_svc.apply_change_request.assert_not_called()
+
+
+def test_publish_action_rejected_without_permissions(client):
+    """POST action=publish returns 302 error when user lacks validate permission."""
+    from django.test import override_settings
+    # User has view but NOT validate permission
+    user = _make_user("cr_pub4", ["view_content_change_requests"])
+    client.force_login(user)
+    cr = _make_cr(lifecycle_state="proposed", request_version=1)
+    url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
+
+    mock_svc = _make_service()
+
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+            resp = client.post(url, data={"action": "publish", "expected_version": "1"})
+
+    # Redirects with error message (does not call validate)
+    assert resp.status_code == 302
+    mock_svc.validate_change_request.assert_not_called()
+
+
+def test_publish_action_not_valid_from_validated_state(client):
+    """POST action=publish is rejected for already-validated state (use apply instead)."""
+    from django.test import override_settings
+    user = _make_user("cr_pub5", [
+        "view_content_change_requests",
+        "validate_content_changes",
+        "apply_content_changes",
+    ])
+    client.force_login(user)
+    cr = _make_cr(lifecycle_state="validated", request_version=2)
+    url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
+
+    mock_svc = _make_service()
+
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+            resp = client.post(url, data={"action": "publish", "expected_version": "2"})
+
+    # "publish" is not in valid_actions for "validated" state
+    assert resp.status_code == 302
+    mock_svc.validate_change_request.assert_not_called()
+
+
+def test_cr_detail_shows_publish_button_in_proposed_state(client):
+    """GET: Publish button appears in proposed state when user has permissions."""
+    from django.test import override_settings
+    user = _make_user("cr_pub6", [
+        "view_content_change_requests",
+        "validate_content_changes",
+        "apply_content_changes",
+    ])
+    client.force_login(user)
+    cr = _make_cr(lifecycle_state="proposed", request_version=1)
+    url = _DETAIL_URL_FMT.format(request_id=cr.request_id)
+    mock_svc = _make_service()
+
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+            resp = client.get(url)
+
+    content = resp.content.decode()
+    assert 'value="publish"' in content

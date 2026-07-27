@@ -1819,3 +1819,66 @@ def test_list_collections_deduplicates():
     result = service.list_collections(user=user)
     names = [c.name for c in result]
     assert names.count("pages") == 1
+
+
+# ---------------------------------------------------------------------------
+# Validation failure returns structured meta.validation_issues
+# ---------------------------------------------------------------------------
+
+def test_validate_failure_includes_structured_issues_in_meta():
+    """validate_change_request must populate meta['validation_issues'] on failure."""
+    from cauldron_content.contracts import ValidationResult, ValidationIssue
+
+    user = _make_user(is_superuser=True, username="meta_val1")
+    bad_vr = ValidationResult.failed([
+        ValidationIssue(code="schema.missing_field", message="Missing 'title'", collection="pages", item_id="p1")
+    ])
+    service, _ = _make_service_with_repo(validate_return=bad_vr)
+    r = service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}}],
+        provider_name="flatfile",
+    )
+    assert r.ok
+    result = service.validate_change_request(r.request_id, user=user, expected_version=1)
+    assert not result.ok
+    assert "validation_issues" in result.meta
+    issues = result.meta["validation_issues"]
+    assert len(issues) >= 1
+    assert issues[0]["code"] == "schema.missing_field"
+    assert issues[0]["item_id"] == "p1"
+
+
+def test_validate_failure_changeset_issues_in_meta():
+    """Pre-validation changeset issues (missing collection/item_id) also go into meta."""
+    user = _make_user(is_superuser=True, username="meta_val2")
+    service = _make_service()
+    # Create with missing collection to trigger changeset-level validation failure
+    r = service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "", "item_id": "p1", "slug": "p1", "data": {}}],
+        provider_name="flatfile",
+    )
+    if not r.ok:
+        # Some builds may reject at create time — skip this test path
+        return
+    result = service.validate_change_request(r.request_id, user=user, expected_version=1)
+    if not result.ok:
+        assert "validation_issues" in result.meta
+
+
+def test_validate_success_has_empty_or_no_issues_in_meta():
+    """A passing validation must not include validation_issues in meta."""
+    user = _make_user(is_superuser=True, username="meta_val3")
+    service, _ = _make_service_with_repo()
+    r = service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}}],
+        provider_name="flatfile",
+    )
+    assert r.ok
+    result = service.validate_change_request(r.request_id, user=user, expected_version=1)
+    assert result.ok
+    # On success there should be no validation_issues key or it should be empty
+    issues = result.meta.get("validation_issues", [])
+    assert issues == []

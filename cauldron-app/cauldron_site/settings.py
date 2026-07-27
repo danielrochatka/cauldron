@@ -59,7 +59,7 @@ CAULDRON_MODULES = {
         "workspace_root": str(WORKSPACE_DIR),
     },
     "cauldron.cms.flatfile": {
-        "site_root": str(BASE_DIR / "site"),
+        "site_root": str(BASE_DIR),
     },
     "cauldron.django.state": {},
     "cauldron.django.auth": {},

@@ -354,6 +354,7 @@ class TestExistingDraftPublish:
         user = _make_user("dp_pub1", [
             "view_published_content",
             "view_draft_content",
+            "propose_content_changes",
             "validate_content_changes",
             "apply_content_changes",
         ])
@@ -378,6 +379,7 @@ class TestExistingDraftPublish:
         user = _make_user("dp_pub2", [
             "view_published_content",
             "view_draft_content",
+            "propose_content_changes",
             "validate_content_changes",
             "apply_content_changes",
         ])
@@ -402,6 +404,7 @@ class TestExistingDraftPublish:
         user = _make_user("dp_pub3", [
             "view_published_content",
             "view_draft_content",
+            "propose_content_changes",
             "validate_content_changes",
             "apply_content_changes",
         ])
@@ -422,6 +425,7 @@ class TestExistingDraftPublish:
     def test_page_detail_post_publish_already_published_redirects(self, client):
         user = _make_user("dp_pub4", [
             "view_published_content",
+            "propose_content_changes",
             "validate_content_changes",
             "apply_content_changes",
         ])
@@ -435,9 +439,15 @@ class TestExistingDraftPublish:
         assert response.status_code == 302
         mock_service.create_change_request.assert_not_called()
 
-    def test_page_detail_post_publish_requires_permission(self, client):
-        from django.test import override_settings
-        user = _make_user("dp_noperm1", ["view_published_content"])
+    def test_page_detail_post_publish_requires_propose_permission(self, client):
+        """validate + apply alone are not sufficient; propose_content_changes is also required."""
+        user = _make_user("dp_nopropose1", [
+            "view_published_content",
+            "view_draft_content",
+            "validate_content_changes",
+            "apply_content_changes",
+            # deliberately omitting propose_content_changes
+        ])
         item = _make_item(status="draft")
         mock_service = MagicMock()
         mock_service.get_item.return_value = item
@@ -448,9 +458,24 @@ class TestExistingDraftPublish:
         assert response.status_code == 302
         mock_service.create_change_request.assert_not_called()
 
+    def test_page_detail_post_publish_blocked_service_never_called(self, client):
+        """When _can_publish() is False the service is never reached."""
+        user = _make_user("dp_nopropose2", ["view_published_content", "view_draft_content"])
+        item = _make_item(status="draft")
+        mock_service = MagicMock()
+        mock_service.get_item.return_value = item
+
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+            self._post_detail_publish(client, user, item.id)
+
+        mock_service.create_change_request.assert_not_called()
+        mock_service.validate_change_request.assert_not_called()
+        mock_service.apply_change_request.assert_not_called()
+
     def test_page_detail_post_publish_draft_not_visible_without_draft_perm(self, client):
         user = _make_user("dp_nodraft1", [
             "view_published_content",
+            "propose_content_changes",
             "validate_content_changes",
             "apply_content_changes",
         ])
@@ -558,6 +583,7 @@ class TestPageDetailPublishButton:
         user = _make_user("pdb_show1", [
             "view_published_content",
             "view_draft_content",
+            "propose_content_changes",
             "validate_content_changes",
             "apply_content_changes",
         ])
@@ -578,6 +604,7 @@ class TestPageDetailPublishButton:
         from django.test import override_settings
         user = _make_user("pdb_hide1", [
             "view_published_content",
+            "propose_content_changes",
             "validate_content_changes",
             "apply_content_changes",
         ])
@@ -593,4 +620,64 @@ class TestPageDetailPublishButton:
         assert response.status_code == 200
         content = response.content.decode()
         # The publish button form should not appear for already-published items
+        assert 'name="action" value="publish"' not in content
+
+    def test_page_detail_no_publish_button_without_propose_perm(self, client):
+        """propose_content_changes is required for can_publish; button must not appear without it."""
+        from django.test import override_settings
+        user = _make_user("pdb_nopropose1", [
+            "view_published_content",
+            "view_draft_content",
+            "validate_content_changes",
+            "apply_content_changes",
+            # deliberately omitting propose_content_changes
+        ])
+        item = _make_item(status="draft")
+        mock_service = MagicMock()
+        mock_service.get_item.return_value = item
+
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+            client.force_login(user)
+            with override_settings(ROOT_URLCONF="tests.urls"):
+                response = client.get(f"/cauldron-admin/content/pages/{item.id}/")
+
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert 'name="action" value="publish"' not in content
+
+    def test_content_browser_no_publish_button_without_propose_perm(self, client):
+        """Publish button must not appear in the browser for users lacking propose_content_changes."""
+        from django.test import override_settings
+        user = _make_user("pdb_nopropose2", [
+            "view_published_content",
+            "view_draft_content",
+            "validate_content_changes",
+            "apply_content_changes",
+            # deliberately omitting propose_content_changes
+        ])
+        item_id = str(uuid.uuid4())
+        draft_item_dict = {
+            "id": item_id,
+            "slug": "draft-page",
+            "status": "draft",
+            "schema": "page",
+            "provider": "flatfile",
+            "hash": "abc",
+            "body": "",
+            "collection": "pages",
+            "data": {"title": "Draft Page"},
+        }
+        draft_item_mock = MagicMock()
+        draft_item_mock.to_dict.return_value = draft_item_dict
+        mock_service = MagicMock()
+        mock_service.list_collections.return_value = []
+        mock_service.list_items.return_value = [draft_item_mock]
+
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+            client.force_login(user)
+            with override_settings(ROOT_URLCONF="tests.urls"):
+                response = client.get("/cauldron-admin/content/?collection=pages&include_drafts=1")
+
+        assert response.status_code == 200
+        content = response.content.decode()
         assert 'name="action" value="publish"' not in content

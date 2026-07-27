@@ -90,7 +90,13 @@ def _load_edit_token(token: str) -> dict | None:
 
 
 def _can_publish(request: HttpRequest, require_approval: bool) -> bool:
-    """True when the user has the permissions needed for the publish flow."""
+    """True when the user has all permissions required for the publish flow.
+
+    Publishing is a proposal that skips the normal review queue, so it requires
+    propose + validate (always) and apply when approval is disabled.
+    """
+    if not request.user.has_perm("cauldron_content_operations.propose_content_changes"):
+        return False
     if not request.user.has_perm("cauldron_content_operations.validate_content_changes"):
         return False
     if not require_approval:

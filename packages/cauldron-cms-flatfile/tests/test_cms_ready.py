@@ -76,7 +76,17 @@ class TestReady:
             _register_provider()
             assert registry.get("flatfile") is first_repo
 
-    def test_invalid_site_root_raises_improperly_configured(self, tmp_path):
+    def test_relative_site_root_raises_improperly_configured(self):
+        from django.core.exceptions import ImproperlyConfigured
+
+        with override_settings(CAULDRON_MODULES={
+            "cauldron.content": {},
+            "cauldron.cms.flatfile": {"site_root": "relative/path"},
+        }):
+            with pytest.raises(ImproperlyConfigured, match="must be an absolute path"):
+                _register_provider()
+
+    def test_invalid_content_root_raises_improperly_configured(self, tmp_path):
         from django.core.exceptions import ImproperlyConfigured
 
         with override_settings(CAULDRON_MODULES={

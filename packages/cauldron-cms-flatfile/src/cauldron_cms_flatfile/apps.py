@@ -19,6 +19,8 @@ def _register_provider() -> None:
     the module is absent or site_root is not configured (Django checks emit I600).
     Idempotent: safe to call on repeated ready() invocations.
     """
+    from pathlib import Path
+
     from django.conf import settings
     from django.core.exceptions import ImproperlyConfigured
 
@@ -35,6 +37,12 @@ def _register_provider() -> None:
     site_root = cfg.get("site_root")
     if not site_root:
         return
+
+    site_root_path = Path(site_root)
+    if not site_root_path.is_absolute():
+        raise ImproperlyConfigured(
+            "cauldron.cms.flatfile.site_root must be an absolute path."
+        )
 
     if registry.get(PROVIDER_NAME) is not None:
         return

@@ -1,0 +1,30 @@
+---
+const {
+  title,
+  seoTitle,
+  metaDescription,
+  robotsIndex = true,
+  robotsFollow = true,
+  canonicalUrl,
+} = Astro.props;
+
+const pageTitle = seoTitle || title || 'Cauldron';
+const robots = [
+  robotsIndex ? 'index' : 'noindex',
+  robotsFollow ? 'follow' : 'nofollow',
+].join(', ');
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{pageTitle}</title>
+    {metaDescription && <meta name="description" content={metaDescription} />}
+    <meta name="robots" content={robots} />
+    {canonicalUrl && <link rel="canonical" href={canonicalUrl} />}
+  </head>
+  <body>
+    <slot />
+  </body>
+</html>

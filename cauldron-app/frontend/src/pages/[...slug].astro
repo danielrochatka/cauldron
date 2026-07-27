@@ -1,0 +1,40 @@
+---
+import { readFileSync } from 'fs';
+import { marked } from 'marked';
+import Base from '../layouts/Base.astro';
+
+export function getStaticPaths() {
+  const manifestPath = process.env.CAULDRON_MANIFEST;
+  if (!manifestPath) {
+    throw new Error('CAULDRON_MANIFEST environment variable is required.');
+  }
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+
+  return manifest.pages.map((page) => {
+    // Homepage: route "/" → params.slug = undefined → generates index.html
+    // Other: route "/about/" → params.slug = "about" → generates about/index.html
+    const slug = page.route === '/' ? undefined : page.route.replace(/^\//, '').replace(/\/$/, '');
+    return {
+      params: { slug },
+      props: { page },
+    };
+  });
+}
+
+const { page } = Astro.props;
+const bodyHtml = marked.parse(page.body || '');
+---
+<Base
+  title={page.title}
+  seoTitle={page.seo_title}
+  metaDescription={page.meta_description}
+  robotsIndex={page.robots_index}
+  robotsFollow={page.robots_follow}
+  canonicalUrl={page.canonical_url}
+>
+  <main>
+    <h1>{page.title}</h1>
+    {page.summary && <p class="summary">{page.summary}</p>}
+    <div class="body" set:html={bodyHtml} />
+  </main>
+</Base>

@@ -122,11 +122,19 @@ echo "--> Collecting static assets..."
 # 9. Initialize override directory.
 "$CAULDRON_DIR/manage" cauldron_ui_init 2>/dev/null || true
 
-# 10. Run system check.
+# 10. Install frontend npm dependencies and rebuild public site.
+if [ -f "$CAULDRON_DIR/frontend/package.json" ]; then
+  echo "--> Installing frontend dependencies..."
+  npm ci --prefix "$CAULDRON_DIR/frontend" --silent
+  echo "--> Building public site..."
+  "$CAULDRON_DIR/manage" cauldron_site_build || true
+fi
+
+# 11. Run system check.
 echo "--> Running system check..."
 "$CAULDRON_DIR/manage" check
 
-# 11. Start server.
+# 12. Start server.
 echo "--> Starting server..."
 PORT="${CAULDRON_PORT:-8000}"
 launch_server "$CAULDRON_DIR" "$PORT"

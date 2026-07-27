@@ -135,6 +135,8 @@ def _handle_publish_flow(
     request_version: int,
     *,
     on_form_error,
+    approval_message="Page submitted for review.",
+    published_message="Page published successfully.",
 ):
     """Shared publish flow: validate → (if no approval needed) apply.
 
@@ -163,7 +165,7 @@ def _handle_publish_flow(
         return on_form_error(issues, fresh_token)
 
     if cfg.require_approval:
-        messages.success(request, "Page submitted for review.")
+        messages.success(request, approval_message)
         return _redirect_after_proposal(request, request_id)
 
     try:
@@ -175,7 +177,7 @@ def _handle_publish_flow(
         return _redirect_after_proposal(request, request_id)
 
     if apply_result.ok:
-        messages.success(request, "Page published successfully.")
+        messages.success(request, published_message)
         return _redirect_after_publish(request, request_id)
 
     error_msg = apply_result.error.message if apply_result.error else "Apply failed."
@@ -1027,22 +1029,12 @@ class HomepageView(View):
                     validation_issues=issues,
                 )
 
-            publish_result = _handle_publish_flow(
+            return _handle_publish_flow(
                 request, service, result.request_id, result.request_version,
                 on_form_error=_form_error,
+                approval_message="Homepage submitted for review.",
+                published_message="Homepage queued for publishing.",
             )
-            # Override the generic "Page published/submitted" message with
-            # Homepage-specific wording.
-            from django.contrib.messages import get_messages as _get_msgs
-            storage = messages.get_messages(request)
-            storage.used = True  # mark so next render won't double-show
-            from cauldron_content_operations.config import get_operations_config
-            cfg = get_operations_config()
-            if cfg.require_approval:
-                messages.success(request, "Homepage submitted for review.")
-            else:
-                messages.success(request, "Homepage published successfully.")
-            return publish_result
 
         messages.success(request, "Homepage draft saved.")
         return HttpResponseRedirect(homepage_url)

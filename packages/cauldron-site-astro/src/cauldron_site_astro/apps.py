@@ -14,38 +14,19 @@ class CauldronSiteAstroConfig(AppConfig):
 
 
 def _connect_signals() -> None:
-    """Connect the post-apply signal handler."""
     try:
-        from cauldron_content_operations.signals import content_change_applied
-
-        content_change_applied.connect(_handle_content_applied, weak=False)
+        from cauldron_content_operations.signals import canonical_content_changed
+        canonical_content_changed.connect(_handle_content_changed, weak=False)
     except ImportError:
-        pass  # cauldron-content-operations not installed
+        pass
 
 
-def _handle_content_applied(sender, request_id, provider_name, applied_by, **kwargs):
-    """Rebuild the public site after a successful content apply."""
+def _handle_content_changed(sender, change_type, change_id, provider_name, changed_by, **kwargs):
     import logging
-
     logger = logging.getLogger(__name__)
     try:
-        from cauldron_site_astro.service import get_build_service
-
-        svc = get_build_service()
-        result = svc.build()
-        if result.ok:
-            logger.info(
-                "Site rebuilt after apply of %s: %d page(s) generated.",
-                request_id,
-                result.pages_built,
-            )
-        else:
-            logger.error(
-                "Site build failed after apply of %s: %s",
-                request_id,
-                result.error,
-            )
+        from cauldron_site_astro.dispatcher import get_dispatcher
+        get_dispatcher().dispatch()
+        logger.info("cauldron.site.astro: build dispatched after %s of %s", change_type, change_id)
     except Exception:
-        logger.exception(
-            "Unexpected error during site build after apply of %s", request_id
-        )
+        logger.exception("cauldron.site.astro: error dispatching build after %s of %s", change_type, change_id)

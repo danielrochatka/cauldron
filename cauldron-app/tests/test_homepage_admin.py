@@ -260,3 +260,126 @@ class TestHomepageViewPost:
         mock_service.apply_change_request.assert_called_once()
         # On success, redirects to content browser (after publish)
         assert response.status_code == 302
+
+
+class TestHomepagePublishMessages:
+    """Verify that publish messages are only shown after confirmed success."""
+
+    @pytest.mark.django_db
+    def test_validation_exception_shows_error_only(self, auth_client):
+        """Validation exception → error message only, no success message."""
+        mock_result = MagicMock()
+        mock_result.ok = True
+        mock_result.request_id = "req-msg-001"
+        mock_result.request_version = 1
+
+        with patch("cauldron_admin_content.views._get_service") as mock_get_service:
+            mock_service = MagicMock()
+            mock_service.get_item.return_value = None
+            mock_service.create_change_request.return_value = mock_result
+            mock_service.validate_change_request.side_effect = Exception("Validation exploded")
+            mock_get_service.return_value = mock_service
+
+            response = auth_client.post(HOMEPAGE_URL, {
+                "action": "publish",
+                "title": "Home",
+                "body": "# Hello",
+                "template": "homepage",
+                "submission_token": "",
+            }, follow=True)
+
+        messages_list = list(response.context["messages"])
+        assert any("error" in str(m.tags) or m.level_tag == "error" for m in messages_list), \
+            "Expected an error message for validation exception"
+        assert not any(
+            "published" in str(m.message).lower() or "submitted" in str(m.message).lower() or "queued" in str(m.message).lower()
+            for m in messages_list
+        ), "No success message should appear after validation exception"
+
+    @pytest.mark.django_db
+    def test_apply_failure_shows_error_only(self, auth_client):
+        """Apply failure → error message only, no success message."""
+        from django.contrib.messages import get_messages
+
+        mock_result = MagicMock()
+        mock_result.ok = True
+        mock_result.request_id = "req-msg-002"
+        mock_result.request_version = 1
+
+        mock_validate = MagicMock()
+        mock_validate.ok = True
+        mock_validate.meta = {}
+        mock_validate.request_version = 2
+
+        mock_apply = MagicMock()
+        mock_apply.ok = False
+        mock_apply.error = MagicMock()
+        mock_apply.error.message = "Apply failed: conflict"
+
+        with patch("cauldron_admin_content.views._get_service") as mock_get_service:
+            mock_service = MagicMock()
+            mock_service.get_item.return_value = None
+            mock_service.create_change_request.return_value = mock_result
+            mock_service.validate_change_request.return_value = mock_validate
+            mock_service.apply_change_request.return_value = mock_apply
+            mock_get_service.return_value = mock_service
+
+            # Don't follow: apply failure redirects to a CR detail URL that
+            # doesn't exist in the test DB, so the followed page has no messages.
+            response = auth_client.post(HOMEPAGE_URL, {
+                "action": "publish",
+                "title": "Home",
+                "body": "# Hello",
+                "template": "homepage",
+                "submission_token": "",
+            })
+
+        assert response.status_code == 302
+        messages_list = list(get_messages(response.wsgi_request))
+        assert any("error" in str(m.tags) or m.level_tag == "error" for m in messages_list)
+        assert not any(
+            "published" in str(m.message).lower() or "queued" in str(m.message).lower()
+            for m in messages_list
+        )
+
+    @pytest.mark.django_db
+    def test_successful_publish_shows_queued_message(self, auth_client):
+        """Successful publish → homepage-specific queued message (not generic 'Page published')."""
+        mock_result = MagicMock()
+        mock_result.ok = True
+        mock_result.request_id = "req-msg-003"
+        mock_result.request_version = 1
+
+        mock_validate = MagicMock()
+        mock_validate.ok = True
+        mock_validate.meta = {}
+        mock_validate.request_version = 2
+
+        mock_apply = MagicMock()
+        mock_apply.ok = True
+
+        with patch("cauldron_admin_content.views._get_service") as mock_get_service:
+            mock_service = MagicMock()
+            mock_service.get_item.return_value = None
+            mock_service.create_change_request.return_value = mock_result
+            mock_service.validate_change_request.return_value = mock_validate
+            mock_service.apply_change_request.return_value = mock_apply
+            mock_get_service.return_value = mock_service
+
+            response = auth_client.post(HOMEPAGE_URL, {
+                "action": "publish",
+                "title": "Home",
+                "body": "# Hello",
+                "template": "homepage",
+                "submission_token": "",
+            }, follow=True)
+
+        messages_list = list(response.context["messages"])
+        assert any(
+            "queued" in str(m.message).lower() or "homepage" in str(m.message).lower()
+            for m in messages_list
+        ), "Expected a homepage-specific message after successful publish"
+        # Must NOT say "Page published successfully" (generic message)
+        assert not any(
+            m.message == "Page published successfully." for m in messages_list
+        )

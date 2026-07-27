@@ -1961,6 +1961,14 @@ class ContentOperationService:
             provider_name=cr2.provider_name,
             applied_by=user,
         )
+        from cauldron_content_operations.signals import canonical_content_changed
+        canonical_content_changed.send_robust(
+            sender=self.__class__,
+            change_type="apply",
+            change_id=request_id,
+            provider_name=cr2.provider_name,
+            changed_by=user,
+        )
         return ChangeRequestResult(ok=True, request_id=request_id, lifecycle_state=LifecycleState.APPLIED.value, request_version=cr2.request_version)
 
     def rollback_change_request(
@@ -2163,6 +2171,7 @@ class ContentOperationService:
             )
 
         # Perform rollback via adapter (outside DB transaction)
+        rollback_succeeded = False
         rollback_ok = False
         rollback_error = ""
         rollback_error_code = "rollback.failed"
@@ -2281,6 +2290,7 @@ class ContentOperationService:
                     provider=cr.provider_name,
                     correlation_id=correlation_id,
                 )
+                rollback_succeeded = True
             elif rollback_ok and (verification_failed or persistence_failed):
                 # Item 5: workspace/verify failure post-mutation → reconciliation.
                 # SQL rollback_completed remains set.
@@ -2360,6 +2370,16 @@ class ContentOperationService:
                     correlation_id=correlation_id,
                     detail={"error_summary": rollback_error, "error_code": rollback_error_code},
                 )
+
+        if rollback_succeeded:
+            from cauldron_content_operations.signals import canonical_content_changed
+            canonical_content_changed.send_robust(
+                sender=self.__class__,
+                change_type="rollback",
+                change_id=request_id,
+                provider_name=provider_name,
+                changed_by=user,
+            )
 
         if rollback_ok and not verification_failed and not persistence_failed:
             return ChangeRequestResult(ok=True, request_id=request_id, lifecycle_state=LifecycleState.ROLLED_BACK.value, request_version=cr2.request_version)

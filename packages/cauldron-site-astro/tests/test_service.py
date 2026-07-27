@@ -77,8 +77,9 @@ def _fail_proc(returncode: int = 1, stdout: str = "", stderr: str = "Error!") ->
 # ---------------------------------------------------------------------------
 
 
-def test_build_no_published_pages_skips_astro(tmp_path: Path):
-    """When router returns no published pages, build returns ok=True, pages_built=0."""
+def test_build_no_published_pages_clears_output_root(tmp_path: Path):
+    """When router returns no published pages, build returns ok=True, pages_built=0
+    and output_root is replaced with an empty directory."""
     config = _make_config(tmp_path)
     router = _make_router([])
     svc = SiteBuildService(config, router)
@@ -89,10 +90,15 @@ def test_build_no_published_pages_skips_astro(tmp_path: Path):
     assert result.ok is True
     assert result.pages_built == 0
     mock_run.assert_not_called()
+    output_root = Path(config.output_root)
+    assert output_root.exists()
+    assert output_root.is_dir()
+    assert list(output_root.iterdir()) == []
 
 
-def test_build_only_draft_pages_skips_astro(tmp_path: Path):
-    """Draft pages are excluded; if that leaves nothing, Astro is not invoked."""
+def test_build_only_draft_pages_clears_output_root(tmp_path: Path):
+    """Draft pages are excluded; if that leaves nothing, Astro is not invoked
+    and output_root is replaced with an empty directory."""
     draft = _make_item("page.draft", "draft", status="draft")
     config = _make_config(tmp_path)
     router = _make_router([draft])
@@ -104,6 +110,10 @@ def test_build_only_draft_pages_skips_astro(tmp_path: Path):
     assert result.ok is True
     assert result.pages_built == 0
     mock_run.assert_not_called()
+    output_root = Path(config.output_root)
+    assert output_root.exists()
+    assert output_root.is_dir()
+    assert list(output_root.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------
@@ -492,3 +502,128 @@ def test_build_log_included_in_failure(tmp_path: Path):
 
     assert result.ok is False
     assert "Build error!" in result.build_log
+
+
+# ---------------------------------------------------------------------------
+# Failure-injection tests for _promote_output
+# ---------------------------------------------------------------------------
+
+
+def test_staging_copy_failure_leaves_existing_output(tmp_path):
+    """If staging copy fails, the existing output is preserved."""
+    # Pre-create existing output
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    (output_root / "index.html").write_text("<html>Old</html>")
+
+    homepage = _make_item("homepage", "homepage", data={"title": "Home"}, body="Hello")
+    config = _make_config(tmp_path)
+    router = _make_router([homepage])
+    svc = SiteBuildService(config, router)
+
+    import shutil
+    original_copytree = shutil.copytree
+
+    def fail_copytree(src, dst, **kwargs):
+        raise OSError("disk full")
+
+    def fake_run(cmd, **kwargs):
+        tmp_out = kwargs["env"]["CAULDRON_OUTDIR"]
+        Path(tmp_out).mkdir(parents=True, exist_ok=True)
+        (Path(tmp_out) / "index.html").write_text("<html>New</html>")
+        return _ok_proc()
+
+    with patch("subprocess.run", side_effect=fake_run):
+        with patch("shutil.copytree", side_effect=fail_copytree):
+            result = svc.build()
+
+    assert result.ok is False
+    # Old output must still be readable
+    assert (output_root / "index.html").read_text() == "<html>Old</html>"
+
+
+def test_first_rename_failure_leaves_existing_output(tmp_path):
+    """If renaming output_root to previous fails, existing output is preserved."""
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    (output_root / "index.html").write_text("<html>Old</html>")
+
+    homepage = _make_item("homepage", "homepage", data={"title": "Home"}, body="Hello")
+    config = _make_config(tmp_path)
+    router = _make_router([homepage])
+    svc = SiteBuildService(config, router)
+
+    real_rename = Path.rename
+    call_count = [0]
+
+    def fail_first_rename(self, target):
+        call_count[0] += 1
+        if call_count[0] == 1:  # First rename is output_root → previous
+            raise OSError("rename failed")
+        return real_rename(self, target)
+
+    def fake_run(cmd, **kwargs):
+        tmp_out = kwargs["env"]["CAULDRON_OUTDIR"]
+        Path(tmp_out).mkdir(parents=True, exist_ok=True)
+        return _ok_proc()
+
+    with patch("subprocess.run", side_effect=fake_run):
+        with patch.object(Path, "rename", fail_first_rename):
+            result = svc.build()
+
+    assert result.ok is False
+    assert (output_root / "index.html").read_text() == "<html>Old</html>"
+
+
+def test_second_rename_failure_restores_previous_output(tmp_path):
+    """If staging→output_root rename fails, previous output is restored."""
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    (output_root / "index.html").write_text("<html>Old</html>")
+
+    homepage = _make_item("homepage", "homepage", data={"title": "Home"}, body="Hello")
+    config = _make_config(tmp_path)
+    router = _make_router([homepage])
+    svc = SiteBuildService(config, router)
+
+    real_rename = Path.rename
+    call_count = [0]
+
+    def fail_second_rename(self, target):
+        call_count[0] += 1
+        if call_count[0] == 2:  # Second rename is staging → output_root
+            raise OSError("rename failed")
+        return real_rename(self, target)
+
+    def fake_run(cmd, **kwargs):
+        tmp_out = kwargs["env"]["CAULDRON_OUTDIR"]
+        Path(tmp_out).mkdir(parents=True, exist_ok=True)
+        return _ok_proc()
+
+    with patch("subprocess.run", side_effect=fake_run):
+        with patch.object(Path, "rename", fail_second_rename):
+            result = svc.build()
+
+    assert result.ok is False
+    # Output must be restored
+    assert output_root.exists()
+    assert (output_root / "index.html").read_text() == "<html>Old</html>"
+
+
+def test_existing_output_readable_after_every_failed_build(tmp_path):
+    """After any build failure, the existing output must remain readable."""
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    sentinel = output_root / "index.html"
+    sentinel.write_text("<html>Sentinel</html>")
+
+    homepage = _make_item("homepage", "homepage", data={"title": "Home"}, body="Hello")
+    config = _make_config(tmp_path)
+    router = _make_router([homepage])
+    svc = SiteBuildService(config, router)
+
+    # Failure mode: Astro returns non-zero
+    with patch("subprocess.run", return_value=_fail_proc(returncode=1)):
+        result = svc.build()
+    assert result.ok is False
+    assert sentinel.read_text() == "<html>Sentinel</html>"

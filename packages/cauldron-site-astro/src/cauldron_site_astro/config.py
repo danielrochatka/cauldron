@@ -14,6 +14,8 @@ class SiteAstroConfig:
     homepage_item_id: str = HOMEPAGE_ITEM_ID
     npm_command: str = "npm"
     build_timeout: int = 120
+    manage_py_path: str = ""
+    build_log_file: str = ""
 
 
 def get_site_astro_config() -> SiteAstroConfig:
@@ -25,4 +27,6 @@ def get_site_astro_config() -> SiteAstroConfig:
         homepage_item_id=cfg.get("homepage_item_id", HOMEPAGE_ITEM_ID),
         npm_command=cfg.get("npm_command", "npm"),
         build_timeout=int(cfg.get("build_timeout", 120)),
+        manage_py_path=cfg.get("manage_py_path", ""),
+        build_log_file=cfg.get("build_log_file", ""),
     )

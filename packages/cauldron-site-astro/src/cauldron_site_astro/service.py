@@ -1,6 +1,10 @@
 """Site build service for cauldron-site-astro."""
 from __future__ import annotations
 
+import fcntl
+import glob
+import shutil
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -12,6 +16,62 @@ class BuildResult:
     output_dir: str = ""
     error: str = ""
     build_log: str = ""
+
+
+def _promote_output(src_dir: Path | str, output_root: Path) -> None:
+    """Atomically replace output_root with src_dir using a locked staging rename.
+
+    Steps:
+      1. Acquire an exclusive flock on output_root + ".swap.lock"
+      2. Copy src_dir → staging path
+      3. Rename output_root → previous path (if output_root exists)
+      4. Rename staging → output_root  (atomic on same filesystem)
+      5. Remove previous path
+
+    On any exception in steps 2–5:
+      - Restore previous → output_root if output_root is missing
+      - Remove staging and previous (ignore errors)
+      - Re-raise
+    """
+    src_dir = Path(src_dir)
+    output_root.parent.mkdir(parents=True, exist_ok=True)
+
+    lock_path = Path(str(output_root) + ".swap.lock")
+    staging = Path(str(output_root) + ".staging-" + uuid.uuid4().hex[:8])
+    previous = Path(str(output_root) + ".previous-" + uuid.uuid4().hex[:8])
+
+    lock_fd = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+        try:
+            # Step 2: copy src → staging
+            shutil.copytree(str(src_dir), str(staging))
+
+            # Step 3: move existing output out of the way
+            if output_root.exists():
+                output_root.rename(previous)
+
+            # Step 4: move staging into place (atomic on same filesystem)
+            staging.rename(output_root)
+
+            # Step 5: remove old output
+            if previous.exists():
+                shutil.rmtree(previous)
+
+        except Exception:
+            # Restore: if previous exists and output_root is gone, put it back
+            if previous.exists() and not output_root.exists():
+                try:
+                    previous.rename(output_root)
+                except Exception:
+                    pass
+            shutil.rmtree(staging, ignore_errors=True)
+            shutil.rmtree(previous, ignore_errors=True)
+            raise
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
 
 
 class SiteBuildService:
@@ -35,7 +95,6 @@ class SiteBuildService:
         import json
         import logging
         import os
-        import shutil
         import subprocess
         import tempfile
 
@@ -58,6 +117,14 @@ class SiteBuildService:
 
         frontend_root = Path(cfg.frontend_root)
         output_root = Path(cfg.output_root)
+
+        # Clean up any abandoned staging/previous paths from crashed prior runs
+        for pattern in (
+            str(output_root) + ".staging-*",
+            str(output_root) + ".previous-*",
+        ):
+            for abandoned in glob.glob(pattern):
+                shutil.rmtree(abandoned, ignore_errors=True)
 
         # Collect published pages
         pages = []
@@ -94,7 +161,16 @@ class SiteBuildService:
             )
 
         if not pages:
-            logger.info("No published pages; skipping Astro build.")
+            logger.info("No published pages; replacing output with empty directory.")
+            empty_dir = None
+            try:
+                empty_dir = Path(tempfile.mkdtemp(prefix="cauldron_astro_empty_"))
+                _promote_output(empty_dir, output_root)
+            except Exception as exc:
+                return BuildResult(ok=False, error=str(exc))
+            finally:
+                if empty_dir and empty_dir.exists():
+                    shutil.rmtree(empty_dir, ignore_errors=True)
             return BuildResult(ok=True, pages_built=0, output_dir=str(output_root))
 
         manifest = {"pages": pages}
@@ -134,16 +210,8 @@ class SiteBuildService:
                     build_log=build_log,
                 )
 
-            # Atomic replace: rename tmp_out over output_root
-            output_root.parent.mkdir(parents=True, exist_ok=True)
-            swap = Path(str(output_root) + ".prev")
-            if output_root.exists():
-                if swap.exists():
-                    shutil.rmtree(swap)
-                output_root.rename(swap)
-            shutil.copytree(tmp_out, str(output_root))
-            if swap.exists():
-                shutil.rmtree(swap)
+            # Atomic replace: promote tmp_out over output_root
+            _promote_output(tmp_out, output_root)
 
             return BuildResult(
                 ok=True,

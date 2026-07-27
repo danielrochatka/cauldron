@@ -1931,3 +1931,195 @@ def test_validate_failure_meta_contains_all_issues_not_truncated():
     assert len(returned_issues) == 12, (
         f"Expected all 12 issues in meta, got {len(returned_issues)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# canonical_content_changed signal
+# ---------------------------------------------------------------------------
+
+
+def _make_service_for_apply(tmp_path):
+    """Create a service with a real workspace and no approval requirement, suitable for full apply tests."""
+    from unittest.mock import MagicMock
+    from cauldron_content.contracts import ApplyResult
+    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.config import ContentOperationsConfig
+    from cauldron_workspace_flatfile.config import WorkspaceConfig
+    from cauldron_workspace_flatfile.store import ChangeSetStore
+
+    ws = ChangeSetStore(WorkspaceConfig(workspace_root=tmp_path / "ws"))
+    router = MagicMock()
+    router.list_items.return_value = []
+    router.get_by_id.return_value = None
+    router.resolve_provider.return_value = "flatfile"
+    router.apply.return_value = ApplyResult(success=True, applied=(), conflicts=(), validation_errors=())
+
+    cfg = ContentOperationsConfig(require_approval=False, max_operations_per_change_set=10)
+    return ContentOperationService(router=router, workspace=ws, config=cfg)
+
+
+def test_canonical_content_changed_emitted_after_apply(db, tmp_path):
+    """canonical_content_changed fires with change_type='apply' after successful apply."""
+    from cauldron_content_operations.signals import canonical_content_changed
+
+    received = []
+
+    def receiver(sender, change_type, change_id, provider_name, changed_by, **kwargs):
+        received.append({"change_type": change_type, "change_id": change_id})
+
+    canonical_content_changed.connect(receiver)
+    try:
+        service = _make_service_for_apply(tmp_path)
+        user = _make_user(
+            perms=["propose_content_changes", "validate_content_changes", "apply_content_changes"],
+            username="sig_apply_user",
+        )
+
+        create_result = service.create_change_request(
+            user=user,
+            operations=[{
+                "kind": "create", "provider": "flatfile", "collection": "pages",
+                "item_id": "signal-test-item", "slug": "signal-test",
+                "status": "published", "schema": "page",
+                "data": {"title": "Signal Test"}, "body": "",
+            }],
+            provider_name="flatfile",
+        )
+        assert create_result.ok, f"create failed: {create_result}"
+
+        validate_result = service.validate_change_request(
+            create_result.request_id, user=user, expected_version=create_result.request_version,
+        )
+        assert validate_result.ok, f"validate failed: {validate_result}"
+
+        apply_result = service.apply_change_request(
+            create_result.request_id, user=user, expected_version=validate_result.request_version,
+        )
+        assert apply_result.ok, f"apply failed: {apply_result}"
+
+        assert len(received) == 1
+        assert received[0]["change_type"] == "apply"
+        assert received[0]["change_id"] == create_result.request_id
+    finally:
+        canonical_content_changed.disconnect(receiver)
+
+
+def test_canonical_content_changed_not_emitted_on_failed_apply(db, tmp_path):
+    """canonical_content_changed does NOT fire when apply fails."""
+    from cauldron_content_operations.signals import canonical_content_changed
+
+    received = []
+
+    def receiver(**kw):
+        received.append(kw)
+
+    canonical_content_changed.connect(receiver)
+    try:
+        service = _make_service_for_apply(tmp_path)
+        # Make the router's apply raise an exception so apply fails.
+        service._router.apply.side_effect = RuntimeError("apply failed")
+        user = _make_user(
+            perms=["propose_content_changes", "validate_content_changes", "apply_content_changes"],
+            username="sig_fail_user",
+        )
+
+        create_result = service.create_change_request(
+            user=user,
+            operations=[{
+                "kind": "create", "collection": "pages",
+                "item_id": "fail-test", "slug": "fail-test",
+                "status": "published", "schema": "page",
+                "data": {"title": "Fail"}, "body": "",
+            }],
+            provider_name="flatfile",
+        )
+        assert create_result.ok, f"create failed: {create_result}"
+
+        validate_result = service.validate_change_request(
+            create_result.request_id, user=user, expected_version=create_result.request_version,
+        )
+        assert validate_result.ok, f"validate failed: {validate_result}"
+
+        apply_result = service.apply_change_request(
+            create_result.request_id, user=user, expected_version=validate_result.request_version,
+        )
+        # Apply should have failed due to the mock side effect.
+        if not apply_result.ok:
+            assert len(received) == 0
+    finally:
+        canonical_content_changed.disconnect(receiver)
+
+
+def test_canonical_content_changed_emitted_after_rollback(db, tmp_path):
+    """canonical_content_changed fires with change_type='rollback' after successful rollback."""
+    from cauldron_content_operations.signals import canonical_content_changed
+    from cauldron_content_operations.models import ContentChangeRequest
+    from cauldron_content_operations.reversible import (
+        register_adapter, unregister_adapter, VerificationResult,
+    )
+    import uuid
+
+    received = []
+
+    def receiver(sender, change_type, change_id, provider_name, changed_by, **kwargs):
+        received.append({"change_type": change_type, "change_id": change_id})
+
+    canonical_content_changed.connect(receiver)
+
+    from unittest.mock import MagicMock
+    from cauldron_content_operations.service import ContentOperationService
+    from cauldron_content_operations.config import ContentOperationsConfig
+
+    locks_dir = tmp_path / "locks"
+    locks_dir.mkdir()
+
+    adapter = MagicMock()
+    adapter.supports_rollback = True
+    adapter.reversible_adapter_version = 2
+    adapter.has_rollback_artifact.return_value = True
+    adapter.rollback.return_value = None
+    adapter.verify_rolled_back_state.return_value = VerificationResult(status="verified")
+
+    register_adapter("flatfile", adapter)
+    try:
+        router = MagicMock()
+        workspace = MagicMock()
+        workspace.locks_dir = str(locks_dir)
+        workspace.save_rollback_result.return_value = None
+
+        cfg = ContentOperationsConfig(require_approval=False, max_operations_per_change_set=10)
+        service = ContentOperationService(router=router, workspace=workspace, config=cfg)
+
+        request_id = str(uuid.uuid4())
+        user = _make_user(
+            perms=["rollback_content_changes"],
+            username="sig_rb_user",
+        )
+        ContentChangeRequest.objects.create(
+            request_id=request_id,
+            workspace_changeset_id=str(uuid.uuid4()),
+            provider_name="flatfile",
+            lifecycle_state="applied",
+            request_version=1,
+            payload_hash="a" * 64,
+            rollback_artifact_digest="a" * 64,
+            metadata={"rollback_artifact_entry_count": 1, "application_completed": True},
+            created_by=user,
+        )
+
+        result = service.rollback_change_request(request_id, user=user, expected_version=1)
+        assert result.ok, f"rollback failed: {result}"
+
+        assert len(received) == 1
+        assert received[0]["change_type"] == "rollback"
+        assert received[0]["change_id"] == request_id
+    finally:
+        unregister_adapter("flatfile")
+        canonical_content_changed.disconnect(receiver)
+
+
+def test_canonical_content_changed_signal_has_documented_kwargs():
+    """canonical_content_changed docstring documents change_type keyword argument."""
+    from cauldron_content_operations.signals import canonical_content_changed
+    assert canonical_content_changed.__doc__ is not None
+    assert "change_type" in canonical_content_changed.__doc__

@@ -4,7 +4,7 @@ from django.urls import include, path, re_path
 from django.views.generic import RedirectView
 
 from cauldron_django_admin.urls import get_admin_urls, get_cauldron_urls
-from cauldron_site.views.public_site import serve_index, serve_page
+from cauldron_site.views.public_site import serve_index, serve_page, serve_asset
 
 urlpatterns = [
     # Technical admin interface (keep available)
@@ -20,7 +20,9 @@ urlpatterns = [
     # Content API
     path("cauldron/api/v1/", include("cauldron_content_api.urls")),
     # Public site — MUST be last
-    # Trailing-slash redirect for slugs: /about → /about/
+    # Nested generated assets: _astro/chunk.js, images/hero.png, etc.
+    re_path(r'^(?P<asset_path>[^/]+(?:/[^/]+)+)$', serve_asset, name="public-asset"),
+    # Bare slug redirect: /about → /about/
     re_path(r'^(?P<slug>[^/]+)$', RedirectView.as_view(url='/%(slug)s/', permanent=False)),
     path("<slug:slug>/", serve_page, name="public-page"),
     path("", serve_index, name="public-index"),

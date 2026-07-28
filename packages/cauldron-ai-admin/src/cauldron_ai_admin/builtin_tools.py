@@ -53,8 +53,10 @@ BUILTIN_TOOL_NAMES: tuple[str, ...] = (
     "content.get_item",
     "content.create_proposal",
     "content.preview_change_request",
+    "system.admin_ai_inventory",
     "system.django_checks",
     "system.module_status",
+    "system.site_rebuild",
     "ui.styles.list_files",
     "ui.styles.read_file",
     "ui.styles.create_proposal",
@@ -815,6 +817,111 @@ def _handle_module_status(context: AdminAIToolContext, **kwargs) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# system.admin_ai_inventory
+# ---------------------------------------------------------------------------
+
+_ADMIN_AI_INVENTORY_SCHEMA: dict = {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": False,
+}
+
+# Per-tool entry byte budget — keeps total inventory within max_result_bytes.
+_INVENTORY_DESC_MAX = 200
+
+
+def _handle_admin_ai_inventory(context: AdminAIToolContext, **kwargs) -> Any:
+    deadline_err = _check_deadline("system.admin_ai_inventory", context)
+    if deadline_err is not None:
+        return deadline_err
+    if kwargs:
+        return AdminAIToolError(
+            tool_name="system.admin_ai_inventory",
+            error_code="tool.invalid_arguments",
+            message="system.admin_ai_inventory takes no arguments.",
+        )
+    registry = get_tool_registry()
+    permitted = registry.list_for_actor(context.actor)
+
+    by_risk: dict[str, list[dict]] = {}
+    for defn in permitted:
+        level = defn.risk_level.value
+        by_risk.setdefault(level, []).append({
+            "name": defn.name,
+            "version": defn.version,
+            "owning_module": defn.owning_module,
+            "description": defn.description[:_INVENTORY_DESC_MAX],
+            "requires_human_approval": defn.requires_human_approval,
+        })
+
+    return AdminAIToolResult(
+        tool_name="system.admin_ai_inventory",
+        success=True,
+        data={
+            "total": len(permitted),
+            "by_risk_level": by_risk,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# system.site_rebuild
+# ---------------------------------------------------------------------------
+
+_SITE_REBUILD_SCHEMA: dict = {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": False,
+}
+
+
+def _handle_site_rebuild(context: AdminAIToolContext, **kwargs) -> Any:
+    deadline_err = _check_deadline("system.site_rebuild", context)
+    if deadline_err is not None:
+        return deadline_err
+    if kwargs:
+        return AdminAIToolError(
+            tool_name="system.site_rebuild",
+            error_code="tool.invalid_arguments",
+            message="system.site_rebuild takes no arguments.",
+        )
+    try:
+        from cauldron_site_astro.service import get_build_service
+        service = get_build_service()
+    except Exception:
+        return AdminAIToolError(
+            tool_name="system.site_rebuild",
+            error_code="system.site_rebuild_unavailable",
+            message="Site build service is not available.",
+        )
+
+    deadline_err = _check_deadline("system.site_rebuild", context)
+    if deadline_err is not None:
+        return deadline_err
+
+    try:
+        result = service.build()
+    except Exception as exc:
+        return AdminAIToolError(
+            tool_name="system.site_rebuild",
+            error_code="system.site_rebuild_failed",
+            message=redact_exception(exc, max_bytes=200),
+        )
+
+    ok = bool(getattr(result, "ok", False))
+    return AdminAIToolResult(
+        tool_name="system.site_rebuild",
+        success=ok,
+        data={
+            "ok": ok,
+            "pages_built": getattr(result, "pages_built", None),
+            "error": (getattr(result, "error", "") or "")[:400],
+        },
+        message="Site rebuild completed." if ok else "Site rebuild failed.",
+    )
+
+
+# ---------------------------------------------------------------------------
 # ui.styles helpers
 # ---------------------------------------------------------------------------
 
@@ -1069,6 +1176,40 @@ def _builtin_definitions() -> tuple[tuple[AdminAIToolDefinition, Any], ...]:
                 owning_module=OWNING_MODULE,
             ),
             _handle_preview_change_request,
+        ),
+        (
+            AdminAIToolDefinition(
+                name="system.admin_ai_inventory",
+                version="1.0",
+                description=(
+                    "Report the effective Admin AI tool inventory for the current "
+                    "actor: which tools are visible, their risk levels, and whether "
+                    "they require human approval. Output is bounded to stay within "
+                    "the configured result-size limit."
+                ),
+                argument_schema=_ADMIN_AI_INVENTORY_SCHEMA,
+                risk_level=RiskLevel.READ_ONLY,
+                required_permission="cauldron_ai_admin.use_admin_ai",
+                owning_module=OWNING_MODULE,
+            ),
+            _handle_admin_ai_inventory,
+        ),
+        (
+            AdminAIToolDefinition(
+                name="system.site_rebuild",
+                version="1.0",
+                description=(
+                    "Trigger an Astro public-site rebuild from the currently "
+                    "applied content. Idempotent and non-destructive: the build "
+                    "reads approved, applied content only. Returns a compact "
+                    "summary including page count and any build error."
+                ),
+                argument_schema=_SITE_REBUILD_SCHEMA,
+                risk_level=RiskLevel.READ_ONLY,
+                required_permission="cauldron_ai_admin.manage_admin_ai_settings",
+                owning_module=OWNING_MODULE,
+            ),
+            _handle_site_rebuild,
         ),
         (
             AdminAIToolDefinition(

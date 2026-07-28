@@ -80,12 +80,6 @@ CAULDRON_MODULES = {
     # settings page or OPENAI_* env vars).
     "cauldron.ai.admin": {
         "provider": _ai_provider,
-        "max_model_turns": 3,
-        "max_tool_calls": 5,
-        "tool_timeout_seconds": 10,
-        "run_timeout_seconds": 30,
-        "max_argument_bytes": 4096,
-        "max_result_bytes": 8192,
     },
     # Astro static-site builder — generates public HTML from published pages.
     # output_root is served by Django at / and /<slug>/.

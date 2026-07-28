@@ -69,38 +69,133 @@ def _resolve_provider_with_factory(provider_name: str, store=None):
         )
 
 
-def _resolve_runtime(store, cfg: dict) -> dict[str, Any]:
+EXECUTION_BUDGET_DEFAULTS: dict[str, Any] = {
+    "max_model_turns": 8,
+    "max_tool_calls": 12,
+    "tool_timeout_seconds": 10.0,
+    "run_timeout_seconds": 30.0,
+    "max_argument_bytes": 4096,
+    "max_result_bytes": 8192,
+    "include_content_tools": True,
+}
+
+# Per-key (type, min, max) — mirrors RuntimeSettingsForm field constraints.
+_BUDGET_BOUNDS: dict[str, tuple] = {
+    "max_model_turns":      (int,   1,      20),
+    "max_tool_calls":       (int,   1,      50),
+    "tool_timeout_seconds": (float, 1.0,    300.0),
+    "run_timeout_seconds":  (float, 10.0,   600.0),
+    "max_argument_bytes":   (int,   1024,   1048576),
+    "max_result_bytes":     (int,   1024,   1048576),
+}
+
+
+class ExecutionBudgetError(Exception):
+    """An execution-budget value is invalid: wrong type, out of range, or
+    violates the tool_timeout < run_timeout cross-field invariant."""
+
+
+def coerce_execution_budget(values: dict) -> dict[str, Any]:
+    """Validate and coerce a (possibly partial) execution-budget mapping.
+
+    Accepts any recognised subset of the six numeric keys plus
+    ``include_content_tools``.  Coerces each numeric key to its declared
+    Python type, validates per-key min/max bounds, and enforces the
+    ``tool_timeout_seconds < run_timeout_seconds`` invariant when both keys
+    are present.
+
+    Raises ``ExecutionBudgetError`` for any invalid value with an actionable
+    message naming the key and the allowed range.  Unrecognised keys are
+    silently ignored.  Returns a new dict of the recognised, coerced values.
+    """
+    out: dict[str, Any] = {}
+    for key, (typ, lo, hi) in _BUDGET_BOUNDS.items():
+        if key not in values:
+            continue
+        raw = values[key]
+        try:
+            val = typ(raw)
+        except (TypeError, ValueError) as exc:
+            raise ExecutionBudgetError(
+                f"cauldron.ai.admin: {key!r} must be a {typ.__name__} "
+                f"(received {type(raw).__name__} {raw!r})"
+            ) from exc
+        if not (lo <= val <= hi):
+            raise ExecutionBudgetError(
+                f"cauldron.ai.admin: {key!r} must be between {lo} and {hi} "
+                f"(received {val!r})"
+            )
+        out[key] = val
+    if "include_content_tools" in values:
+        out["include_content_tools"] = bool(values["include_content_tools"])
+    # Cross-field invariant — only enforced when both timeout keys are present.
+    tool_t = out.get("tool_timeout_seconds")
+    run_t = out.get("run_timeout_seconds")
+    if tool_t is not None and run_t is not None and tool_t >= run_t:
+        raise ExecutionBudgetError(
+            f"cauldron.ai.admin: tool_timeout_seconds ({tool_t}) "
+            f"must be less than run_timeout_seconds ({run_t})"
+        )
+    return out
+
+
+def resolve_runtime_settings(store, cfg: dict) -> dict[str, Any]:
     """Return the effective runtime settings.
 
     Precedence per key:
     1. ``AIProviderSettingsStore.get_runtime()``  (values saved via settings UI)
     2. ``CAULDRON_MODULES["cauldron.ai.admin"]`` values (from Django settings)
-    3. Hard-coded defaults matching the pre-Phase-2 constants.
+    3. ``EXECUTION_BUDGET_DEFAULTS`` module defaults.
 
-    ``include_content_tools`` uses ``.get(..., default)`` semantics rather
-    than truthiness so an explicit ``False`` in either layer is honoured.
+    Validation is applied at two levels so that individually valid partial
+    settings from different sources cannot produce an invalid combined result:
+
+    * The *deployment baseline* (EXECUTION_BUDGET_DEFAULTS merged with
+      deployment overrides) is validated after merging.  A cross-source
+      violation (e.g. a cfg ``tool_timeout`` that exceeds the default
+      ``run_timeout``) raises ``ImproperlyConfigured`` at startup.
+    * The *final config* (baseline merged with saved settings) is validated
+      again.  If saved settings create an invalid combination (e.g. a saved
+      ``tool_timeout`` that exceeds a deployment-override ``run_timeout``),
+      the saved settings are silently discarded and the valid baseline is
+      returned instead.
     """
+    # Step 1 — validate deployment overrides individually; any single-key
+    # violation (wrong type, out-of-range) is a deployment error.
     try:
-        saved = dict(store.get_runtime() or {})
+        coerced_cfg = coerce_execution_budget(cfg)
+    except ExecutionBudgetError as exc:
+        raise ImproperlyConfigured(str(exc)) from exc
+
+    # Step 2 — build the complete deployment baseline and validate it as a
+    # whole so cross-source violations (cfg vs defaults) are caught here.
+    baseline = {**EXECUTION_BUDGET_DEFAULTS, **coerced_cfg}
+    try:
+        baseline = coerce_execution_budget(baseline)
+    except ExecutionBudgetError as exc:
+        raise ImproperlyConfigured(str(exc)) from exc
+
+    # Step 3 — load and individually validate saved settings; discard on any
+    # error so a corrupt store or out-of-range manual edit never crashes the
+    # service.
+    try:
+        raw_saved = dict(store.get_runtime() or {})
+        coerced_saved = coerce_execution_budget(raw_saved)
     except Exception:
-        saved = {}
+        coerced_saved = {}
 
-    def _numeric(name: str, default: Any) -> Any:
-        return saved.get(name) or cfg.get(name) or default
+    if not coerced_saved:
+        return baseline
 
-    return {
-        "max_model_turns": _numeric("max_model_turns", 6),
-        "max_tool_calls": _numeric("max_tool_calls", 10),
-        "tool_timeout_seconds": _numeric("tool_timeout_seconds", 30.0),
-        "run_timeout_seconds": _numeric("run_timeout_seconds", 120.0),
-        "max_argument_bytes": _numeric("max_argument_bytes", 32768),
-        "max_result_bytes": _numeric("max_result_bytes", 65536),
-        "include_content_tools": (
-            saved["include_content_tools"]
-            if "include_content_tools" in saved
-            else cfg.get("include_content_tools", True)
-        ),
-    }
+    # Step 4 — merge saved over baseline and validate the complete result.
+    # If two individually valid partial settings produce a cross-source
+    # violation (e.g. saved tool_timeout > deployment run_timeout), discard
+    # the saved settings and return the safe, already-validated baseline.
+    merged = {**baseline, **coerced_saved}
+    try:
+        return coerce_execution_budget(merged)
+    except ExecutionBudgetError:
+        return baseline
 
 
 def get_admin_ai_service() -> AdminAIService:
@@ -140,7 +235,7 @@ def get_admin_ai_service() -> AdminAIService:
         if isinstance(provider, _FactoryProviderMarker):
             provider = _resolve_provider_with_factory(provider.name, store)
 
-    runtime = _resolve_runtime(store, cfg)
+    runtime = resolve_runtime_settings(store, cfg)
 
     # Optionally attach the content-operations service so PROPOSE tools
     # can call it. We fetch it lazily to avoid tying admin-ai to a

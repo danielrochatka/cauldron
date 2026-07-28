@@ -401,12 +401,12 @@ def test_clear_flags_reflects_form_state():
 def test_runtime_form_defaults_are_valid():
     from cauldron_ai_admin.forms import RuntimeSettingsForm
     form = RuntimeSettingsForm(data={
-        "max_model_turns": "6",
-        "max_tool_calls": "10",
-        "tool_timeout_seconds": "30",
-        "run_timeout_seconds": "120",
-        "max_argument_bytes": "32768",
-        "max_result_bytes": "65536",
+        "max_model_turns": "8",
+        "max_tool_calls": "12",
+        "tool_timeout_seconds": "10",
+        "run_timeout_seconds": "30",
+        "max_argument_bytes": "4096",
+        "max_result_bytes": "8192",
         "include_content_tools": "on",
     })
     assert form.is_valid(), form.errors
@@ -415,12 +415,12 @@ def test_runtime_form_defaults_are_valid():
 def test_runtime_form_rejects_tool_timeout_ge_run_timeout():
     from cauldron_ai_admin.forms import RuntimeSettingsForm
     form = RuntimeSettingsForm(data={
-        "max_model_turns": "6",
-        "max_tool_calls": "10",
+        "max_model_turns": "8",
+        "max_tool_calls": "12",
         "tool_timeout_seconds": "120",
         "run_timeout_seconds": "60",
-        "max_argument_bytes": "32768",
-        "max_result_bytes": "65536",
+        "max_argument_bytes": "4096",
+        "max_result_bytes": "8192",
     })
     assert not form.is_valid()
     assert "tool_timeout_seconds" in form.errors
@@ -430,11 +430,11 @@ def test_runtime_form_rejects_out_of_range_values():
     from cauldron_ai_admin.forms import RuntimeSettingsForm
     form = RuntimeSettingsForm(data={
         "max_model_turns": "0",  # below min_value=1
-        "max_tool_calls": "10",
-        "tool_timeout_seconds": "30",
-        "run_timeout_seconds": "120",
-        "max_argument_bytes": "32768",
-        "max_result_bytes": "65536",
+        "max_tool_calls": "12",
+        "tool_timeout_seconds": "10",
+        "run_timeout_seconds": "30",
+        "max_argument_bytes": "4096",
+        "max_result_bytes": "8192",
     })
     assert not form.is_valid()
 
@@ -442,12 +442,12 @@ def test_runtime_form_rejects_out_of_range_values():
 def test_runtime_form_include_content_tools_unchecked_defaults_false():
     from cauldron_ai_admin.forms import RuntimeSettingsForm
     form = RuntimeSettingsForm(data={
-        "max_model_turns": "6",
-        "max_tool_calls": "10",
-        "tool_timeout_seconds": "30",
-        "run_timeout_seconds": "120",
-        "max_argument_bytes": "32768",
-        "max_result_bytes": "65536",
+        "max_model_turns": "8",
+        "max_tool_calls": "12",
+        "tool_timeout_seconds": "10",
+        "run_timeout_seconds": "30",
+        "max_argument_bytes": "4096",
+        "max_result_bytes": "8192",
         # include_content_tools omitted → False
     })
     assert form.is_valid(), form.errors

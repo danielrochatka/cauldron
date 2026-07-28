@@ -51,10 +51,10 @@ echo "--> Collecting static files..."
 # 9. Initialize override directory
 "$CAULDRON_DIR/manage" cauldron_ui_init 2>/dev/null || true
 
-# 10. Install frontend npm dependencies (if cauldron.site.astro is configured)
-if [ -f "$CAULDRON_DIR/frontend/package.json" ]; then
-  echo "--> Installing frontend dependencies..."
-  npm ci --prefix "$CAULDRON_DIR/frontend" --silent
+# 10. Install frontend dependencies when the Astro binary is absent.
+#     On normal restarts the binary already exists and this step is skipped.
+if ! is_frontend_installed "$CAULDRON_DIR"; then
+  install_frontend "$CAULDRON_DIR"
 fi
 
 # 11. Start the server

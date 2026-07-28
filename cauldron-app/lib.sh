@@ -124,3 +124,44 @@ install_python_projects() {
 
   pip install "${args[@]}"
 }
+
+# install_frontend CAULDRON_DIR
+#
+# Runs `npm ci` in frontend/ using the tracked package-lock.json, verifies the
+# local Astro binary is present and executable, and prints the Astro version.
+# Fails with a clear error message when npm or Astro installation fails.
+# No-ops when frontend/package.json is absent (no frontend configured).
+install_frontend() {
+  local cauldron_dir="$1"
+  local frontend_dir="$cauldron_dir/frontend"
+
+  if [ ! -f "$frontend_dir/package.json" ]; then
+    return 0  # No frontend configured; skip silently.
+  fi
+
+  echo "--> Installing frontend dependencies..."
+  if ! npm ci --prefix "$frontend_dir"; then
+    echo "ERROR: npm install failed. Ensure Node.js and npm are installed," >&2
+    echo "       then run: ./install" >&2
+    return 1
+  fi
+
+  local astro_bin="$frontend_dir/node_modules/.bin/astro"
+  if [ ! -x "$astro_bin" ]; then
+    echo "ERROR: Astro binary not found after npm install: $astro_bin" >&2
+    echo "       Run: ./install" >&2
+    return 1
+  fi
+
+  local astro_version
+  astro_version=$("$astro_bin" --version 2>/dev/null || echo "unknown")
+  echo "--> Astro ${astro_version} installed."
+}
+
+# is_frontend_installed CAULDRON_DIR
+#
+# Returns 0 (true) when the local Astro binary is present and executable.
+is_frontend_installed() {
+  local cauldron_dir="$1"
+  [ -x "$cauldron_dir/frontend/node_modules/.bin/astro" ]
+}

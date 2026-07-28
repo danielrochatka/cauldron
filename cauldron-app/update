@@ -122,24 +122,24 @@ echo "--> Collecting static assets..."
 # 9. Initialize override directory.
 "$CAULDRON_DIR/manage" cauldron_ui_init 2>/dev/null || true
 
-# 10. Install frontend npm dependencies and rebuild public site.
-if [ -f "$CAULDRON_DIR/frontend/package.json" ]; then
-  echo "--> Installing frontend dependencies..."
-  npm ci --prefix "$CAULDRON_DIR/frontend" --silent
-  echo "--> Building public site..."
-  "$CAULDRON_DIR/manage" cauldron_site_build || true
-fi
+# 10. Install/upgrade frontend dependencies (always re-runs after a git pull
+#     in case package-lock.json was updated).
+install_frontend "$CAULDRON_DIR"
 
-# 11. Run system check.
+# 11. Build public site.
+echo "--> Building public site..."
+"$CAULDRON_DIR/manage" cauldron_site_build || true
+
+# 13. Run system check.
 echo "--> Running system check..."
 "$CAULDRON_DIR/manage" check
 
-# 12. Start server.
+# 14. Start server.
 echo "--> Starting server..."
 PORT="${CAULDRON_PORT:-8000}"
 launch_server "$CAULDRON_DIR" "$PORT"
 
-# 12. Health check — verify the app and static files are reachable.
+# 15. Health check — verify the app and static files are reachable.
 #     Triggers the ERR trap (and therefore rollback) on failure.
 echo "--> Verifying server health..."
 HEALTHY=0

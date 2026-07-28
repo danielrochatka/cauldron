@@ -108,6 +108,19 @@ def _fake_npm(tmp_path: Path, *, returncode: int = 0, creates_astro: bool = True
     return bin_dir
 
 
+def _make_failing_astro_bin(fr: Path, *, exit_code: int = 1) -> Path:
+    """Create an astro binary that exits EXIT_CODE with an error on stderr."""
+    bin_dir = fr / "node_modules" / ".bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    astro = bin_dir / "astro"
+    astro.write_text(
+        f"#!/bin/sh\necho 'ERR: Node.js version incompatible' >&2\nexit {exit_code}\n",
+        encoding="utf-8",
+    )
+    astro.chmod(0o755)
+    return astro
+
+
 def _fake_node(tmp_path: Path, version: str) -> Path:
     """Create a fake_bin directory containing a `node` binary reporting VERSION."""
     bin_dir = tmp_path / "fake_node_bin"
@@ -257,6 +270,29 @@ class TestInstallFrontend:
         env = {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
         result = _source_lib(f"install_frontend {tmp_path!s}", env=env)
         assert "./install" in result.stderr
+
+    def test_fails_when_astro_binary_exits_nonzero(self, tmp_path: Path):
+        """An executable astro binary that exits nonzero must fail install_frontend.
+
+        This covers Node.js version incompatibility: npm installs an astro
+        binary that is executable but crashes when run.
+        """
+        fr = _make_frontend(tmp_path)
+        # Fake npm that succeeds but installs a *crashing* astro binary.
+        fake_bin = _fake_npm(tmp_path, returncode=0, creates_astro=False)
+        _make_failing_astro_bin(fr)
+        env = {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+        result = _source_lib(f"install_frontend {tmp_path!s}", env=env)
+        assert result.returncode != 0
+
+    def test_astro_failure_message_mentions_node_incompatibility(self, tmp_path: Path):
+        """Error output when astro --version fails must hint at Node.js incompatibility."""
+        fr = _make_frontend(tmp_path)
+        fake_bin = _fake_npm(tmp_path, returncode=0, creates_astro=False)
+        _make_failing_astro_bin(fr)
+        env = {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+        result = _source_lib(f"install_frontend {tmp_path!s}", env=env)
+        assert "Node" in result.stderr or "node" in result.stderr
 
 
 # ---------------------------------------------------------------------------

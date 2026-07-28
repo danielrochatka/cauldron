@@ -191,7 +191,13 @@ install_frontend() {
   fi
 
   local astro_version
-  astro_version=$("$astro_bin" --version 2>/dev/null || echo "unknown")
+  if ! astro_version=$("$astro_bin" --version 2>&1); then
+    echo "ERROR: Astro binary failed to run (exit $?)." >&2
+    echo "       This usually means the installed Node.js version is incompatible." >&2
+    echo "       Output: $astro_version" >&2
+    echo "       Run: ./install" >&2
+    return 1
+  fi
   echo "--> Astro ${astro_version} installed."
 }
 

@@ -60,10 +60,12 @@ from cauldron_ai.contracts import (
 )
 from cauldron_ai.provider_configuration import (
     AIProviderAuthenticationError,
+    AIProviderConfigurationError,
     AIProviderConnectionError,
     AIProviderError,
     AIProviderRateLimitError,
     AIProviderResponseError,
+    AIProviderTimeoutError,
 )
 from cauldron_ai.providers import AIModelProvider
 
@@ -128,23 +130,31 @@ MAX_CORRELATION_ID_BYTES = 128
 
 
 def _classify_provider_error(exc: Exception) -> tuple[str, bool]:
-    """Return (stable_error_code, is_retryable) for a provider exception."""
+    """Return (stable_error_code, is_retryable) for a provider exception.
+
+    Specific subclasses are checked before the base class so that the most
+    accurate code is chosen. Unknown exceptions (not ``AIProviderError``)
+    are classified as ``provider.internal_error`` and are never retried.
+    """
+    if isinstance(exc, AIProviderConfigurationError):
+        return "provider.configuration_error", False
     if isinstance(exc, AIProviderAuthenticationError):
         return "provider.authentication_error", False
+    if isinstance(exc, AIProviderTimeoutError):
+        return "provider.timeout", True
     if isinstance(exc, AIProviderConnectionError):
         return "provider.connection_error", True
     if isinstance(exc, AIProviderRateLimitError):
         return "provider.rate_limited", True
     if isinstance(exc, AIProviderResponseError):
-        http_status = getattr(exc, "http_status", None) or getattr(exc, "status_code", None)
+        http_status = getattr(exc, "http_status", None)
         if http_status == 429:
             return "provider.rate_limited", True
         if isinstance(http_status, int) and 500 <= http_status < 600:
             return "provider.server_error", True
         return "provider.invalid_request", False
-    if isinstance(exc, AIProviderError):
-        return "provider.connection_error", True
-    return "provider.connection_error", True
+    # AIProviderError base class (not a known subclass) or any other exception.
+    return "provider.internal_error", False
 
 
 def _build_provider_error_summary(
@@ -155,22 +165,42 @@ def _build_provider_error_summary(
     elapsed_ms: int,
     remaining_ms: int,
     retryable: bool,
+    attempt: int = 1,
+    request_bytes: int = 0,
+    tool_result_bytes: int = 0,
+    provider_name: str = "",
+    model_name: str = "",
 ) -> str:
-    """Build a sanitized, stable diagnostic summary (no exception message)."""
+    """Build a sanitized, stable diagnostic summary (no exception message).
+
+    All fields are safe to persist: exception messages, request bodies,
+    credentials, headers, and raw response content are never included.
+    """
     fields: dict[str, Any] = {
         "error_code": error_code,
         "exc_class": type(exc).__name__,
         "turn": turn,
+        "attempt": attempt,
         "elapsed_ms": elapsed_ms,
         "remaining_ms": remaining_ms,
+        "request_bytes": request_bytes,
+        "tool_result_bytes": tool_result_bytes,
         "retryable": retryable,
     }
-    http_status = getattr(exc, "http_status", None) or getattr(exc, "status_code", None)
+    if provider_name:
+        fields["provider_name"] = provider_name
+    if model_name:
+        fields["model_name"] = model_name
+    # Structured metadata carried by provider-neutral exceptions.
+    http_status = getattr(exc, "http_status", None)
     if isinstance(http_status, int):
         fields["http_status"] = http_status
-    request_id = getattr(exc, "request_id", None)
-    if isinstance(request_id, str) and request_id:
-        fields["provider_request_id"] = request_id[:64]
+    provider_request_id = getattr(exc, "provider_request_id", None)
+    if isinstance(provider_request_id, str) and provider_request_id:
+        fields["provider_request_id"] = provider_request_id
+    retry_after = getattr(exc, "retry_after", None)
+    if isinstance(retry_after, (int, float)) and retry_after > 0:
+        fields["retry_after"] = float(retry_after)
     return json.dumps(fields, sort_keys=True)
 
 
@@ -428,9 +458,12 @@ class AdminAIService:
                 tools=tool_defs_for_model,
                 system=effective_system,
                 max_tokens=4096,
-                timeout_seconds=self._tool_timeout_seconds,
-                correlation_id=correlation_id or "",
+                # Use remaining run deadline as the HTTP timeout so the
+                # provider call is bounded by the overall run budget.
+                # tool_timeout_seconds applies only to tool execution below.
+                timeout_seconds=remaining,
                 deadline_seconds=remaining,
+                correlation_id=correlation_id or "",
             )
             t_call_start = time.monotonic()
             response = self._call_provider(
@@ -559,30 +592,68 @@ class AdminAIService:
     ) -> AIModelResponse | None:
         """Call provider with at most one bounded retry for retryable errors.
 
-        Returns the response on success, or None after finalizing the run with
-        a classified error code.
+        On each retry: sleep the backoff, recalculate the remaining deadline,
+        and build a fresh ``AIModelRequest`` carrying the updated timeouts.
+        Returns the response on success, or None after finalizing the run.
         """
         last_exc: Exception | None = None
+        current_request = provider_request
+        attempt_count = 0
+        deadline_expired_on_retry = False
+
+        request_bytes = sum(
+            len((m.content or "").encode("utf-8")) for m in provider_request.messages
+        )
+        tool_result_bytes = sum(
+            len((m.content or "").encode("utf-8"))
+            for m in provider_request.messages
+            if m.role == "tool"
+        )
+
         for attempt in range(2):
+            attempt_count = attempt + 1
             try:
-                return self._provider.complete(provider_request)
+                return self._provider.complete(current_request)
             except Exception as exc:
                 last_exc = exc
                 _, retryable = _classify_provider_error(exc)
                 if not retryable or attempt >= 1:
                     break
+                # Check whether the backoff would leave enough time for a
+                # meaningful retry BEFORE sleeping, to avoid a long wait we
+                # then have to abort.
+                remaining_before = (
+                    deadline - datetime.now(tz=timezone.utc)
+                ).total_seconds()
+                if (remaining_before - _PROVIDER_RETRY_BACKOFF) < _MIN_PROVIDER_CALL_DEADLINE:
+                    break
+                time.sleep(_PROVIDER_RETRY_BACKOFF)
+                # After sleeping, recheck the remaining deadline and build a
+                # replacement request with the refreshed timeout values.
                 remaining_after = (
                     deadline - datetime.now(tz=timezone.utc)
                 ).total_seconds()
-                if (remaining_after - _PROVIDER_RETRY_BACKOFF) < _MIN_PROVIDER_CALL_DEADLINE:
+                if remaining_after < _MIN_PROVIDER_CALL_DEADLINE:
+                    deadline_expired_on_retry = True
                     break
-                time.sleep(_PROVIDER_RETRY_BACKOFF)
+                current_request = AIModelRequest(
+                    messages=current_request.messages,
+                    tools=current_request.tools,
+                    system=current_request.system,
+                    max_tokens=current_request.max_tokens,
+                    timeout_seconds=remaining_after,
+                    deadline_seconds=remaining_after,
+                    correlation_id=current_request.correlation_id,
+                )
 
         elapsed_ms = int((time.monotonic() - t_call_start) * 1000)
         remaining_ms = int(
             (deadline - datetime.now(tz=timezone.utc)).total_seconds() * 1000
         )
-        error_code, retryable = _classify_provider_error(last_exc)
+        if deadline_expired_on_retry:
+            error_code, retryable = "provider.timeout", False
+        else:
+            error_code, retryable = _classify_provider_error(last_exc)
         summary = _build_provider_error_summary(
             exc=last_exc,
             error_code=error_code,
@@ -590,6 +661,11 @@ class AdminAIService:
             elapsed_ms=elapsed_ms,
             remaining_ms=remaining_ms,
             retryable=retryable,
+            attempt=attempt_count,
+            request_bytes=request_bytes,
+            tool_result_bytes=tool_result_bytes,
+            provider_name=getattr(self._provider, "name", "") or "",
+            model_name=str(getattr(self._provider, "model", None) or ""),
         )
         self._finalize_error(run, error_code, summary)
         return None

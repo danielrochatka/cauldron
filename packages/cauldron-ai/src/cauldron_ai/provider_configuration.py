@@ -158,7 +158,25 @@ class AIModelProviderFactory(Protocol):
 # ---------------------------------------------------------------------------
 
 class AIProviderError(RuntimeError):
-    """Base class for all AI provider errors."""
+    """Base class for all AI provider errors.
+
+    Optional keyword-only metadata is safe to record in audit logs —
+    callers must never populate these fields with raw exception text,
+    request bodies, credentials, or response headers.
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        http_status: int | None = None,
+        provider_request_id: str | None = None,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.http_status: int | None = http_status
+        self.provider_request_id: str | None = provider_request_id
+        self.retry_after: float | None = retry_after
 
 
 class AIProviderConfigurationError(AIProviderError):
@@ -171,6 +189,10 @@ class AIProviderAuthenticationError(AIProviderError):
 
 class AIProviderConnectionError(AIProviderError):
     """Raised when a network error prevents reaching the provider."""
+
+
+class AIProviderTimeoutError(AIProviderError):
+    """Raised when the provider call times out before returning a response."""
 
 
 class AIProviderRateLimitError(AIProviderError):

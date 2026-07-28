@@ -49,10 +49,29 @@ from cauldron_ai.provider_configuration import (
     AIProviderConnectionResult,
     AIProviderRateLimitError,
     AIProviderResponseError,
+    AIProviderTimeoutError,
 )
 
 _PROVIDER_NAME = "openai"
 _MAX_TOKENS_TEST = 32
+
+
+def _safe_request_id(exc: Any) -> str | None:
+    """Extract a provider request ID without leaking raw exception text."""
+    val = getattr(exc, "request_id", None)
+    return val[:64] if isinstance(val, str) and val else None
+
+
+def _safe_retry_after(exc: Any) -> float | None:
+    """Extract Retry-After seconds from a rate-limit exception's response headers."""
+    try:
+        headers = getattr(getattr(exc, "response", None), "headers", None)
+        if not headers:
+            return None
+        raw = headers.get("retry-after") or headers.get("Retry-After")
+        return float(raw) if raw else None
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 _CONFIGURATION_SPEC = AIProviderConfigurationSpec(
@@ -287,17 +306,22 @@ class OpenAIProvider:
 
         try:
             response = self._client.responses.create(**kwargs)
-        except openai.AuthenticationError:
+        except openai.AuthenticationError as exc:
             raise AIProviderAuthenticationError(
                 "OpenAI rejected the API key. "
-                "Check your credentials in AI settings."
+                "Check your credentials in AI settings.",
+                http_status=getattr(exc, "status_code", None),
+                provider_request_id=_safe_request_id(exc),
             )
-        except openai.RateLimitError:
+        except openai.RateLimitError as exc:
             raise AIProviderRateLimitError(
-                "OpenAI rate limit reached. Please wait before retrying."
+                "OpenAI rate limit reached. Please wait before retrying.",
+                http_status=getattr(exc, "status_code", None),
+                provider_request_id=_safe_request_id(exc),
+                retry_after=_safe_retry_after(exc),
             )
         except openai.APITimeoutError:
-            raise AIProviderConnectionError(
+            raise AIProviderTimeoutError(
                 "OpenAI request timed out. The model may be under load."
             )
         except openai.APIConnectionError:
@@ -305,13 +329,17 @@ class OpenAIProvider:
                 "Could not reach OpenAI. "
                 "Check your network or API base URL."
             )
-        except openai.BadRequestError:
+        except openai.BadRequestError as exc:
             raise AIProviderResponseError(
-                "OpenAI returned a bad request error."
+                "OpenAI returned a bad request error.",
+                http_status=getattr(exc, "status_code", None),
+                provider_request_id=_safe_request_id(exc),
             )
-        except openai.APIStatusError:
+        except openai.APIStatusError as exc:
             raise AIProviderResponseError(
-                "OpenAI returned an unexpected response."
+                "OpenAI returned an unexpected response.",
+                http_status=getattr(exc, "status_code", None),
+                provider_request_id=_safe_request_id(exc),
             )
 
         # Validate terminal status before touching output; raises for

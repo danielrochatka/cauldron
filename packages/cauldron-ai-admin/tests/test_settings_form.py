@@ -401,8 +401,8 @@ def test_clear_flags_reflects_form_state():
 def test_runtime_form_defaults_are_valid():
     from cauldron_ai_admin.forms import RuntimeSettingsForm
     form = RuntimeSettingsForm(data={
-        "max_model_turns": "6",
-        "max_tool_calls": "10",
+        "max_model_turns": "8",
+        "max_tool_calls": "12",
         "tool_timeout_seconds": "30",
         "run_timeout_seconds": "120",
         "max_argument_bytes": "32768",

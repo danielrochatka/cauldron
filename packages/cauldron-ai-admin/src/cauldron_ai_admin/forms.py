@@ -292,12 +292,12 @@ class RuntimeSettingsForm(forms.Form):
 
     max_model_turns = forms.IntegerField(
         label="Max model turns",
-        min_value=1, max_value=20, initial=6,
+        min_value=1, max_value=20, initial=8,
         help_text="Maximum tool-call rounds per run.",
     )
     max_tool_calls = forms.IntegerField(
         label="Max tool calls",
-        min_value=1, max_value=50, initial=10,
+        min_value=1, max_value=50, initial=12,
         help_text="Maximum tool invocations across all rounds.",
     )
     tool_timeout_seconds = forms.FloatField(

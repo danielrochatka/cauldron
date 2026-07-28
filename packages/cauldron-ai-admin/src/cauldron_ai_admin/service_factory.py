@@ -69,13 +69,24 @@ def _resolve_provider_with_factory(provider_name: str, store=None):
         )
 
 
-def _resolve_runtime(store, cfg: dict) -> dict[str, Any]:
+EXECUTION_BUDGET_DEFAULTS: dict[str, Any] = {
+    "max_model_turns": 8,
+    "max_tool_calls": 12,
+    "tool_timeout_seconds": 30.0,
+    "run_timeout_seconds": 120.0,
+    "max_argument_bytes": 32768,
+    "max_result_bytes": 65536,
+    "include_content_tools": True,
+}
+
+
+def resolve_runtime_settings(store, cfg: dict) -> dict[str, Any]:
     """Return the effective runtime settings.
 
     Precedence per key:
     1. ``AIProviderSettingsStore.get_runtime()``  (values saved via settings UI)
     2. ``CAULDRON_MODULES["cauldron.ai.admin"]`` values (from Django settings)
-    3. Hard-coded defaults matching the pre-Phase-2 constants.
+    3. ``EXECUTION_BUDGET_DEFAULTS`` module defaults.
 
     ``include_content_tools`` uses ``.get(..., default)`` semantics rather
     than truthiness so an explicit ``False`` in either layer is honoured.
@@ -85,20 +96,23 @@ def _resolve_runtime(store, cfg: dict) -> dict[str, Any]:
     except Exception:
         saved = {}
 
-    def _numeric(name: str, default: Any) -> Any:
-        return saved.get(name) or cfg.get(name) or default
+    def _numeric(name: str) -> Any:
+        return saved.get(name) or cfg.get(name) or EXECUTION_BUDGET_DEFAULTS[name]
 
     return {
-        "max_model_turns": _numeric("max_model_turns", 6),
-        "max_tool_calls": _numeric("max_tool_calls", 10),
-        "tool_timeout_seconds": _numeric("tool_timeout_seconds", 30.0),
-        "run_timeout_seconds": _numeric("run_timeout_seconds", 120.0),
-        "max_argument_bytes": _numeric("max_argument_bytes", 32768),
-        "max_result_bytes": _numeric("max_result_bytes", 65536),
+        "max_model_turns": _numeric("max_model_turns"),
+        "max_tool_calls": _numeric("max_tool_calls"),
+        "tool_timeout_seconds": _numeric("tool_timeout_seconds"),
+        "run_timeout_seconds": _numeric("run_timeout_seconds"),
+        "max_argument_bytes": _numeric("max_argument_bytes"),
+        "max_result_bytes": _numeric("max_result_bytes"),
         "include_content_tools": (
             saved["include_content_tools"]
             if "include_content_tools" in saved
-            else cfg.get("include_content_tools", True)
+            else cfg.get(
+                "include_content_tools",
+                EXECUTION_BUDGET_DEFAULTS["include_content_tools"],
+            )
         ),
     }
 
@@ -140,7 +154,7 @@ def get_admin_ai_service() -> AdminAIService:
         if isinstance(provider, _FactoryProviderMarker):
             provider = _resolve_provider_with_factory(provider.name, store)
 
-    runtime = _resolve_runtime(store, cfg)
+    runtime = resolve_runtime_settings(store, cfg)
 
     # Optionally attach the content-operations service so PROPOSE tools
     # can call it. We fetch it lazily to avoid tying admin-ai to a

@@ -166,22 +166,6 @@ def _credential_states_for(spec, provider_name: str, store) -> dict[str, str]:
     return result
 
 
-def _resolve_runtime_defaults() -> dict[str, Any]:
-    """Return the runtime defaults merged from CAULDRON_MODULES."""
-    from django.conf import settings as django_settings
-    modules = getattr(django_settings, "CAULDRON_MODULES", {}) or {}
-    cfg = modules.get("cauldron.ai.admin") or {}
-    return {
-        "max_model_turns": cfg.get("max_model_turns", 6),
-        "max_tool_calls": cfg.get("max_tool_calls", 10),
-        "tool_timeout_seconds": cfg.get("tool_timeout_seconds", 30.0),
-        "run_timeout_seconds": cfg.get("run_timeout_seconds", 120.0),
-        "max_argument_bytes": cfg.get("max_argument_bytes", 32768),
-        "max_result_bytes": cfg.get("max_result_bytes", 65536),
-        "include_content_tools": cfg.get("include_content_tools", True),
-    }
-
-
 _SETTINGS_TEST_CACHE_KEY = "cauldron_ai_admin.settings.connection_test"
 _SETTINGS_TEST_THROTTLE_SECONDS = 30
 
@@ -290,12 +274,9 @@ class AdminAISettingsView(View):
         )
 
         if runtime_form is None:
-            defaults = _resolve_runtime_defaults()
-            try:
-                saved_runtime = store.get_runtime()
-            except AIProviderStoreError:
-                saved_runtime = {}
-            initial = {**defaults, **saved_runtime}
+            from .checks import _admin_ai_config as _get_module_cfg
+            from .service_factory import resolve_runtime_settings
+            initial = resolve_runtime_settings(store, _get_module_cfg())
             runtime_form = RuntimeSettingsForm(initial=initial)
 
         return {

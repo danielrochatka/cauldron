@@ -2,61 +2,25 @@
 set -euo pipefail
 
 CAULDRON_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="$(dirname "$CAULDRON_DIR")"
 
 source "$CAULDRON_DIR/lib.sh"
 
-# 1. Check Python 3.11+
-PYTHON_VERSION=$(python3 --version 2>&1 | awk '{print $2}')
-PYTHON_MAJOR=$(echo "$PYTHON_VERSION" | cut -d. -f1)
-PYTHON_MINOR=$(echo "$PYTHON_VERSION" | cut -d. -f2)
-
-if [ -z "$PYTHON_VERSION" ] || [ "$PYTHON_MAJOR" -lt 3 ] || { [ "$PYTHON_MAJOR" -eq 3 ] && [ "$PYTHON_MINOR" -lt 11 ]; }; then
-  echo "ERROR: Python 3.11 or newer is required. Found: ${PYTHON_VERSION:-none}"
-  echo "Please install Python 3.11+ from https://www.python.org/downloads/"
+# 1. Verify installation is complete.
+if ! is_installation_ready "$CAULDRON_DIR"; then
+  echo "" >&2
+  echo "ERROR: Cauldron is not fully installed. Run:" >&2
+  echo "       ./install" >&2
   exit 1
 fi
 
-# 2. Create virtualenv if it doesn't exist
-if [ ! -d "$CAULDRON_DIR/.venv" ]; then
-  echo "--> Creating virtual environment..."
-  python3 -m venv "$CAULDRON_DIR/.venv"
-fi
-
-# 3. Activate virtualenv
+# 2. Activate the virtualenv.
 source "$CAULDRON_DIR/.venv/bin/activate"
 
-# 4. Install/upgrade dependencies.
-echo "--> Installing dependencies..."
-install_python_projects "$REPO_DIR" "$CAULDRON_DIR/requirements.txt"
-
-# 5. Initialize config.env (creates it on first run, fills in SECRET_KEY).
-initialize_config "$CAULDRON_DIR/config.env" "$CAULDRON_DIR/config.env.example"
-
-# 6. Load config.env
+# 3. Load configuration.
 set -a
 source "$CAULDRON_DIR/config.env"
 set +a
 
-cd "$CAULDRON_DIR"
-
-# 7. Run migrations
-echo "--> Running database migrations..."
-"$CAULDRON_DIR/manage" migrate --no-input
-
-# 8. Collect static assets
-echo "--> Collecting static files..."
-"$CAULDRON_DIR/manage" collectstatic --no-input --clear -v 0
-
-# 9. Initialize override directory
-"$CAULDRON_DIR/manage" cauldron_ui_init 2>/dev/null || true
-
-# 10. Install frontend npm dependencies (if cauldron.site.astro is configured)
-if [ -f "$CAULDRON_DIR/frontend/package.json" ]; then
-  echo "--> Installing frontend dependencies..."
-  npm ci --prefix "$CAULDRON_DIR/frontend" --silent
-fi
-
-# 11. Start the server
+# 4. Start the server.
 PORT="${CAULDRON_PORT:-8000}"
 launch_server "$CAULDRON_DIR" "$PORT"

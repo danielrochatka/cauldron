@@ -122,24 +122,34 @@ echo "--> Collecting static assets..."
 # 9. Initialize override directory.
 "$CAULDRON_DIR/manage" cauldron_ui_init 2>/dev/null || true
 
-# 10. Install frontend npm dependencies and rebuild public site.
-if [ -f "$CAULDRON_DIR/frontend/package.json" ]; then
-  echo "--> Installing frontend dependencies..."
-  npm ci --prefix "$CAULDRON_DIR/frontend" --silent
-  echo "--> Building public site..."
-  "$CAULDRON_DIR/manage" cauldron_site_build || true
+# 10. Install/upgrade frontend dependencies (always re-runs after a git pull
+#     in case package-lock.json was updated).
+install_frontend "$CAULDRON_DIR"
+
+# 11. Rebuild public site.
+#     A build failure does NOT roll back the Python/database updates — those
+#     are safe to keep.  We record the outcome and report it at the end after
+#     the server is confirmed healthy.
+echo "--> Building public site..."
+SITE_BUILD_OK=1
+"$CAULDRON_DIR/manage" cauldron_site_build \
+  2>&1 | tee -a "$CAULDRON_DIR/logs/site_build.log" || SITE_BUILD_OK=0
+if [ "$SITE_BUILD_OK" -eq 0 ]; then
+  echo ""
+  echo "    WARNING: Public-site rebuild failed. Existing output was preserved."
+  echo "             See: $CAULDRON_DIR/logs/site_build.log"
 fi
 
-# 11. Run system check.
+# 12. Run system check.
 echo "--> Running system check..."
 "$CAULDRON_DIR/manage" check
 
-# 12. Start server.
+# 13. Start server.
 echo "--> Starting server..."
 PORT="${CAULDRON_PORT:-8000}"
 launch_server "$CAULDRON_DIR" "$PORT"
 
-# 12. Health check — verify the app and static files are reachable.
+# 14. Health check — verify the app and static files are reachable.
 #     Triggers the ERR trap (and therefore rollback) on failure.
 echo "--> Verifying server health..."
 HEALTHY=0
@@ -160,6 +170,18 @@ fi
 trap - ERR
 
 NEW_COMMIT="$(git -C "$REPO_DIR" rev-parse --short HEAD)"
+
+# Report final status.  A site-build failure is surfaced here — after the
+# server is confirmed healthy — so Python/database updates are kept.
+if [ "$SITE_BUILD_OK" -eq 0 ]; then
+  echo ""
+  echo "==> Application updated; public-site rebuild failed."
+  echo "    Retry:     ./manage cauldron_site_build"
+  echo "    Build log: $CAULDRON_DIR/logs/site_build.log"
+  echo "    ${PREV_COMMIT:0:8} -> $NEW_COMMIT"
+  exit 1
+fi
+
 echo ""
 echo "==> Cauldron updated successfully."
 echo "    ${PREV_COMMIT:0:8} -> $NEW_COMMIT"

@@ -46,7 +46,7 @@ def _make_user():
 
 
 def _make_service(provider, registry, *, max_tool_calls=12, max_model_turns=8,
-                  max_argument_bytes=32768, max_result_bytes=65536):
+                  max_argument_bytes=4096, max_result_bytes=8192):
     from cauldron_ai_admin.service import AdminAIService
     from helpers import make_assembly_service_for_tools
     asm = make_assembly_service_for_tools(
@@ -108,11 +108,12 @@ def test_execution_budget_defaults_all_six_numeric_keys_present():
 
 
 def test_execution_budget_defaults_preserved_numeric_values():
+    """Former self-hosted limits in settings.py are now the module defaults."""
     from cauldron_ai_admin.service_factory import EXECUTION_BUDGET_DEFAULTS
-    assert EXECUTION_BUDGET_DEFAULTS["tool_timeout_seconds"] == 30.0
-    assert EXECUTION_BUDGET_DEFAULTS["run_timeout_seconds"] == 120.0
-    assert EXECUTION_BUDGET_DEFAULTS["max_argument_bytes"] == 32768
-    assert EXECUTION_BUDGET_DEFAULTS["max_result_bytes"] == 65536
+    assert EXECUTION_BUDGET_DEFAULTS["tool_timeout_seconds"] == 10.0
+    assert EXECUTION_BUDGET_DEFAULTS["run_timeout_seconds"] == 30.0
+    assert EXECUTION_BUDGET_DEFAULTS["max_argument_bytes"] == 4096
+    assert EXECUTION_BUDGET_DEFAULTS["max_result_bytes"] == 8192
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +495,192 @@ def test_oversized_argument_rejected_at_configured_limit():
     run = svc.run(user, "Huge arguments.")
     assert run.status == "failed"
     assert run.error_code == "tool.arguments_too_large"
+
+
+# ---------------------------------------------------------------------------
+# coerce_execution_budget — unit tests for the validation function
+# ---------------------------------------------------------------------------
+
+def test_coerce_execution_budget_returns_coerced_values():
+    from cauldron_ai_admin.service_factory import coerce_execution_budget
+    result = coerce_execution_budget({"max_model_turns": "5", "max_tool_calls": 8})
+    assert result["max_model_turns"] == 5
+    assert isinstance(result["max_model_turns"], int)
+    assert result["max_tool_calls"] == 8
+
+
+def test_coerce_execution_budget_ignores_unrecognised_keys():
+    from cauldron_ai_admin.service_factory import coerce_execution_budget
+    result = coerce_execution_budget({"max_model_turns": 3, "unknown_key": "x"})
+    assert "unknown_key" not in result
+    assert result["max_model_turns"] == 3
+
+
+def test_coerce_execution_budget_rejects_wrong_type():
+    from cauldron_ai_admin.service_factory import ExecutionBudgetError, coerce_execution_budget
+    with pytest.raises(ExecutionBudgetError) as exc_info:
+        coerce_execution_budget({"max_model_turns": "not-a-number"})
+    assert "max_model_turns" in str(exc_info.value)
+    assert "int" in str(exc_info.value)
+
+
+def test_coerce_execution_budget_rejects_value_below_minimum():
+    from cauldron_ai_admin.service_factory import ExecutionBudgetError, coerce_execution_budget
+    with pytest.raises(ExecutionBudgetError) as exc_info:
+        coerce_execution_budget({"max_model_turns": 0})  # min is 1
+    assert "max_model_turns" in str(exc_info.value)
+    assert "between" in str(exc_info.value)
+
+
+def test_coerce_execution_budget_rejects_value_above_maximum():
+    from cauldron_ai_admin.service_factory import ExecutionBudgetError, coerce_execution_budget
+    with pytest.raises(ExecutionBudgetError) as exc_info:
+        coerce_execution_budget({"max_model_turns": 999})  # max is 20
+    assert "max_model_turns" in str(exc_info.value)
+
+
+def test_coerce_execution_budget_rejects_cross_field_timeout_violation():
+    from cauldron_ai_admin.service_factory import ExecutionBudgetError, coerce_execution_budget
+    with pytest.raises(ExecutionBudgetError) as exc_info:
+        coerce_execution_budget({
+            "tool_timeout_seconds": 60.0,
+            "run_timeout_seconds": 30.0,
+        })
+    msg = str(exc_info.value)
+    assert "tool_timeout_seconds" in msg
+    assert "run_timeout_seconds" in msg
+
+
+def test_coerce_execution_budget_equal_timeouts_also_rejected():
+    """tool_timeout == run_timeout must be rejected (must be strictly less)."""
+    from cauldron_ai_admin.service_factory import ExecutionBudgetError, coerce_execution_budget
+    with pytest.raises(ExecutionBudgetError):
+        coerce_execution_budget({
+            "tool_timeout_seconds": 30.0,
+            "run_timeout_seconds": 30.0,
+        })
+
+
+def test_coerce_execution_budget_skips_cross_field_check_when_only_one_timeout():
+    """No cross-field error when only one timeout key is present."""
+    from cauldron_ai_admin.service_factory import coerce_execution_budget
+    # Only tool_timeout, no run_timeout — no cross-field check should fire.
+    result = coerce_execution_budget({"tool_timeout_seconds": 25.0})
+    assert result["tool_timeout_seconds"] == 25.0
+
+
+def test_coerce_execution_budget_rejects_argument_bytes_below_minimum():
+    from cauldron_ai_admin.service_factory import ExecutionBudgetError, coerce_execution_budget
+    with pytest.raises(ExecutionBudgetError) as exc_info:
+        coerce_execution_budget({"max_argument_bytes": 512})  # min is 1024
+    assert "max_argument_bytes" in str(exc_info.value)
+
+
+def test_coerce_execution_budget_error_message_is_actionable():
+    """Error messages name the key and state the allowed range."""
+    from cauldron_ai_admin.service_factory import ExecutionBudgetError, coerce_execution_budget
+    with pytest.raises(ExecutionBudgetError) as exc_info:
+        coerce_execution_budget({"run_timeout_seconds": 9999})  # max is 600
+    msg = str(exc_info.value)
+    assert "run_timeout_seconds" in msg
+    assert "600" in msg  # upper bound visible in message
+
+
+# ---------------------------------------------------------------------------
+# Deployment override rejection (ImproperlyConfigured path)
+# ---------------------------------------------------------------------------
+
+def test_deployment_override_wrong_type_raises_improperly_configured(tmp_path):
+    from django.core.exceptions import ImproperlyConfigured
+    from cauldron_ai_admin.service_factory import resolve_runtime_settings
+    store, reset = _make_store(tmp_path)
+    try:
+        with pytest.raises(ImproperlyConfigured) as exc_info:
+            resolve_runtime_settings(store, {"max_model_turns": "not-a-number"})
+        assert "max_model_turns" in str(exc_info.value)
+    finally:
+        reset(path=None)
+
+
+def test_deployment_override_out_of_range_raises_improperly_configured(tmp_path):
+    from django.core.exceptions import ImproperlyConfigured
+    from cauldron_ai_admin.service_factory import resolve_runtime_settings
+    store, reset = _make_store(tmp_path)
+    try:
+        with pytest.raises(ImproperlyConfigured) as exc_info:
+            resolve_runtime_settings(store, {"max_tool_calls": 0})  # below min=1
+        assert "max_tool_calls" in str(exc_info.value)
+    finally:
+        reset(path=None)
+
+
+def test_deployment_override_cross_field_violation_raises_improperly_configured(tmp_path):
+    from django.core.exceptions import ImproperlyConfigured
+    from cauldron_ai_admin.service_factory import resolve_runtime_settings
+    store, reset = _make_store(tmp_path)
+    try:
+        with pytest.raises(ImproperlyConfigured) as exc_info:
+            resolve_runtime_settings(store, {
+                "tool_timeout_seconds": 60.0,
+                "run_timeout_seconds": 20.0,
+            })
+        assert "tool_timeout_seconds" in str(exc_info.value)
+    finally:
+        reset(path=None)
+
+
+def test_deployment_override_error_message_is_actionable(tmp_path):
+    """ImproperlyConfigured message includes the key name and the offending value."""
+    from django.core.exceptions import ImproperlyConfigured
+    from cauldron_ai_admin.service_factory import resolve_runtime_settings
+    store, reset = _make_store(tmp_path)
+    try:
+        with pytest.raises(ImproperlyConfigured) as exc_info:
+            resolve_runtime_settings(store, {"max_argument_bytes": 100})  # below 1024
+        msg = str(exc_info.value)
+        assert "max_argument_bytes" in msg
+        assert "1024" in msg  # lower bound visible
+    finally:
+        reset(path=None)
+
+
+def test_corrupted_saved_settings_fall_back_to_defaults(tmp_path):
+    """Saved settings that fail coerce_execution_budget are discarded gracefully."""
+    from cauldron_ai_admin.service_factory import EXECUTION_BUDGET_DEFAULTS, resolve_runtime_settings
+    store, reset = _make_store(tmp_path)
+    try:
+        # Write valid settings first, then simulate corruption by bypassing the store.
+        import json
+        store_path = tmp_path / "ai.json"
+        data = json.loads(store_path.read_text()) if store_path.exists() else {}
+        # Inject an out-of-range runtime value directly into the JSON file.
+        data.setdefault("runtime", {})["max_model_turns"] = 999  # above max=20
+        store_path.write_text(json.dumps(data))
+
+        # resolve_runtime_settings should fall back to defaults rather than crashing.
+        result = resolve_runtime_settings(store, {})
+        assert result["max_model_turns"] == EXECUTION_BUDGET_DEFAULTS["max_model_turns"]
+    finally:
+        reset(path=None)
+
+
+# ---------------------------------------------------------------------------
+# Form uses coerce_execution_budget for the cross-field check
+# ---------------------------------------------------------------------------
+
+def test_form_cross_field_check_uses_shared_validation():
+    """RuntimeSettingsForm.clean() rejects equal timeouts via coerce_execution_budget."""
+    from cauldron_ai_admin.forms import RuntimeSettingsForm
+    form = RuntimeSettingsForm(data={
+        "max_model_turns": "8",
+        "max_tool_calls": "12",
+        "tool_timeout_seconds": "30",   # == run_timeout → must fail
+        "run_timeout_seconds": "30",
+        "max_argument_bytes": "4096",
+        "max_result_bytes": "8192",
+    })
+    assert not form.is_valid()
+    assert "tool_timeout_seconds" in form.errors
 
 
 # ---------------------------------------------------------------------------

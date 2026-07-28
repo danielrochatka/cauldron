@@ -72,12 +72,71 @@ def _resolve_provider_with_factory(provider_name: str, store=None):
 EXECUTION_BUDGET_DEFAULTS: dict[str, Any] = {
     "max_model_turns": 8,
     "max_tool_calls": 12,
-    "tool_timeout_seconds": 30.0,
-    "run_timeout_seconds": 120.0,
-    "max_argument_bytes": 32768,
-    "max_result_bytes": 65536,
+    "tool_timeout_seconds": 10.0,
+    "run_timeout_seconds": 30.0,
+    "max_argument_bytes": 4096,
+    "max_result_bytes": 8192,
     "include_content_tools": True,
 }
+
+# Per-key (type, min, max) — mirrors RuntimeSettingsForm field constraints.
+_BUDGET_BOUNDS: dict[str, tuple] = {
+    "max_model_turns":      (int,   1,      20),
+    "max_tool_calls":       (int,   1,      50),
+    "tool_timeout_seconds": (float, 1.0,    300.0),
+    "run_timeout_seconds":  (float, 10.0,   600.0),
+    "max_argument_bytes":   (int,   1024,   1048576),
+    "max_result_bytes":     (int,   1024,   1048576),
+}
+
+
+class ExecutionBudgetError(Exception):
+    """An execution-budget value is invalid: wrong type, out of range, or
+    violates the tool_timeout < run_timeout cross-field invariant."""
+
+
+def coerce_execution_budget(values: dict) -> dict[str, Any]:
+    """Validate and coerce a (possibly partial) execution-budget mapping.
+
+    Accepts any recognised subset of the six numeric keys plus
+    ``include_content_tools``.  Coerces each numeric key to its declared
+    Python type, validates per-key min/max bounds, and enforces the
+    ``tool_timeout_seconds < run_timeout_seconds`` invariant when both keys
+    are present.
+
+    Raises ``ExecutionBudgetError`` for any invalid value with an actionable
+    message naming the key and the allowed range.  Unrecognised keys are
+    silently ignored.  Returns a new dict of the recognised, coerced values.
+    """
+    out: dict[str, Any] = {}
+    for key, (typ, lo, hi) in _BUDGET_BOUNDS.items():
+        if key not in values:
+            continue
+        raw = values[key]
+        try:
+            val = typ(raw)
+        except (TypeError, ValueError) as exc:
+            raise ExecutionBudgetError(
+                f"cauldron.ai.admin: {key!r} must be a {typ.__name__} "
+                f"(received {type(raw).__name__} {raw!r})"
+            ) from exc
+        if not (lo <= val <= hi):
+            raise ExecutionBudgetError(
+                f"cauldron.ai.admin: {key!r} must be between {lo} and {hi} "
+                f"(received {val!r})"
+            )
+        out[key] = val
+    if "include_content_tools" in values:
+        out["include_content_tools"] = bool(values["include_content_tools"])
+    # Cross-field invariant — only enforced when both timeout keys are present.
+    tool_t = out.get("tool_timeout_seconds")
+    run_t = out.get("run_timeout_seconds")
+    if tool_t is not None and run_t is not None and tool_t >= run_t:
+        raise ExecutionBudgetError(
+            f"cauldron.ai.admin: tool_timeout_seconds ({tool_t}) "
+            f"must be less than run_timeout_seconds ({run_t})"
+        )
+    return out
 
 
 def resolve_runtime_settings(store, cfg: dict) -> dict[str, Any]:
@@ -88,11 +147,23 @@ def resolve_runtime_settings(store, cfg: dict) -> dict[str, Any]:
     2. ``CAULDRON_MODULES["cauldron.ai.admin"]`` values (from Django settings)
     3. ``EXECUTION_BUDGET_DEFAULTS`` module defaults.
 
-    ``include_content_tools`` uses ``.get(..., default)`` semantics rather
-    than truthiness so an explicit ``False`` in either layer is honoured.
+    Deployment overrides (``cfg``) are validated via ``coerce_execution_budget``
+    and raise ``ImproperlyConfigured`` immediately so operators see the error
+    at startup rather than at request time.  Corrupted saved settings are
+    discarded gracefully so a bad JSON edit never takes the service down.
     """
+    # Validate deployment overrides loudly — misconfigured settings.py is a
+    # deployment error the operator must fix before the service can start.
     try:
-        saved = dict(store.get_runtime() or {})
+        cfg = coerce_execution_budget(cfg)
+    except ExecutionBudgetError as exc:
+        raise ImproperlyConfigured(str(exc)) from exc
+
+    # Load saved settings; discard silently if the store is unreadable or
+    # the persisted values somehow failed validation (e.g. manual JSON edit).
+    try:
+        raw_saved = dict(store.get_runtime() or {})
+        saved = coerce_execution_budget(raw_saved)
     except Exception:
         saved = {}
 

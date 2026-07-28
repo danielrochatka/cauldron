@@ -302,22 +302,22 @@ class RuntimeSettingsForm(forms.Form):
     )
     tool_timeout_seconds = forms.FloatField(
         label="Tool timeout (seconds)",
-        min_value=1.0, max_value=300.0, initial=30.0,
+        min_value=1.0, max_value=300.0, initial=10.0,
         help_text="Per-tool deadline.",
     )
     run_timeout_seconds = forms.FloatField(
         label="Run timeout (seconds)",
-        min_value=10.0, max_value=600.0, initial=120.0,
+        min_value=10.0, max_value=600.0, initial=30.0,
         help_text="End-to-end deadline for a single request.",
     )
     max_argument_bytes = forms.IntegerField(
         label="Max argument bytes",
-        min_value=1024, max_value=1048576, initial=32768,
+        min_value=1024, max_value=1048576, initial=4096,
         help_text="Reject tool calls with argument payloads above this size.",
     )
     max_result_bytes = forms.IntegerField(
         label="Max result bytes",
-        min_value=1024, max_value=1048576, initial=65536,
+        min_value=1024, max_value=1048576, initial=8192,
         help_text="Reject tool results above this size.",
     )
     include_content_tools = forms.BooleanField(
@@ -333,9 +333,16 @@ class RuntimeSettingsForm(forms.Form):
         data = super().clean()
         tool_t = data.get("tool_timeout_seconds")
         run_t = data.get("run_timeout_seconds")
-        if tool_t and run_t and tool_t >= run_t:
-            self.add_error(
-                "tool_timeout_seconds",
-                "Tool timeout must be less than run timeout.",
-            )
+        if tool_t is not None and run_t is not None:
+            from .service_factory import ExecutionBudgetError, coerce_execution_budget
+            try:
+                coerce_execution_budget({
+                    "tool_timeout_seconds": tool_t,
+                    "run_timeout_seconds": run_t,
+                })
+            except ExecutionBudgetError:
+                self.add_error(
+                    "tool_timeout_seconds",
+                    "Tool timeout must be less than run timeout.",
+                )
         return data

@@ -684,6 +684,142 @@ def test_form_cross_field_check_uses_shared_validation():
 
 
 # ---------------------------------------------------------------------------
+# Cross-source timeout validation — the hardening change
+#
+# Two individually valid partial settings from different sources must not
+# be allowed to produce an invalid combined timeout pair.
+# ---------------------------------------------------------------------------
+
+def test_saved_tool_timeout_exceeds_deployment_run_timeout_falls_back(tmp_path):
+    """saved tool_timeout > deployment run_timeout → discard saved, return baseline.
+
+    saved:      tool_timeout_seconds = 20  (valid: 1–300)
+    deployment: run_timeout_seconds  = 15  (valid: 10–600)
+    baseline:   tool=10 (default), run=15 → 10 < 15  ✓
+    merged:     tool=20, run=15 → 20 ≥ 15  ✗ → fall back to baseline
+    """
+    from cauldron_ai_admin.service_factory import resolve_runtime_settings
+    store, reset = _make_store(tmp_path)
+    try:
+        store.set_runtime({"tool_timeout_seconds": 20.0})
+        result = resolve_runtime_settings(store, {"run_timeout_seconds": 15.0})
+        # Saved tool_timeout (20) must be discarded; baseline tool_timeout (10) used.
+        assert result["tool_timeout_seconds"] == 10.0
+        assert result["run_timeout_seconds"] == 15.0
+    finally:
+        reset(path=None)
+
+
+def test_saved_run_timeout_below_deployment_tool_timeout_falls_back(tmp_path):
+    """saved run_timeout < deployment tool_timeout → discard saved, return baseline.
+
+    saved:      run_timeout_seconds  = 25  (valid: 10–600)
+    deployment: tool_timeout_seconds = 30  (valid: 1–300)
+    baseline:   tool=30, run=30 (default) → 30 ≥ 30  → ImproperlyConfigured
+    """
+    # This case means the deployment baseline itself is invalid first, so
+    # it raises rather than falling back — tested by the next function.
+    # Here we use a deployment tool_timeout that is valid against the default run_timeout.
+    #
+    # saved:      run_timeout_seconds  = 12  (valid)
+    # deployment: tool_timeout_seconds = 20  (valid)
+    # baseline:   tool=20, run=30 (default) → valid
+    # merged:     tool=20, run=12 → 20 ≥ 12  ✗ → fall back to baseline
+    from cauldron_ai_admin.service_factory import resolve_runtime_settings
+    store, reset = _make_store(tmp_path)
+    try:
+        store.set_runtime({"run_timeout_seconds": 12.0})
+        result = resolve_runtime_settings(store, {"tool_timeout_seconds": 20.0})
+        # Saved run_timeout (12) must be discarded; baseline run_timeout (30) used.
+        assert result["run_timeout_seconds"] == 30.0
+        assert result["tool_timeout_seconds"] == 20.0
+    finally:
+        reset(path=None)
+
+
+def test_deployment_tool_timeout_exceeds_default_run_timeout_raises(tmp_path):
+    """A deployment tool_timeout that exceeds the module default run_timeout raises.
+
+    deployment: tool_timeout_seconds = 35  (valid: 1–300)
+    defaults:   run_timeout_seconds  = 30
+    baseline:   tool=35, run=30 → 35 ≥ 30  ✗ → ImproperlyConfigured
+    """
+    from django.core.exceptions import ImproperlyConfigured
+    from cauldron_ai_admin.service_factory import resolve_runtime_settings
+    store, reset = _make_store(tmp_path)
+    try:
+        with pytest.raises(ImproperlyConfigured) as exc_info:
+            resolve_runtime_settings(store, {"tool_timeout_seconds": 35.0})
+        msg = str(exc_info.value)
+        assert "tool_timeout_seconds" in msg
+        assert "run_timeout_seconds" in msg
+    finally:
+        reset(path=None)
+
+
+def test_invalid_saved_merged_config_falls_back_to_valid_baseline(tmp_path):
+    """Any cross-source violation in the merged final config falls back to baseline.
+
+    saved:      tool_timeout_seconds = 28  (valid alone)
+                run_timeout_seconds  = 25  (valid alone, but 28 ≥ 25)
+    baseline:   all from EXECUTION_BUDGET_DEFAULTS → tool=10, run=30
+    merged:     tool=28, run=25 → 28 ≥ 25  ✗ → fall back to baseline
+    """
+    from cauldron_ai_admin.service_factory import EXECUTION_BUDGET_DEFAULTS, resolve_runtime_settings
+    store, reset = _make_store(tmp_path)
+    try:
+        store.set_runtime({
+            "tool_timeout_seconds": 28.0,
+            "run_timeout_seconds": 25.0,
+        })
+        result = resolve_runtime_settings(store, {})
+        assert result["tool_timeout_seconds"] == EXECUTION_BUDGET_DEFAULTS["tool_timeout_seconds"]
+        assert result["run_timeout_seconds"] == EXECUTION_BUDGET_DEFAULTS["run_timeout_seconds"]
+    finally:
+        reset(path=None)
+
+
+def test_invalid_deployment_default_combination_raises_improperly_configured(tmp_path):
+    """Deployment override + module default = invalid baseline → ImproperlyConfigured.
+
+    Distinct from a single-key out-of-range rejection: here each key is
+    individually valid, but the combination violates the cross-field rule.
+    """
+    from django.core.exceptions import ImproperlyConfigured
+    from cauldron_ai_admin.service_factory import resolve_runtime_settings
+    store, reset = _make_store(tmp_path)
+    try:
+        # tool_timeout=35 is valid by itself; default run_timeout=30 is also valid.
+        # But 35 >= 30, so the baseline is invalid.
+        with pytest.raises(ImproperlyConfigured):
+            resolve_runtime_settings(store, {"tool_timeout_seconds": 35.0})
+    finally:
+        reset(path=None)
+
+
+def test_valid_partial_settings_preserve_existing_precedence(tmp_path):
+    """Valid partial settings from each source compose correctly.
+
+    saved:      max_model_turns = 10
+    deployment: max_tool_calls  = 6
+    defaults:   everything else
+    """
+    from cauldron_ai_admin.service_factory import EXECUTION_BUDGET_DEFAULTS, resolve_runtime_settings
+    store, reset = _make_store(tmp_path)
+    try:
+        store.set_runtime({"max_model_turns": 10})
+        result = resolve_runtime_settings(store, {"max_tool_calls": 6})
+        assert result["max_model_turns"] == 10     # from saved
+        assert result["max_tool_calls"] == 6       # from deployment
+        assert result["tool_timeout_seconds"] == EXECUTION_BUDGET_DEFAULTS["tool_timeout_seconds"]
+        assert result["run_timeout_seconds"] == EXECUTION_BUDGET_DEFAULTS["run_timeout_seconds"]
+        assert result["max_argument_bytes"] == EXECUTION_BUDGET_DEFAULTS["max_argument_bytes"]
+        assert result["max_result_bytes"] == EXECUTION_BUDGET_DEFAULTS["max_result_bytes"]
+    finally:
+        reset(path=None)
+
+
+# ---------------------------------------------------------------------------
 # Absence of execution-budget keys from cauldron_site/settings.py
 # ---------------------------------------------------------------------------
 

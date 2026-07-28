@@ -147,45 +147,55 @@ def resolve_runtime_settings(store, cfg: dict) -> dict[str, Any]:
     2. ``CAULDRON_MODULES["cauldron.ai.admin"]`` values (from Django settings)
     3. ``EXECUTION_BUDGET_DEFAULTS`` module defaults.
 
-    Deployment overrides (``cfg``) are validated via ``coerce_execution_budget``
-    and raise ``ImproperlyConfigured`` immediately so operators see the error
-    at startup rather than at request time.  Corrupted saved settings are
-    discarded gracefully so a bad JSON edit never takes the service down.
+    Validation is applied at two levels so that individually valid partial
+    settings from different sources cannot produce an invalid combined result:
+
+    * The *deployment baseline* (EXECUTION_BUDGET_DEFAULTS merged with
+      deployment overrides) is validated after merging.  A cross-source
+      violation (e.g. a cfg ``tool_timeout`` that exceeds the default
+      ``run_timeout``) raises ``ImproperlyConfigured`` at startup.
+    * The *final config* (baseline merged with saved settings) is validated
+      again.  If saved settings create an invalid combination (e.g. a saved
+      ``tool_timeout`` that exceeds a deployment-override ``run_timeout``),
+      the saved settings are silently discarded and the valid baseline is
+      returned instead.
     """
-    # Validate deployment overrides loudly — misconfigured settings.py is a
-    # deployment error the operator must fix before the service can start.
+    # Step 1 — validate deployment overrides individually; any single-key
+    # violation (wrong type, out-of-range) is a deployment error.
     try:
-        cfg = coerce_execution_budget(cfg)
+        coerced_cfg = coerce_execution_budget(cfg)
     except ExecutionBudgetError as exc:
         raise ImproperlyConfigured(str(exc)) from exc
 
-    # Load saved settings; discard silently if the store is unreadable or
-    # the persisted values somehow failed validation (e.g. manual JSON edit).
+    # Step 2 — build the complete deployment baseline and validate it as a
+    # whole so cross-source violations (cfg vs defaults) are caught here.
+    baseline = {**EXECUTION_BUDGET_DEFAULTS, **coerced_cfg}
+    try:
+        baseline = coerce_execution_budget(baseline)
+    except ExecutionBudgetError as exc:
+        raise ImproperlyConfigured(str(exc)) from exc
+
+    # Step 3 — load and individually validate saved settings; discard on any
+    # error so a corrupt store or out-of-range manual edit never crashes the
+    # service.
     try:
         raw_saved = dict(store.get_runtime() or {})
-        saved = coerce_execution_budget(raw_saved)
+        coerced_saved = coerce_execution_budget(raw_saved)
     except Exception:
-        saved = {}
+        coerced_saved = {}
 
-    def _numeric(name: str) -> Any:
-        return saved.get(name) or cfg.get(name) or EXECUTION_BUDGET_DEFAULTS[name]
+    if not coerced_saved:
+        return baseline
 
-    return {
-        "max_model_turns": _numeric("max_model_turns"),
-        "max_tool_calls": _numeric("max_tool_calls"),
-        "tool_timeout_seconds": _numeric("tool_timeout_seconds"),
-        "run_timeout_seconds": _numeric("run_timeout_seconds"),
-        "max_argument_bytes": _numeric("max_argument_bytes"),
-        "max_result_bytes": _numeric("max_result_bytes"),
-        "include_content_tools": (
-            saved["include_content_tools"]
-            if "include_content_tools" in saved
-            else cfg.get(
-                "include_content_tools",
-                EXECUTION_BUDGET_DEFAULTS["include_content_tools"],
-            )
-        ),
-    }
+    # Step 4 — merge saved over baseline and validate the complete result.
+    # If two individually valid partial settings produce a cross-source
+    # violation (e.g. saved tool_timeout > deployment run_timeout), discard
+    # the saved settings and return the safe, already-validated baseline.
+    merged = {**baseline, **coerced_saved}
+    try:
+        return coerce_execution_budget(merged)
+    except ExecutionBudgetError:
+        return baseline
 
 
 def get_admin_ai_service() -> AdminAIService:

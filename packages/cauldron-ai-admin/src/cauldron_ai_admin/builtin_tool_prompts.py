@@ -268,6 +268,62 @@ _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
         ),
     ),
     AIToolPromptTemplate(
+        tool_name="system.admin_ai_inventory",
+        template_version="v2",
+        owning_module="cauldron.ai.admin",
+        purpose=(
+            "Report the effective Admin AI tool inventory for the current actor: "
+            "which tools are visible, their risk levels, and whether they require "
+            "human approval. Use this to understand what capabilities are available "
+            "before attempting any operation."
+        ),
+        supported_tasks=("capability discovery", "permissions audit", "tool inventory"),
+        required_permission="cauldron_ai_admin.use_admin_ai",
+        risk_level="READ_ONLY",
+        read_scope=(
+            "Names, versions, owning modules, truncated descriptions, risk levels, "
+            "and approval requirements for all tools the current actor can access. "
+            "No secrets, credentials, or internal paths are exposed."
+        ),
+        write_scope="None.",
+        preconditions=("Actor has use_admin_ai permission.",),
+        input_expectations="No arguments required.",
+        result_behavior=(
+            "Returns 'total_accessible' (total permitted tools), 'returned' "
+            "(tools included in this response), 'truncated' (boolean — true when "
+            "the registry is too large to fit in a single response), and "
+            "'by_risk_level' (object keyed by READ_ONLY/PROPOSE/MAINTENANCE/"
+            "PRIVILEGED, each a list of tool entries). "
+            "When no PROPOSE tools are accessible a 'hint' field explains "
+            "which Django permissions are required to unlock proposal capabilities."
+        ),
+        approval_requirements="None; read-only.",
+        clarification_behavior=(
+            "Use this tool to answer questions about what capabilities are available "
+            "before attempting any operation. If the actor asks about a tool not in "
+            "the result, explain it is not accessible with their current permissions. "
+            "If the 'hint' field is present and warns that no PROPOSE tools are "
+            "available, relay this clearly: content and style proposals require "
+            "additional Django permissions that an administrator must grant."
+        ),
+        refusal_behavior="Never refuse; output is always byte-bounded.",
+        error_guidance=(
+            "This tool does not contact external services and should not fail. "
+            "If it does, report the error code."
+        ),
+        positive_examples=(
+            "What tools do I have access to?",
+            "Can I propose content changes?",
+            "Show me the Admin AI tool inventory.",
+        ),
+        boundary_examples=(
+            "Do not infer permissions beyond what this tool reports.",
+            "Do not reveal the actor's full Django permission set — only tool visibility.",
+            "If truncated=true, not all tools are shown; the actor may have more "
+            "than returned indicates.",
+        ),
+    ),
+    AIToolPromptTemplate(
         tool_name="system.django_checks",
         template_version="v1",
         owning_module="cauldron.ai.admin",

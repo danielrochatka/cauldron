@@ -1,6 +1,6 @@
 """Built-in Admin AI tools.
 
-Seven tools ship with the module. They are registered exactly once, when
+These tools ship with the module. They are registered exactly once, when
 ``cauldron_ai_admin.apps.CauldronAIAdminConfig.ready()`` calls
 :func:`register_builtin_tools`.
 
@@ -15,6 +15,7 @@ stack. When ``context.content_service`` is ``None`` the handler returns
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any
@@ -53,6 +54,7 @@ BUILTIN_TOOL_NAMES: tuple[str, ...] = (
     "content.get_item",
     "content.create_proposal",
     "content.preview_change_request",
+    "system.admin_ai_inventory",
     "system.django_checks",
     "system.module_status",
     "ui.styles.list_files",
@@ -815,6 +817,100 @@ def _handle_module_status(context: AdminAIToolContext, **kwargs) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# system.admin_ai_inventory
+# ---------------------------------------------------------------------------
+
+_ADMIN_AI_INVENTORY_SCHEMA: dict = {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": False,
+}
+
+# Truncate descriptions in inventory entries to keep them compact.
+_INVENTORY_DESC_MAX = 200
+
+# Reserve headroom so the JSON-encoded data dict plus the AdminAIToolResult
+# wrapper never tips over the service-level max_result_bytes limit.
+_INVENTORY_BYTE_RESERVE = 512
+
+_INVENTORY_NO_PROPOSE_HINT = (
+    "No PROPOSE tools are currently accessible. "
+    "Proposal capabilities require additional Django permissions "
+    "(e.g. cauldron_content_operations.propose_content_changes, "
+    "cauldron_ai_admin.propose_ui_style_changes)."
+)
+
+
+def _handle_admin_ai_inventory(context: AdminAIToolContext, **kwargs) -> Any:
+    deadline_err = _check_deadline("system.admin_ai_inventory", context)
+    if deadline_err is not None:
+        return deadline_err
+    if kwargs:
+        return AdminAIToolError(
+            tool_name="system.admin_ai_inventory",
+            error_code="tool.invalid_arguments",
+            message="system.admin_ai_inventory takes no arguments.",
+        )
+    # Use the effective limit from the context (populated by AdminAIService
+    # from resolve_runtime_settings so it reflects saved and deployment
+    # overrides).  The context falls back to _CONTEXT_DEFAULT_MAX_RESULT_BYTES
+    # (8 192) when constructed outside the service.
+    byte_budget = context.max_result_bytes - _INVENTORY_BYTE_RESERVE
+
+    registry = get_tool_registry()
+    permitted = registry.list_for_actor(context.actor)
+    total = len(permitted)
+
+    by_risk: dict[str, list[dict]] = {}
+    returned = 0
+    truncated = False
+
+    for defn in permitted:
+        entry = {
+            "name": defn.name,
+            "version": defn.version,
+            "owning_module": defn.owning_module,
+            "description": defn.description[:_INVENTORY_DESC_MAX],
+            "requires_human_approval": defn.requires_human_approval,
+        }
+        level = defn.risk_level.value
+
+        # Probe whether adding this entry exceeds the byte budget.
+        candidate: dict[str, list[dict]] = {k: list(v) for k, v in by_risk.items()}
+        candidate.setdefault(level, []).append(entry)
+        probe = {
+            "total_accessible": total,
+            "returned": returned + 1,
+            "truncated": False,
+            "by_risk_level": candidate,
+        }
+        if len(json.dumps(probe).encode("utf-8")) > byte_budget:
+            truncated = True
+            break
+        by_risk = candidate
+        returned += 1
+
+    has_propose = any(
+        defn.risk_level.value == "PROPOSE" for defn in permitted
+    )
+
+    data: dict[str, Any] = {
+        "total_accessible": total,
+        "returned": returned,
+        "truncated": truncated,
+        "by_risk_level": by_risk,
+    }
+    if not has_propose:
+        data["hint"] = _INVENTORY_NO_PROPOSE_HINT
+
+    return AdminAIToolResult(
+        tool_name="system.admin_ai_inventory",
+        success=True,
+        data=data,
+    )
+
+
+# ---------------------------------------------------------------------------
 # ui.styles helpers
 # ---------------------------------------------------------------------------
 
@@ -1069,6 +1165,23 @@ def _builtin_definitions() -> tuple[tuple[AdminAIToolDefinition, Any], ...]:
                 owning_module=OWNING_MODULE,
             ),
             _handle_preview_change_request,
+        ),
+        (
+            AdminAIToolDefinition(
+                name="system.admin_ai_inventory",
+                version="1.0",
+                description=(
+                    "Report the effective Admin AI tool inventory for the current "
+                    "actor: which tools are visible, their risk levels, and whether "
+                    "they require human approval. Output is bounded to stay within "
+                    "the configured result-size limit."
+                ),
+                argument_schema=_ADMIN_AI_INVENTORY_SCHEMA,
+                risk_level=RiskLevel.READ_ONLY,
+                required_permission="cauldron_ai_admin.use_admin_ai",
+                owning_module=OWNING_MODULE,
+            ),
+            _handle_admin_ai_inventory,
         ),
         (
             AdminAIToolDefinition(

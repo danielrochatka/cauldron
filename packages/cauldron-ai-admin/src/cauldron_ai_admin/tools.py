@@ -198,6 +198,15 @@ class AdminAIToolDefinition:
             raise ValueError("max_output_bytes must be a positive integer")
 
 
+# Fallback used when AdminAIToolContext is constructed without an explicit
+# max_result_bytes (e.g. in older tests or third-party integrations that
+# do not go through AdminAIService).  Mirrors EXECUTION_BUDGET_DEFAULTS so
+# the behaviour is identical to a freshly configured service.  We cannot
+# import EXECUTION_BUDGET_DEFAULTS here because service_factory imports
+# from this module, which would create a circular dependency.
+_CONTEXT_DEFAULT_MAX_RESULT_BYTES: int = 8192
+
+
 @dataclass
 class AdminAIToolContext:
     """Runtime context passed to a tool handler.
@@ -212,6 +221,7 @@ class AdminAIToolContext:
     content_service: Any = None      # ContentOperationService or None
     deadline: datetime | None = None
     dry_run: bool = False
+    max_result_bytes: int = _CONTEXT_DEFAULT_MAX_RESULT_BYTES
 
     def deadline_remaining_seconds(self) -> float | None:
         """Return seconds remaining until the run deadline, or ``None``.

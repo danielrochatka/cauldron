@@ -81,6 +81,43 @@ PY
   fi
 }
 
+# check_node_version MIN_MAJOR
+#
+# Verifies that node is in PATH and that its major version is >= MIN_MAJOR.
+# Prints a diagnostic line on success ("--> Node.js vX.Y.Z OK").
+# Prints an error to stderr and returns 1 on failure.
+check_node_version() {
+  local min_major="${1:-18}"
+
+  if ! command -v node &>/dev/null; then
+    echo "ERROR: Node.js is required but was not found in PATH." >&2
+    echo "       Install Node.js ${min_major} or newer from https://nodejs.org/" >&2
+    return 1
+  fi
+
+  local raw
+  if ! raw=$(node --version 2>/dev/null); then
+    echo "ERROR: 'node --version' failed. Ensure Node.js is properly installed." >&2
+    return 1
+  fi
+
+  local major
+  major=$(echo "$raw" | sed -n 's/^v\([0-9]*\)\..*/\1/p')
+  if [ -z "$major" ]; then
+    echo "ERROR: Could not parse Node.js version from: '$raw'" >&2
+    echo "       Install Node.js ${min_major} or newer from https://nodejs.org/" >&2
+    return 1
+  fi
+
+  if [ "$major" -lt "$min_major" ]; then
+    echo "ERROR: Node.js ${min_major} or newer is required. Found: $raw" >&2
+    echo "       Install Node.js ${min_major} or newer from https://nodejs.org/" >&2
+    return 1
+  fi
+
+  echo "--> Node.js $raw OK"
+}
+
 # launch_server CAULDRON_DIR PORT
 #
 # Starts Gunicorn in daemon mode, or falls back to Django's dev server.
@@ -164,4 +201,35 @@ install_frontend() {
 is_frontend_installed() {
   local cauldron_dir="$1"
   [ -x "$cauldron_dir/frontend/node_modules/.bin/astro" ]
+}
+
+# is_installation_ready CAULDRON_DIR
+#
+# Returns 0 when all installation artifacts are present:
+#   - .venv/bin/python (Python virtualenv)
+#   - config.env (configuration file)
+#   - frontend/node_modules/.bin/astro (when frontend/package.json exists)
+# Prints a diagnostic line to stderr for each missing artifact and returns 1
+# when anything is absent.
+is_installation_ready() {
+  local cauldron_dir="$1"
+  local ok=1
+
+  if [ ! -x "$cauldron_dir/.venv/bin/python" ]; then
+    echo "  Missing: .venv/bin/python (Python virtualenv not installed)" >&2
+    ok=0
+  fi
+
+  if [ ! -f "$cauldron_dir/config.env" ]; then
+    echo "  Missing: config.env (configuration not initialised)" >&2
+    ok=0
+  fi
+
+  if [ -f "$cauldron_dir/frontend/package.json" ] && \
+     [ ! -x "$cauldron_dir/frontend/node_modules/.bin/astro" ]; then
+    echo "  Missing: frontend/node_modules/.bin/astro (frontend not installed)" >&2
+    ok=0
+  fi
+
+  return $((1 - ok))
 }

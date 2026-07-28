@@ -17,30 +17,29 @@ echo ""
 # ---------------------------------------------------------------------------
 
 # Python 3.11+
+if ! command -v python3 &>/dev/null; then
+  echo "ERROR: Python 3.11 or newer is required but python3 was not found in PATH." >&2
+  echo "       Install from https://www.python.org/downloads/" >&2
+  exit 1
+fi
 PYTHON_VERSION=$(python3 --version 2>&1 | awk '{print $2}')
 PYTHON_MAJOR=$(echo "$PYTHON_VERSION" | cut -d. -f1)
 PYTHON_MINOR=$(echo "$PYTHON_VERSION" | cut -d. -f2)
-if [ -z "${PYTHON_VERSION:-}" ] || [ "${PYTHON_MAJOR:-0}" -lt 3 ] || \
+if [ "${PYTHON_MAJOR:-0}" -lt 3 ] || \
    { [ "${PYTHON_MAJOR:-0}" -eq 3 ] && [ "${PYTHON_MINOR:-0}" -lt 11 ]; }; then
-  echo "ERROR: Python 3.11 or newer is required. Found: ${PYTHON_VERSION:-none}"
-  echo "       Install from https://www.python.org/downloads/"
+  echo "ERROR: Python 3.11 or newer is required. Found: ${PYTHON_VERSION:-none}" >&2
+  echo "       Install from https://www.python.org/downloads/" >&2
   exit 1
 fi
 echo "--> Python ${PYTHON_VERSION} OK"
 
-# Node.js
-if ! command -v node &>/dev/null; then
-  echo "ERROR: Node.js is required but was not found in PATH."
-  echo "       Install from https://nodejs.org/"
-  exit 1
-fi
-NODE_VERSION=$(node --version 2>/dev/null)
-echo "--> Node.js ${NODE_VERSION} OK"
+# Node.js 18+
+check_node_version 18
 
 # npm
 if ! command -v npm &>/dev/null; then
-  echo "ERROR: npm is required but was not found in PATH."
-  echo "       npm is bundled with Node.js — reinstall from https://nodejs.org/"
+  echo "ERROR: npm is required but was not found in PATH." >&2
+  echo "       npm is bundled with Node.js — reinstall from https://nodejs.org/" >&2
   exit 1
 fi
 NPM_VERSION=$(npm --version 2>/dev/null)
@@ -48,17 +47,17 @@ echo "--> npm ${NPM_VERSION} OK"
 
 # frontend/package.json
 if [ ! -f "$CAULDRON_DIR/frontend/package.json" ]; then
-  echo "ERROR: frontend/package.json is missing."
-  echo "       This file must be present in the repository checkout."
-  echo "       Try: git checkout frontend/package.json"
+  echo "ERROR: frontend/package.json is missing." >&2
+  echo "       This file must be present in the repository checkout." >&2
+  echo "       Try: git checkout frontend/package.json" >&2
   exit 1
 fi
 
 # frontend/package-lock.json
 if [ ! -f "$CAULDRON_DIR/frontend/package-lock.json" ]; then
-  echo "ERROR: frontend/package-lock.json is missing."
-  echo "       This file must be tracked in the repository."
-  echo "       Try: git checkout frontend/package-lock.json"
+  echo "ERROR: frontend/package-lock.json is missing." >&2
+  echo "       This file must be tracked in the repository." >&2
+  echo "       Try: git checkout frontend/package-lock.json" >&2
   exit 1
 fi
 echo "--> frontend/package.json and package-lock.json OK"
@@ -119,15 +118,11 @@ echo "--> Checking for missing migrations..."
 # ---------------------------------------------------------------------------
 
 echo "--> Building public site..."
-if ! "$CAULDRON_DIR/manage" cauldron_site_build 2>&1; then
-  echo ""
-  echo "    NOTE: The site build reported an issue."
-  echo "          This is normal on a fresh installation — no Homepage has"
-  echo "          been published yet.  The site will build automatically when"
-  echo "          you publish content, or run:"
-  echo "              ./manage cauldron_site_build"
-  echo "          Any existing generated site was preserved."
-  echo ""
+if ! "$CAULDRON_DIR/manage" cauldron_site_build; then
+  echo "" >&2
+  echo "ERROR: Public site build failed. The error output is above." >&2
+  echo "       Existing generated output (if any) was preserved." >&2
+  exit 1
 fi
 
 echo ""

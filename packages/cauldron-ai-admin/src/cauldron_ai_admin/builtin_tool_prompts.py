@@ -269,12 +269,13 @@ _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
     ),
     AIToolPromptTemplate(
         tool_name="system.admin_ai_inventory",
-        template_version="v1",
+        template_version="v2",
         owning_module="cauldron.ai.admin",
         purpose=(
             "Report the effective Admin AI tool inventory for the current actor: "
             "which tools are visible, their risk levels, and whether they require "
-            "human approval."
+            "human approval. Use this to understand what capabilities are available "
+            "before attempting any operation."
         ),
         supported_tasks=("capability discovery", "permissions audit", "tool inventory"),
         required_permission="cauldron_ai_admin.use_admin_ai",
@@ -288,17 +289,24 @@ _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
         preconditions=("Actor has use_admin_ai permission.",),
         input_expectations="No arguments required.",
         result_behavior=(
-            "Returns 'total' (integer) and 'by_risk_level' (object keyed by "
-            "READ_ONLY/PROPOSE/MAINTENANCE/PRIVILEGED, each a list of tool entries). "
-            "Output is bounded: descriptions are truncated at 200 characters."
+            "Returns 'total_accessible' (total permitted tools), 'returned' "
+            "(tools included in this response), 'truncated' (boolean — true when "
+            "the registry is too large to fit in a single response), and "
+            "'by_risk_level' (object keyed by READ_ONLY/PROPOSE/MAINTENANCE/"
+            "PRIVILEGED, each a list of tool entries). "
+            "When no PROPOSE tools are accessible a 'hint' field explains "
+            "which Django permissions are required to unlock proposal capabilities."
         ),
         approval_requirements="None; read-only.",
         clarification_behavior=(
             "Use this tool to answer questions about what capabilities are available "
             "before attempting any operation. If the actor asks about a tool not in "
-            "the result, explain it is not accessible with their current permissions."
+            "the result, explain it is not accessible with their current permissions. "
+            "If the 'hint' field is present and warns that no PROPOSE tools are "
+            "available, relay this clearly: content and style proposals require "
+            "additional Django permissions that an administrator must grant."
         ),
-        refusal_behavior="Never refuse; output is always bounded.",
+        refusal_behavior="Never refuse; output is always byte-bounded.",
         error_guidance=(
             "This tool does not contact external services and should not fail. "
             "If it does, report the error code."
@@ -311,61 +319,8 @@ _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
         boundary_examples=(
             "Do not infer permissions beyond what this tool reports.",
             "Do not reveal the actor's full Django permission set — only tool visibility.",
-        ),
-    ),
-    AIToolPromptTemplate(
-        tool_name="system.site_rebuild",
-        template_version="v1",
-        owning_module="cauldron.ai.admin",
-        purpose=(
-            "Trigger an Astro public-site rebuild from the currently applied "
-            "content. Use after content has been applied to ensure the public "
-            "site reflects the latest state."
-        ),
-        supported_tasks=("site deployment", "public-site rebuild", "post-publish rebuild"),
-        required_permission="cauldron_ai_admin.manage_admin_ai_settings",
-        risk_level="READ_ONLY",
-        read_scope=(
-            "Build outcome: ok flag, pages_built count, and error message if any. "
-            "No filesystem paths or internal build logs are exposed."
-        ),
-        write_scope=(
-            "Triggers a build process that reads from applied content and writes "
-            "static output files. Build is idempotent and non-destructive — it "
-            "reads only canonical (applied) content."
-        ),
-        preconditions=(
-            "Actor has manage_admin_ai_settings permission.",
-            "The Astro site build service must be available.",
-            "Typically used after content has been applied via the approval workflow.",
-        ),
-        input_expectations="No arguments required.",
-        result_behavior=(
-            "Returns 'ok' (boolean), 'pages_built' (integer or null), and 'error' "
-            "(string, empty on success). The 'success' field of the tool result "
-            "reflects the build outcome."
-        ),
-        approval_requirements="None; build reads from already-approved content.",
-        clarification_behavior=(
-            "Only trigger a rebuild when the user explicitly requests it or when "
-            "content has just been applied and the public site needs to reflect "
-            "the change. Confirm with the user before triggering if uncertain."
-        ),
-        refusal_behavior=(
-            "Refuse if the site build service is unavailable (return the error). "
-            "Do not retry automatically on failure."
-        ),
-        error_guidance=(
-            "On build failure, report the error message from the result. "
-            "Suggest checking content validity and site configuration."
-        ),
-        positive_examples=(
-            "Rebuild the public site after applying content changes.",
-            "Trigger a site rebuild.",
-        ),
-        boundary_examples=(
-            "Do not claim the site is updated until ok=true is returned.",
-            "Do not expose build log details beyond what the tool returns.",
+            "If truncated=true, not all tools are shown; the actor may have more "
+            "than returned indicates.",
         ),
     ),
     AIToolPromptTemplate(

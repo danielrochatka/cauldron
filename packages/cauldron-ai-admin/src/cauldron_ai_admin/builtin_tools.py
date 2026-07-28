@@ -1,6 +1,6 @@
 """Built-in Admin AI tools.
 
-Seven tools ship with the module. They are registered exactly once, when
+These tools ship with the module. They are registered exactly once, when
 ``cauldron_ai_admin.apps.CauldronAIAdminConfig.ready()`` calls
 :func:`register_builtin_tools`.
 
@@ -15,6 +15,7 @@ stack. When ``context.content_service`` is ``None`` the handler returns
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any
@@ -56,7 +57,6 @@ BUILTIN_TOOL_NAMES: tuple[str, ...] = (
     "system.admin_ai_inventory",
     "system.django_checks",
     "system.module_status",
-    "system.site_rebuild",
     "ui.styles.list_files",
     "ui.styles.read_file",
     "ui.styles.create_proposal",
@@ -826,8 +826,19 @@ _ADMIN_AI_INVENTORY_SCHEMA: dict = {
     "additionalProperties": False,
 }
 
-# Per-tool entry byte budget — keeps total inventory within max_result_bytes.
+# Truncate descriptions in inventory entries to keep them compact.
 _INVENTORY_DESC_MAX = 200
+
+# Reserve headroom so the JSON-encoded data dict plus the AdminAIToolResult
+# wrapper never tips over the service-level max_result_bytes limit.
+_INVENTORY_BYTE_RESERVE = 512
+
+_INVENTORY_NO_PROPOSE_HINT = (
+    "No PROPOSE tools are currently accessible. "
+    "Proposal capabilities require additional Django permissions "
+    "(e.g. cauldron_content_operations.propose_content_changes, "
+    "cauldron_ai_admin.propose_ui_style_changes)."
+)
 
 
 def _handle_admin_ai_inventory(context: AdminAIToolContext, **kwargs) -> Any:
@@ -840,84 +851,60 @@ def _handle_admin_ai_inventory(context: AdminAIToolContext, **kwargs) -> Any:
             error_code="tool.invalid_arguments",
             message="system.admin_ai_inventory takes no arguments.",
         )
+    # Resolve the effective byte budget lazily to avoid circular imports.
+    from .service_factory import EXECUTION_BUDGET_DEFAULTS
+    byte_budget = EXECUTION_BUDGET_DEFAULTS["max_result_bytes"] - _INVENTORY_BYTE_RESERVE
+
     registry = get_tool_registry()
     permitted = registry.list_for_actor(context.actor)
+    total = len(permitted)
 
     by_risk: dict[str, list[dict]] = {}
+    returned = 0
+    truncated = False
+
     for defn in permitted:
-        level = defn.risk_level.value
-        by_risk.setdefault(level, []).append({
+        entry = {
             "name": defn.name,
             "version": defn.version,
             "owning_module": defn.owning_module,
             "description": defn.description[:_INVENTORY_DESC_MAX],
             "requires_human_approval": defn.requires_human_approval,
-        })
+        }
+        level = defn.risk_level.value
+
+        # Probe whether adding this entry exceeds the byte budget.
+        candidate: dict[str, list[dict]] = {k: list(v) for k, v in by_risk.items()}
+        candidate.setdefault(level, []).append(entry)
+        probe = {
+            "total_accessible": total,
+            "returned": returned + 1,
+            "truncated": False,
+            "by_risk_level": candidate,
+        }
+        if len(json.dumps(probe).encode("utf-8")) > byte_budget:
+            truncated = True
+            break
+        by_risk = candidate
+        returned += 1
+
+    has_propose = any(
+        defn.risk_level.value == "PROPOSE" for defn in permitted
+    )
+
+    data: dict[str, Any] = {
+        "total_accessible": total,
+        "returned": returned,
+        "truncated": truncated,
+        "by_risk_level": by_risk,
+    }
+    if not has_propose:
+        data["hint"] = _INVENTORY_NO_PROPOSE_HINT
 
     return AdminAIToolResult(
         tool_name="system.admin_ai_inventory",
         success=True,
-        data={
-            "total": len(permitted),
-            "by_risk_level": by_risk,
-        },
-    )
-
-
-# ---------------------------------------------------------------------------
-# system.site_rebuild
-# ---------------------------------------------------------------------------
-
-_SITE_REBUILD_SCHEMA: dict = {
-    "type": "object",
-    "properties": {},
-    "additionalProperties": False,
-}
-
-
-def _handle_site_rebuild(context: AdminAIToolContext, **kwargs) -> Any:
-    deadline_err = _check_deadline("system.site_rebuild", context)
-    if deadline_err is not None:
-        return deadline_err
-    if kwargs:
-        return AdminAIToolError(
-            tool_name="system.site_rebuild",
-            error_code="tool.invalid_arguments",
-            message="system.site_rebuild takes no arguments.",
-        )
-    try:
-        from cauldron_site_astro.service import get_build_service
-        service = get_build_service()
-    except Exception:
-        return AdminAIToolError(
-            tool_name="system.site_rebuild",
-            error_code="system.site_rebuild_unavailable",
-            message="Site build service is not available.",
-        )
-
-    deadline_err = _check_deadline("system.site_rebuild", context)
-    if deadline_err is not None:
-        return deadline_err
-
-    try:
-        result = service.build()
-    except Exception as exc:
-        return AdminAIToolError(
-            tool_name="system.site_rebuild",
-            error_code="system.site_rebuild_failed",
-            message=redact_exception(exc, max_bytes=200),
-        )
-
-    ok = bool(getattr(result, "ok", False))
-    return AdminAIToolResult(
-        tool_name="system.site_rebuild",
-        success=ok,
-        data={
-            "ok": ok,
-            "pages_built": getattr(result, "pages_built", None),
-            "error": (getattr(result, "error", "") or "")[:400],
-        },
-        message="Site rebuild completed." if ok else "Site rebuild failed.",
+        data=data,
     )
 
 
@@ -1193,23 +1180,6 @@ def _builtin_definitions() -> tuple[tuple[AdminAIToolDefinition, Any], ...]:
                 owning_module=OWNING_MODULE,
             ),
             _handle_admin_ai_inventory,
-        ),
-        (
-            AdminAIToolDefinition(
-                name="system.site_rebuild",
-                version="1.0",
-                description=(
-                    "Trigger an Astro public-site rebuild from the currently "
-                    "applied content. Idempotent and non-destructive: the build "
-                    "reads approved, applied content only. Returns a compact "
-                    "summary including page count and any build error."
-                ),
-                argument_schema=_SITE_REBUILD_SCHEMA,
-                risk_level=RiskLevel.READ_ONLY,
-                required_permission="cauldron_ai_admin.manage_admin_ai_settings",
-                owning_module=OWNING_MODULE,
-            ),
-            _handle_site_rebuild,
         ),
         (
             AdminAIToolDefinition(

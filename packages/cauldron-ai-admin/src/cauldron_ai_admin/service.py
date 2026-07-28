@@ -17,6 +17,14 @@ Policy summary
 * Exceeding ``max_tool_calls`` produces ``run.max_tool_calls_exceeded``.
 * Run deadline exceeded produces ``run.timeout`` (before provider) or
   ``tool.timeout`` (before a specific tool executes).
+* Insufficient remaining deadline before a provider call produces
+  ``provider.timeout`` (pre-call, no HTTP request made).
+* Provider network/connection failure produces ``provider.connection_error``
+  (retried once if deadline allows).
+* Provider authentication failure produces ``provider.authentication_error``.
+* Provider rate-limit produces ``provider.rate_limited`` (retried once).
+* Provider 5xx response produces ``provider.server_error`` (retried once).
+* Other provider response error produces ``provider.invalid_request``.
 * Provider ``stop_reason == "max_tokens"`` produces ``provider.max_tokens``.
 * Provider ``stop_reason == "timeout"`` produces ``provider.timeout``.
 * Malformed provider response produces ``provider.invalid_response``.
@@ -49,6 +57,13 @@ from cauldron_ai.contracts import (
     AIModelToolCall,
     AIModelToolDefinition,
     _assert_json_compatible,
+)
+from cauldron_ai.provider_configuration import (
+    AIProviderAuthenticationError,
+    AIProviderConnectionError,
+    AIProviderError,
+    AIProviderRateLimitError,
+    AIProviderResponseError,
 )
 from cauldron_ai.providers import AIModelProvider
 
@@ -94,6 +109,14 @@ ADMIN_AI_PERMISSION = "cauldron_ai_admin.use_admin_ai"
 # Minimum meaningful remaining-deadline before a mutation is allowed.
 _DEADLINE_EPSILON = 0.1
 
+# Minimum remaining budget (seconds) before we will attempt a provider call.
+# Below this threshold we record provider.timeout immediately rather than
+# sending an impossibly tight deadline_seconds to the provider SDK.
+_MIN_PROVIDER_CALL_DEADLINE: float = 5.0
+
+# Seconds to sleep before the single allowed retry on a retryable error.
+_PROVIDER_RETRY_BACKOFF: float = 1.0
+
 # Hard caps on model-supplied identifiers. Anything longer is refused
 # outright (never truncated) — a runaway ID is almost always a bug in the
 # provider adapter or a hostile response.
@@ -102,6 +125,53 @@ MAX_TOOL_NAME_BYTES = 128
 # Caller-supplied correlation IDs are truncated (never rejected) since
 # they originate from local trusted callers.
 MAX_CORRELATION_ID_BYTES = 128
+
+
+def _classify_provider_error(exc: Exception) -> tuple[str, bool]:
+    """Return (stable_error_code, is_retryable) for a provider exception."""
+    if isinstance(exc, AIProviderAuthenticationError):
+        return "provider.authentication_error", False
+    if isinstance(exc, AIProviderConnectionError):
+        return "provider.connection_error", True
+    if isinstance(exc, AIProviderRateLimitError):
+        return "provider.rate_limited", True
+    if isinstance(exc, AIProviderResponseError):
+        http_status = getattr(exc, "http_status", None) or getattr(exc, "status_code", None)
+        if http_status == 429:
+            return "provider.rate_limited", True
+        if isinstance(http_status, int) and 500 <= http_status < 600:
+            return "provider.server_error", True
+        return "provider.invalid_request", False
+    if isinstance(exc, AIProviderError):
+        return "provider.connection_error", True
+    return "provider.connection_error", True
+
+
+def _build_provider_error_summary(
+    *,
+    exc: Exception,
+    error_code: str,
+    turn: int,
+    elapsed_ms: int,
+    remaining_ms: int,
+    retryable: bool,
+) -> str:
+    """Build a sanitized, stable diagnostic summary (no exception message)."""
+    fields: dict[str, Any] = {
+        "error_code": error_code,
+        "exc_class": type(exc).__name__,
+        "turn": turn,
+        "elapsed_ms": elapsed_ms,
+        "remaining_ms": remaining_ms,
+        "retryable": retryable,
+    }
+    http_status = getattr(exc, "http_status", None) or getattr(exc, "status_code", None)
+    if isinstance(http_status, int):
+        fields["http_status"] = http_status
+    request_id = getattr(exc, "request_id", None)
+    if isinstance(request_id, str) and request_id:
+        fields["provider_request_id"] = request_id[:64]
+    return json.dumps(fields, sort_keys=True)
 
 
 class AdminAIService:
@@ -338,6 +408,21 @@ class AdminAIService:
                 return
 
             remaining = (deadline - datetime.now(tz=timezone.utc)).total_seconds()
+            if remaining < _MIN_PROVIDER_CALL_DEADLINE:
+                self._finalize_error(
+                    run,
+                    "provider.timeout",
+                    _build_provider_error_summary(
+                        exc=TimeoutError(),
+                        error_code="provider.timeout",
+                        turn=turn_index,
+                        elapsed_ms=0,
+                        remaining_ms=int(remaining * 1000),
+                        retryable=False,
+                    ),
+                )
+                return
+
             provider_request = AIModelRequest(
                 messages=tuple(messages),
                 tools=tool_defs_for_model,
@@ -345,14 +430,13 @@ class AdminAIService:
                 max_tokens=4096,
                 timeout_seconds=self._tool_timeout_seconds,
                 correlation_id=correlation_id or "",
-                deadline_seconds=max(remaining, 0.1),
+                deadline_seconds=remaining,
             )
-            try:
-                response = self._provider.complete(provider_request)
-            except Exception as exc:
-                self._finalize_error(
-                    run, "provider.error", redact_exception(exc)
-                )
+            t_call_start = time.monotonic()
+            response = self._call_provider(
+                run, provider_request, deadline, turn_index, t_call_start,
+            )
+            if response is None:
                 return
 
             validation_code = self._validate_provider_response(response)
@@ -464,6 +548,51 @@ class AdminAIService:
             "run.max_turns_exceeded",
             "Model exceeded the per-run turn budget without a final answer.",
         )
+
+    def _call_provider(
+        self,
+        run: AdminAIRun,
+        provider_request: AIModelRequest,
+        deadline: datetime,
+        turn_index: int,
+        t_call_start: float,
+    ) -> AIModelResponse | None:
+        """Call provider with at most one bounded retry for retryable errors.
+
+        Returns the response on success, or None after finalizing the run with
+        a classified error code.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                return self._provider.complete(provider_request)
+            except Exception as exc:
+                last_exc = exc
+                _, retryable = _classify_provider_error(exc)
+                if not retryable or attempt >= 1:
+                    break
+                remaining_after = (
+                    deadline - datetime.now(tz=timezone.utc)
+                ).total_seconds()
+                if (remaining_after - _PROVIDER_RETRY_BACKOFF) < _MIN_PROVIDER_CALL_DEADLINE:
+                    break
+                time.sleep(_PROVIDER_RETRY_BACKOFF)
+
+        elapsed_ms = int((time.monotonic() - t_call_start) * 1000)
+        remaining_ms = int(
+            (deadline - datetime.now(tz=timezone.utc)).total_seconds() * 1000
+        )
+        error_code, retryable = _classify_provider_error(last_exc)
+        summary = _build_provider_error_summary(
+            exc=last_exc,
+            error_code=error_code,
+            turn=turn_index,
+            elapsed_ms=elapsed_ms,
+            remaining_ms=remaining_ms,
+            retryable=retryable,
+        )
+        self._finalize_error(run, error_code, summary)
+        return None
 
     def _validate_provider_response(self, response: Any) -> str | None:
         """Return a stable error code if *response* is unusable, else None."""

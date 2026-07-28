@@ -8,7 +8,9 @@ Verifies that:
 4. Style changes use the module-owned UIStyleChangeService mutation path.
 5. Disabled modules remove their tools from the effective registry.
 6. Tool schemas sent to the provider include authorized mutation tools.
-7. The diagnostic inventory is byte-bounded even with large registries.
+7. The diagnostic inventory is byte-bounded even with large registries,
+   using the effective limit from AdminAIToolContext rather than the
+   module default constant.
 8. A representative request can inspect content and then propose a change
    rather than remaining read-only.
 9. Admin AI contains no direct import of the Astro build service (module
@@ -477,10 +479,14 @@ def test_inventory_groups_tools_by_risk_level():
 
 
 def test_inventory_byte_bounded_large_registry():
-    """With a synthetic registry containing far more tools than can fit in
-    max_result_bytes, the handler must truncate and still stay within budget."""
+    """With a synthetic registry containing far more tools than can fit,
+    the handler must truncate at the *context-provided* effective limit,
+    not the module-level EXECUTION_BUDGET_DEFAULTS constant.
+
+    This test uses context.max_result_bytes=3000 — well below the 8192
+    default — to prove the effective limit drives truncation, not the
+    fallback constant."""
     from cauldron_ai_admin.builtin_tools import _handle_admin_ai_inventory
-    from cauldron_ai_admin.service_factory import EXECUTION_BUDGET_DEFAULTS
     from cauldron_ai_admin.tools import (
         AdminAIToolContext,
         AdminAIToolDefinition,
@@ -489,12 +495,14 @@ def test_inventory_byte_bounded_large_registry():
         RiskLevel,
     )
 
+    CUSTOM_LIMIT = 3000
+
     reg = AdminAIToolRegistry()
 
     def _noop(ctx, **kw):
         return AdminAIToolResult(tool_name="x.y", success=True)
 
-    # Register 200 synthetic tools — far more than fit in 8 KB.
+    # Register 200 synthetic tools — far more than can fit in 3 KB.
     for i in range(200):
         reg.register(
             AdminAIToolDefinition(
@@ -518,7 +526,10 @@ def test_inventory_byte_bounded_large_registry():
         def has_perm(self, perm): return True
 
     with patch("cauldron_ai_admin.builtin_tools.get_tool_registry", return_value=reg):
-        ctx = AdminAIToolContext(actor=_AllPermsActor(), run_id="r", correlation_id="c")
+        ctx = AdminAIToolContext(
+            actor=_AllPermsActor(), run_id="r", correlation_id="c",
+            max_result_bytes=CUSTOM_LIMIT,
+        )
         result = _handle_admin_ai_inventory(ctx)
 
     assert isinstance(result, AdminAIToolResult)
@@ -526,13 +537,13 @@ def test_inventory_byte_bounded_large_registry():
 
     data = result.data
     serialised = json.dumps(data).encode("utf-8")
-    max_bytes = EXECUTION_BUDGET_DEFAULTS["max_result_bytes"]
-    assert len(serialised) <= max_bytes, (
-        f"Inventory JSON is {len(serialised)} bytes with 200 tools, "
-        f"exceeds max_result_bytes={max_bytes}"
+    # Must fit within the *context* limit (3000), not the module default (8192).
+    assert len(serialised) <= CUSTOM_LIMIT, (
+        f"Inventory JSON is {len(serialised)} bytes; "
+        f"exceeds context-provided limit of {CUSTOM_LIMIT}"
     )
     assert data["truncated"] is True, (
-        "200 large synthetic tools must exceed the byte budget and force truncation"
+        "200 tools must exceed the 3000-byte budget and force truncation"
     )
     assert data["total_accessible"] == 200
     assert data["returned"] < 200
@@ -671,3 +682,231 @@ def test_representative_request_inspects_then_proposes():
     )
     proposal_inv = next(i for i in invocations if i.tool_name == "content.create_proposal")
     assert proposal_inv.status == "completed"
+
+
+# ---------------------------------------------------------------------------
+# Effective max_result_bytes propagation through context
+# ---------------------------------------------------------------------------
+
+def test_inventory_honors_custom_lower_max_result_bytes():
+    """Passing a lower max_result_bytes on the context must constrain the
+    inventory output to that limit, not the 8192 module default."""
+    from cauldron_ai_admin.builtin_tools import _handle_admin_ai_inventory
+    from cauldron_ai_admin.tools import (
+        AdminAIToolContext,
+        AdminAIToolDefinition,
+        AdminAIToolRegistry,
+        AdminAIToolResult,
+        RiskLevel,
+    )
+
+    CUSTOM_LIMIT = 2000
+    reg = AdminAIToolRegistry()
+
+    def _noop(ctx, **kw):
+        return AdminAIToolResult(tool_name="x.y", success=True)
+
+    for i in range(100):
+        reg.register(
+            AdminAIToolDefinition(
+                name=f"bounded.tool{i:03d}",
+                version="1.0",
+                description=f"Tool {i:03d} for limit-honoring test with padding.",
+                argument_schema={"type": "object"},
+                risk_level=RiskLevel.READ_ONLY,
+                required_permission="cauldron_ai_admin.use_admin_ai",
+                owning_module="cauldron.ai.admin",
+            ),
+            _noop,
+        )
+
+    class _AllPermsActor:
+        is_active = True
+        def has_perm(self, perm): return True
+
+    with patch("cauldron_ai_admin.builtin_tools.get_tool_registry", return_value=reg):
+        ctx = AdminAIToolContext(
+            actor=_AllPermsActor(), run_id="r", correlation_id="c",
+            max_result_bytes=CUSTOM_LIMIT,
+        )
+        result = _handle_admin_ai_inventory(ctx)
+
+    assert isinstance(result, AdminAIToolResult)
+    serialised = json.dumps(result.data).encode("utf-8")
+    assert len(serialised) <= CUSTOM_LIMIT, (
+        f"Result ({len(serialised)} bytes) exceeds custom limit {CUSTOM_LIMIT}"
+    )
+    # 100 tools must exceed 2000 bytes so truncation must kick in.
+    assert result.data["truncated"] is True
+    assert result.data["returned"] < result.data["total_accessible"]
+
+
+def test_saved_runtime_max_result_bytes_flows_into_context(tmp_path):
+    """When max_result_bytes is saved in the runtime settings store the value
+    must flow through resolve_runtime_settings → AdminAIService → context."""
+    from cauldron_ai.contracts import AIModelResponse, AIModelToolCall
+    from cauldron_ai.testing import FakeAIModelProvider
+    from cauldron_ai_admin.builtin_tools import _handle_admin_ai_inventory, register_builtin_tools
+    from cauldron_ai_admin.provider_config import AIProviderSettingsStore, _reset_store_for_tests
+    from cauldron_ai_admin.service import AdminAIService
+    from cauldron_ai_admin.service_factory import resolve_runtime_settings
+    from cauldron_ai_admin.tools import get_tool_registry
+
+    SAVED_LIMIT = 4096
+
+    # Write saved runtime setting.
+    store_path = tmp_path / "ai.json"
+    _reset_store_for_tests(path=store_path)
+    store = AIProviderSettingsStore(store_path)
+    store.set_runtime({"max_result_bytes": SAVED_LIMIT})
+
+    # resolve_runtime_settings must pick up the saved value.
+    resolved = resolve_runtime_settings(store, cfg={})
+    assert resolved["max_result_bytes"] == SAVED_LIMIT, (
+        f"resolve_runtime_settings returned {resolved['max_result_bytes']}, "
+        f"expected {SAVED_LIMIT}"
+    )
+
+    register_builtin_tools()
+    user = _make_user("runtime-limit-user", perms=[
+        "cauldron_ai_admin.use_admin_ai",
+        "cauldron_content_operations.view_published_content",
+    ])
+
+    # Build service with the resolved limit.
+    fake = FakeAIModelProvider()
+    fake.queue_response(AIModelResponse(
+        provider_request_id="r1",
+        tool_calls=(
+            AIModelToolCall(
+                id="c1",
+                name="system.admin_ai_inventory",
+                arguments={},
+            ),
+        ),
+        stop_reason="tool_use",
+    ))
+    fake.queue_response(AIModelResponse(
+        provider_request_id="r2",
+        content="Inventory retrieved.",
+        stop_reason="end_turn",
+    ))
+
+    registry = get_tool_registry()
+    from helpers import make_assembly_service_for_tools
+    asm = make_assembly_service_for_tools(
+        *[d.name for d in registry.list_for_actor(user)]
+    )
+    svc = AdminAIService(
+        provider=fake,
+        tool_registry=registry,
+        prompt_assembly_service=asm,
+        max_result_bytes=resolved["max_result_bytes"],
+    )
+    assert svc.max_result_bytes == SAVED_LIMIT
+
+    run = svc.run(user, "Show me the tool inventory.")
+    assert run.status == "completed"
+
+    # The tool invocation must have succeeded within the saved limit.
+    from cauldron_ai_admin.models import AdminAIToolInvocation
+    inv = AdminAIToolInvocation.objects.get(run=run, tool_name="system.admin_ai_inventory")
+    assert inv.status == "completed"
+
+
+def test_permission_hint_within_configured_limit():
+    """The permission hint must not push the result over the configured limit
+    even when the limit is small."""
+    from cauldron_ai_admin.builtin_tools import _handle_admin_ai_inventory
+    from cauldron_ai_admin.tools import (
+        AdminAIToolContext,
+        AdminAIToolDefinition,
+        AdminAIToolRegistry,
+        AdminAIToolResult,
+        RiskLevel,
+    )
+
+    # Tight limit — hint + a handful of tools must still fit.
+    SMALL_LIMIT = 1500
+    reg = AdminAIToolRegistry()
+
+    def _noop(ctx, **kw):
+        return AdminAIToolResult(tool_name="x.y", success=True)
+
+    for i in range(5):
+        reg.register(
+            AdminAIToolDefinition(
+                name=f"hint.tool{i:03d}",
+                version="1.0",
+                description=f"Tool {i:03d}.",
+                argument_schema={"type": "object"},
+                risk_level=RiskLevel.READ_ONLY,
+                required_permission="cauldron_ai_admin.use_admin_ai",
+                owning_module="cauldron.ai.admin",
+            ),
+            _noop,
+        )
+
+    class _ReadOnlyActor:
+        is_active = True
+        def has_perm(self, perm): return True  # has use_admin_ai only
+
+    with patch("cauldron_ai_admin.builtin_tools.get_tool_registry", return_value=reg):
+        ctx = AdminAIToolContext(
+            actor=_ReadOnlyActor(), run_id="r", correlation_id="c",
+            max_result_bytes=SMALL_LIMIT,
+        )
+        result = _handle_admin_ai_inventory(ctx)
+
+    assert isinstance(result, AdminAIToolResult)
+    assert result.success is True
+
+    serialised = json.dumps(result.data).encode("utf-8")
+    assert len(serialised) <= SMALL_LIMIT, (
+        f"Result with hint is {len(serialised)} bytes, exceeds limit {SMALL_LIMIT}"
+    )
+
+
+def test_inventory_default_fallback_matches_execution_budget_default():
+    """A context created without an explicit max_result_bytes must fall back to
+    the same value as EXECUTION_BUDGET_DEFAULTS['max_result_bytes'] (8192)."""
+    from cauldron_ai_admin.service_factory import EXECUTION_BUDGET_DEFAULTS
+    from cauldron_ai_admin.tools import AdminAIToolContext, _CONTEXT_DEFAULT_MAX_RESULT_BYTES
+
+    assert _CONTEXT_DEFAULT_MAX_RESULT_BYTES == EXECUTION_BUDGET_DEFAULTS["max_result_bytes"], (
+        "_CONTEXT_DEFAULT_MAX_RESULT_BYTES must match EXECUTION_BUDGET_DEFAULTS "
+        "so contexts created outside the service behave identically to those "
+        "created by a freshly configured AdminAIService."
+    )
+
+    user_mock = MagicMock()
+    ctx = AdminAIToolContext(actor=user_mock, run_id="r", correlation_id="c")
+    assert ctx.max_result_bytes == EXECUTION_BUDGET_DEFAULTS["max_result_bytes"]
+
+
+def test_inventory_default_8192_behavior_unchanged():
+    """A default context (no explicit max_result_bytes) must produce inventory
+    output that fits within 8192 bytes for the standard builtin tool set."""
+    from cauldron_ai_admin.builtin_tools import _handle_admin_ai_inventory, register_builtin_tools
+    from cauldron_ai_admin.tools import AdminAIToolResult
+
+    register_builtin_tools()
+
+    user = _make_user("default-limit-user", perms=[
+        "cauldron_ai_admin.use_admin_ai",
+        "cauldron_ai_admin.view_ui_styles",
+        "cauldron_ai_admin.propose_ui_style_changes",
+        "cauldron_content_operations.view_published_content",
+        "cauldron_content_operations.propose_content_changes",
+        "cauldron_content_operations.view_content_change_requests",
+    ])
+    ctx = _ctx(user)  # uses _CONTEXT_DEFAULT_MAX_RESULT_BYTES = 8192
+    result = _handle_admin_ai_inventory(ctx)
+
+    assert isinstance(result, AdminAIToolResult)
+    assert result.success is True
+    assert result.data["truncated"] is False, (
+        "Builtin tool set must fit within the 8192-byte default"
+    )
+    serialised = json.dumps(result.data).encode("utf-8")
+    assert len(serialised) <= 8192

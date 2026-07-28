@@ -851,9 +851,11 @@ def _handle_admin_ai_inventory(context: AdminAIToolContext, **kwargs) -> Any:
             error_code="tool.invalid_arguments",
             message="system.admin_ai_inventory takes no arguments.",
         )
-    # Resolve the effective byte budget lazily to avoid circular imports.
-    from .service_factory import EXECUTION_BUDGET_DEFAULTS
-    byte_budget = EXECUTION_BUDGET_DEFAULTS["max_result_bytes"] - _INVENTORY_BYTE_RESERVE
+    # Use the effective limit from the context (populated by AdminAIService
+    # from resolve_runtime_settings so it reflects saved and deployment
+    # overrides).  The context falls back to _CONTEXT_DEFAULT_MAX_RESULT_BYTES
+    # (8 192) when constructed outside the service.
+    byte_budget = context.max_result_bytes - _INVENTORY_BYTE_RESERVE
 
     registry = get_tool_registry()
     permitted = registry.list_for_actor(context.actor)

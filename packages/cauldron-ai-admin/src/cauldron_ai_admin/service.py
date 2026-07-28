@@ -670,6 +670,7 @@ class AdminAIService:
             content_service=self._content_service,
             deadline=effective_deadline,
             dry_run=False,
+            max_result_bytes=self._max_result_bytes,
         )
 
         # Per-tool byte budget is bounded by the service max.

@@ -554,6 +554,9 @@ def _handle_inspect_preview(context, *, change_set_id, **kwargs):
 
 
 def _handle_publish(context, *, change_set_id, confirm, **kwargs):
+    import shutil
+    import tempfile
+
     from django.utils import timezone
 
     from cauldron_ai_admin.tools import AdminAIToolResult
@@ -600,20 +603,22 @@ def _handle_publish(context, *, change_set_id, confirm, **kwargs):
     cs.status = SiteChangeSet.PUBLISHING
     cs.save(update_fields=["status", "updated_at"])
 
-    # ---- Apply each content change request in order ------------------------
+    # ---- Pre-flight: validate ALL content requests before any mutation ------
+    # Validation is read-only. Nothing is committed to the content store here;
+    # that only happens after a successful build, ensuring a failed build
+    # never leaves content items marked "published" in the database while
+    # the live output is unchanged.
     content_service = _get_content_operation_service()
+    validated: dict = {}
 
-    applied_ids: list[str] = []
     for req_id in cs.content_request_ids or ():
         if content_service is None:
             cs.status = SiteChangeSet.PUBLISH_FAILED
             cs.publish_build_result = {
                 "error": "content-operations service unavailable",
-                "applied": applied_ids,
+                "applied": [],
             }
-            cs.save(update_fields=[
-                "status", "publish_build_result", "updated_at",
-            ])
+            cs.save(update_fields=["status", "publish_build_result", "updated_at"])
             return AdminAIToolResult(
                 tool_name="site.publish",
                 success=False,
@@ -622,19 +627,15 @@ def _handle_publish(context, *, change_set_id, confirm, **kwargs):
             )
 
         try:
-            v = content_service.validate_change_request(
-                req_id, user=context.actor,
-            )
+            v = content_service.validate_change_request(req_id, user=context.actor)
         except Exception as exc:
             cs.status = SiteChangeSet.PUBLISH_FAILED
             cs.publish_build_result = {
                 "error": f"validate raised: {_safe_exc(exc)}",
-                "applied": applied_ids,
+                "applied": [],
                 "failed_request_id": req_id,
             }
-            cs.save(update_fields=[
-                "status", "publish_build_result", "updated_at",
-            ])
+            cs.save(update_fields=["status", "publish_build_result", "updated_at"])
             return AdminAIToolResult(
                 tool_name="site.publish",
                 success=False,
@@ -648,12 +649,10 @@ def _handle_publish(context, *, change_set_id, confirm, **kwargs):
             cs.status = SiteChangeSet.PUBLISH_FAILED
             cs.publish_build_result = {
                 "error": f"validate failed for {req_id}: {err_msg[:_MAX_EXC_MSG]}",
-                "applied": applied_ids,
+                "applied": [],
                 "failed_request_id": req_id,
             }
-            cs.save(update_fields=[
-                "status", "publish_build_result", "updated_at",
-            ])
+            cs.save(update_fields=["status", "publish_build_result", "updated_at"])
             return AdminAIToolResult(
                 tool_name="site.publish",
                 success=False,
@@ -661,134 +660,160 @@ def _handle_publish(context, *, change_set_id, confirm, **kwargs):
                 message=f"Validation of {req_id!r} failed: {err_msg[:_MAX_EXC_MSG]}",
             )
 
-        try:
-            a = content_service.apply_change_request(
-                req_id,
-                user=context.actor,
-                expected_version=getattr(v, "request_version", 0),
-            )
-        except Exception as exc:
-            cs.status = SiteChangeSet.PUBLISH_FAILED
-            cs.publish_build_result = {
-                "error": f"apply raised: {_safe_exc(exc)}",
-                "applied": applied_ids,
-                "failed_request_id": req_id,
-            }
-            cs.save(update_fields=[
-                "status", "publish_build_result", "updated_at",
-            ])
-            return AdminAIToolResult(
-                tool_name="site.publish",
-                success=False,
-                data={"change_set_id": str(cs.id)},
-                message=f"Apply of {req_id!r} raised: {_safe_exc(exc)}",
-            )
+        validated[req_id] = v
 
-        if not getattr(a, "ok", False):
-            err = getattr(a, "error", None)
-            err_msg = getattr(err, "message", "apply failed")
-            cs.status = SiteChangeSet.PUBLISH_FAILED
-            cs.publish_build_result = {
-                "error": f"apply failed for {req_id}: {err_msg[:_MAX_EXC_MSG]}",
-                "applied": applied_ids,
-                "failed_request_id": req_id,
-            }
-            cs.save(update_fields=[
-                "status", "publish_build_result", "updated_at",
-            ])
-            return AdminAIToolResult(
-                tool_name="site.publish",
-                success=False,
-                data={"change_set_id": str(cs.id)},
-                message=f"Apply of {req_id!r} failed: {err_msg[:_MAX_EXC_MSG]}",
-            )
-
-        applied_ids.append(req_id)
-
-    # ---- Build the live site with the staged CSS injected ------------------
+    # ---- Build with draft items, content requests NOT yet applied ----------
+    # build_preview includes the published baseline plus the drafts from this
+    # change set (via affected_item_ids). This is identical to what the user
+    # reviewed, so the output is always consistent with the preview. Content
+    # requests are applied AFTER the build succeeds — never before.
+    tmp_build_dir = tempfile.mkdtemp(prefix="cauldron_pub_")
     try:
-        result = svc.build(theme_css_override=cs.staged_theme_css or "")
-    except Exception as exc:
-        cs.status = SiteChangeSet.PUBLISH_FAILED
-        cs.publish_build_result = {
-            "error": f"build raised: {_safe_exc(exc)}",
-            "applied": applied_ids,
-        }
-        cs.save(update_fields=["status", "publish_build_result", "updated_at"])
-        return AdminAIToolResult(
-            tool_name="site.publish",
-            success=False,
-            data={"change_set_id": str(cs.id)},
-            message=f"Publish build raised an exception: {_safe_exc(exc)}",
-        )
-
-    if not result.ok:
-        cs.status = SiteChangeSet.PUBLISH_FAILED
-        cs.publish_build_result = {
-            "error": (result.error or "")[:_MAX_EXC_MSG],
-            "applied": applied_ids,
-            "build_log_tail": (result.build_log or "")[-_MAX_BUILD_LOG_TAIL:],
-        }
-        cs.save(update_fields=["status", "publish_build_result", "updated_at"])
-        return AdminAIToolResult(
-            tool_name="site.publish",
-            success=False,
-            data={
-                "change_set_id": str(cs.id),
-                "build_log": (result.build_log or "")[-_MAX_BUILD_LOG_TAIL:],
-            },
-            message=f"Publish build failed: {(result.error or '')[:_MAX_EXC_MSG]}",
-        )
-
-    # ---- Only NOW promote the staged CSS to active -------------------------
-    if cs.staged_theme_css and cfg.theme_root:
         try:
-            from cauldron_site_astro.theme import SiteThemeService
-            theme_svc = SiteThemeService(cfg.theme_root)
-            theme_svc.stage_css(cs.staged_theme_css)
-            theme_svc.promote_staged()
+            result = svc.build_preview(
+                output_dir=tmp_build_dir,
+                item_ids_to_include=cs.affected_item_ids or None,
+                theme_css=cs.staged_theme_css or "",
+            )
         except Exception as exc:
-            # Build already succeeded, so mark PUBLISH_FAILED but leave the
-            # live output in place. The site is technically live with the old
-            # CSS; the caller can retry.
             cs.status = SiteChangeSet.PUBLISH_FAILED
             cs.publish_build_result = {
-                "error": f"theme promote failed: {_safe_exc(exc)}",
+                "error": f"build raised: {_safe_exc(exc)}",
+                "applied": [],
+            }
+            cs.save(update_fields=["status", "publish_build_result", "updated_at"])
+            return AdminAIToolResult(
+                tool_name="site.publish",
+                success=False,
+                data={"change_set_id": str(cs.id)},
+                message=f"Publish build raised an exception: {_safe_exc(exc)}",
+            )
+
+        if not result.ok:
+            cs.status = SiteChangeSet.PUBLISH_FAILED
+            cs.publish_build_result = {
+                "error": (result.error or "")[:_MAX_EXC_MSG],
+                "applied": [],
+                "build_log_tail": (result.build_log or "")[-_MAX_BUILD_LOG_TAIL:],
+            }
+            cs.save(update_fields=["status", "publish_build_result", "updated_at"])
+            return AdminAIToolResult(
+                tool_name="site.publish",
+                success=False,
+                data={
+                    "change_set_id": str(cs.id),
+                    "build_log": (result.build_log or "")[-_MAX_BUILD_LOG_TAIL:],
+                },
+                message=f"Publish build failed: {(result.error or '')[:_MAX_EXC_MSG]}",
+            )
+
+        # ---- Build succeeded: now apply content requests -------------------
+        applied_ids: list[str] = []
+        for req_id in cs.content_request_ids or ():
+            v = validated[req_id]
+            try:
+                a = content_service.apply_change_request(
+                    req_id,
+                    user=context.actor,
+                    expected_version=getattr(v, "request_version", 0),
+                )
+            except Exception as exc:
+                cs.status = SiteChangeSet.PUBLISH_FAILED
+                cs.publish_build_result = {
+                    "error": f"apply raised: {_safe_exc(exc)}",
+                    "applied": applied_ids,
+                    "failed_request_id": req_id,
+                }
+                cs.save(update_fields=["status", "publish_build_result", "updated_at"])
+                return AdminAIToolResult(
+                    tool_name="site.publish",
+                    success=False,
+                    data={"change_set_id": str(cs.id)},
+                    message=f"Apply of {req_id!r} raised: {_safe_exc(exc)}",
+                )
+
+            if not getattr(a, "ok", False):
+                err = getattr(a, "error", None)
+                err_msg = getattr(err, "message", "apply failed")
+                cs.status = SiteChangeSet.PUBLISH_FAILED
+                cs.publish_build_result = {
+                    "error": f"apply failed for {req_id}: {err_msg[:_MAX_EXC_MSG]}",
+                    "applied": applied_ids,
+                    "failed_request_id": req_id,
+                }
+                cs.save(update_fields=["status", "publish_build_result", "updated_at"])
+                return AdminAIToolResult(
+                    tool_name="site.publish",
+                    success=False,
+                    data={"change_set_id": str(cs.id)},
+                    message=f"Apply of {req_id!r} failed: {err_msg[:_MAX_EXC_MSG]}",
+                )
+
+            applied_ids.append(req_id)
+
+        # ---- Promote the built output to the live output_root --------------
+        try:
+            svc.promote_output(tmp_build_dir)
+        except Exception as exc:
+            cs.status = SiteChangeSet.PUBLISH_FAILED
+            cs.publish_build_result = {
+                "error": f"output promotion failed: {_safe_exc(exc)}",
                 "applied": applied_ids,
                 "pages_built": result.pages_built,
             }
-            cs.save(update_fields=[
-                "status", "publish_build_result", "updated_at",
-            ])
+            cs.save(update_fields=["status", "publish_build_result", "updated_at"])
             return AdminAIToolResult(
                 tool_name="site.publish",
                 success=False,
                 data={"change_set_id": str(cs.id)},
-                message=f"Post-build theme promotion failed: {_safe_exc(exc)}",
+                message=f"Output promotion failed: {_safe_exc(exc)}",
             )
 
-    cs.status = SiteChangeSet.PUBLISHED
-    cs.published_at = timezone.now()
-    cs.publish_build_result = {
-        "applied": applied_ids,
-        "pages_built": result.pages_built,
-    }
-    cs.save(update_fields=[
-        "status", "published_at", "publish_build_result", "updated_at",
-    ])
+        # ---- Only NOW promote the staged CSS to active ---------------------
+        if cs.staged_theme_css and cfg.theme_root:
+            try:
+                from cauldron_site_astro.theme import SiteThemeService
+                theme_svc = SiteThemeService(cfg.theme_root)
+                theme_svc.stage_css(cs.staged_theme_css)
+                theme_svc.promote_staged()
+            except Exception as exc:
+                cs.status = SiteChangeSet.PUBLISH_FAILED
+                cs.publish_build_result = {
+                    "error": f"theme promote failed: {_safe_exc(exc)}",
+                    "applied": applied_ids,
+                    "pages_built": result.pages_built,
+                }
+                cs.save(update_fields=["status", "publish_build_result", "updated_at"])
+                return AdminAIToolResult(
+                    tool_name="site.publish",
+                    success=False,
+                    data={"change_set_id": str(cs.id)},
+                    message=f"Post-build theme promotion failed: {_safe_exc(exc)}",
+                )
 
-    return AdminAIToolResult(
-        tool_name="site.publish",
-        success=True,
-        data={
-            "change_set_id": str(cs.id),
+        cs.status = SiteChangeSet.PUBLISHED
+        cs.published_at = timezone.now()
+        cs.publish_build_result = {
+            "applied": applied_ids,
             "pages_built": result.pages_built,
-            # The now-live site: return a stable Django-style path, never a
-            # filesystem path.
-            "preview_url": "/",
-        },
-        message=(
-            f"Change set {cs.id} published successfully "
-            f"({result.pages_built} page(s))."
-        ),
-    )
+        }
+        cs.save(update_fields=[
+            "status", "published_at", "publish_build_result", "updated_at",
+        ])
+
+        return AdminAIToolResult(
+            tool_name="site.publish",
+            success=True,
+            data={
+                "change_set_id": str(cs.id),
+                "pages_built": result.pages_built,
+                "preview_url": "/",
+            },
+            message=(
+                f"Change set {cs.id} published successfully "
+                f"({result.pages_built} page(s))."
+            ),
+        )
+
+    finally:
+        shutil.rmtree(tmp_build_dir, ignore_errors=True)

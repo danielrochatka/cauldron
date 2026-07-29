@@ -268,6 +268,19 @@ class SiteBuildService:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+    def promote_output(self, src_dir: "str | Path") -> None:
+        """Atomically replace the live output_root with src_dir.
+
+        Called by the publish workflow after a successful build so that
+        output promotion and content-request application can be ordered
+        correctly: build first, apply content changes, then promote.
+        """
+        if not self._config.output_root:
+            raise ValueError(
+                "cauldron.site.astro output_root must be configured."
+            )
+        _promote_output(src_dir, Path(self._config.output_root))
+
     def build_preview(
         self,
         *,

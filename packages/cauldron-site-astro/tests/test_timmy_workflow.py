@@ -168,7 +168,9 @@ def test_publish_does_not_promote_css_on_build_failure(tmp_path):
     build_result.error = "Build failed"
     svc = MagicMock()
     svc._config = config
-    svc.build.return_value = build_result
+    # Publish now builds via build_preview (not build) so draft content is
+    # included without being applied first.
+    svc.build_preview.return_value = build_result
 
     with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
         result = _handle_publish(ctx, change_set_id=str(cs.id), confirm=True)
@@ -176,6 +178,52 @@ def test_publish_does_not_promote_css_on_build_failure(tmp_path):
     assert result.success is False
     theme_svc = SiteThemeService(theme_dir)
     assert theme_svc.get_active_css() == ""
+
+    cs.refresh_from_db()
+    assert cs.status == SiteChangeSet.PUBLISH_FAILED
+
+
+def test_content_not_published_on_build_failure(tmp_path):
+    """Content change requests must NOT be applied if the build fails.
+
+    Publish is atomic with respect to the build: validate → build → apply.
+    A failed build leaves the content store unchanged (items remain draft).
+    """
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_site_astro.site_tools import _handle_publish
+
+    ctx = _ctx("timmy-atomic")
+
+    cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        content_request_ids=["req-atomicity"],
+        staged_theme_css="",
+        affected_item_ids=["item-x"],
+    )
+
+    config = _make_config(tmp_path)
+    build_result = _make_build_result(ok=False)
+    build_result.error = "Astro crashed"
+    svc = MagicMock()
+    svc._config = config
+    svc.build_preview.return_value = build_result
+
+    fake_content_service = MagicMock()
+    fake_validation = MagicMock(ok=True, request_version=1)
+    fake_content_service.validate_change_request.return_value = fake_validation
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=fake_content_service,
+    ):
+        with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+            result = _handle_publish(ctx, change_set_id=str(cs.id), confirm=True)
+
+    assert result.success is False
+
+    # Validation ran (read-only pre-flight), but apply was never called.
+    fake_content_service.validate_change_request.assert_called_once()
+    fake_content_service.apply_change_request.assert_not_called()
 
     cs.refresh_from_db()
     assert cs.status == SiteChangeSet.PUBLISH_FAILED
@@ -236,8 +284,10 @@ def test_full_workflow_prepare_then_inspect_then_publish(tmp_path):
 
     # 3. publish — stub out the content operations service so the publish
     # loop successfully "applies" the fake request id without needing a
-    # real workspace-backed service.
-    svc.build.return_value = _make_build_result(ok=True, pages_built=1)
+    # real workspace-backed service.  Publish now calls build_preview
+    # (not build) so the draft items are included without being applied
+    # first; promote_output is a MagicMock no-op on the fake svc.
+    svc.build_preview.side_effect = fake_build_preview
 
     fake_content_service = MagicMock()
     fake_ok = MagicMock()

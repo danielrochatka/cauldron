@@ -25,6 +25,7 @@ from cauldron_ai.provider_configuration import (
     AIProviderConnectionError,
     AIProviderRateLimitError,
     AIProviderResponseError,
+    AIProviderTimeoutError,
 )
 from cauldron_ai_openai.provider import (
     OpenAIProvider,
@@ -415,15 +416,32 @@ def test_provider_rate_limit_message_is_safe(monkeypatch):
     assert "org-abc" not in str(exc_info.value)
 
 
-def test_provider_timeout_message_is_safe(monkeypatch):
+def test_provider_timeout_raises_provider_timeout_error(monkeypatch):
     import openai
     provider, mock_client = _make_provider(monkeypatch)
     mock_client.responses.create.side_effect = openai.APITimeoutError(
         request=MagicMock(),
     )
-    with pytest.raises(AIProviderConnectionError) as exc_info:
+    with pytest.raises(AIProviderTimeoutError) as exc_info:
         provider.complete(_simple_request())
     assert "timed out" in str(exc_info.value).lower()
+
+
+def test_provider_timeout_is_distinct_from_connection_error(monkeypatch):
+    """APITimeoutError must map to AIProviderTimeoutError, not AIProviderConnectionError."""
+    import openai
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_client.responses.create.side_effect = openai.APITimeoutError(
+        request=MagicMock(),
+    )
+    with pytest.raises(AIProviderTimeoutError):
+        provider.complete(_simple_request())
+    # Explicit: connection error must NOT be raised for a timeout.
+    mock_client.responses.create.side_effect = openai.APIConnectionError(
+        request=MagicMock(),
+    )
+    with pytest.raises(AIProviderConnectionError):
+        provider.complete(_simple_request())
 
 
 def test_provider_connection_error_message_is_safe(monkeypatch):
@@ -445,6 +463,67 @@ def test_provider_bad_request_error_message_is_safe(monkeypatch):
     with pytest.raises(AIProviderResponseError) as exc_info:
         provider.complete(_simple_request())
     assert "org-xxx" not in str(exc_info.value)
+
+
+def test_provider_rate_limit_carries_http_status(monkeypatch):
+    """AIProviderRateLimitError must carry the HTTP status from the SDK exception."""
+    import openai
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_response = MagicMock()
+    mock_response.status_code = 429
+    mock_client.responses.create.side_effect = openai.RateLimitError(
+        "rate limited", response=mock_response, body={},
+    )
+    with pytest.raises(AIProviderRateLimitError) as exc_info:
+        provider.complete(_simple_request())
+    assert exc_info.value.http_status == 429
+
+
+def test_provider_server_error_carries_http_status(monkeypatch):
+    """AIProviderResponseError for 5xx must carry the HTTP status."""
+    import openai
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_response = MagicMock()
+    mock_response.status_code = 503
+    mock_client.responses.create.side_effect = openai.APIStatusError(
+        "server error", response=mock_response, body={},
+    )
+    with pytest.raises(AIProviderResponseError) as exc_info:
+        provider.complete(_simple_request())
+    assert exc_info.value.http_status == 503
+
+
+def test_provider_request_id_propagated_to_exception(monkeypatch):
+    """The provider request ID from the SDK exception must appear on the raised exception."""
+    import openai
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_response = MagicMock()
+    mock_response.status_code = 429
+    mock_response.headers = {}
+    exc = openai.RateLimitError("limited", response=mock_response, body={})
+    exc.request_id = "req-abc123"
+    mock_client.responses.create.side_effect = exc
+    with pytest.raises(AIProviderRateLimitError) as exc_info:
+        provider.complete(_simple_request())
+    assert exc_info.value.provider_request_id == "req-abc123"
+
+
+def test_provider_request_id_not_in_exception_message(monkeypatch):
+    """The request ID must not appear in the exception text (only in metadata)."""
+    import openai
+    provider, mock_client = _make_provider(monkeypatch)
+    mock_response = MagicMock()
+    mock_response.status_code = 429
+    mock_response.headers = {}
+    exc = openai.RateLimitError("rate limited", response=mock_response, body={})
+    exc.request_id = "req-secret-id"
+    mock_client.responses.create.side_effect = exc
+    with pytest.raises(AIProviderRateLimitError) as exc_info:
+        provider.complete(_simple_request())
+    # The request ID must not bleed into the message string.
+    assert "req-secret-id" not in str(exc_info.value)
+    # But it must appear on the metadata attribute.
+    assert exc_info.value.provider_request_id == "req-secret-id"
 
 
 def test_provider_empty_api_key_raises_at_init(monkeypatch):
@@ -568,6 +647,23 @@ def test_factory_test_connection_no_model_returns_config_error():
     result = factory.test_connection({}, {"api_key": "sk-test"})
     assert result.success is False
     assert result.status == "configuration_error"
+
+
+def test_factory_test_connection_timeout_returns_timeout_status(monkeypatch):
+    """An OpenAI SDK timeout during test_connection must produce status='timeout', not 'error'."""
+    import openai
+    mock_client = MagicMock()
+    mock_client.responses.create.side_effect = openai.APITimeoutError(
+        request=MagicMock(),
+    )
+    monkeypatch.setattr(openai, "OpenAI", lambda **kw: mock_client)
+    factory = OpenAIProviderFactory()
+    result = factory.test_connection({"model": "gpt-4o"}, {"api_key": "sk-test"})
+    assert result.success is False
+    assert result.status == "timeout"
+    assert result.latency_ms is not None
+    # Message must be credential-safe — no API key or raw SDK text.
+    assert "sk-test" not in result.message
 
 
 # ---------------------------------------------------------------------------

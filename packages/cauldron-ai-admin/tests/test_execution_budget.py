@@ -108,10 +108,10 @@ def test_execution_budget_defaults_all_six_numeric_keys_present():
 
 
 def test_execution_budget_defaults_preserved_numeric_values():
-    """Former self-hosted limits in settings.py are now the module defaults."""
+    """Module defaults must reflect practical multi-step workflow requirements."""
     from cauldron_ai_admin.service_factory import EXECUTION_BUDGET_DEFAULTS
     assert EXECUTION_BUDGET_DEFAULTS["tool_timeout_seconds"] == 10.0
-    assert EXECUTION_BUDGET_DEFAULTS["run_timeout_seconds"] == 30.0
+    assert EXECUTION_BUDGET_DEFAULTS["run_timeout_seconds"] == 120.0
     assert EXECUTION_BUDGET_DEFAULTS["max_argument_bytes"] == 4096
     assert EXECUTION_BUDGET_DEFAULTS["max_result_bytes"] == 8192
 
@@ -723,15 +723,15 @@ def test_saved_run_timeout_below_deployment_tool_timeout_falls_back(tmp_path):
     #
     # saved:      run_timeout_seconds  = 12  (valid)
     # deployment: tool_timeout_seconds = 20  (valid)
-    # baseline:   tool=20, run=30 (default) → valid
+    # baseline:   tool=20, run=120 (default) → valid
     # merged:     tool=20, run=12 → 20 ≥ 12  ✗ → fall back to baseline
     from cauldron_ai_admin.service_factory import resolve_runtime_settings
     store, reset = _make_store(tmp_path)
     try:
         store.set_runtime({"run_timeout_seconds": 12.0})
         result = resolve_runtime_settings(store, {"tool_timeout_seconds": 20.0})
-        # Saved run_timeout (12) must be discarded; baseline run_timeout (30) used.
-        assert result["run_timeout_seconds"] == 30.0
+        # Saved run_timeout (12) must be discarded; baseline run_timeout (120) used.
+        assert result["run_timeout_seconds"] == 120.0
         assert result["tool_timeout_seconds"] == 20.0
     finally:
         reset(path=None)
@@ -740,16 +740,16 @@ def test_saved_run_timeout_below_deployment_tool_timeout_falls_back(tmp_path):
 def test_deployment_tool_timeout_exceeds_default_run_timeout_raises(tmp_path):
     """A deployment tool_timeout that exceeds the module default run_timeout raises.
 
-    deployment: tool_timeout_seconds = 35  (valid: 1–300)
-    defaults:   run_timeout_seconds  = 30
-    baseline:   tool=35, run=30 → 35 ≥ 30  ✗ → ImproperlyConfigured
+    deployment: tool_timeout_seconds = 125  (valid: 1–300)
+    defaults:   run_timeout_seconds  = 120
+    baseline:   tool=125, run=120 → 125 ≥ 120  ✗ → ImproperlyConfigured
     """
     from django.core.exceptions import ImproperlyConfigured
     from cauldron_ai_admin.service_factory import resolve_runtime_settings
     store, reset = _make_store(tmp_path)
     try:
         with pytest.raises(ImproperlyConfigured) as exc_info:
-            resolve_runtime_settings(store, {"tool_timeout_seconds": 35.0})
+            resolve_runtime_settings(store, {"tool_timeout_seconds": 125.0})
         msg = str(exc_info.value)
         assert "tool_timeout_seconds" in msg
         assert "run_timeout_seconds" in msg
@@ -789,10 +789,10 @@ def test_invalid_deployment_default_combination_raises_improperly_configured(tmp
     from cauldron_ai_admin.service_factory import resolve_runtime_settings
     store, reset = _make_store(tmp_path)
     try:
-        # tool_timeout=35 is valid by itself; default run_timeout=30 is also valid.
-        # But 35 >= 30, so the baseline is invalid.
+        # tool_timeout=125 is valid by itself; default run_timeout=120 is also valid.
+        # But 125 >= 120, so the baseline is invalid.
         with pytest.raises(ImproperlyConfigured):
-            resolve_runtime_settings(store, {"tool_timeout_seconds": 35.0})
+            resolve_runtime_settings(store, {"tool_timeout_seconds": 125.0})
     finally:
         reset(path=None)
 

@@ -73,7 +73,7 @@ EXECUTION_BUDGET_DEFAULTS: dict[str, Any] = {
     "max_model_turns": 8,
     "max_tool_calls": 12,
     "tool_timeout_seconds": 10.0,
-    "run_timeout_seconds": 30.0,
+    "run_timeout_seconds": 120.0,
     "max_argument_bytes": 4096,
     "max_result_bytes": 8192,
     "include_content_tools": True,

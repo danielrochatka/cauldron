@@ -307,7 +307,7 @@ class RuntimeSettingsForm(forms.Form):
     )
     run_timeout_seconds = forms.FloatField(
         label="Run timeout (seconds)",
-        min_value=10.0, max_value=600.0, initial=30.0,
+        min_value=10.0, max_value=600.0, initial=120.0,
         help_text="End-to-end deadline for a single request.",
     )
     max_argument_bytes = forms.IntegerField(

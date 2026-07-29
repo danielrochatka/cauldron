@@ -477,6 +477,80 @@ def test_promote_output_no_partial_directory_exposed(tmp_path):
     assert previous_dirs == [], f"previous artefacts must be cleaned up: {previous_dirs}"
 
 
+def test_promote_output_with_backup__atomic_swap_invariants(tmp_path):
+    """promote_output_with_backup upholds three reader-visible invariants.
+
+    (1) No partial tree at output_root: after the swap output_root contains
+        exactly the new content — no mix with the old content.
+    (2) No missing live root: output_root exists before and after the swap.
+    (3) Backup is not the live root: the returned snapshot lives at
+        output_root.previous-<uuid>, a distinct path that is never served.
+
+    Same-filesystem guarantee (documented here, enforced by construction):
+    The staging path is output_root.staging-<uuid> — it shares output_root's
+    parent directory and is therefore always on the same filesystem as
+    output_root.  os.rename(staging → output_root) is consequently a single
+    atomic POSIX rename(2) syscall; no reader can observe an intermediate
+    state between the old and new complete trees.
+
+    Also verifies that restore_output reinstates the previous content
+    completely (the snapshot is a full copy, not a partial one).
+    """
+    from cauldron_site_astro.service import SiteBuildService
+
+    config = _make_config(tmp_path)
+    svc = SiteBuildService(config, MagicMock())
+    output_root = Path(config.output_root)
+
+    # Establish a complete initial output: files a, b, c
+    output_root.mkdir(parents=True, exist_ok=True)
+    for name in ("a.html", "b.html", "c.html"):
+        (output_root / name).write_text(f"<html>{name}</html>")
+
+    # New complete content: files x, y, z
+    new_build = tmp_path / "new_build"
+    new_build.mkdir()
+    for name in ("x.html", "y.html", "z.html"):
+        (new_build / name).write_text(f"<html>{name}</html>")
+
+    snapshot = svc.promote_output_with_backup(new_build)
+
+    # Invariant 1: output_root exists after the swap
+    assert output_root.exists(), "live root must exist after swap (no missing root)"
+
+    # Invariant 2: output_root has exactly the new files — never a mix
+    live_files = {p.name for p in output_root.iterdir()}
+    assert live_files == {"x.html", "y.html", "z.html"}, (
+        f"output_root must contain exactly the new content, got: {live_files!r}"
+    )
+
+    # Invariant 3: the snapshot is at a different path from output_root
+    assert snapshot is not None
+    snapshot_path = Path(snapshot)
+    assert snapshot_path != output_root, "snapshot must not be output_root"
+    assert not snapshot_path.samefile(output_root), "snapshot must not resolve to output_root"
+
+    # Snapshot is complete (full copy of previous content)
+    backup_files = {p.name for p in snapshot_path.iterdir()}
+    assert backup_files == {"a.html", "b.html", "c.html"}, (
+        f"snapshot must be the complete previous content, got: {backup_files!r}"
+    )
+
+    # Same-filesystem constraint: snapshot lives in the same directory as output_root
+    assert snapshot_path.parent == output_root.parent, (
+        "snapshot (and staging) share output_root.parent, guaranteeing same-filesystem "
+        "for os.rename() — cross-device rename would raise EXDEV"
+    )
+
+    # restore_output reinstates the previous content completely
+    svc.restore_output(snapshot)
+    assert output_root.exists(), "output_root must exist after restore"
+    restored_files = {p.name for p in output_root.iterdir()}
+    assert restored_files == {"a.html", "b.html", "c.html"}, (
+        f"restore must produce exactly the original content, got: {restored_files!r}"
+    )
+
+
 def test_full_workflow_prepare_then_inspect_then_publish(tmp_path):
     """End-to-end: theme-only change set goes through the full lifecycle.
 

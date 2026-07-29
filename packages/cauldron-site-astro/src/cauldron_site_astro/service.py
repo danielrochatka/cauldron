@@ -89,15 +89,51 @@ def _promote_output(src_dir: Path | str, output_root: Path) -> None:
 def _promote_output_snapshotted(src_dir: Path | str, output_root: Path) -> "Path | None":
     """Like _promote_output but retains the displaced directory as a rollback snapshot.
 
-    Identical to _promote_output except step 5 is skipped: the previous
-    output_root is kept at output_root.previous-<uuid> instead of deleted.
+    Exact filesystem operations
+    ----------------------------
+    1. Acquire an exclusive flock on ``output_root.swap.lock`` (serialises
+       concurrent publish attempts).
+    2. ``shutil.copytree(src_dir, output_root.staging-<uuid>)`` — the full
+       copy lands in a private path that is *never served*.  A concurrent
+       reader of ``output_root`` observes nothing during this step.
+    3. ``os.rename(output_root, output_root.previous-<uuid>)`` — displaces
+       the current live tree in one atomic rename(2) syscall.  ``output_root``
+       ceases to exist for an instant, but the webserver's open file handles
+       on files within it remain valid until all handles are closed (POSIX
+       unlink semantics).
+    4. ``os.rename(staging, output_root)`` — makes the new complete tree live
+       in one atomic rename(2) syscall.  From this moment a reader either saw
+       the old ``output_root`` (still valid via open handles) or sees the new
+       complete one.  No partial tree is ever reachable at ``output_root``.
 
-    Returns the Path of that snapshot, or None if output_root did not exist
+    Step 5 of ``_promote_output`` (``rmtree(previous)``) is intentionally
+    **skipped**; the displaced directory is kept as a rollback snapshot and its
+    path is returned to the caller.
+
+    Returns the Path of the snapshot, or None if output_root did not exist
     (first-ever publish — nothing to snapshot).
 
+    Same-filesystem constraint
+    --------------------------
+    ``staging`` and ``previous`` are both created under ``output_root.parent``
+    (e.g. ``/srv/site.staging-a1b2c3d4``).  Because ``output_root``,
+    ``staging``, and ``previous`` all share the same parent directory they are
+    guaranteed to be on the same filesystem.  ``os.rename()`` across
+    filesystems raises ``OSError(EXDEV)``; that error is impossible here
+    provided ``output_root`` and its parent directory are on the same mount.
+
+    Reader-visible states at ``output_root``
+    -----------------------------------------
+    At any observable instant ``output_root`` is in one of these states:
+    - Does not exist yet (before any publish).
+    - Points to the previous complete tree (before step 4).
+    - Points to the new complete tree (after step 4).
+    A reader never observes a partially-copied tree or the backup path as
+    the live root.
+
     The caller MUST subsequently call either:
-      - _promote_output(snapshot, output_root) + rmtree(snapshot)  — to roll back, OR
-      - shutil.rmtree(snapshot)                                     — to commit (discard)
+      - ``restore_output(snapshot)``       — to roll back (calls _promote_output + rmtree)
+      - ``discard_output_backup(snapshot)`` — to commit (rmtree only)
     """
     src_dir = Path(src_dir)
     output_root.parent.mkdir(parents=True, exist_ok=True)

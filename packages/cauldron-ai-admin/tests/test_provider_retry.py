@@ -6,7 +6,13 @@ from unittest import mock
 
 import pytest
 
-from cauldron_ai.contracts import AIModelResponse, AIModelToolCall
+from cauldron_ai.contracts import (
+    AIModelMessage,
+    AIModelRequest,
+    AIModelResponse,
+    AIModelToolCall,
+    AIModelToolDefinition,
+)
 from cauldron_ai.provider_configuration import (
     AIProviderAuthenticationError,
     AIProviderConfigurationError,
@@ -19,6 +25,7 @@ from cauldron_ai_admin.service import (
     AdminAIService,
     _build_provider_error_summary,
     _classify_provider_error,
+    _measure_request_bytes,
 )
 from cauldron_ai_admin.service_factory import EXECUTION_BUDGET_DEFAULTS
 from cauldron_ai_admin.tools import (
@@ -559,3 +566,90 @@ def test_error_summary_includes_http_status_and_request_id_when_available():
     assert data["http_status"] == 429
     assert data["provider_request_id"] == "req-abc"
     assert data["retry_after"] == 60.0
+
+
+# ---------------------------------------------------------------------------
+# request_bytes measurement accuracy
+# ---------------------------------------------------------------------------
+
+def _bare_request(**kwargs):
+    """Return a minimal AIModelRequest with a single user message."""
+    defaults = dict(
+        messages=(AIModelMessage(role="user", content="Hi"),),
+        system="",
+        tools=(),
+    )
+    defaults.update(kwargs)
+    return AIModelRequest(**defaults)
+
+
+def test_request_bytes_includes_system_prompt():
+    """System-prompt bytes must be counted in request_bytes."""
+    base = _bare_request(system="")
+    with_system = _bare_request(system="A" * 100)
+    assert _measure_request_bytes(with_system) > _measure_request_bytes(base)
+
+
+def test_request_bytes_includes_tool_schema():
+    """Tool-definition schema bytes must be counted in request_bytes."""
+    base = _bare_request(tools=())
+    tool = AIModelToolDefinition(
+        name="my.tool",
+        description="Does something",
+        parameters={
+            "type": "object",
+            "properties": {"x": {"type": "string", "description": "A" * 200}},
+        },
+    )
+    with_tool = _bare_request(tools=(tool,))
+    assert _measure_request_bytes(with_tool) > _measure_request_bytes(base)
+
+
+def test_request_bytes_includes_tool_call_arguments():
+    """Tool-call argument bytes inside messages must be counted in request_bytes."""
+    small_args = AIModelToolCall(id="c1", name="tool", arguments={})
+    large_args = AIModelToolCall(id="c1", name="tool", arguments={"input": "A" * 200})
+
+    base = AIModelRequest(
+        messages=(
+            AIModelMessage(role="user", content="Hi"),
+            AIModelMessage(role="assistant", content="", tool_calls=(small_args,)),
+        ),
+    )
+    with_args = AIModelRequest(
+        messages=(
+            AIModelMessage(role="user", content="Hi"),
+            AIModelMessage(role="assistant", content="", tool_calls=(large_args,)),
+        ),
+    )
+    assert _measure_request_bytes(with_args) > _measure_request_bytes(base)
+
+
+def test_request_bytes_counts_unicode_as_utf8():
+    """Multi-byte Unicode chars must count their full UTF-8 width in request_bytes."""
+    # "€" encodes as 3 bytes in UTF-8; "A" is 1 byte.
+    ascii_req = _bare_request(messages=(AIModelMessage(role="user", content="A" * 20),))
+    euro_req = _bare_request(messages=(AIModelMessage(role="user", content="€" * 20),))
+    assert _measure_request_bytes(euro_req) > _measure_request_bytes(ascii_req)
+
+
+def test_diagnostic_stores_byte_count_not_content():
+    """error_summary must carry request_bytes as a number, never raw request content."""
+    provider = _mock_provider(
+        AIProviderConnectionError("net fail"),
+        AIProviderConnectionError("net fail again"),
+    )
+    svc = _service(provider)
+    user = _make_user()
+
+    with mock.patch("cauldron_ai_admin.service._PROVIDER_RETRY_BACKOFF", 0):
+        run = svc.run(user, "do something secret")
+
+    data = json.loads(run.error_summary)
+    assert "request_bytes" in data
+    assert isinstance(data["request_bytes"], int)
+    assert data["request_bytes"] > 0
+    # Raw content keys and values must never appear in the summary.
+    assert "messages" not in data
+    assert "system" not in data
+    assert "do something secret" not in run.error_summary

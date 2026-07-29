@@ -204,6 +204,52 @@ def _build_provider_error_summary(
     return json.dumps(fields, sort_keys=True)
 
 
+def _measure_request_bytes(request: AIModelRequest) -> int:
+    """Return the UTF-8 byte length of a deterministic JSON serialization
+    of the complete request content (messages, tools, system, limits, id).
+
+    Excludes timeout_seconds and deadline_seconds (per-attempt operational
+    metadata). Never persists the payload.
+    """
+    from collections.abc import Mapping as _Mapping
+
+    def _plain(obj: Any) -> Any:
+        if isinstance(obj, _Mapping):
+            return {k: _plain(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_plain(item) for item in obj]
+        return obj
+
+    def _msg(m: AIModelMessage) -> dict:
+        d: dict[str, Any] = {"content": m.content, "role": m.role}
+        if m.tool_call_id is not None:
+            d["tool_call_id"] = m.tool_call_id
+        if m.tool_calls:
+            d["tool_calls"] = [
+                {"arguments": _plain(tc.arguments), "id": tc.id, "name": tc.name}
+                for tc in m.tool_calls
+            ]
+        return d
+
+    def _tool(t: AIModelToolDefinition) -> dict:
+        return {
+            "description": t.description,
+            "name": t.name,
+            "parameters": _plain(t.parameters),
+        }
+
+    payload = {
+        "correlation_id": request.correlation_id,
+        "max_tokens": request.max_tokens,
+        "messages": [_msg(m) for m in request.messages],
+        "system": request.system,
+        "tools": [_tool(t) for t in request.tools],
+    }
+    return len(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    )
+
+
 class AdminAIService:
     def __init__(
         self,
@@ -601,9 +647,7 @@ class AdminAIService:
         attempt_count = 0
         deadline_expired_on_retry = False
 
-        request_bytes = sum(
-            len((m.content or "").encode("utf-8")) for m in provider_request.messages
-        )
+        request_bytes = _measure_request_bytes(provider_request)
         tool_result_bytes = sum(
             len((m.content or "").encode("utf-8"))
             for m in provider_request.messages

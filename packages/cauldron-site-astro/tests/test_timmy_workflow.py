@@ -536,9 +536,10 @@ def test_promote_output_with_backup__atomic_swap_invariants(tmp_path):
         f"snapshot must be the complete previous content, got: {backup_files!r}"
     )
 
-    # Same-filesystem constraint: snapshot lives in the same directory as output_root
-    assert snapshot_path.parent == output_root.parent, (
-        "snapshot (and staging) share output_root.parent, guaranteeing same-filesystem "
+    # Same-filesystem constraint: snapshot lives under output_root.parent (inside
+    # output_root.releases/), guaranteeing all rename() calls are on the same filesystem.
+    assert output_root.parent in snapshot_path.parents, (
+        "snapshot lives under output_root.parent, guaranteeing same-filesystem "
         "for os.rename() — cross-device rename would raise EXDEV"
     )
 
@@ -549,6 +550,66 @@ def test_promote_output_with_backup__atomic_swap_invariants(tmp_path):
     assert restored_files == {"a.html", "b.html", "c.html"}, (
         f"restore must produce exactly the original content, got: {restored_files!r}"
     )
+
+
+def test_promote_output_concurrent_reader_never_sees_missing_root(tmp_path):
+    """output_root is continuously accessible during an atomic symlink swap.
+
+    A reader thread polls output_root.exists() throughout a second promote_output
+    call.  Because the activation is a single os.rename(next_link, output_root)
+    syscall — which replaces one symlink with another atomically at the kernel
+    level — output_root is never absent for any reader that reaches the path
+    after the first promote (i.e. after output_root is already a symlink).
+
+    The migration case (real-dir → symlink on first call) has a documented brief
+    window; only the second and subsequent promotions are fully atomic.  This
+    test exercises the second call to isolate the symlink-swap invariant.
+    """
+    import threading
+    from cauldron_site_astro.service import SiteBuildService
+
+    config = _make_config(tmp_path)
+    svc = SiteBuildService(config, MagicMock())
+    output_root = Path(config.output_root)
+
+    # First promote: establishes output_root as a symlink → initial release.
+    initial = tmp_path / "initial"
+    initial.mkdir()
+    (initial / "init.html").write_text("<html>init</html>")
+    svc.promote_output(initial)
+
+    assert output_root.exists()
+    assert output_root.is_symlink(), "output_root must be a symlink after first promote"
+
+    # Prepare a second build to swap in.
+    new_build = tmp_path / "new_build"
+    new_build.mkdir()
+    (new_build / "new.html").write_text("<html>new</html>")
+
+    gaps_observed: list[bool] = []
+    stop_event = threading.Event()
+
+    def reader():
+        while not stop_event.is_set():
+            if not output_root.exists():
+                gaps_observed.append(True)
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+
+    # Second promote: atomic symlink swap — reader must never see a gap.
+    svc.promote_output(new_build)
+
+    stop_event.set()
+    t.join(timeout=5)
+
+    assert not gaps_observed, (
+        f"output_root was absent {len(gaps_observed)} time(s) during the symlink swap — "
+        "the activation is not atomic"
+    )
+    assert output_root.exists()
+    assert output_root.is_symlink()
+    assert (output_root / "new.html").exists()
 
 
 def test_full_workflow_prepare_then_inspect_then_publish(tmp_path):

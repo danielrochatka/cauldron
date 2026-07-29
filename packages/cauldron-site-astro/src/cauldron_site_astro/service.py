@@ -1,8 +1,7 @@
 """Site build service for cauldron-site-astro."""
 from __future__ import annotations
 
-import fcntl
-import glob
+import os
 import shutil
 import uuid
 from dataclasses import dataclass, field
@@ -32,145 +31,148 @@ class BuildResult:
     build_log: str = ""
 
 
+def _releases_dir(output_root: Path) -> Path:
+    return output_root.parent / (output_root.name + ".releases")
+
+
 def _promote_output(src_dir: Path | str, output_root: Path) -> None:
-    """Atomically replace output_root with src_dir using a locked staging rename.
+    """Atomically replace output_root with a symlink to a new versioned release.
 
     Steps:
-      1. Acquire an exclusive flock on output_root + ".swap.lock"
-      2. Copy src_dir → staging path  (not yet live)
-      3. Rename output_root → previous path  (if output_root exists)
-      4. Rename staging → output_root  (atomic on same filesystem)
-      5. Remove previous path
+      1. Copy src_dir to a new versioned release directory under output_root.releases/
+      2. If output_root is an existing real directory (one-time migration on first use):
+         rename it into releases/ as legacy-<uuid>.  A brief window exists here because
+         POSIX rename(2) cannot atomically replace a directory with a symlink in one step.
+         This window is bounded to this first-ever migration; all subsequent activations
+         are fully atomic.
+      3. Create a temp symlink at output_root.next pointing to the new release directory.
+      4. os.rename(output_root.next, output_root) — a single atomic rename(2) syscall
+         replaces output_root with the new symlink.  From this point output_root is
+         continuously accessible; no reader ever observes it absent.
+      5. Remove the old release directory (or legacy directory from migration).
 
-    The live output_root transitions directly from fully-old to fully-new in
-    step 4; no partially-copied tree is ever exposed.
-
-    On any exception in steps 2–5:
-      - Restore previous → output_root if output_root is missing
-      - Remove staging and previous (ignore errors)
-      - Re-raise
+    On any exception: restore any migrated directory; clean up the new release
+    directory and temp symlink; re-raise.
     """
     src_dir = Path(src_dir)
     output_root.parent.mkdir(parents=True, exist_ok=True)
 
-    lock_path = Path(str(output_root) + ".swap.lock")
-    staging = Path(str(output_root) + ".staging-" + uuid.uuid4().hex[:8])
-    previous = Path(str(output_root) + ".previous-" + uuid.uuid4().hex[:8])
+    releases = _releases_dir(output_root)
+    releases.mkdir(parents=True, exist_ok=True)
 
-    lock_fd = open(lock_path, "w")
+    new_release = releases / uuid.uuid4().hex
+    next_link = output_root.parent / (output_root.name + ".next")
+
+    old_target: "Path | None" = None
+    migrated_from: "Path | None" = None
+
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        shutil.copytree(str(src_dir), str(new_release))
 
-        try:
-            shutil.copytree(str(src_dir), str(staging))
+        if output_root.is_symlink():
+            raw = os.readlink(str(output_root))
+            old_target = Path(raw) if Path(raw).is_absolute() else (output_root.parent / raw)
+        elif output_root.exists():
+            # One-time migration: move the existing real directory into releases/.
+            # Brief window between this rename and the symlink creation below.
+            legacy = releases / ("legacy-" + uuid.uuid4().hex)
+            output_root.rename(legacy)
+            migrated_from = legacy
+            old_target = legacy
 
-            if output_root.exists():
-                output_root.rename(previous)
+        next_link.unlink(missing_ok=True)
+        next_link.symlink_to(new_release)
+        os.rename(str(next_link), str(output_root))
 
-            staging.rename(output_root)
+        if old_target is not None and old_target.exists():
+            shutil.rmtree(str(old_target), ignore_errors=True)
 
-            if previous.exists():
-                shutil.rmtree(previous)
-
-        except Exception:
-            if previous.exists() and not output_root.exists():
-                try:
-                    previous.rename(output_root)
-                except Exception:
-                    pass
-            shutil.rmtree(staging, ignore_errors=True)
-            shutil.rmtree(previous, ignore_errors=True)
-            raise
-    finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        lock_fd.close()
+    except Exception:
+        if migrated_from is not None and migrated_from.exists() and not output_root.exists():
+            try:
+                migrated_from.rename(output_root)
+            except Exception:
+                pass
+        shutil.rmtree(str(new_release), ignore_errors=True)
+        next_link.unlink(missing_ok=True)
+        raise
 
 
 def _promote_output_snapshotted(src_dir: Path | str, output_root: Path) -> "Path | None":
-    """Like _promote_output but retains the displaced directory as a rollback snapshot.
+    """Like _promote_output but retains the displaced release as a rollback snapshot.
 
     Exact filesystem operations
     ----------------------------
-    1. Acquire an exclusive flock on ``output_root.swap.lock`` (serialises
-       concurrent publish attempts).
-    2. ``shutil.copytree(src_dir, output_root.staging-<uuid>)`` — the full
-       copy lands in a private path that is *never served*.  A concurrent
-       reader of ``output_root`` observes nothing during this step.
-    3. ``os.rename(output_root, output_root.previous-<uuid>)`` — displaces
-       the current live tree in one atomic rename(2) syscall.  ``output_root``
-       ceases to exist for an instant, but the webserver's open file handles
-       on files within it remain valid until all handles are closed (POSIX
-       unlink semantics).
-    4. ``os.rename(staging, output_root)`` — makes the new complete tree live
-       in one atomic rename(2) syscall.  From this moment a reader either saw
-       the old ``output_root`` (still valid via open handles) or sees the new
-       complete one.  No partial tree is ever reachable at ``output_root``.
+    1. Copy src_dir into a new versioned release directory under output_root.releases/.
+       Concurrent readers of output_root observe nothing during this step.
+    2a. If output_root is an existing symlink: read the target it currently points to
+        (that becomes the snapshot).
+    2b. If output_root is a real directory (first-time migration): rename it into
+        releases/ as legacy-<uuid>.  A brief window exists here — see _promote_output.
+    3. Create temp symlink output_root.next → new release directory.
+    4. os.rename(output_root.next, output_root) — single atomic rename(2) syscall.
+       output_root is continuously accessible; from this moment readers either hold
+       open handles on the old release (still valid via POSIX open-handle semantics)
+       or dereference the symlink and reach the new complete release.
 
-    Step 5 of ``_promote_output`` (``rmtree(previous)``) is intentionally
-    **skipped**; the displaced directory is kept as a rollback snapshot and its
-    path is returned to the caller.
+    Step 5 of _promote_output (rmtree(old)) is intentionally skipped; the old release
+    is kept as the rollback snapshot and its path is returned to the caller.
 
-    Returns the Path of the snapshot, or None if output_root did not exist
-    (first-ever publish — nothing to snapshot).
+    Returns the Path of the snapshot (the old release directory), or None if
+    output_root did not exist before (first-ever publish — nothing to snapshot).
 
-    Same-filesystem constraint
+    Same-filesystem guarantee
     --------------------------
-    ``staging`` and ``previous`` are both created under ``output_root.parent``
-    (e.g. ``/srv/site.staging-a1b2c3d4``).  Because ``output_root``,
-    ``staging``, and ``previous`` all share the same parent directory they are
-    guaranteed to be on the same filesystem.  ``os.rename()`` across
-    filesystems raises ``OSError(EXDEV)``; that error is impossible here
-    provided ``output_root`` and its parent directory are on the same mount.
-
-    Reader-visible states at ``output_root``
-    -----------------------------------------
-    At any observable instant ``output_root`` is in one of these states:
-    - Does not exist yet (before any publish).
-    - Points to the previous complete tree (before step 4).
-    - Points to the new complete tree (after step 4).
-    A reader never observes a partially-copied tree or the backup path as
-    the live root.
+    All release directories live under output_root.releases/ which is a sibling
+    directory of output_root (same parent, same filesystem).  os.rename() across
+    filesystems raises EXDEV; that is impossible here because all paths share the
+    same parent directory.
 
     The caller MUST subsequently call either:
-      - ``restore_output(snapshot)``       — to roll back (calls _promote_output + rmtree)
-      - ``discard_output_backup(snapshot)`` — to commit (rmtree only)
+      - restore_output(snapshot)        — to roll back (re-points symlink atomically;
+                                          discards the failed build; keeps snapshot alive)
+      - discard_output_backup(snapshot) — to commit (rmtree only)
     """
     src_dir = Path(src_dir)
     output_root.parent.mkdir(parents=True, exist_ok=True)
 
-    lock_path = Path(str(output_root) + ".swap.lock")
-    staging = Path(str(output_root) + ".staging-" + uuid.uuid4().hex[:8])
-    previous = Path(str(output_root) + ".previous-" + uuid.uuid4().hex[:8])
-    had_previous = False
+    releases = _releases_dir(output_root)
+    releases.mkdir(parents=True, exist_ok=True)
 
-    lock_fd = open(lock_path, "w")
+    new_release = releases / uuid.uuid4().hex
+    next_link = output_root.parent / (output_root.name + ".next")
+
+    old_target: "Path | None" = None
+    migrated_from: "Path | None" = None
+
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        shutil.copytree(str(src_dir), str(new_release))
 
-        try:
-            shutil.copytree(str(src_dir), str(staging))
+        if output_root.is_symlink():
+            raw = os.readlink(str(output_root))
+            old_target = Path(raw) if Path(raw).is_absolute() else (output_root.parent / raw)
+        elif output_root.exists():
+            legacy = releases / ("legacy-" + uuid.uuid4().hex)
+            output_root.rename(legacy)
+            migrated_from = legacy
+            old_target = legacy
 
-            if output_root.exists():
-                output_root.rename(previous)
-                had_previous = True
+        next_link.unlink(missing_ok=True)
+        next_link.symlink_to(new_release)
+        os.rename(str(next_link), str(output_root))
 
-            staging.rename(output_root)
+        # Do NOT remove old_target — caller holds it as the rollback snapshot.
+        return old_target
 
-            # Do NOT remove previous — caller holds it as a rollback snapshot.
-            return previous if had_previous else None
-
-        except Exception:
-            if previous.exists() and not output_root.exists():
-                try:
-                    previous.rename(output_root)
-                except Exception:
-                    pass
-            shutil.rmtree(staging, ignore_errors=True)
-            shutil.rmtree(previous, ignore_errors=True)
-            raise
-    finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        lock_fd.close()
+    except Exception:
+        if migrated_from is not None and migrated_from.exists() and not output_root.exists():
+            try:
+                migrated_from.rename(output_root)
+            except Exception:
+                pass
+        shutil.rmtree(str(new_release), ignore_errors=True)
+        next_link.unlink(missing_ok=True)
+        raise
 
 
 class SiteBuildService:
@@ -223,13 +225,9 @@ class SiteBuildService:
         frontend_root = Path(cfg.frontend_root)
         output_root = Path(cfg.output_root)
 
-        # Clean up any abandoned staging/previous paths from crashed prior runs
-        for pattern in (
-            str(output_root) + ".staging-*",
-            str(output_root) + ".previous-*",
-        ):
-            for abandoned in glob.glob(pattern):
-                shutil.rmtree(abandoned, ignore_errors=True)
+        # Clean up any abandoned .next symlink left by a crashed prior run.
+        next_link = output_root.parent / (output_root.name + ".next")
+        next_link.unlink(missing_ok=True)
 
         # Collect published pages
         pages = []
@@ -378,11 +376,15 @@ class SiteBuildService:
         return _promote_output_snapshotted(src_dir, Path(self._config.output_root))
 
     def restore_output(self, snapshot: "Path | None") -> None:
-        """Replace output_root with the snapshot from promote_output_with_backup.
+        """Re-point output_root to the snapshot from promote_output_with_backup.
 
+        Atomically re-points the output_root symlink to the snapshot directory
+        (no copy), then removes the failed release that was previously live.
         Silently no-ops if snapshot is None or has already been removed.
-        After this call the snapshot path no longer exists — the caller
-        should set their reference to None to prevent double-cleanup.
+
+        After this call the snapshot directory IS the live release — the caller
+        MUST set its snapshot reference to None to prevent accidental cleanup
+        via discard_output_backup.
         """
         if snapshot is None:
             return
@@ -391,10 +393,23 @@ class SiteBuildService:
             return
         if not self._config.output_root:
             return
-        # _promote_output copies snapshot → staging, atomically swaps into output_root,
-        # and discards whatever was currently in output_root.
-        _promote_output(snapshot, Path(self._config.output_root))
-        shutil.rmtree(str(snapshot), ignore_errors=True)
+        output_root = Path(self._config.output_root)
+        next_link = output_root.parent / (output_root.name + ".next")
+
+        # Identify the failed release currently live (for cleanup after restore).
+        old_target: "Path | None" = None
+        if output_root.is_symlink():
+            raw = os.readlink(str(output_root))
+            old_target = Path(raw) if Path(raw).is_absolute() else (output_root.parent / raw)
+
+        # Atomically re-point output_root to the snapshot.
+        next_link.unlink(missing_ok=True)
+        next_link.symlink_to(snapshot)
+        os.rename(str(next_link), str(output_root))
+
+        # Discard the failed build that was just displaced.
+        if old_target is not None and old_target != snapshot and old_target.exists():
+            shutil.rmtree(str(old_target), ignore_errors=True)
 
     def discard_output_backup(self, snapshot: "Path | None") -> None:
         """Discard the snapshot after a successful publish (commit path)."""

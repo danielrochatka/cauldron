@@ -543,7 +543,7 @@ def test_staging_copy_failure_leaves_existing_output(tmp_path):
 
 
 def test_first_rename_failure_leaves_existing_output(tmp_path):
-    """If renaming output_root to previous fails, existing output is preserved."""
+    """If the one-time migration rename (output_root→releases/legacy) fails, existing output is preserved."""
     output_root = tmp_path / "output"
     output_root.mkdir()
     (output_root / "index.html").write_text("<html>Old</html>")
@@ -558,7 +558,7 @@ def test_first_rename_failure_leaves_existing_output(tmp_path):
 
     def fail_first_rename(self, target):
         call_count[0] += 1
-        if call_count[0] == 1:  # First rename is output_root → previous
+        if call_count[0] == 1:  # First Path.rename is output_root → releases/legacy-<uuid>
             raise OSError("rename failed")
         return real_rename(self, target)
 
@@ -575,8 +575,13 @@ def test_first_rename_failure_leaves_existing_output(tmp_path):
     assert (output_root / "index.html").read_text() == "<html>Old</html>"
 
 
-def test_second_rename_failure_restores_previous_output(tmp_path):
-    """If staging→output_root rename fails, previous output is restored."""
+def test_activation_rename_failure_restores_previous_output(tmp_path):
+    """If the atomic symlink-activation os.rename fails, previous output is restored.
+
+    The activation step is os.rename(next_link, output_root) — a single syscall.
+    If it fails after the migration rename moved output_root aside, the exception
+    handler must restore the migrated directory back to output_root.
+    """
     output_root = tmp_path / "output"
     output_root.mkdir()
     (output_root / "index.html").write_text("<html>Old</html>")
@@ -586,14 +591,8 @@ def test_second_rename_failure_restores_previous_output(tmp_path):
     router = _make_router([homepage])
     svc = SiteBuildService(config, router)
 
-    real_rename = Path.rename
-    call_count = [0]
-
-    def fail_second_rename(self, target):
-        call_count[0] += 1
-        if call_count[0] == 2:  # Second rename is staging → output_root
-            raise OSError("rename failed")
-        return real_rename(self, target)
+    def fail_os_rename(src, dst):
+        raise OSError("rename failed")
 
     def fake_run(cmd, **kwargs):
         tmp_out = kwargs["env"]["CAULDRON_OUTDIR"]
@@ -601,11 +600,11 @@ def test_second_rename_failure_restores_previous_output(tmp_path):
         return _ok_proc()
 
     with patch("subprocess.run", side_effect=fake_run):
-        with patch.object(Path, "rename", fail_second_rename):
+        with patch("cauldron_site_astro.service.os.rename", side_effect=fail_os_rename):
             result = svc.build()
 
     assert result.ok is False
-    # Output must be restored
+    # Previous output must be restored
     assert output_root.exists()
     assert (output_root / "index.html").read_text() == "<html>Old</html>"
 

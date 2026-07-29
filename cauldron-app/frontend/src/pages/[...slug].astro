@@ -3,22 +3,20 @@ import { readFileSync } from 'fs';
 import { marked } from 'marked';
 import Base from '../layouts/Base.astro';
 
-function buildNavItems(pages: any[]): Array<{ title: string; route: string }> {
-  return pages
-    .filter((p) => {
-      // If the page has an explicit nav_visible field, respect it.
-      if ('nav_visible' in p) return Boolean(p.nav_visible);
-      // Otherwise include if the navigation label is non-empty.
-      const label = (p.navigation_title || p.title || '').trim();
-      return label !== '';
-    })
-    .map((p) => ({
-      title: (p.navigation_title || p.title || '').trim(),
-      route: p.route,
-    }));
-}
-
 export function getStaticPaths() {
+  function buildNavItems(pages: any[]): Array<{ title: string; route: string }> {
+    return pages
+      .filter((p) => {
+        if ('nav_visible' in p) return Boolean(p.nav_visible);
+        const label = (p.navigation_title || p.title || '').trim();
+        return label !== '';
+      })
+      .map((p) => ({
+        title: (p.navigation_title || p.title || '').trim(),
+        route: p.route,
+      }));
+  }
+
   const manifestPath = process.env.CAULDRON_MANIFEST;
   if (!manifestPath) {
     throw new Error('CAULDRON_MANIFEST environment variable is required.');

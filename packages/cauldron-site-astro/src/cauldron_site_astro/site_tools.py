@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from cauldron_site_astro.service import get_build_service
+
 if TYPE_CHECKING:
     from cauldron_ai_admin.tools import AdminAIToolRegistry
 
@@ -179,7 +181,6 @@ def _handle_site_inspect(context, **kwargs):
     from pathlib import Path
 
     from cauldron_ai_admin.tools import AdminAIToolResult
-    from cauldron_site_astro.service import get_build_service
 
     try:
         svc = get_build_service()
@@ -220,7 +221,6 @@ def _handle_site_inspect(context, **kwargs):
 
 def _handle_stage_theme(context, *, css_content, description="", **kwargs):
     from cauldron_ai_admin.tools import AdminAIToolResult
-    from cauldron_site_astro.service import get_build_service
 
     try:
         svc = get_build_service()
@@ -269,7 +269,6 @@ def _handle_prepare_preview(context, *, description="", **kwargs):
     from pathlib import Path
 
     from cauldron_ai_admin.tools import AdminAIToolResult
-    from cauldron_site_astro.service import get_build_service
 
     try:
         svc = get_build_service()
@@ -343,7 +342,6 @@ def _handle_inspect_preview(context, *, preview_id, **kwargs):
     from pathlib import Path
 
     from cauldron_ai_admin.tools import AdminAIToolResult
-    from cauldron_site_astro.service import get_build_service
 
     try:
         svc = get_build_service()
@@ -388,7 +386,6 @@ def _handle_inspect_preview(context, *, preview_id, **kwargs):
 
 def _handle_publish(context, *, confirm, **kwargs):
     from cauldron_ai_admin.tools import AdminAIToolResult
-    from cauldron_site_astro.service import get_build_service
 
     if not confirm:
         return AdminAIToolResult(

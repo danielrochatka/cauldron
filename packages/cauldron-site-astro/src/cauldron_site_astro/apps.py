@@ -12,6 +12,7 @@ class CauldronSiteAstroConfig(AppConfig):
 
         _connect_signals()
         _register_site_tools()
+        _register_site_tool_prompts()
 
 
 def _register_site_tools() -> None:
@@ -21,6 +22,14 @@ def _register_site_tools() -> None:
         site_tools.register(get_tool_registry())
     except ImportError:
         pass  # cauldron-ai-admin not installed
+
+
+def _register_site_tool_prompts() -> None:
+    try:
+        from cauldron_site_astro.site_tool_prompts import register_builtin_site_tool_prompts
+        register_builtin_site_tool_prompts()
+    except ImportError:
+        pass  # cauldron-ai not installed
 
 
 def _connect_signals() -> None:

@@ -229,6 +229,254 @@ def test_content_not_published_on_build_failure(tmp_path):
     assert cs.status == SiteChangeSet.PUBLISH_FAILED
 
 
+# ---------------------------------------------------------------------------
+# Post-build failure path tests: snapshot/restore guarantees
+# ---------------------------------------------------------------------------
+
+
+def _make_real_svc(config):
+    """Real SiteBuildService with a mock router (no DB access needed)."""
+    from unittest.mock import MagicMock
+    from cauldron_site_astro.service import SiteBuildService
+    return SiteBuildService(config, MagicMock())
+
+
+def _fake_build_ok(new_filename="new.html"):
+    """Return a build_preview side_effect that writes one file to output_dir."""
+    from cauldron_site_astro.service import BuildResult
+
+    def _impl(**kwargs):
+        out = Path(kwargs["output_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        (out / new_filename).write_text("<html>new</html>")
+        return BuildResult(ok=True, pages_built=1, output_dir=str(out))
+
+    return _impl
+
+
+def test_output_promotion_failure__content_unpublished_previous_output_intact(tmp_path):
+    """If output promotion fails, no content requests are applied.
+
+    _promote_output_snapshotted fails before performing any rename, so
+    output_root content is entirely unchanged after the failed publish.
+    """
+    from unittest.mock import MagicMock, patch
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_site_astro.site_tools import _handle_publish
+
+    ctx = _ctx("p-out-fail")
+    config = _make_config(tmp_path)
+    output_root = Path(config.output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "original.html").write_text("<html>original</html>")
+
+    cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        content_request_ids=["req-out"],
+        affected_item_ids=["item-out"],
+    )
+
+    svc = _make_real_svc(config)
+    svc.build_preview = MagicMock(side_effect=_fake_build_ok())
+    svc.promote_output_with_backup = MagicMock(side_effect=OSError("no space left"))
+
+    fake_cs = MagicMock(ok=True, request_version=1)
+    fake_svc = MagicMock()
+    fake_svc.validate_change_request.return_value = fake_cs
+
+    with patch("cauldron_site_astro.site_tools._get_content_operation_service", return_value=fake_svc):
+        with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+            result = _handle_publish(ctx, change_set_id=str(cs.id), confirm=True)
+
+    assert result.success is False
+    fake_svc.apply_change_request.assert_not_called()
+
+    assert (output_root / "original.html").exists(), "previous output must be intact"
+    assert not (output_root / "new.html").exists()
+
+    cs.refresh_from_db()
+    assert cs.status == SiteChangeSet.PUBLISH_FAILED
+
+
+def test_css_promotion_failure__content_unpublished_output_restored(tmp_path):
+    """If CSS promotion fails after the output swap, the output is restored.
+
+    Sequence: output promoted → CSS promote raises → output restored from
+    snapshot → no DB changes applied. active.css is never created.
+    """
+    from unittest.mock import MagicMock, patch
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_site_astro.site_tools import _handle_publish
+    from cauldron_site_astro.theme import SiteThemeService
+
+    ctx = _ctx("p-css-fail")
+    theme_dir = tmp_path / "theme"
+    config = _make_config(tmp_path, theme_root=str(theme_dir))
+    output_root = Path(config.output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "original.html").write_text("<html>original</html>")
+
+    cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        content_request_ids=["req-css"],
+        staged_theme_css="body { color: crimson; }",
+        affected_item_ids=["item-css"],
+    )
+
+    svc = _make_real_svc(config)
+    svc.build_preview = MagicMock(side_effect=_fake_build_ok())
+
+    fake_cs = MagicMock(ok=True, request_version=1)
+    fake_content_svc = MagicMock()
+    fake_content_svc.validate_change_request.return_value = fake_cs
+
+    with patch("cauldron_site_astro.site_tools._get_content_operation_service", return_value=fake_content_svc):
+        with patch("cauldron_site_astro.theme.SiteThemeService.promote_staged", side_effect=OSError("disk full")):
+            with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+                result = _handle_publish(ctx, change_set_id=str(cs.id), confirm=True)
+
+    assert result.success is False
+    fake_content_svc.apply_change_request.assert_not_called()
+
+    assert SiteThemeService(theme_dir).get_active_css() == "", "active CSS must be unchanged"
+    assert (output_root / "original.html").exists(), "previous output must be restored"
+    assert not (output_root / "new.html").exists(), "new output must not remain live"
+
+    cs.refresh_from_db()
+    assert cs.status == SiteChangeSet.PUBLISH_FAILED
+
+
+def test_db_apply_failure__output_and_css_restored(tmp_path):
+    """If the DB transaction fails, both output and active CSS are rolled back.
+
+    By the time apply runs, both FS promotions have succeeded. The
+    transaction.atomic() block raises, triggering DB rollback. The publish
+    handler then uses the output snapshot and the in-memory CSS snapshot to
+    restore both FS artefacts.
+    """
+    from unittest.mock import MagicMock, patch
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_site_astro.site_tools import _handle_publish
+    from cauldron_site_astro.theme import SiteThemeService
+
+    ctx = _ctx("p-db-fail")
+    theme_dir = tmp_path / "theme"
+    config = _make_config(tmp_path, theme_root=str(theme_dir))
+    output_root = Path(config.output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "original.html").write_text("<html>original</html>")
+
+    prev_css = "body { color: green; }"
+    SiteThemeService(theme_dir).set_active_css(prev_css)
+
+    cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        content_request_ids=["req-db"],
+        staged_theme_css="body { color: blue; }",
+        affected_item_ids=["item-db"],
+    )
+
+    svc = _make_real_svc(config)
+    svc.build_preview = MagicMock(side_effect=_fake_build_ok())
+
+    fake_validation = MagicMock(ok=True, request_version=1)
+    fake_content_svc = MagicMock()
+    fake_content_svc.validate_change_request.return_value = fake_validation
+    fake_content_svc.apply_change_request.side_effect = Exception("DB constraint failed")
+
+    with patch("cauldron_site_astro.site_tools._get_content_operation_service", return_value=fake_content_svc):
+        with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+            result = _handle_publish(ctx, change_set_id=str(cs.id), confirm=True)
+
+    assert result.success is False
+    fake_content_svc.apply_change_request.assert_called_once()
+
+    assert (output_root / "original.html").exists(), "previous output must be restored"
+    assert not (output_root / "new.html").exists(), "new output must not remain after DB rollback"
+    assert SiteThemeService(theme_dir).get_active_css() == prev_css, \
+        "active CSS must be restored after DB rollback"
+
+    cs.refresh_from_db()
+    assert cs.status == SiteChangeSet.PUBLISH_FAILED
+
+
+def test_retry_publish_failed_succeeds_without_double_apply(tmp_path):
+    """A PUBLISH_FAILED change set can be retried and completes cleanly.
+
+    Because all applies run inside a single transaction.atomic() that
+    either fully commits or fully rolls back, a retry always starts from
+    a clean content-store state; req-retry is applied exactly once.
+    """
+    from unittest.mock import MagicMock, patch
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_site_astro.site_tools import _handle_publish
+
+    ctx = _ctx("p-retry")
+    config = _make_config(tmp_path)
+
+    cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.PUBLISH_FAILED,
+        content_request_ids=["req-retry"],
+        staged_theme_css="",
+        affected_item_ids=["item-retry"],
+    )
+
+    svc = _make_real_svc(config)
+    svc.build_preview = MagicMock(side_effect=_fake_build_ok())
+
+    fake_validation = MagicMock(ok=True, request_version=1)
+    fake_apply_ok = MagicMock(ok=True)
+    fake_content_svc = MagicMock()
+    fake_content_svc.validate_change_request.return_value = fake_validation
+    fake_content_svc.apply_change_request.return_value = fake_apply_ok
+
+    with patch("cauldron_site_astro.site_tools._get_content_operation_service", return_value=fake_content_svc):
+        with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+            result = _handle_publish(ctx, change_set_id=str(cs.id), confirm=True)
+
+    assert result.success is True, result.message
+    fake_content_svc.apply_change_request.assert_called_once_with(
+        "req-retry",
+        user=ctx.actor,
+        expected_version=1,
+    )
+
+    cs.refresh_from_db()
+    assert cs.status == SiteChangeSet.PUBLISHED
+
+
+def test_promote_output_no_partial_directory_exposed(tmp_path):
+    """promote_output leaves no .staging-* or .previous-* directories.
+
+    The partial copy lives at output_root.staging-<uuid> (never live).
+    Only after the copy completes does the atomic os.rename() swap it into
+    output_root. Callers therefore never observe a partially-copied tree.
+    """
+    from cauldron_site_astro.service import SiteBuildService
+
+    config = _make_config(tmp_path)
+    svc = SiteBuildService(config, MagicMock())
+
+    output_root = Path(config.output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "old.html").write_text("<html>old</html>")
+
+    new_build = tmp_path / "new_build"
+    new_build.mkdir()
+    (new_build / "new.html").write_text("<html>new</html>")
+
+    svc.promote_output(new_build)
+
+    assert (output_root / "new.html").exists()
+    assert not (output_root / "old.html").exists()
+
+    parent = output_root.parent
+    staging_dirs = list(parent.glob(output_root.name + ".staging-*"))
+    previous_dirs = list(parent.glob(output_root.name + ".previous-*"))
+    assert staging_dirs == [], f"staging artefacts must be cleaned up: {staging_dirs}"
+    assert previous_dirs == [], f"previous artefacts must be cleaned up: {previous_dirs}"
+
+
 def test_full_workflow_prepare_then_inspect_then_publish(tmp_path):
     """End-to-end: theme-only change set goes through the full lifecycle.
 

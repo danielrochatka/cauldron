@@ -37,10 +37,13 @@ def _promote_output(src_dir: Path | str, output_root: Path) -> None:
 
     Steps:
       1. Acquire an exclusive flock on output_root + ".swap.lock"
-      2. Copy src_dir → staging path
-      3. Rename output_root → previous path (if output_root exists)
+      2. Copy src_dir → staging path  (not yet live)
+      3. Rename output_root → previous path  (if output_root exists)
       4. Rename staging → output_root  (atomic on same filesystem)
       5. Remove previous path
+
+    The live output_root transitions directly from fully-old to fully-new in
+    step 4; no partially-copied tree is ever exposed.
 
     On any exception in steps 2–5:
       - Restore previous → output_root if output_root is missing
@@ -59,22 +62,68 @@ def _promote_output(src_dir: Path | str, output_root: Path) -> None:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
         try:
-            # Step 2: copy src → staging
             shutil.copytree(str(src_dir), str(staging))
 
-            # Step 3: move existing output out of the way
             if output_root.exists():
                 output_root.rename(previous)
 
-            # Step 4: move staging into place (atomic on same filesystem)
             staging.rename(output_root)
 
-            # Step 5: remove old output
             if previous.exists():
                 shutil.rmtree(previous)
 
         except Exception:
-            # Restore: if previous exists and output_root is gone, put it back
+            if previous.exists() and not output_root.exists():
+                try:
+                    previous.rename(output_root)
+                except Exception:
+                    pass
+            shutil.rmtree(staging, ignore_errors=True)
+            shutil.rmtree(previous, ignore_errors=True)
+            raise
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+
+
+def _promote_output_snapshotted(src_dir: Path | str, output_root: Path) -> "Path | None":
+    """Like _promote_output but retains the displaced directory as a rollback snapshot.
+
+    Identical to _promote_output except step 5 is skipped: the previous
+    output_root is kept at output_root.previous-<uuid> instead of deleted.
+
+    Returns the Path of that snapshot, or None if output_root did not exist
+    (first-ever publish — nothing to snapshot).
+
+    The caller MUST subsequently call either:
+      - _promote_output(snapshot, output_root) + rmtree(snapshot)  — to roll back, OR
+      - shutil.rmtree(snapshot)                                     — to commit (discard)
+    """
+    src_dir = Path(src_dir)
+    output_root.parent.mkdir(parents=True, exist_ok=True)
+
+    lock_path = Path(str(output_root) + ".swap.lock")
+    staging = Path(str(output_root) + ".staging-" + uuid.uuid4().hex[:8])
+    previous = Path(str(output_root) + ".previous-" + uuid.uuid4().hex[:8])
+    had_previous = False
+
+    lock_fd = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+        try:
+            shutil.copytree(str(src_dir), str(staging))
+
+            if output_root.exists():
+                output_root.rename(previous)
+                had_previous = True
+
+            staging.rename(output_root)
+
+            # Do NOT remove previous — caller holds it as a rollback snapshot.
+            return previous if had_previous else None
+
+        except Exception:
             if previous.exists() and not output_root.exists():
                 try:
                     previous.rename(output_root)
@@ -269,17 +318,52 @@ class SiteBuildService:
 
 
     def promote_output(self, src_dir: "str | Path") -> None:
-        """Atomically replace the live output_root with src_dir.
-
-        Called by the publish workflow after a successful build so that
-        output promotion and content-request application can be ordered
-        correctly: build first, apply content changes, then promote.
-        """
+        """Atomically replace the live output_root with src_dir (no rollback snapshot)."""
         if not self._config.output_root:
             raise ValueError(
                 "cauldron.site.astro output_root must be configured."
             )
         _promote_output(src_dir, Path(self._config.output_root))
+
+    def promote_output_with_backup(self, src_dir: "str | Path") -> "Path | None":
+        """Atomically replace output_root with src_dir, keeping the previous as a snapshot.
+
+        Returns the Path of the kept-aside previous directory, or None if
+        output_root did not exist yet (first publish).
+
+        The caller MUST eventually call either:
+          - ``restore_output(snapshot)``       — on failure (rolls back + discards)
+          - ``discard_output_backup(snapshot)`` — on success (discards the old copy)
+        """
+        if not self._config.output_root:
+            raise ValueError(
+                "cauldron.site.astro output_root must be configured."
+            )
+        return _promote_output_snapshotted(src_dir, Path(self._config.output_root))
+
+    def restore_output(self, snapshot: "Path | None") -> None:
+        """Replace output_root with the snapshot from promote_output_with_backup.
+
+        Silently no-ops if snapshot is None or has already been removed.
+        After this call the snapshot path no longer exists — the caller
+        should set their reference to None to prevent double-cleanup.
+        """
+        if snapshot is None:
+            return
+        snapshot = Path(snapshot)
+        if not snapshot.exists():
+            return
+        if not self._config.output_root:
+            return
+        # _promote_output copies snapshot → staging, atomically swaps into output_root,
+        # and discards whatever was currently in output_root.
+        _promote_output(snapshot, Path(self._config.output_root))
+        shutil.rmtree(str(snapshot), ignore_errors=True)
+
+    def discard_output_backup(self, snapshot: "Path | None") -> None:
+        """Discard the snapshot after a successful publish (commit path)."""
+        if snapshot is not None:
+            shutil.rmtree(str(snapshot), ignore_errors=True)
 
     def build_preview(
         self,

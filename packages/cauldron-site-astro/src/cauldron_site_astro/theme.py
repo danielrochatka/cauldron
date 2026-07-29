@@ -64,3 +64,13 @@ class SiteThemeService:
         """Remove any staged draft without promoting it."""
         with self._lock:
             self._staged.unlink(missing_ok=True)
+
+    def set_active_css(self, content: str) -> None:
+        """Write content directly to active.css, replacing any existing stylesheet.
+
+        Used only by the publish rollback path to restore a previously
+        snapshotted active CSS after a failed database transaction.
+        """
+        with self._lock:
+            self._ensure_dir()
+            self._active.write_text(content, encoding="utf-8")

@@ -23,6 +23,7 @@ from cauldron_ai.provider_configuration import (
 )
 from cauldron_ai_admin.service import (
     AdminAIService,
+    _bound_diagnostic_summary,
     _build_provider_error_summary,
     _classify_provider_error,
     _measure_request_bytes,
@@ -653,3 +654,134 @@ def test_diagnostic_stores_byte_count_not_content():
     assert "messages" not in data
     assert "system" not in data
     assert "do something secret" not in run.error_summary
+
+
+# ---------------------------------------------------------------------------
+# _bound_diagnostic_summary — JSON-aware bounding
+# ---------------------------------------------------------------------------
+
+_REQUIRED_SUMMARY_FIELDS = (
+    "error_code", "turn", "attempt", "elapsed_ms", "remaining_ms",
+    "request_bytes", "tool_result_bytes", "retryable",
+)
+
+
+def _base_fields(**overrides) -> dict:
+    """Minimal valid diagnostic field dict."""
+    base = {
+        "error_code": "provider.connection_error",
+        "exc_class": "AIProviderConnectionError",
+        "turn": 0,
+        "attempt": 1,
+        "elapsed_ms": 100,
+        "remaining_ms": 25000,
+        "request_bytes": 512,
+        "tool_result_bytes": 0,
+        "retryable": True,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_bound_summary_fits_within_budget_with_no_truncation_flag():
+    """A summary that fits naturally must parse cleanly and carry no truncated key."""
+    text = _bound_diagnostic_summary(_base_fields(provider_name="openai", model_name="gpt-4o"))
+    assert len(text.encode("utf-8")) <= 512
+    data = json.loads(text)
+    assert "truncated" not in data
+
+
+def test_bound_summary_always_valid_json_with_max_length_model_name():
+    """A 200-char model name must produce valid JSON ≤ 512 bytes."""
+    fields = _base_fields(model_name="m" * 200, provider_name="openai")
+    text = _bound_diagnostic_summary(fields)
+    json.loads(text)  # must not raise
+    assert len(text.encode("utf-8")) <= 512
+
+
+def test_bound_summary_always_valid_json_with_max_length_request_id():
+    """A 64-char provider_request_id must produce valid JSON ≤ 512 bytes."""
+    fields = _base_fields(
+        model_name="gpt-4o",
+        provider_request_id="req-" + "x" * 60,
+        http_status=503,
+        retry_after=120.0,
+    )
+    text = _bound_diagnostic_summary(fields)
+    json.loads(text)  # must not raise
+    assert len(text.encode("utf-8")) <= 512
+
+
+def test_bound_summary_never_exceeds_512_bytes_with_all_optional_fields():
+    """Every combination of max-size optional fields must still fit in 512 bytes."""
+    fields = _base_fields(
+        model_name="m" * 200,
+        provider_name="p" * 50,
+        provider_request_id="r" * 64,
+        exc_class="A" * 80,
+        http_status=503,
+        retry_after=999.0,
+    )
+    text = _bound_diagnostic_summary(fields)
+    assert len(text.encode("utf-8")) <= 512
+
+
+def test_bound_summary_required_fields_survive_truncation():
+    """Required diagnostic fields must remain present after optional fields are dropped."""
+    fields = _base_fields(model_name="m" * 300, provider_request_id="r" * 64)
+    text = _bound_diagnostic_summary(fields)
+    data = json.loads(text)
+    for key in _REQUIRED_SUMMARY_FIELDS:
+        assert key in data, f"required field missing after truncation: {key!r}"
+    assert data["truncated"] is True
+
+
+def test_bound_summary_optional_fields_dropped_deterministically():
+    """Given the same inputs the bounding function must always produce the same output."""
+    fields = _base_fields(
+        model_name="m" * 200,
+        provider_request_id="r" * 64,
+        retry_after=60.0,
+        http_status=429,
+    )
+    assert _bound_diagnostic_summary(fields) == _bound_diagnostic_summary(fields)
+
+
+def test_bound_summary_excludes_sensitive_content():
+    """No exception message text, credentials, or raw content may appear in the summary."""
+    fields = _base_fields(
+        model_name="gpt-4o",
+        provider_name="openai",
+        provider_request_id="req-safe-id",
+    )
+    text = _bound_diagnostic_summary(fields)
+    data = json.loads(text)
+    # The function only serializes what it's given; verify no raw strings
+    # from exception messages or sensitive patterns are injected.
+    for value in data.values():
+        if isinstance(value, str):
+            assert "sk-" not in value
+            assert "password" not in value.lower()
+            assert "secret" not in value.lower()
+
+
+def test_persisted_error_summary_is_always_valid_json_with_long_model_name():
+    """End-to-end: a long model name must not cause the persisted summary to be invalid JSON."""
+    exc = AIProviderConnectionError("net fail")
+    summary = _build_provider_error_summary(
+        exc=exc,
+        error_code="provider.connection_error",
+        turn=0,
+        elapsed_ms=100,
+        remaining_ms=25000,
+        retryable=True,
+        attempt=2,
+        request_bytes=1024,
+        tool_result_bytes=0,
+        provider_name="openai",
+        model_name="gpt-4o-" + "x" * 300,  # 307 chars — forces truncation
+    )
+    assert len(summary.encode("utf-8")) <= 512
+    data = json.loads(summary)
+    assert data["error_code"] == "provider.connection_error"
+    assert data["truncated"] is True

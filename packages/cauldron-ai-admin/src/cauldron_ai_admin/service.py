@@ -157,6 +157,60 @@ def _classify_provider_error(exc: Exception) -> tuple[str, bool]:
     return "provider.internal_error", False
 
 
+# Optional diagnostic fields dropped (in this order) when the JSON summary
+# would exceed the persistence byte limit.  Required fields — error_code,
+# turn, attempt, elapsed_ms, remaining_ms, request_bytes, tool_result_bytes,
+# retryable — are never removed.
+_SUMMARY_OPTIONAL_DROP_ORDER: tuple[str, ...] = (
+    "retry_after",
+    "provider_request_id",
+    "model_name",
+    "provider_name",
+    "http_status",
+    "exc_class",
+)
+
+
+def _bound_diagnostic_summary(fields: dict, *, max_bytes: int = 512) -> str:
+    """Return a JSON-serialized diagnostic dict guaranteed ≤ max_bytes UTF-8.
+
+    Works on the raw field dict *before* serialization so the output is
+    always valid JSON — never byte-truncates an already-serialized string.
+    If the full serialization fits, it is returned unchanged.  Otherwise
+    optional fields are dropped in :data:`_SUMMARY_OPTIONAL_DROP_ORDER`
+    order and a ``truncated`` flag is added to signal the loss.  Required
+    numeric fields survive in all cases.
+    """
+    def _serialize(d: dict) -> str:
+        return json.dumps(d, sort_keys=True)
+
+    def _fits(text: str) -> bool:
+        return len(text.encode("utf-8")) <= max_bytes
+
+    text = _serialize(fields)
+    if _fits(text):
+        return text
+
+    out = dict(fields)
+    out["truncated"] = True
+    for key in _SUMMARY_OPTIONAL_DROP_ORDER:
+        if key not in out:
+            continue
+        del out[key]
+        text = _serialize(out)
+        if _fits(text):
+            return text
+
+    # Final fallback: keep only the eight required numeric/bool fields.
+    _REQUIRED = frozenset({
+        "error_code", "turn", "attempt", "elapsed_ms", "remaining_ms",
+        "request_bytes", "tool_result_bytes", "retryable",
+    })
+    minimal = {k: fields[k] for k in _REQUIRED if k in fields}
+    minimal["truncated"] = True
+    return _serialize(minimal)
+
+
 def _build_provider_error_summary(
     *,
     exc: Exception,
@@ -175,6 +229,7 @@ def _build_provider_error_summary(
 
     All fields are safe to persist: exception messages, request bodies,
     credentials, headers, and raw response content are never included.
+    The returned string is guaranteed to be valid JSON ≤ 512 UTF-8 bytes.
     """
     fields: dict[str, Any] = {
         "error_code": error_code,
@@ -201,7 +256,7 @@ def _build_provider_error_summary(
     retry_after = getattr(exc, "retry_after", None)
     if isinstance(retry_after, (int, float)) and retry_after > 0:
         fields["retry_after"] = float(retry_after)
-    return json.dumps(fields, sort_keys=True)
+    return _bound_diagnostic_summary(fields)
 
 
 def _measure_request_bytes(request: AIModelRequest) -> int:

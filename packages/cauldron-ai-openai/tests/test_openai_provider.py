@@ -649,6 +649,23 @@ def test_factory_test_connection_no_model_returns_config_error():
     assert result.status == "configuration_error"
 
 
+def test_factory_test_connection_timeout_returns_timeout_status(monkeypatch):
+    """An OpenAI SDK timeout during test_connection must produce status='timeout', not 'error'."""
+    import openai
+    mock_client = MagicMock()
+    mock_client.responses.create.side_effect = openai.APITimeoutError(
+        request=MagicMock(),
+    )
+    monkeypatch.setattr(openai, "OpenAI", lambda **kw: mock_client)
+    factory = OpenAIProviderFactory()
+    result = factory.test_connection({"model": "gpt-4o"}, {"api_key": "sk-test"})
+    assert result.success is False
+    assert result.status == "timeout"
+    assert result.latency_ms is not None
+    # Message must be credential-safe — no API key or raw SDK text.
+    assert "sk-test" not in result.message
+
+
 # ---------------------------------------------------------------------------
 # Legacy model_name compatibility
 # ---------------------------------------------------------------------------

@@ -536,6 +536,13 @@ class OpenAIProviderFactory:
                 message=str(exc),
                 latency_ms=(time.monotonic() - t0) * 1000,
             )
+        except AIProviderTimeoutError as exc:
+            return AIProviderConnectionResult(
+                success=False,
+                status="timeout",
+                message=str(exc),
+                latency_ms=(time.monotonic() - t0) * 1000,
+            )
         except AIProviderConnectionError as exc:
             return AIProviderConnectionResult(
                 success=False,

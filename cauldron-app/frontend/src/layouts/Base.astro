@@ -1,4 +1,21 @@
 ---
+import Navigation from '../components/Navigation.astro';
+
+interface NavItem {
+  title: string;
+  route: string;
+  current?: boolean;
+}
+interface Props {
+  title: string;
+  seoTitle?: string;
+  metaDescription?: string;
+  robotsIndex?: boolean;
+  robotsFollow?: boolean;
+  canonicalUrl?: string;
+  navItems?: NavItem[];
+  isPreview?: boolean;
+}
 const {
   title,
   seoTitle,
@@ -6,6 +23,8 @@ const {
   robotsIndex = true,
   robotsFollow = true,
   canonicalUrl,
+  navItems = [],
+  isPreview = false,
 } = Astro.props;
 
 const pageTitle = seoTitle || title || 'Cauldron';
@@ -23,8 +42,15 @@ const robots = [
     {metaDescription && <meta name="description" content={metaDescription} />}
     <meta name="robots" content={robots} />
     {canonicalUrl && <link rel="canonical" href={canonicalUrl} />}
+    <link rel="stylesheet" href="/theme.css" />
   </head>
   <body>
+    {isPreview && (
+      <div class="cauldron-preview-banner" role="alert" aria-live="polite">
+        Preview — not published
+      </div>
+    )}
+    <Navigation items={navItems} />
     <slot />
   </body>
 </html>

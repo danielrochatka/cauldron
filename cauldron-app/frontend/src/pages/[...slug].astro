@@ -3,26 +3,52 @@ import { readFileSync } from 'fs';
 import { marked } from 'marked';
 import Base from '../layouts/Base.astro';
 
+function buildNavItems(pages: any[]): Array<{ title: string; route: string }> {
+  return pages
+    .filter((p) => {
+      // If the page has an explicit nav_visible field, respect it.
+      if ('nav_visible' in p) return Boolean(p.nav_visible);
+      // Otherwise include if the navigation label is non-empty.
+      const label = (p.navigation_title || p.title || '').trim();
+      return label !== '';
+    })
+    .map((p) => ({
+      title: (p.navigation_title || p.title || '').trim(),
+      route: p.route,
+    }));
+}
+
 export function getStaticPaths() {
   const manifestPath = process.env.CAULDRON_MANIFEST;
   if (!manifestPath) {
     throw new Error('CAULDRON_MANIFEST environment variable is required.');
   }
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  const allNavItems = buildNavItems(manifest.pages || []);
 
-  return manifest.pages.map((page) => {
+  return (manifest.pages || []).map((page: any) => {
     // Homepage: route "/" → params.slug = undefined → generates index.html
     // Other: route "/about/" → params.slug = "about" → generates about/index.html
-    const slug = page.route === '/' ? undefined : page.route.replace(/^\//, '').replace(/\/$/, '');
+    const slug =
+      page.route === '/'
+        ? undefined
+        : page.route.replace(/^\//, '').replace(/\/$/, '');
     return {
       params: { slug },
-      props: { page },
+      props: { page, allNavItems },
     };
   });
 }
 
-const { page } = Astro.props;
-const bodyHtml = marked.parse(page.body || '');
+const { page, allNavItems } = Astro.props;
+const bodyHtml = await marked.parse(page.body || '');
+const isPreview = process.env.CAULDRON_IS_PREVIEW === '1';
+
+// Mark which nav item is current for this page.
+const navItems = allNavItems.map((item: { title: string; route: string }) => ({
+  ...item,
+  current: item.route === page.route,
+}));
 ---
 <Base
   title={page.title}
@@ -31,6 +57,8 @@ const bodyHtml = marked.parse(page.body || '');
   robotsIndex={page.robots_index}
   robotsFollow={page.robots_follow}
   canonicalUrl={page.canonical_url}
+  navItems={navItems}
+  isPreview={isPreview}
 >
   <main>
     <h1>{page.title}</h1>

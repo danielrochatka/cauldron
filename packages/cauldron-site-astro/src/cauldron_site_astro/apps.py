@@ -11,6 +11,16 @@ class CauldronSiteAstroConfig(AppConfig):
         from . import checks  # noqa: F401
 
         _connect_signals()
+        _register_site_tools()
+
+
+def _register_site_tools() -> None:
+    try:
+        from cauldron_ai_admin.tools import get_tool_registry
+        from cauldron_site_astro import site_tools
+        site_tools.register(get_tool_registry())
+    except ImportError:
+        pass  # cauldron-ai-admin not installed
 
 
 def _connect_signals() -> None:

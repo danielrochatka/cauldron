@@ -627,3 +627,268 @@ def test_existing_output_readable_after_every_failed_build(tmp_path):
         result = svc.build()
     assert result.ok is False
     assert sentinel.read_text() == "<html>Sentinel</html>"
+
+
+# ---------------------------------------------------------------------------
+# Theme in manifest
+# ---------------------------------------------------------------------------
+
+
+def test_manifest_includes_theme_key_without_theme_root(tmp_path: Path):
+    """When theme_root is empty, manifest has theme.css_content == ''."""
+    homepage = _make_item("homepage", "homepage", data={"title": "Home"}, body="Hello")
+    config = _make_config(tmp_path)
+    router = _make_router([homepage])
+    svc = SiteBuildService(config, router)
+
+    captured_manifest = {}
+
+    def fake_run(cmd, **kwargs):
+        manifest_path = kwargs["env"]["CAULDRON_MANIFEST"]
+        tmp_out = kwargs["env"]["CAULDRON_OUTDIR"]
+        Path(tmp_out).mkdir(parents=True, exist_ok=True)
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            captured_manifest.update(json.load(f))
+        return _ok_proc()
+
+    with patch("subprocess.run", side_effect=fake_run):
+        result = svc.build()
+
+    assert result.ok is True
+    assert "theme" in captured_manifest
+    assert "css_content" in captured_manifest["theme"]
+    assert captured_manifest["theme"]["css_content"] == ""
+
+
+def test_manifest_includes_active_theme_css_when_theme_root_set(tmp_path: Path):
+    """When theme_root has active.css, its content appears in manifest."""
+    # Set up active.css
+    theme_dir = tmp_path / "theme"
+    theme_dir.mkdir()
+    (theme_dir / "active.css").write_text("body { background: #fff; }", encoding="utf-8")
+
+    homepage = _make_item("homepage", "homepage", data={"title": "Home"}, body="Hello")
+    config = _make_config(tmp_path, theme_root=str(theme_dir))
+    router = _make_router([homepage])
+    svc = SiteBuildService(config, router)
+
+    captured_manifest = {}
+
+    def fake_run(cmd, **kwargs):
+        manifest_path = kwargs["env"]["CAULDRON_MANIFEST"]
+        tmp_out = kwargs["env"]["CAULDRON_OUTDIR"]
+        Path(tmp_out).mkdir(parents=True, exist_ok=True)
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            captured_manifest.update(json.load(f))
+        return _ok_proc()
+
+    with patch("subprocess.run", side_effect=fake_run):
+        result = svc.build()
+
+    assert result.ok is True
+    assert captured_manifest["theme"]["css_content"] == "body { background: #fff; }"
+
+
+# ---------------------------------------------------------------------------
+# build_preview
+# ---------------------------------------------------------------------------
+
+
+def test_build_preview_missing_frontend_root_returns_error(tmp_path: Path):
+    """Empty frontend_root short-circuits before any subprocess call."""
+    config = SiteAstroConfig(
+        frontend_root="",
+        output_root=str(tmp_path / "out"),
+        previews_root=str(tmp_path / "previews"),
+    )
+    router = _make_router([])
+    svc = SiteBuildService(config, router)
+
+    with patch("subprocess.run") as mock_run:
+        result = svc.build_preview(output_dir=tmp_path / "preview_out")
+
+    assert result.ok is False
+    assert "frontend_root" in result.error
+    mock_run.assert_not_called()
+
+
+def test_build_preview_no_pages_creates_empty_output(tmp_path: Path):
+    """When router returns no items, preview creates an empty output dir."""
+    config = _make_config(tmp_path)
+    router = _make_router([])
+    svc = SiteBuildService(config, router)
+    preview_out = tmp_path / "preview"
+
+    with patch("subprocess.run") as mock_run:
+        result = svc.build_preview(output_dir=preview_out)
+
+    assert result.ok is True
+    assert result.pages_built == 0
+    mock_run.assert_not_called()
+    assert preview_out.exists()
+
+
+def test_build_preview_includes_draft_pages(tmp_path: Path):
+    """build_preview includes draft pages (include_drafts=True)."""
+    draft = _make_item("page.draft", "draft-page", status="draft", data={"title": "Draft"})
+    published = _make_item("homepage", "homepage", status="published", data={"title": "Home"})
+    config = _make_config(tmp_path)
+    router = _make_router([draft, published])
+    svc = SiteBuildService(config, router)
+    preview_out = tmp_path / "preview"
+
+    captured_manifest = {}
+
+    def fake_run(cmd, **kwargs):
+        manifest_path = kwargs["env"]["CAULDRON_MANIFEST"]
+        preview_out.mkdir(parents=True, exist_ok=True)
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            captured_manifest.update(json.load(f))
+        return _ok_proc()
+
+    with patch("subprocess.run", side_effect=fake_run):
+        result = svc.build_preview(output_dir=preview_out)
+
+    assert result.ok is True
+    # Both draft and published pages should appear
+    page_ids = {p["id"] for p in captured_manifest["pages"]}
+    assert "page.draft" in page_ids
+    assert "homepage" in page_ids
+
+
+def test_build_preview_uses_provided_theme_css(tmp_path: Path):
+    """theme_css arg overrides the active theme in the preview manifest."""
+    homepage = _make_item("homepage", "homepage", data={"title": "Home"})
+    config = _make_config(tmp_path)
+    router = _make_router([homepage])
+    svc = SiteBuildService(config, router)
+    preview_out = tmp_path / "preview"
+
+    captured_manifest = {}
+
+    def fake_run(cmd, **kwargs):
+        manifest_path = kwargs["env"]["CAULDRON_MANIFEST"]
+        preview_out.mkdir(parents=True, exist_ok=True)
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            captured_manifest.update(json.load(f))
+        return _ok_proc()
+
+    custom_css = "body { color: green; }"
+    with patch("subprocess.run", side_effect=fake_run):
+        result = svc.build_preview(output_dir=preview_out, theme_css=custom_css)
+
+    assert result.ok is True
+    assert captured_manifest["theme"]["css_content"] == custom_css
+
+
+def test_build_preview_sets_cauldron_is_preview_env(tmp_path: Path):
+    """CAULDRON_IS_PREVIEW=1 is set in the subprocess environment."""
+    homepage = _make_item("homepage", "homepage", data={"title": "Home"})
+    config = _make_config(tmp_path)
+    router = _make_router([homepage])
+    svc = SiteBuildService(config, router)
+    preview_out = tmp_path / "preview"
+
+    captured_env = {}
+
+    def fake_run(cmd, **kwargs):
+        captured_env.update(kwargs["env"])
+        preview_out.mkdir(parents=True, exist_ok=True)
+        return _ok_proc()
+
+    with patch("subprocess.run", side_effect=fake_run):
+        svc.build_preview(output_dir=preview_out)
+
+    assert captured_env.get("CAULDRON_IS_PREVIEW") == "1"
+
+
+def test_build_preview_does_not_touch_output_root(tmp_path: Path):
+    """build_preview writes to output_dir, not output_root."""
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    (output_root / "existing.html").write_text("<html>Live</html>")
+
+    homepage = _make_item("homepage", "homepage", data={"title": "Home"})
+    config = _make_config(tmp_path)
+    router = _make_router([homepage])
+    svc = SiteBuildService(config, router)
+    preview_out = tmp_path / "preview"
+
+    def fake_run(cmd, **kwargs):
+        preview_out.mkdir(parents=True, exist_ok=True)
+        return _ok_proc()
+
+    with patch("subprocess.run", side_effect=fake_run):
+        result = svc.build_preview(output_dir=preview_out)
+
+    assert result.ok is True
+    # Live output_root must be untouched
+    assert (output_root / "existing.html").read_text() == "<html>Live</html>"
+
+
+def test_build_preview_failed_build_returns_error(tmp_path: Path):
+    """When Astro returns non-zero, build_preview returns ok=False."""
+    homepage = _make_item("homepage", "homepage", data={"title": "Home"})
+    config = _make_config(tmp_path)
+    router = _make_router([homepage])
+    svc = SiteBuildService(config, router)
+    preview_out = tmp_path / "preview"
+
+    with patch("subprocess.run", return_value=_fail_proc(returncode=1, stderr="Build error")):
+        result = svc.build_preview(output_dir=preview_out)
+
+    assert result.ok is False
+    assert "exited 1" in result.error
+
+
+def test_build_preview_timeout_returns_error(tmp_path: Path):
+    """TimeoutExpired causes BuildResult(ok=False) with timeout message."""
+    homepage = _make_item("homepage", "homepage", data={"title": "Home"})
+    config = _make_config(tmp_path, build_timeout=5)
+    router = _make_router([homepage])
+    svc = SiteBuildService(config, router)
+    preview_out = tmp_path / "preview"
+
+    def raise_timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=["npm", "run", "build"], timeout=5)
+
+    with patch("subprocess.run", side_effect=raise_timeout):
+        result = svc.build_preview(output_dir=preview_out)
+
+    assert result.ok is False
+    assert "timed out" in result.error
+
+
+def test_build_preview_extra_items_win_deduplication(tmp_path: Path):
+    """Extra items override router items with the same id."""
+    from types import SimpleNamespace
+
+    router_item = _make_item("homepage", "homepage", data={"title": "Old Home"})
+    extra_item = SimpleNamespace(
+        id="homepage",
+        slug="homepage",
+        status="draft",
+        data={"title": "New Home Draft"},
+        body="Updated body",
+    )
+    config = _make_config(tmp_path)
+    router = _make_router([router_item])
+    svc = SiteBuildService(config, router)
+    preview_out = tmp_path / "preview"
+
+    captured_manifest = {}
+
+    def fake_run(cmd, **kwargs):
+        manifest_path = kwargs["env"]["CAULDRON_MANIFEST"]
+        preview_out.mkdir(parents=True, exist_ok=True)
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            captured_manifest.update(json.load(f))
+        return _ok_proc()
+
+    with patch("subprocess.run", side_effect=fake_run):
+        result = svc.build_preview(output_dir=preview_out, extra_items=[extra_item])
+
+    assert result.ok is True
+    # Only one page (deduplicated), and extra_item wins
+    assert len(captured_manifest["pages"]) == 1
+    assert captured_manifest["pages"][0]["title"] == "New Home Draft"

@@ -200,12 +200,18 @@ class ContentBrowserView(View):
 
     def get(self, request: HttpRequest) -> Any:
         from cauldron_content.pages import PAGE_COLLECTION
-        collection = request.GET.get("collection", "")
-        requested_drafts = request.GET.get("include_drafts", "").lower() in ("1", "true", "yes")
+        # Default to 'pages' collection if none specified
+        collection = request.GET.get("collection", PAGE_COLLECTION)
         has_draft_perm = request.user.has_perm(
             "cauldron_content_operations.view_draft_content"
         )
-        include_drafts = requested_drafts and has_draft_perm
+        # Default include_drafts to True for users with draft permission,
+        # unless explicitly overridden in the query string
+        if "include_drafts" in request.GET:
+            requested_drafts = request.GET.get("include_drafts", "").lower() in ("1", "true", "yes")
+            include_drafts = requested_drafts and has_draft_perm
+        else:
+            include_drafts = has_draft_perm
         can_propose = request.user.has_perm(
             "cauldron_content_operations.propose_content_changes"
         )
@@ -238,6 +244,7 @@ class ContentBrowserView(View):
         except Exception as exc:
             error = html.escape(str(exc)[:200])
 
+        # Auto-load items for the selected collection (always, no Browse submit needed)
         if collection:
             try:
                 items_raw = service.list_items(collection, user=request.user, include_drafts=include_drafts)

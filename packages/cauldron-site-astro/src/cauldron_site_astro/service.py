@@ -173,7 +173,17 @@ class SiteBuildService:
                     shutil.rmtree(empty_dir, ignore_errors=True)
             return BuildResult(ok=True, pages_built=0, output_dir=str(output_root))
 
-        manifest = {"pages": pages}
+        # Read active theme CSS if theme_root is configured
+        theme_css = ""
+        if cfg.theme_root:
+            try:
+                from cauldron_site_astro.theme import SiteThemeService
+                theme_svc = SiteThemeService(cfg.theme_root)
+                theme_css = theme_svc.get_active_css()
+            except Exception:
+                pass  # Non-fatal: build without theme
+
+        manifest = {"pages": pages, "theme": {"css_content": theme_css}}
         tmp_dir = None
         try:
             tmp_dir = tempfile.mkdtemp(prefix="cauldron_astro_")
@@ -224,6 +234,173 @@ class SiteBuildService:
             return BuildResult(
                 ok=False,
                 error=f"Astro build timed out after {cfg.build_timeout}s.",
+            )
+        except Exception as exc:
+            return BuildResult(ok=False, error=str(exc))
+        finally:
+            if tmp_dir and Path(tmp_dir).exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+    def build_preview(
+        self,
+        *,
+        output_dir: "str | Path",
+        extra_items: "list | None" = None,
+        theme_css: str = "",
+    ) -> BuildResult:
+        """Build a preview including draft pages and a proposed theme.
+
+        ``extra_items`` are duck-typed content items (same shape as returned
+        by the router) added alongside published pages (deduplicated by id).
+        ``theme_css`` overrides the active theme stylesheet for this build only.
+        The result is written to ``output_dir`` without touching output_root.
+        """
+        import json
+        import logging
+        import os
+        import subprocess
+        import tempfile
+
+        from cauldron_content.homepage import (
+            HOMEPAGE_COLLECTION,
+            HOMEPAGE_ITEM_ID,
+            HOMEPAGE_ROUTE,
+        )
+
+        logger = logging.getLogger(__name__)
+        cfg = self._config
+
+        if not cfg.frontend_root:
+            return BuildResult(
+                ok=False,
+                error=(
+                    "cauldron.site.astro frontend_root must be configured."
+                ),
+            )
+
+        frontend_root = Path(cfg.frontend_root)
+        output_path = Path(output_dir)
+
+        # Collect published pages from router
+        pages_by_id: dict = {}
+        try:
+            items = self._router.list_items(HOMEPAGE_COLLECTION, include_drafts=True)
+        except Exception as exc:
+            return BuildResult(ok=False, error=f"Failed to list pages: {exc}")
+
+        for item in items:
+            if item.id == HOMEPAGE_ITEM_ID:
+                route = HOMEPAGE_ROUTE
+            else:
+                route = f"/{item.slug}/"
+            pages_by_id[item.id] = {
+                "id": item.id,
+                "route": route,
+                "title": item.data.get("title", ""),
+                "navigation_title": item.data.get("navigation_title", ""),
+                "summary": item.data.get("summary", ""),
+                "body": item.body or "",
+                "template": item.data.get("template", "page"),
+                "seo_title": item.data.get("seo_title", ""),
+                "meta_description": item.data.get("meta_description", ""),
+                "canonical_url": item.data.get("canonical_url", ""),
+                "robots_index": item.data.get("robots_index", True),
+                "robots_follow": item.data.get("robots_follow", True),
+                "social_title": item.data.get("social_title", ""),
+                "social_description": item.data.get("social_description", ""),
+                "social_image": item.data.get("social_image", ""),
+            }
+
+        # Merge extra_items (deduplicate by id, extra_items win)
+        for item in (extra_items or []):
+            if item.id == HOMEPAGE_ITEM_ID:
+                route = HOMEPAGE_ROUTE
+            else:
+                route = f"/{item.slug}/"
+            pages_by_id[item.id] = {
+                "id": item.id,
+                "route": route,
+                "title": item.data.get("title", ""),
+                "navigation_title": item.data.get("navigation_title", ""),
+                "summary": item.data.get("summary", ""),
+                "body": item.body or "",
+                "template": item.data.get("template", "page"),
+                "seo_title": item.data.get("seo_title", ""),
+                "meta_description": item.data.get("meta_description", ""),
+                "canonical_url": item.data.get("canonical_url", ""),
+                "robots_index": item.data.get("robots_index", True),
+                "robots_follow": item.data.get("robots_follow", True),
+                "social_title": item.data.get("social_title", ""),
+                "social_description": item.data.get("social_description", ""),
+                "social_image": item.data.get("social_image", ""),
+            }
+
+        pages = list(pages_by_id.values())
+
+        if not pages:
+            # Write an empty output directory for the preview
+            output_path.mkdir(parents=True, exist_ok=True)
+            return BuildResult(ok=True, pages_built=0, output_dir=str(output_path))
+
+        # Use provided theme_css, otherwise fall back to active theme
+        effective_theme_css = theme_css
+        if not effective_theme_css and cfg.theme_root:
+            try:
+                from cauldron_site_astro.theme import SiteThemeService
+                theme_svc = SiteThemeService(cfg.theme_root)
+                effective_theme_css = theme_svc.get_active_css()
+            except Exception:
+                pass
+
+        manifest = {"pages": pages, "theme": {"css_content": effective_theme_css}}
+        tmp_dir = None
+        try:
+            tmp_dir = tempfile.mkdtemp(prefix="cauldron_astro_preview_")
+            manifest_path = os.path.join(tmp_dir, "manifest.json")
+
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f)
+
+            env = {
+                **os.environ,
+                "CAULDRON_MANIFEST": manifest_path,
+                "CAULDRON_OUTDIR": str(output_path),
+                "CAULDRON_IS_PREVIEW": "1",
+            }
+            proc = subprocess.run(
+                [cfg.npm_command, "run", "build"],
+                cwd=str(frontend_root),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=cfg.build_timeout,
+            )
+            build_log = (proc.stdout or "") + (proc.stderr or "")
+
+            if proc.returncode != 0:
+                logger.error(
+                    "Astro preview build failed (exit %d):\n%s",
+                    proc.returncode,
+                    build_log[-2000:],
+                )
+                return BuildResult(
+                    ok=False,
+                    error=f"Astro preview build exited {proc.returncode}.",
+                    build_log=build_log,
+                )
+
+            return BuildResult(
+                ok=True,
+                pages_built=len(pages),
+                output_dir=str(output_path),
+                build_log=build_log,
+            )
+
+        except subprocess.TimeoutExpired:
+            return BuildResult(
+                ok=False,
+                error=f"Astro preview build timed out after {cfg.build_timeout}s.",
             )
         except Exception as exc:
             return BuildResult(ok=False, error=str(exc))

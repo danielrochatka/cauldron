@@ -200,12 +200,15 @@ class ContentBrowserView(View):
 
     def get(self, request: HttpRequest) -> Any:
         from cauldron_content.pages import PAGE_COLLECTION
-        collection = request.GET.get("collection", "")
-        requested_drafts = request.GET.get("include_drafts", "").lower() in ("1", "true", "yes")
+        # Default to 'pages' collection if none specified
+        collection = request.GET.get("collection", PAGE_COLLECTION)
         has_draft_perm = request.user.has_perm(
             "cauldron_content_operations.view_draft_content"
         )
-        include_drafts = requested_drafts and has_draft_perm
+        # Editors with view_draft_content always see drafts + published; there
+        # is no "Include Drafts" checkbox any more. Authors without draft
+        # permission continue to see published items only.
+        include_drafts = has_draft_perm
         can_propose = request.user.has_perm(
             "cauldron_content_operations.propose_content_changes"
         )
@@ -221,7 +224,6 @@ class ContentBrowserView(View):
                 "collections": [],
                 "selected_collection": "",
                 "items": [],
-                "include_drafts": False,
                 "can_view_drafts": has_draft_perm,
                 "can_propose": can_propose,
                 "can_publish": _can_publish(request, require_approval),
@@ -238,6 +240,7 @@ class ContentBrowserView(View):
         except Exception as exc:
             error = html.escape(str(exc)[:200])
 
+        # Auto-load items for the selected collection (always, no Browse submit needed)
         if collection:
             try:
                 items_raw = service.list_items(collection, user=request.user, include_drafts=include_drafts)
@@ -249,7 +252,6 @@ class ContentBrowserView(View):
             "collections": collections,
             "selected_collection": collection,
             "items": items,
-            "include_drafts": include_drafts,
             "can_view_drafts": has_draft_perm,
             "can_propose": can_propose,
             "can_publish": _can_publish(request, require_approval),

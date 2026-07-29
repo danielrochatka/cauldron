@@ -17,9 +17,14 @@ urlpatterns = [
     path("cauldron/", include("cauldron_admin_content.urls", namespace="cauldron_admin_content")),
     # Cauldron shell: AI admin + style proposals
     path("cauldron/", include("cauldron_ai_admin.urls", namespace="cauldron_ai_admin")),
+    # Cauldron shell: site preview server (authenticated, per-change-set)
+    path("cauldron/", include("cauldron_site_astro.urls", namespace="cauldron_site_astro")),
     # Content API
     path("cauldron/api/v1/", include("cauldron_content_api.urls")),
     # Public site — MUST be last
+    # Top-level generated files with extensions: theme.css, favicon.ico, robots.txt, etc.
+    # Must come before the bare-slug redirect so /theme.css is served directly.
+    re_path(r'^(?P<asset_path>[^/]+\.[^/]+)$', serve_asset, name="public-top-asset"),
     # Nested generated assets: _astro/chunk.js, images/hero.png, etc.
     re_path(r'^(?P<asset_path>[^/]+(?:/[^/]+)+)$', serve_asset, name="public-asset"),
     # Bare slug redirect: /about → /about/

@@ -86,6 +86,8 @@ CAULDRON_MODULES = {
     "cauldron.site.astro": {
         "frontend_root": str(BASE_DIR / "frontend"),
         "output_root": str(BASE_DIR / "data" / "public"),
+        "theme_root": str(BASE_DIR / "data" / "theme"),
+        "previews_root": str(BASE_DIR / "data" / "previews"),
     },
 }
 

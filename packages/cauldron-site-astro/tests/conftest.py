@@ -23,5 +23,6 @@ def pytest_configure(config):
                     "output_root": "/tmp/cauldron_test_output",
                 }
             },
+            ROOT_URLCONF="tests.urls",
             SECRET_KEY="test-key",
         )

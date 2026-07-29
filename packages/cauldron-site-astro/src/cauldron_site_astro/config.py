@@ -16,6 +16,8 @@ class SiteAstroConfig:
     build_timeout: int = 120
     manage_py_path: str = ""
     build_log_file: str = ""
+    theme_root: str = ""       # Where active.css / staged.css are stored
+    previews_root: str = ""    # Where preview builds go (previews/<change_set_id>/)
 
 
 def get_site_astro_config() -> SiteAstroConfig:
@@ -29,4 +31,6 @@ def get_site_astro_config() -> SiteAstroConfig:
         build_timeout=int(cfg.get("build_timeout", 120)),
         manage_py_path=cfg.get("manage_py_path", ""),
         build_log_file=cfg.get("build_log_file", ""),
+        theme_root=cfg.get("theme_root", ""),
+        previews_root=cfg.get("previews_root", ""),
     )

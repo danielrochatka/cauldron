@@ -13,22 +13,12 @@
   <form method="get" class="cui-form cui-form--inline">
     <div class="cui-form-field">
       <label for="collection">Collection</label>
-      <select name="collection" id="collection">
-        <option value="">— Select Collection —</option>
+      <select name="collection" id="collection" onchange="this.form.submit()">
         {% for coll in collections %}
         <option value="{{ coll|escape }}" {% if coll == selected_collection %}selected{% endif %}>{{ coll|escape }}</option>
         {% endfor %}
       </select>
     </div>
-    {% if can_view_drafts %}
-    <div class="cui-form-field">
-      <label>
-        <input type="checkbox" name="include_drafts" value="1" {% if include_drafts %}checked{% endif %}>
-        Include Drafts
-      </label>
-    </div>
-    {% endif %}
-    <button type="submit" class="cui-button">Browse</button>
   </form>
 </div>
 

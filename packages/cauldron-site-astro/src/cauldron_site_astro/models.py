@@ -64,6 +64,11 @@ class SiteChangeSet(models.Model):
     # Affected page routes (informational — populated at prepare time)
     page_routes = models.JSONField(default=list, blank=True)
 
+    # Content item ids affected by this change set (extracted from operations
+    # of the referenced ContentChangeRequests). Used to scope preview builds
+    # so drafts belonging to unrelated in-flight work are not surfaced.
+    affected_item_ids = models.JSONField(default=list, blank=True)
+
     # Build result payloads
     publish_build_result = models.JSONField(default=dict, blank=True)
 
@@ -81,3 +86,15 @@ class SiteChangeSet(models.Model):
 
     def __str__(self) -> str:
         return f"SiteChangeSet({self.id}, {self.status})"
+
+    def get_preview_url(self) -> str:
+        """Return the Django URL path where this change set's preview is served.
+
+        The path is always a Django URL (starts with ``/``), never a filesystem
+        path — this is the URL that gets exposed to admin tools and users.
+        """
+        from django.urls import reverse
+        return reverse(
+            "cauldron_site_astro:preview-home",
+            kwargs={"change_set_id": str(self.id)},
+        )

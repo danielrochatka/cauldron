@@ -1,13 +1,20 @@
 """Admin AI site tools for cauldron-site-astro.
 
-Provides 5 tools that let the Admin AI authoring workflow inspect and
-initiate site builds / previews without granting unrestricted write access:
+Five tools drive the AI authoring workflow. Every result exposes only
+Django URL paths and business-safe data — filesystem paths (frontend_root,
+output_root, theme_root, previews_root) are never leaked to the model:
 
-1. site.inspect      — read current build status (READ_ONLY)
-2. site.stage_theme  — stage a CSS theme for the next publish (PROPOSE)
-3. site.prepare_preview — run a preview build with draft content (PROPOSE)
-4. site.inspect_preview — read a preview build's status (READ_ONLY)
-5. site.publish      — promote a preview to the live site (MAINTENANCE)
+1. ``site.inspect``            — read current build status (READ_ONLY)
+2. ``site.stage_theme``        — stage a CSS theme for the next publish (PROPOSE)
+3. ``site.prepare_change_set`` — create a SiteChangeSet + scoped preview (PROPOSE)
+4. ``site.inspect_preview``    — read a change set's preview status (READ_ONLY)
+5. ``site.publish``            — apply a draft-ready change set to live (MAINTENANCE)
+
+Tools 3-5 operate on a persisted :class:`SiteChangeSet` (keyed by
+``change_set_id``) so status transitions are durable across the multi-step
+prepare -> review -> publish flow. Previews are scoped to just the content
+requests attached to the change set, so unrelated in-flight drafts never
+leak into an unrelated preview.
 """
 from __future__ import annotations
 
@@ -17,6 +24,11 @@ from cauldron_site_astro.service import get_build_service
 
 if TYPE_CHECKING:
     from cauldron_ai_admin.tools import AdminAIToolRegistry
+
+
+# Bounded lengths for safety: never dump raw exception text or large logs.
+_MAX_EXC_MSG = 200
+_MAX_BUILD_LOG_TAIL = 500
 
 
 def register(registry: "AdminAIToolRegistry") -> None:
@@ -37,8 +49,7 @@ def register(registry: "AdminAIToolRegistry") -> None:
             version="1.0",
             description=(
                 "Inspect the current public site build status: whether a live "
-                "build exists, the output directory, and whether a staged theme "
-                "CSS is pending. Read-only."
+                "build exists and whether a staged theme CSS is pending. Read-only."
             ),
             argument_schema={"type": "object", "properties": {}, "required": []},
             risk_level=RiskLevel.READ_ONLY,
@@ -82,34 +93,50 @@ def register(registry: "AdminAIToolRegistry") -> None:
     )
 
     # ------------------------------------------------------------------
-    # 3. site.prepare_preview
+    # 3. site.prepare_change_set
     # ------------------------------------------------------------------
     registry.register(
         AdminAIToolDefinition(
-            name="site.prepare_preview",
-            version="1.0",
+            name="site.prepare_change_set",
+            version="2.0",
             description=(
-                "Run a preview Astro build that includes draft pages and the "
-                "staged theme (if any). The result is written to a dedicated "
-                "preview directory and does NOT touch the live site. "
-                "Returns a preview_id and the output directory path."
+                "Create a SiteChangeSet from one or more content change "
+                "requests plus an optional staged theme CSS, and build a "
+                "scoped preview. The preview shows the published site with "
+                "only the drafts from these change requests layered on top; "
+                "unrelated in-flight drafts are excluded. Does not touch the "
+                "live site. Returns change_set_id and a Django preview URL."
             ),
             argument_schema={
                 "type": "object",
                 "properties": {
+                    "content_request_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Content change-request IDs to include in this change set."
+                        ),
+                    },
+                    "theme_css": {
+                        "type": "string",
+                        "description": (
+                            "Optional CSS to preview alongside the drafts. "
+                            "This CSS is only promoted to live on successful publish."
+                        ),
+                    },
                     "description": {
                         "type": "string",
-                        "description": "Optional description for this preview.",
+                        "description": "Optional description for this change set.",
                     },
                 },
-                "required": [],
+                "required": ["content_request_ids"],
             },
             risk_level=RiskLevel.PROPOSE,
             required_permission=_PERM_PROPOSE,
             owning_module=_OWNING_MODULE,
             timeout_seconds=180.0,
         ),
-        _handle_prepare_preview,
+        _handle_prepare_change_set,
     )
 
     # ------------------------------------------------------------------
@@ -118,20 +145,20 @@ def register(registry: "AdminAIToolRegistry") -> None:
     registry.register(
         AdminAIToolDefinition(
             name="site.inspect_preview",
-            version="1.0",
+            version="2.0",
             description=(
-                "Inspect a previously prepared preview build. Returns its "
-                "output directory path and the list of pages it contains."
+                "Inspect a previously prepared SiteChangeSet preview. "
+                "Returns status, page count, and the Django preview URL."
             ),
             argument_schema={
                 "type": "object",
                 "properties": {
-                    "preview_id": {
+                    "change_set_id": {
                         "type": "string",
-                        "description": "UUID string returned by site.prepare_preview.",
+                        "description": "UUID returned by site.prepare_change_set.",
                     },
                 },
-                "required": ["preview_id"],
+                "required": ["change_set_id"],
             },
             risk_level=RiskLevel.READ_ONLY,
             required_permission=_PERM_VIEW,
@@ -146,22 +173,27 @@ def register(registry: "AdminAIToolRegistry") -> None:
     registry.register(
         AdminAIToolDefinition(
             name="site.publish",
-            version="1.0",
+            version="2.0",
             description=(
-                "Trigger a full public-site rebuild and promote it to the live "
-                "output directory. This is a deliberate publish action that "
-                "replaces the live site. Requires MAINTENANCE-level permission. "
-                "If a staged theme is present it is promoted to active first."
+                "Publish a draft-ready SiteChangeSet to the live site: apply "
+                "its content change requests, build the site with the staged "
+                "theme, and promote both together. Requires confirm=true. If "
+                "the build fails, no staged CSS is promoted and the live site "
+                "is left untouched."
             ),
             argument_schema={
                 "type": "object",
                 "properties": {
+                    "change_set_id": {
+                        "type": "string",
+                        "description": "UUID of the SiteChangeSet to publish.",
+                    },
                     "confirm": {
                         "type": "boolean",
                         "description": "Must be true to confirm the publish action.",
                     },
                 },
-                "required": ["confirm"],
+                "required": ["change_set_id", "confirm"],
             },
             risk_level=RiskLevel.MAINTENANCE,
             required_permission=_PERM_MAINTAIN,
@@ -170,6 +202,110 @@ def register(registry: "AdminAIToolRegistry") -> None:
         ),
         _handle_publish,
     )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _safe_exc(exc: BaseException) -> str:
+    """Bound exception text so unbounded backends can't leak into results."""
+    return str(exc)[:_MAX_EXC_MSG]
+
+
+def _coerce_run_id(raw) -> "uuid.UUID | None":  # noqa: F821 - forward str
+    """Convert the tool context's run_id string into a UUID for the model.
+
+    ``originating_run_id`` is a UUIDField, but the tool context stores run_id
+    as an opaque string. Malformed strings become ``None`` rather than
+    breaking the change set creation.
+    """
+    import uuid as _uuid
+
+    if not raw:
+        return None
+    try:
+        return _uuid.UUID(str(raw))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _get_content_operation_service():
+    """Return a ContentOperationService instance, or ``None`` if unavailable.
+
+    Different Cauldron installations wire the service via different
+    factories. We try the well-known cauldron-admin-content factory first;
+    if that fails (either not installed or misconfigured), the caller must
+    handle a ``None`` and surface a clear error to the tool result.
+    """
+    try:
+        from cauldron_admin_content.service_factory import get_service
+        return get_service()
+    except Exception:
+        return None
+
+
+def _extract_item_ids(content_request_ids: list[str]) -> list[str]:
+    """Best-effort: return item_ids affected by the given change requests.
+
+    Preview scoping needs the item_ids so it only includes the drafts that
+    belong to this change set. We look up each ContentChangeRequest and pull
+    ``item_id`` out of each op in its workspace changeset.
+
+    If cauldron-content-operations is not installed, or a lookup fails, we
+    return an empty list — the caller will fall back to a published-only
+    preview rather than crashing the whole workflow.
+    """
+    if not content_request_ids:
+        return []
+
+    item_ids: list[str] = []
+    try:
+        from cauldron_content_operations.models import ContentChangeRequest
+    except Exception:
+        return []
+
+    service = _get_content_operation_service()
+    workspace = getattr(service, "_workspace", None) if service is not None else None
+
+    for req_id in content_request_ids:
+        try:
+            cr = ContentChangeRequest.objects.get(request_id=req_id)
+        except Exception:
+            continue
+
+        # Preferred path: pull operations from the workspace changeset.
+        ws_id = getattr(cr, "workspace_changeset_id", "")
+        if workspace is not None and ws_id:
+            try:
+                changeset = workspace.load_changeset(ws_id)
+                for op in getattr(changeset, "operations", ()) or ():
+                    op_item_id = getattr(op, "item_id", None)
+                    if op_item_id:
+                        item_ids.append(str(op_item_id))
+                continue
+            except Exception:
+                pass
+
+        # Fallback path: some installations attach operations directly on
+        # the change request (JSONField). Accept that shape too.
+        raw_ops = getattr(cr, "operations", None)
+        if isinstance(raw_ops, list):
+            for op in raw_ops:
+                if isinstance(op, dict):
+                    op_item_id = op.get("item_id")
+                    if op_item_id:
+                        item_ids.append(str(op_item_id))
+
+    # Deduplicate while preserving first-seen order.
+    seen: set[str] = set()
+    out: list[str] = []
+    for iid in item_ids:
+        if iid not in seen:
+            seen.add(iid)
+            out.append(iid)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +325,7 @@ def _handle_site_inspect(context, **kwargs):
         return AdminAIToolResult(
             tool_name="site.inspect",
             success=False,
-            message=f"Could not load site build config: {exc}",
+            message=f"Could not load site build config: {_safe_exc(exc)}",
         )
 
     output_root = Path(cfg.output_root) if cfg.output_root else None
@@ -201,19 +337,18 @@ def _handle_site_inspect(context, **kwargs):
     if cfg.theme_root:
         try:
             from cauldron_site_astro.theme import SiteThemeService
-            staged_theme_pending = SiteThemeService(cfg.theme_root).get_staged_css() is not None
+            staged_theme_pending = (
+                SiteThemeService(cfg.theme_root).get_staged_css() is not None
+            )
         except Exception:
             pass
 
+    # Only surface flags — never the filesystem paths themselves.
     return AdminAIToolResult(
         tool_name="site.inspect",
         success=True,
         data={
             "live_build_exists": live_build_exists,
-            "output_root": cfg.output_root or "",
-            "frontend_root": cfg.frontend_root or "",
-            "theme_root": cfg.theme_root or "",
-            "previews_root": cfg.previews_root or "",
             "staged_theme_pending": staged_theme_pending,
         },
     )
@@ -229,7 +364,7 @@ def _handle_stage_theme(context, *, css_content, description="", **kwargs):
         return AdminAIToolResult(
             tool_name="site.stage_theme",
             success=False,
-            message=f"Could not load site build config: {exc}",
+            message=f"Could not load site build config: {_safe_exc(exc)}",
         )
 
     if not cfg.theme_root:
@@ -246,7 +381,7 @@ def _handle_stage_theme(context, *, css_content, description="", **kwargs):
         return AdminAIToolResult(
             tool_name="site.stage_theme",
             success=False,
-            message=f"Failed to stage theme CSS: {exc}",
+            message=f"Failed to stage theme CSS: {_safe_exc(exc)}",
         )
 
     return AdminAIToolResult(
@@ -258,90 +393,136 @@ def _handle_stage_theme(context, *, css_content, description="", **kwargs):
             "description": description,
         },
         message=(
-            "Theme CSS staged. Call site.prepare_preview to verify it, "
-            "then site.publish to promote it to the live site."
+            "Theme CSS staged. Attach it to a change set via "
+            "site.prepare_change_set(theme_css=...) to preview it, "
+            "then site.publish to promote it live."
         ),
     )
 
 
-def _handle_prepare_preview(context, *, description="", **kwargs):
-    import uuid
+def _handle_prepare_change_set(
+    context,
+    *,
+    content_request_ids,
+    theme_css="",
+    description="",
+    **kwargs,
+):
     from pathlib import Path
 
-    from cauldron_ai_admin.tools import AdminAIToolResult
+    from django.utils import timezone
 
+    from cauldron_ai_admin.tools import AdminAIToolResult
+    from cauldron_site_astro.models import SiteChangeSet
+
+    # ---- Validate inputs ---------------------------------------------------
+    if not isinstance(content_request_ids, list) or not content_request_ids:
+        return AdminAIToolResult(
+            tool_name="site.prepare_change_set",
+            success=False,
+            message="content_request_ids must be a non-empty list of strings.",
+        )
+    content_request_ids = [str(x) for x in content_request_ids]
+
+    # ---- Load build config -------------------------------------------------
     try:
         svc = get_build_service()
         cfg = svc._config
     except Exception as exc:
         return AdminAIToolResult(
-            tool_name="site.prepare_preview",
+            tool_name="site.prepare_change_set",
             success=False,
-            message=f"Could not load site build config: {exc}",
+            message=f"Could not load site build config: {_safe_exc(exc)}",
         )
 
     if not cfg.previews_root:
         return AdminAIToolResult(
-            tool_name="site.prepare_preview",
+            tool_name="site.prepare_change_set",
             success=False,
             message="previews_root is not configured; cannot build preview.",
         )
 
-    preview_id = str(uuid.uuid4())
-    output_dir = Path(cfg.previews_root) / preview_id
+    # ---- Create the SiteChangeSet in 'preparing' state --------------------
+    affected_item_ids = _extract_item_ids(content_request_ids)
+    cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.PREPARING,
+        content_request_ids=content_request_ids,
+        staged_theme_css=theme_css or "",
+        originating_run_id=_coerce_run_id(getattr(context, "run_id", None)),
+        creator=getattr(context, "actor", None),
+        affected_item_ids=affected_item_ids,
+    )
 
-    # Use staged theme CSS if available
-    theme_css = ""
-    if cfg.theme_root:
-        try:
-            from cauldron_site_astro.theme import SiteThemeService
-            staged = SiteThemeService(cfg.theme_root).get_staged_css()
-            if staged is not None:
-                theme_css = staged
-        except Exception:
-            pass
-
+    # ---- Build the scoped preview -----------------------------------------
+    output_dir = Path(cfg.previews_root) / str(cs.id)
     try:
         result = svc.build_preview(
             output_dir=output_dir,
-            theme_css=theme_css,
+            item_ids_to_include=affected_item_ids or None,
+            theme_css=theme_css or "",
         )
     except Exception as exc:
+        cs.status = SiteChangeSet.PREVIEW_FAILED
+        cs.save(update_fields=["status", "updated_at"])
         return AdminAIToolResult(
-            tool_name="site.prepare_preview",
+            tool_name="site.prepare_change_set",
             success=False,
-            message=f"Preview build raised an exception: {exc}",
+            data={"change_set_id": str(cs.id)},
+            message=f"Preview build raised an exception: {_safe_exc(exc)}",
         )
 
     if not result.ok:
+        cs.status = SiteChangeSet.PREVIEW_FAILED
+        cs.preview_dir = str(cs.id)
+        cs.save(update_fields=["status", "preview_dir", "updated_at"])
         return AdminAIToolResult(
-            tool_name="site.prepare_preview",
+            tool_name="site.prepare_change_set",
             success=False,
-            data={"preview_id": preview_id, "build_log": result.build_log[-1000:]},
-            message=f"Preview build failed: {result.error}",
+            data={
+                "change_set_id": str(cs.id),
+                "build_log": (result.build_log or "")[-_MAX_BUILD_LOG_TAIL:],
+            },
+            message=f"Preview build failed: {_safe_exc(Exception(result.error or ''))}",
         )
 
+    cs.status = SiteChangeSet.DRAFT_READY
+    cs.preview_dir = str(cs.id)  # relative path beneath previews_root
+    cs.draft_ready_at = timezone.now()
+    cs.save(update_fields=[
+        "status", "preview_dir", "draft_ready_at", "updated_at",
+    ])
+
     return AdminAIToolResult(
-        tool_name="site.prepare_preview",
+        tool_name="site.prepare_change_set",
         success=True,
         data={
-            "preview_id": preview_id,
-            "output_dir": str(output_dir),
+            "change_set_id": str(cs.id),
             "pages_built": result.pages_built,
+            "preview_url": cs.get_preview_url(),
             "description": description,
         },
         message=(
-            f"Preview built with {result.pages_built} page(s). "
-            f"Use site.inspect_preview with preview_id={preview_id!r} to review, "
-            "then site.publish to go live."
+            f"Change set {cs.id} is draft_ready ({result.pages_built} page(s)). "
+            f"Review at the returned preview_url, then call "
+            f"site.publish(change_set_id={str(cs.id)!r}, confirm=true) to go live."
         ),
     )
 
 
-def _handle_inspect_preview(context, *, preview_id, **kwargs):
+def _handle_inspect_preview(context, *, change_set_id, **kwargs):
     from pathlib import Path
 
     from cauldron_ai_admin.tools import AdminAIToolResult
+    from cauldron_site_astro.models import SiteChangeSet
+
+    try:
+        cs = SiteChangeSet.objects.get(id=change_set_id)
+    except (SiteChangeSet.DoesNotExist, ValueError):
+        return AdminAIToolResult(
+            tool_name="site.inspect_preview",
+            success=False,
+            message=f"Change set {change_set_id!r} not found.",
+        )
 
     try:
         svc = get_build_service()
@@ -350,42 +531,33 @@ def _handle_inspect_preview(context, *, preview_id, **kwargs):
         return AdminAIToolResult(
             tool_name="site.inspect_preview",
             success=False,
-            message=f"Could not load site build config: {exc}",
+            message=f"Could not load site build config: {_safe_exc(exc)}",
         )
 
-    if not cfg.previews_root:
-        return AdminAIToolResult(
-            tool_name="site.inspect_preview",
-            success=False,
-            message="previews_root is not configured.",
-        )
-
-    preview_dir = Path(cfg.previews_root) / preview_id
-    if not preview_dir.exists():
-        return AdminAIToolResult(
-            tool_name="site.inspect_preview",
-            success=False,
-            message=f"Preview {preview_id!r} not found.",
-        )
-
-    # Collect .html files as a proxy for built pages
-    html_files = sorted(str(p.relative_to(preview_dir)) for p in preview_dir.rglob("*.html"))
+    pages_built = 0
+    if cfg.previews_root and cs.preview_dir:
+        preview_dir = Path(cfg.previews_root) / cs.preview_dir
+        if preview_dir.exists() and preview_dir.is_dir():
+            pages_built = sum(1 for _ in preview_dir.rglob("*.html"))
 
     return AdminAIToolResult(
         tool_name="site.inspect_preview",
         success=True,
         data={
-            "preview_id": preview_id,
-            "output_dir": str(preview_dir),
-            "html_files": html_files[:50],
-            "html_file_count": len(html_files),
-            "truncated": len(html_files) > 50,
+            "change_set_id": str(cs.id),
+            "status": cs.status,
+            "pages_built": pages_built,
+            "preview_url": cs.get_preview_url(),
+            "created_at": cs.created_at.isoformat() if cs.created_at else "",
         },
     )
 
 
-def _handle_publish(context, *, confirm, **kwargs):
+def _handle_publish(context, *, change_set_id, confirm, **kwargs):
+    from django.utils import timezone
+
     from cauldron_ai_admin.tools import AdminAIToolResult
+    from cauldron_site_astro.models import SiteChangeSet
 
     if not confirm:
         return AdminAIToolResult(
@@ -395,46 +567,228 @@ def _handle_publish(context, *, confirm, **kwargs):
         )
 
     try:
+        cs = SiteChangeSet.objects.get(id=change_set_id)
+    except (SiteChangeSet.DoesNotExist, ValueError):
+        return AdminAIToolResult(
+            tool_name="site.publish",
+            success=False,
+            message=f"Change set {change_set_id!r} not found.",
+        )
+
+    if cs.status != SiteChangeSet.DRAFT_READY:
+        return AdminAIToolResult(
+            tool_name="site.publish",
+            success=False,
+            data={"change_set_id": str(cs.id), "status": cs.status},
+            message=(
+                f"Change set is in status {cs.status!r}; "
+                f"only draft_ready change sets can be published."
+            ),
+        )
+
+    try:
         svc = get_build_service()
         cfg = svc._config
     except Exception as exc:
         return AdminAIToolResult(
             tool_name="site.publish",
             success=False,
-            message=f"Could not load site build config: {exc}",
+            message=f"Could not load site build config: {_safe_exc(exc)}",
         )
 
-    # Promote staged theme to active before building
-    if cfg.theme_root:
-        try:
-            from cauldron_site_astro.theme import SiteThemeService
-            SiteThemeService(cfg.theme_root).promote_staged()
-        except Exception:
-            pass  # Non-fatal: build will use existing active theme
+    # Mark publishing (durable transition).
+    cs.status = SiteChangeSet.PUBLISHING
+    cs.save(update_fields=["status", "updated_at"])
 
+    # ---- Apply each content change request in order ------------------------
+    content_service = _get_content_operation_service()
+
+    applied_ids: list[str] = []
+    for req_id in cs.content_request_ids or ():
+        if content_service is None:
+            cs.status = SiteChangeSet.PUBLISH_FAILED
+            cs.publish_build_result = {
+                "error": "content-operations service unavailable",
+                "applied": applied_ids,
+            }
+            cs.save(update_fields=[
+                "status", "publish_build_result", "updated_at",
+            ])
+            return AdminAIToolResult(
+                tool_name="site.publish",
+                success=False,
+                data={"change_set_id": str(cs.id)},
+                message="Content operations service is unavailable; cannot apply changes.",
+            )
+
+        try:
+            v = content_service.validate_change_request(
+                req_id, user=context.actor,
+            )
+        except Exception as exc:
+            cs.status = SiteChangeSet.PUBLISH_FAILED
+            cs.publish_build_result = {
+                "error": f"validate raised: {_safe_exc(exc)}",
+                "applied": applied_ids,
+                "failed_request_id": req_id,
+            }
+            cs.save(update_fields=[
+                "status", "publish_build_result", "updated_at",
+            ])
+            return AdminAIToolResult(
+                tool_name="site.publish",
+                success=False,
+                data={"change_set_id": str(cs.id)},
+                message=f"Validation of {req_id!r} raised: {_safe_exc(exc)}",
+            )
+
+        if not getattr(v, "ok", False):
+            err = getattr(v, "error", None)
+            err_msg = getattr(err, "message", "validation failed")
+            cs.status = SiteChangeSet.PUBLISH_FAILED
+            cs.publish_build_result = {
+                "error": f"validate failed for {req_id}: {err_msg[:_MAX_EXC_MSG]}",
+                "applied": applied_ids,
+                "failed_request_id": req_id,
+            }
+            cs.save(update_fields=[
+                "status", "publish_build_result", "updated_at",
+            ])
+            return AdminAIToolResult(
+                tool_name="site.publish",
+                success=False,
+                data={"change_set_id": str(cs.id)},
+                message=f"Validation of {req_id!r} failed: {err_msg[:_MAX_EXC_MSG]}",
+            )
+
+        try:
+            a = content_service.apply_change_request(
+                req_id,
+                user=context.actor,
+                expected_version=getattr(v, "request_version", 0),
+            )
+        except Exception as exc:
+            cs.status = SiteChangeSet.PUBLISH_FAILED
+            cs.publish_build_result = {
+                "error": f"apply raised: {_safe_exc(exc)}",
+                "applied": applied_ids,
+                "failed_request_id": req_id,
+            }
+            cs.save(update_fields=[
+                "status", "publish_build_result", "updated_at",
+            ])
+            return AdminAIToolResult(
+                tool_name="site.publish",
+                success=False,
+                data={"change_set_id": str(cs.id)},
+                message=f"Apply of {req_id!r} raised: {_safe_exc(exc)}",
+            )
+
+        if not getattr(a, "ok", False):
+            err = getattr(a, "error", None)
+            err_msg = getattr(err, "message", "apply failed")
+            cs.status = SiteChangeSet.PUBLISH_FAILED
+            cs.publish_build_result = {
+                "error": f"apply failed for {req_id}: {err_msg[:_MAX_EXC_MSG]}",
+                "applied": applied_ids,
+                "failed_request_id": req_id,
+            }
+            cs.save(update_fields=[
+                "status", "publish_build_result", "updated_at",
+            ])
+            return AdminAIToolResult(
+                tool_name="site.publish",
+                success=False,
+                data={"change_set_id": str(cs.id)},
+                message=f"Apply of {req_id!r} failed: {err_msg[:_MAX_EXC_MSG]}",
+            )
+
+        applied_ids.append(req_id)
+
+    # ---- Build the live site with the staged CSS injected ------------------
     try:
-        result = svc.build()
+        result = svc.build(theme_css_override=cs.staged_theme_css or "")
     except Exception as exc:
+        cs.status = SiteChangeSet.PUBLISH_FAILED
+        cs.publish_build_result = {
+            "error": f"build raised: {_safe_exc(exc)}",
+            "applied": applied_ids,
+        }
+        cs.save(update_fields=["status", "publish_build_result", "updated_at"])
         return AdminAIToolResult(
             tool_name="site.publish",
             success=False,
-            message=f"Publish build raised an exception: {exc}",
+            data={"change_set_id": str(cs.id)},
+            message=f"Publish build raised an exception: {_safe_exc(exc)}",
         )
 
     if not result.ok:
+        cs.status = SiteChangeSet.PUBLISH_FAILED
+        cs.publish_build_result = {
+            "error": (result.error or "")[:_MAX_EXC_MSG],
+            "applied": applied_ids,
+            "build_log_tail": (result.build_log or "")[-_MAX_BUILD_LOG_TAIL:],
+        }
+        cs.save(update_fields=["status", "publish_build_result", "updated_at"])
         return AdminAIToolResult(
             tool_name="site.publish",
             success=False,
-            data={"build_log": result.build_log[-1000:]},
-            message=f"Publish build failed: {result.error}",
+            data={
+                "change_set_id": str(cs.id),
+                "build_log": (result.build_log or "")[-_MAX_BUILD_LOG_TAIL:],
+            },
+            message=f"Publish build failed: {(result.error or '')[:_MAX_EXC_MSG]}",
         )
+
+    # ---- Only NOW promote the staged CSS to active -------------------------
+    if cs.staged_theme_css and cfg.theme_root:
+        try:
+            from cauldron_site_astro.theme import SiteThemeService
+            theme_svc = SiteThemeService(cfg.theme_root)
+            theme_svc.stage_css(cs.staged_theme_css)
+            theme_svc.promote_staged()
+        except Exception as exc:
+            # Build already succeeded, so mark PUBLISH_FAILED but leave the
+            # live output in place. The site is technically live with the old
+            # CSS; the caller can retry.
+            cs.status = SiteChangeSet.PUBLISH_FAILED
+            cs.publish_build_result = {
+                "error": f"theme promote failed: {_safe_exc(exc)}",
+                "applied": applied_ids,
+                "pages_built": result.pages_built,
+            }
+            cs.save(update_fields=[
+                "status", "publish_build_result", "updated_at",
+            ])
+            return AdminAIToolResult(
+                tool_name="site.publish",
+                success=False,
+                data={"change_set_id": str(cs.id)},
+                message=f"Post-build theme promotion failed: {_safe_exc(exc)}",
+            )
+
+    cs.status = SiteChangeSet.PUBLISHED
+    cs.published_at = timezone.now()
+    cs.publish_build_result = {
+        "applied": applied_ids,
+        "pages_built": result.pages_built,
+    }
+    cs.save(update_fields=[
+        "status", "published_at", "publish_build_result", "updated_at",
+    ])
 
     return AdminAIToolResult(
         tool_name="site.publish",
         success=True,
         data={
+            "change_set_id": str(cs.id),
             "pages_built": result.pages_built,
-            "output_dir": result.output_dir,
+            # The now-live site: return a stable Django-style path, never a
+            # filesystem path.
+            "preview_url": "/",
         },
-        message=f"Site published successfully with {result.pages_built} page(s).",
+        message=(
+            f"Change set {cs.id} published successfully "
+            f"({result.pages_built} page(s))."
+        ),
     )

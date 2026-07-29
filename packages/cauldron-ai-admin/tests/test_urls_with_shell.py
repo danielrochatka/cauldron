@@ -24,4 +24,5 @@ urlpatterns = [
     path("", include("cauldron_ai_admin.urls", namespace="cauldron_ai_admin")),
     path("cauldron/", include((_cauldron_stub_patterns(), "cauldron"))),
     path("auth/", include((_cauldron_auth_stub_patterns(), "cauldron_auth"))),
+    path("site/", include("cauldron_site_astro.urls")),
 ]

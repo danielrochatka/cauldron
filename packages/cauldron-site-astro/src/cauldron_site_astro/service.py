@@ -9,6 +9,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+# ---------------------------------------------------------------------------
+# Django -> Astro manifest contract
+# ---------------------------------------------------------------------------
+#
+# ``MANIFEST_API_VERSION`` documents the schema the Astro side reads. Any
+# breaking change to the manifest (removed field, renamed key, new required
+# field) MUST bump this string. The contract test in ``tests/test_contract.py``
+# pins the expected shape so drift is caught early.
+#
+# Consumers on the Astro side must import from ``src/lib/manifest.ts`` and
+# never touch ``process.env.CAULDRON_MANIFEST`` directly.
+MANIFEST_API_VERSION = "1.0"
+
+
 @dataclass
 class BuildResult:
     ok: bool
@@ -81,7 +95,7 @@ class SiteBuildService:
         self._config = config
         self._router = router  # ContentRouter or duck-typed object with list_items()
 
-    def build(self) -> BuildResult:
+    def build(self, *, theme_css_override: str = "") -> BuildResult:
         """Build the full public site.
 
         1. Collect published pages from router.
@@ -91,6 +105,12 @@ class SiteBuildService:
         4. On success: atomically replace output_root with the temp output directory.
         5. On failure: leave output_root untouched.
         6. Clean up temp files regardless.
+
+        ``theme_css_override`` — when non-empty, use this string as the
+        published theme instead of reading ``active.css`` from theme_root.
+        This is how the publish workflow injects the change set's staged CSS
+        into the build **before** promoting it, so a failed build never
+        touches ``active.css``.
         """
         import json
         import logging
@@ -173,9 +193,11 @@ class SiteBuildService:
                     shutil.rmtree(empty_dir, ignore_errors=True)
             return BuildResult(ok=True, pages_built=0, output_dir=str(output_root))
 
-        # Read active theme CSS if theme_root is configured
-        theme_css = ""
-        if cfg.theme_root:
+        # Determine effective theme CSS: an explicit override wins (used by
+        # the publish workflow to build with the staged CSS *before* it is
+        # promoted). Otherwise fall back to active.css from theme_root.
+        theme_css = theme_css_override
+        if not theme_css and cfg.theme_root:
             try:
                 from cauldron_site_astro.theme import SiteThemeService
                 theme_svc = SiteThemeService(cfg.theme_root)
@@ -183,7 +205,11 @@ class SiteBuildService:
             except Exception:
                 pass  # Non-fatal: build without theme
 
-        manifest = {"pages": pages, "theme": {"css_content": theme_css}}
+        manifest = {
+            "api_version": MANIFEST_API_VERSION,
+            "pages": pages,
+            "theme": {"css_content": theme_css},
+        }
         tmp_dir = None
         try:
             tmp_dir = tempfile.mkdtemp(prefix="cauldron_astro_")
@@ -247,12 +273,23 @@ class SiteBuildService:
         *,
         output_dir: "str | Path",
         extra_items: "list | None" = None,
+        item_ids_to_include: "list[str] | None" = None,
         theme_css: str = "",
     ) -> BuildResult:
-        """Build a preview including draft pages and a proposed theme.
+        """Build a preview scoped to a specific set of drafts + a proposed theme.
 
-        ``extra_items`` are duck-typed content items (same shape as returned
-        by the router) added alongside published pages (deduplicated by id).
+        Baseline: all currently *published* items in the homepage collection.
+
+        ``item_ids_to_include`` — draft items whose ids appear here are added
+        to the preview (overriding the published version if the ids collide).
+        Drafts NOT listed here are excluded, so an in-flight preview cannot
+        accidentally surface unrelated authoring work. ``None`` means "no
+        drafts" — the preview shows only the published baseline.
+
+        ``extra_items`` are duck-typed content items appended after the
+        include-filter has run; they always win over router items with the
+        same id. Used for tests and direct callers with pre-built payloads.
+
         ``theme_css`` overrides the active theme stylesheet for this build only.
         The result is written to ``output_dir`` without touching output_root.
         """
@@ -282,59 +319,63 @@ class SiteBuildService:
         frontend_root = Path(cfg.frontend_root)
         output_path = Path(output_dir)
 
-        # Collect published pages from router
+        def _page_entry(item):
+            if item.id == HOMEPAGE_ITEM_ID:
+                route = HOMEPAGE_ROUTE
+            else:
+                route = f"/{item.slug}/"
+            return {
+                "id": item.id,
+                "route": route,
+                "title": item.data.get("title", ""),
+                "navigation_title": item.data.get("navigation_title", ""),
+                "summary": item.data.get("summary", ""),
+                "body": item.body or "",
+                "template": item.data.get("template", "page"),
+                "seo_title": item.data.get("seo_title", ""),
+                "meta_description": item.data.get("meta_description", ""),
+                "canonical_url": item.data.get("canonical_url", ""),
+                "robots_index": item.data.get("robots_index", True),
+                "robots_follow": item.data.get("robots_follow", True),
+                "social_title": item.data.get("social_title", ""),
+                "social_description": item.data.get("social_description", ""),
+                "social_image": item.data.get("social_image", ""),
+            }
+
         pages_by_id: dict = {}
+
+        # Baseline: PUBLISHED items only. Drafts are opted-in below via
+        # item_ids_to_include, preventing the "all drafts" leak.
         try:
-            items = self._router.list_items(HOMEPAGE_COLLECTION, include_drafts=True)
+            published_items = self._router.list_items(
+                HOMEPAGE_COLLECTION, include_drafts=False,
+            )
         except Exception as exc:
             return BuildResult(ok=False, error=f"Failed to list pages: {exc}")
 
-        for item in items:
-            if item.id == HOMEPAGE_ITEM_ID:
-                route = HOMEPAGE_ROUTE
-            else:
-                route = f"/{item.slug}/"
-            pages_by_id[item.id] = {
-                "id": item.id,
-                "route": route,
-                "title": item.data.get("title", ""),
-                "navigation_title": item.data.get("navigation_title", ""),
-                "summary": item.data.get("summary", ""),
-                "body": item.body or "",
-                "template": item.data.get("template", "page"),
-                "seo_title": item.data.get("seo_title", ""),
-                "meta_description": item.data.get("meta_description", ""),
-                "canonical_url": item.data.get("canonical_url", ""),
-                "robots_index": item.data.get("robots_index", True),
-                "robots_follow": item.data.get("robots_follow", True),
-                "social_title": item.data.get("social_title", ""),
-                "social_description": item.data.get("social_description", ""),
-                "social_image": item.data.get("social_image", ""),
-            }
+        for item in published_items:
+            if getattr(item, "status", "published") != "published":
+                # Router may return non-published sentinel; skip anyway.
+                continue
+            pages_by_id[item.id] = _page_entry(item)
 
-        # Merge extra_items (deduplicate by id, extra_items win)
+        # Opt-in drafts: overlay just the requested draft item_ids.
+        include_ids = set(item_ids_to_include or ())
+        if include_ids:
+            try:
+                all_items = self._router.list_items(
+                    HOMEPAGE_COLLECTION, include_drafts=True,
+                )
+            except Exception as exc:
+                return BuildResult(ok=False, error=f"Failed to list pages: {exc}")
+
+            for item in all_items:
+                if item.id in include_ids:
+                    pages_by_id[item.id] = _page_entry(item)
+
+        # extra_items always win last (test hook / direct payload injection)
         for item in (extra_items or []):
-            if item.id == HOMEPAGE_ITEM_ID:
-                route = HOMEPAGE_ROUTE
-            else:
-                route = f"/{item.slug}/"
-            pages_by_id[item.id] = {
-                "id": item.id,
-                "route": route,
-                "title": item.data.get("title", ""),
-                "navigation_title": item.data.get("navigation_title", ""),
-                "summary": item.data.get("summary", ""),
-                "body": item.body or "",
-                "template": item.data.get("template", "page"),
-                "seo_title": item.data.get("seo_title", ""),
-                "meta_description": item.data.get("meta_description", ""),
-                "canonical_url": item.data.get("canonical_url", ""),
-                "robots_index": item.data.get("robots_index", True),
-                "robots_follow": item.data.get("robots_follow", True),
-                "social_title": item.data.get("social_title", ""),
-                "social_description": item.data.get("social_description", ""),
-                "social_image": item.data.get("social_image", ""),
-            }
+            pages_by_id[item.id] = _page_entry(item)
 
         pages = list(pages_by_id.values())
 
@@ -353,7 +394,11 @@ class SiteBuildService:
             except Exception:
                 pass
 
-        manifest = {"pages": pages, "theme": {"css_content": effective_theme_css}}
+        manifest = {
+            "api_version": MANIFEST_API_VERSION,
+            "pages": pages,
+            "theme": {"css_content": effective_theme_css},
+        }
         tmp_dir = None
         try:
             tmp_dir = tempfile.mkdtemp(prefix="cauldron_astro_preview_")

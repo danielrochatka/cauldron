@@ -1,10 +1,10 @@
 ---
-import { readFileSync } from 'fs';
 import { marked } from 'marked';
 import Base from '../layouts/Base.astro';
+import { loadManifest, type ManifestPage } from '../lib/manifest';
 
 export function getStaticPaths() {
-  function buildNavItems(pages: any[]): Array<{ title: string; route: string }> {
+  function buildNavItems(pages: ManifestPage[]): Array<{ title: string; route: string }> {
     return pages
       .filter((p) => {
         if ('nav_visible' in p) return Boolean(p.nav_visible);
@@ -17,16 +17,12 @@ export function getStaticPaths() {
       }));
   }
 
-  const manifestPath = process.env.CAULDRON_MANIFEST;
-  if (!manifestPath) {
-    throw new Error('CAULDRON_MANIFEST environment variable is required.');
-  }
-  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
-  const allNavItems = buildNavItems(manifest.pages || []);
+  const manifest = loadManifest();
+  const allNavItems = buildNavItems(manifest.pages);
 
-  return (manifest.pages || []).map((page: any) => {
-    // Homepage: route "/" → params.slug = undefined → generates index.html
-    // Other: route "/about/" → params.slug = "about" → generates about/index.html
+  return manifest.pages.map((page) => {
+    // Homepage: route "/" -> params.slug = undefined -> generates index.html
+    // Other: route "/about/" -> params.slug = "about" -> generates about/index.html
     const slug =
       page.route === '/'
         ? undefined

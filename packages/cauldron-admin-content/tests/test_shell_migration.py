@@ -104,8 +104,13 @@ def _load_perm(codename: str):
 
 
 @pytest.mark.django_db
-def test_draft_requires_permission(client):
-    """?include_drafts=1 without view_draft_content is silently ignored."""
+def test_draft_visibility_denied_without_permission(client):
+    """Without view_draft_content, drafts are never surfaced.
+
+    The include_drafts query param and checkbox have been removed; the
+    content browser now derives draft visibility purely from the actor's
+    Django permissions.
+    """
     from unittest.mock import MagicMock, patch
     from django.test import override_settings
     from django.contrib.auth import get_user_model
@@ -121,8 +126,15 @@ def test_draft_requires_permission(client):
     user = User.objects.get(pk=user.pk)
     client.force_login(user)
 
+    captured_include_drafts = []
     fake_service = MagicMock()
     fake_service.list_collections.return_value = []
+
+    def fake_list_items(collection, user, include_drafts=False):
+        captured_include_drafts.append(include_drafts)
+        return []
+
+    fake_service.list_items.side_effect = fake_list_items
     with override_settings(ROOT_URLCONF="tests.urls"):
         with patch(
             "cauldron_admin_content.views._get_service",
@@ -131,16 +143,18 @@ def test_draft_requires_permission(client):
             response = client.get(
                 "/cauldron-admin/content/?include_drafts=1",
             )
-    # The page renders successfully; the include_drafts flag must be
+    # The page renders successfully; the (removed) include_drafts flag is
     # ignored because the user lacks the permission.
     assert response.status_code == 200
-    # The response context reflects the ignored flag.
-    assert response.context["include_drafts"] is False
+    assert response.context["can_view_drafts"] is False
+    # Any service call would have used include_drafts=False.
+    if captured_include_drafts:
+        assert all(x is False for x in captured_include_drafts)
 
 
 @pytest.mark.django_db
-def test_draft_flag_honoured_with_permission(client):
-    """?include_drafts=1 IS honoured for users with view_draft_content."""
+def test_draft_visibility_granted_with_permission(client):
+    """Editors with view_draft_content see drafts + published automatically."""
     from unittest.mock import MagicMock, patch
     from django.test import override_settings
     from django.contrib.auth import get_user_model
@@ -156,18 +170,25 @@ def test_draft_flag_honoured_with_permission(client):
     user = User.objects.get(pk=user.pk)
     client.force_login(user)
 
+    captured_include_drafts = []
     fake_service = MagicMock()
     fake_service.list_collections.return_value = []
+
+    def fake_list_items(collection, user, include_drafts=False):
+        captured_include_drafts.append(include_drafts)
+        return []
+
+    fake_service.list_items.side_effect = fake_list_items
     with override_settings(ROOT_URLCONF="tests.urls"):
         with patch(
             "cauldron_admin_content.views._get_service",
             return_value=fake_service,
         ):
-            response = client.get(
-                "/cauldron-admin/content/?include_drafts=1",
-            )
+            response = client.get("/cauldron-admin/content/")
     assert response.status_code == 200
-    assert response.context["include_drafts"] is True
+    assert response.context["can_view_drafts"] is True
+    if captured_include_drafts:
+        assert all(x is True for x in captured_include_drafts)
 
 
 @pytest.mark.django_db

@@ -205,13 +205,10 @@ class ContentBrowserView(View):
         has_draft_perm = request.user.has_perm(
             "cauldron_content_operations.view_draft_content"
         )
-        # Default include_drafts to True for users with draft permission,
-        # unless explicitly overridden in the query string
-        if "include_drafts" in request.GET:
-            requested_drafts = request.GET.get("include_drafts", "").lower() in ("1", "true", "yes")
-            include_drafts = requested_drafts and has_draft_perm
-        else:
-            include_drafts = has_draft_perm
+        # Editors with view_draft_content always see drafts + published; there
+        # is no "Include Drafts" checkbox any more. Authors without draft
+        # permission continue to see published items only.
+        include_drafts = has_draft_perm
         can_propose = request.user.has_perm(
             "cauldron_content_operations.propose_content_changes"
         )
@@ -227,7 +224,6 @@ class ContentBrowserView(View):
                 "collections": [],
                 "selected_collection": "",
                 "items": [],
-                "include_drafts": False,
                 "can_view_drafts": has_draft_perm,
                 "can_propose": can_propose,
                 "can_publish": _can_publish(request, require_approval),
@@ -256,7 +252,6 @@ class ContentBrowserView(View):
             "collections": collections,
             "selected_collection": collection,
             "items": items,
-            "include_drafts": include_drafts,
             "can_view_drafts": has_draft_perm,
             "can_propose": can_propose,
             "can_publish": _can_publish(request, require_approval),

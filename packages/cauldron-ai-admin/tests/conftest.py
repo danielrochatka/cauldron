@@ -28,6 +28,7 @@ def pytest_configure(config):
                 "cauldron_content_operations",
                 "cauldron_django_admin",
                 "cauldron_ai_admin",
+                "cauldron_site_astro",
             ],
             MIDDLEWARE=[
                 "django.contrib.sessions.middleware.SessionMiddleware",

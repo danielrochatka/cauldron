@@ -728,12 +728,71 @@ def test_build_preview_no_pages_creates_empty_output(tmp_path: Path):
     assert preview_out.exists()
 
 
-def test_build_preview_includes_draft_pages(tmp_path: Path):
-    """build_preview includes draft pages (include_drafts=True)."""
+def test_build_preview_includes_only_scoped_drafts(tmp_path: Path):
+    """build_preview includes ONLY drafts listed in item_ids_to_include.
+
+    The old behaviour of surfacing every draft on the workspace is a leak:
+    unrelated in-flight authoring work must not appear in another user's
+    preview. The router is called twice — once for the published baseline
+    (include_drafts=False) and once for opted-in drafts.
+    """
+    draft_included = _make_item(
+        "page.draft.in", "draft-in", status="draft", data={"title": "In"},
+    )
+    draft_excluded = _make_item(
+        "page.draft.out", "draft-out", status="draft", data={"title": "Out"},
+    )
+    published = _make_item(
+        "homepage", "homepage", status="published", data={"title": "Home"},
+    )
+
+    config = _make_config(tmp_path)
+    router = MagicMock()
+
+    def fake_list_items(collection, include_drafts=False):
+        if include_drafts:
+            return [draft_included, draft_excluded, published]
+        return [published]
+
+    router.list_items.side_effect = fake_list_items
+    svc = SiteBuildService(config, router)
+    preview_out = tmp_path / "preview"
+
+    captured_manifest = {}
+
+    def fake_run(cmd, **kwargs):
+        manifest_path = kwargs["env"]["CAULDRON_MANIFEST"]
+        preview_out.mkdir(parents=True, exist_ok=True)
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            captured_manifest.update(json.load(f))
+        return _ok_proc()
+
+    with patch("subprocess.run", side_effect=fake_run):
+        result = svc.build_preview(
+            output_dir=preview_out,
+            item_ids_to_include=["page.draft.in"],
+        )
+
+    assert result.ok is True
+    page_ids = {p["id"] for p in captured_manifest["pages"]}
+    assert "homepage" in page_ids                # baseline (published)
+    assert "page.draft.in" in page_ids           # opted-in
+    assert "page.draft.out" not in page_ids      # NOT opted-in => excluded
+
+
+def test_build_preview_default_excludes_all_drafts(tmp_path: Path):
+    """With no item_ids_to_include, the preview shows only published items."""
     draft = _make_item("page.draft", "draft-page", status="draft", data={"title": "Draft"})
     published = _make_item("homepage", "homepage", status="published", data={"title": "Home"})
     config = _make_config(tmp_path)
-    router = _make_router([draft, published])
+    router = MagicMock()
+
+    def fake_list_items(collection, include_drafts=False):
+        if include_drafts:
+            return [draft, published]
+        return [published]
+
+    router.list_items.side_effect = fake_list_items
     svc = SiteBuildService(config, router)
     preview_out = tmp_path / "preview"
 
@@ -750,10 +809,9 @@ def test_build_preview_includes_draft_pages(tmp_path: Path):
         result = svc.build_preview(output_dir=preview_out)
 
     assert result.ok is True
-    # Both draft and published pages should appear
     page_ids = {p["id"] for p in captured_manifest["pages"]}
-    assert "page.draft" in page_ids
     assert "homepage" in page_ids
+    assert "page.draft" not in page_ids
 
 
 def test_build_preview_uses_provided_theme_css(tmp_path: Path):

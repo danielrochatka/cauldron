@@ -19,14 +19,6 @@
         {% endfor %}
       </select>
     </div>
-    {% if can_view_drafts %}
-    <div class="cui-form-field">
-      <label>
-        <input type="checkbox" name="include_drafts" value="1" {% if include_drafts %}checked{% endif %} onchange="this.form.submit()">
-        Include Drafts
-      </label>
-    </div>
-    {% endif %}
   </form>
 </div>
 

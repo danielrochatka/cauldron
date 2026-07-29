@@ -1,4 +1,4 @@
-import { readFileSync } from 'fs';
+import { loadManifest } from '../lib/manifest';
 
 const DEFAULT_CSS = `/* Cauldron public site – default theme */
 :root {
@@ -70,16 +70,14 @@ h1 { font-size: 2rem; margin-bottom: 1rem; }
 
 export async function GET() {
   let css = DEFAULT_CSS;
-  const manifestPath = process.env.CAULDRON_MANIFEST;
-  if (manifestPath) {
-    try {
-      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
-      if (typeof manifest?.theme?.css_content === 'string' && manifest.theme.css_content) {
-        css = manifest.theme.css_content;
-      }
-    } catch {
-      // Fall through to default
+  try {
+    const manifest = loadManifest();
+    if (typeof manifest?.theme?.css_content === 'string' && manifest.theme.css_content) {
+      css = manifest.theme.css_content;
     }
+  } catch {
+    // No manifest / bad manifest — fall through to default so the theme
+    // route always responds with valid CSS.
   }
   return new Response(css, {
     headers: { 'Content-Type': 'text/css; charset=utf-8' },

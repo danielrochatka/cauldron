@@ -949,3 +949,113 @@ def test_build_preview_extra_items_win_deduplication(tmp_path: Path):
     # Only one page (deduplicated), and extra_item wins
     assert len(captured_manifest["pages"]) == 1
     assert captured_manifest["pages"][0]["title"] == "New Home Draft"
+
+
+# ---------------------------------------------------------------------------
+# migrate_output_root management command
+# ---------------------------------------------------------------------------
+
+
+def test_migrate_output_root_converts_real_dir_to_symlink(tmp_path):
+    """migrate_output_root converts an existing real directory to a symlink release."""
+    from cauldron_site_astro.management.commands.cauldron_migrate_output_root import (
+        migrate_output_root,
+    )
+
+    output_root = tmp_path / "public"
+    output_root.mkdir()
+    (output_root / "index.html").write_text("<html>legacy</html>")
+    (output_root / "about").mkdir()
+    (output_root / "about" / "index.html").write_text("<html>about</html>")
+
+    release = migrate_output_root(output_root)
+
+    # output_root is now a symlink
+    assert output_root.is_symlink(), "output_root must be a symlink after migration"
+    # It points to the new release inside .releases/
+    releases_dir = tmp_path / "public.releases"
+    assert releases_dir.is_dir(), "releases dir must exist"
+    assert release.parent == releases_dir, "release must be inside .releases/"
+
+    # Content is preserved via the symlink
+    assert (output_root / "index.html").read_text() == "<html>legacy</html>"
+    assert (output_root / "about" / "index.html").read_text() == "<html>about</html>"
+
+    # The legacy copy is cleaned up (only the new release remains)
+    remaining = list(releases_dir.iterdir())
+    assert len(remaining) == 1, "only the new release should remain; legacy must be deleted"
+    assert remaining[0] == release
+
+
+def test_migrate_output_root_already_symlink_raises(tmp_path):
+    """migrate_output_root raises ValueError if output_root is already a symlink."""
+    from cauldron_site_astro.management.commands.cauldron_migrate_output_root import (
+        migrate_output_root,
+    )
+
+    target = tmp_path / "release"
+    target.mkdir()
+    link = tmp_path / "public"
+    link.symlink_to(target)
+
+    with pytest.raises(ValueError, match="already a symlink"):
+        migrate_output_root(link)
+
+
+def test_migrate_output_root_missing_raises(tmp_path):
+    """migrate_output_root raises FileNotFoundError if output_root does not exist."""
+    from cauldron_site_astro.management.commands.cauldron_migrate_output_root import (
+        migrate_output_root,
+    )
+
+    with pytest.raises(FileNotFoundError):
+        migrate_output_root(tmp_path / "nonexistent")
+
+
+def test_migrate_output_root_rollback_on_activation_failure(tmp_path):
+    """If the os.rename activation fails, the original directory is restored."""
+    from cauldron_site_astro.management.commands.cauldron_migrate_output_root import (
+        migrate_output_root,
+    )
+
+    output_root = tmp_path / "public"
+    output_root.mkdir()
+    (output_root / "index.html").write_text("<html>original</html>")
+
+    def fail_os_rename(src, dst):
+        raise OSError("simulated rename failure")
+
+    with pytest.raises(OSError, match="simulated rename failure"):
+        with patch("cauldron_site_astro.management.commands.cauldron_migrate_output_root.os.rename", side_effect=fail_os_rename):
+            migrate_output_root(output_root)
+
+    # The original real directory must be restored
+    assert output_root.is_dir() and not output_root.is_symlink()
+    assert (output_root / "index.html").read_text() == "<html>original</html>"
+
+
+def test_migrate_output_root_followed_by_atomic_promote(tmp_path):
+    """After migration, subsequent promote_output calls are fully atomic (no real-dir branch)."""
+    from cauldron_site_astro.management.commands.cauldron_migrate_output_root import (
+        migrate_output_root,
+    )
+
+    output_root = tmp_path / "public"
+    output_root.mkdir()
+    (output_root / "old.html").write_text("<html>old</html>")
+
+    migrate_output_root(output_root)
+    assert output_root.is_symlink()
+
+    # Now a subsequent promote_output must take the is_symlink() branch (atomic, no window)
+    new_build = tmp_path / "new_build"
+    new_build.mkdir()
+    (new_build / "new.html").write_text("<html>new</html>")
+
+    from cauldron_site_astro.service import _promote_output
+
+    _promote_output(new_build, output_root)
+
+    assert output_root.is_symlink()
+    assert (output_root / "new.html").read_text() == "<html>new</html>"
+    assert not (output_root / "old.html").exists()

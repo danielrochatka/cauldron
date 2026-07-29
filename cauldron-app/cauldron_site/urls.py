@@ -22,6 +22,9 @@ urlpatterns = [
     # Content API
     path("cauldron/api/v1/", include("cauldron_content_api.urls")),
     # Public site — MUST be last
+    # Top-level generated files with extensions: theme.css, favicon.ico, robots.txt, etc.
+    # Must come before the bare-slug redirect so /theme.css is served directly.
+    re_path(r'^(?P<asset_path>[^/]+\.[^/]+)$', serve_asset, name="public-top-asset"),
     # Nested generated assets: _astro/chunk.js, images/hero.png, etc.
     re_path(r'^(?P<asset_path>[^/]+(?:/[^/]+)+)$', serve_asset, name="public-asset"),
     # Bare slug redirect: /about → /about/

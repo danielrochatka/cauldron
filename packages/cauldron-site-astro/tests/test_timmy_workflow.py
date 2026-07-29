@@ -693,3 +693,147 @@ def test_full_workflow_prepare_then_inspect_then_publish(tmp_path):
     assert cs.status == SiteChangeSet.PUBLISHED
     # Staged CSS was promoted on successful publish.
     assert SiteThemeService(theme_dir).get_active_css() == "body { background: purple; }"
+
+
+# ---------------------------------------------------------------------------
+# _extract_draft_items: new-page injection into preview builds
+# ---------------------------------------------------------------------------
+
+
+def test_extract_draft_items_empty_input():
+    """Empty request list returns empty ids and items."""
+    from cauldron_site_astro.site_tools import _extract_draft_items
+    ids, items = _extract_draft_items([])
+    assert ids == []
+    assert items == []
+
+
+def test_extract_draft_items_no_matching_requests():
+    """Non-existent request IDs produce empty results without raising."""
+    from cauldron_site_astro.site_tools import _extract_draft_items
+    ids, items = _extract_draft_items(["does-not-exist-123"])
+    assert ids == []
+    assert items == []
+
+
+def test_extract_draft_items_from_workspace_changeset(tmp_path):
+    """Operations from a workspace changeset are returned as extra_items."""
+    from types import SimpleNamespace
+    from cauldron_site_astro.site_tools import _extract_draft_items
+
+    # Build a minimal fake workspace and changeset
+    fake_op = SimpleNamespace(
+        kind="create",
+        item_id="timmy-home",
+        slug="homepage",
+        collection="pages",
+        schema="page",
+        data={"title": "Timmy's Home"},
+        body="Hello from Timmy!",
+    )
+    fake_changeset = SimpleNamespace(operations=[fake_op])
+    fake_workspace = MagicMock()
+    fake_workspace.load_changeset.return_value = fake_changeset
+
+    fake_cr = SimpleNamespace(
+        workspace_changeset_id="ws-abc",
+    )
+
+    fake_service = MagicMock()
+    fake_service._workspace = fake_workspace
+
+    with patch("cauldron_site_astro.site_tools._get_content_operation_service", return_value=fake_service):
+        # Patch ContentChangeRequest.objects.get to return our fake cr
+        with patch(
+            "cauldron_site_astro.site_tools._extract_draft_items.__code__",
+        ) if False else patch(
+            "cauldron_content_operations.models.ContentChangeRequest.objects.get",
+            return_value=fake_cr,
+        ):
+            ids, items = _extract_draft_items(["req-timmy-1"])
+
+    assert "timmy-home" in ids
+    assert len(items) == 1
+    item = items[0]
+    assert item.id == "timmy-home"
+    assert item.slug == "homepage"
+    assert item.data == {"title": "Timmy's Home"}
+    assert item.body == "Hello from Timmy!"
+
+
+def test_extract_draft_items_delete_operations_skipped(tmp_path):
+    """Delete operations are excluded from extra_items (cannot inject a removal)."""
+    from types import SimpleNamespace
+    from cauldron_site_astro.site_tools import _extract_draft_items
+
+    fake_op = SimpleNamespace(
+        kind="delete",
+        item_id="old-page",
+        slug="old-page",
+        collection="pages",
+        schema="page",
+        data={},
+        body="",
+    )
+    fake_changeset = SimpleNamespace(operations=[fake_op])
+    fake_workspace = MagicMock()
+    fake_workspace.load_changeset.return_value = fake_changeset
+
+    fake_cr = SimpleNamespace(workspace_changeset_id="ws-del")
+    fake_service = MagicMock()
+    fake_service._workspace = fake_workspace
+
+    with patch("cauldron_site_astro.site_tools._get_content_operation_service", return_value=fake_service):
+        with patch(
+            "cauldron_content_operations.models.ContentChangeRequest.objects.get",
+            return_value=fake_cr,
+        ):
+            ids, items = _extract_draft_items(["req-del-1"])
+
+    # The item_id IS recorded (for scoping) but no extra_item is injected
+    assert "old-page" in ids
+    assert items == []
+
+
+def test_prepare_change_set_passes_extra_items_to_build_preview(tmp_path):
+    """_handle_prepare_change_set passes extra_items from workspace ops to build_preview."""
+    from types import SimpleNamespace
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_site_astro.site_tools import _handle_prepare_change_set
+
+    ctx = _ctx("timmy-extra-items")
+    previews_root = tmp_path / "previews"
+    config = _make_config(tmp_path, previews_root=str(previews_root))
+    build_result = _make_build_result(ok=True, pages_built=3)
+    svc = MagicMock()
+    svc._config = config
+    svc.build_preview.return_value = build_result
+
+    # Fake draft item that _extract_draft_items will return
+    fake_item = SimpleNamespace(
+        id="new-timmy-page",
+        slug="about-timmy",
+        collection="pages",
+        schema="page",
+        data={"title": "About Timmy"},
+        body="Timmy is a dragon.",
+        status=object(),  # ContentStatus.DRAFT
+        hash="",
+        provider="",
+        source_ref="",
+    )
+
+    with patch(
+        "cauldron_site_astro.site_tools._extract_draft_items",
+        return_value=(["new-timmy-page"], [fake_item]),
+    ):
+        with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+            result = _handle_prepare_change_set(
+                ctx,
+                content_request_ids=["req-timmy-new"],
+            )
+
+    assert result.success is True
+    call_kwargs = svc.build_preview.call_args.kwargs
+    assert call_kwargs.get("item_ids_to_include") == ["new-timmy-page"]
+    assert call_kwargs.get("extra_items") == [fake_item]

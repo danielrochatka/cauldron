@@ -246,28 +246,43 @@ def _get_content_operation_service():
         return None
 
 
-def _extract_item_ids(content_request_ids: list[str]) -> list[str]:
-    """Best-effort: return item_ids affected by the given change requests.
+def _extract_draft_items(
+    content_request_ids: list[str],
+) -> "tuple[list[str], list]":
+    """Best-effort: return (item_ids, extra_items) for the given change requests.
 
-    Preview scoping needs the item_ids so it only includes the drafts that
-    belong to this change set. We look up each ContentChangeRequest and pull
-    ``item_id`` out of each op in its workspace changeset.
+    ``item_ids`` — IDs of all items affected by the change requests.  Passed
+    to ``build_preview(item_ids_to_include=...)`` so the router includes draft
+    versions of pages that already exist in the flatfile store.
 
-    If cauldron-content-operations is not installed, or a lookup fails, we
-    return an empty list — the caller will fall back to a published-only
-    preview rather than crashing the whole workflow.
+    ``extra_items`` — duck-typed ContentItem-like objects constructed directly
+    from workspace changeset operations.  They are passed to
+    ``build_preview(extra_items=...)`` and always win over router items with the
+    same id.  This covers two cases:
+    - *create*: the proposed page does not yet exist in the flatfile store so
+      the router will not find it; extra_items injects it directly.
+    - *update*: the proposed draft data may differ from what the router returns
+      for the same item_id; extra_items overrides it with the exact proposed
+      content the user reviewed during the proposal step.
+
+    If cauldron-content-operations is not installed, or any lookup fails, we
+    return empty lists — the caller falls back to a published-only preview
+    rather than crashing the whole workflow.
     """
     if not content_request_ids:
-        return []
+        return [], []
 
-    item_ids: list[str] = []
     try:
         from cauldron_content_operations.models import ContentChangeRequest
     except Exception:
-        return []
+        return [], []
 
     service = _get_content_operation_service()
     workspace = getattr(service, "_workspace", None) if service is not None else None
+
+    item_ids: list[str] = []
+    extra_items: list = []
+    seen_ids: set[str] = set()
 
     for req_id in content_request_ids:
         try:
@@ -275,37 +290,85 @@ def _extract_item_ids(content_request_ids: list[str]) -> list[str]:
         except Exception:
             continue
 
+        ops_to_process = []
+
         # Preferred path: pull operations from the workspace changeset.
         ws_id = getattr(cr, "workspace_changeset_id", "")
         if workspace is not None and ws_id:
             try:
                 changeset = workspace.load_changeset(ws_id)
-                for op in getattr(changeset, "operations", ()) or ():
-                    op_item_id = getattr(op, "item_id", None)
-                    if op_item_id:
-                        item_ids.append(str(op_item_id))
-                continue
+                ops_to_process = list(getattr(changeset, "operations", ()) or ())
             except Exception:
                 pass
 
-        # Fallback path: some installations attach operations directly on
-        # the change request (JSONField). Accept that shape too.
-        raw_ops = getattr(cr, "operations", None)
-        if isinstance(raw_ops, list):
-            for op in raw_ops:
-                if isinstance(op, dict):
-                    op_item_id = op.get("item_id")
-                    if op_item_id:
-                        item_ids.append(str(op_item_id))
+        # Fallback path: operations stored as a JSONField on the change request.
+        if not ops_to_process:
+            raw_ops = getattr(cr, "operations", None)
+            if isinstance(raw_ops, list):
+                # Wrap raw dicts as SimpleNamespaces so attribute access works below.
+                from types import SimpleNamespace
+                ops_to_process = [
+                    SimpleNamespace(**op) if isinstance(op, dict) else op
+                    for op in raw_ops
+                ]
 
-    # Deduplicate while preserving first-seen order.
-    seen: set[str] = set()
-    out: list[str] = []
-    for iid in item_ids:
-        if iid not in seen:
-            seen.add(iid)
-            out.append(iid)
-    return out
+        for op in ops_to_process:
+            op_item_id = str(getattr(op, "item_id", "") or "")
+            if not op_item_id:
+                continue
+
+            if op_item_id not in seen_ids:
+                seen_ids.add(op_item_id)
+                item_ids.append(op_item_id)
+
+            # Build an extra_item from the operation's proposed content so that
+            # both new pages (create) and proposed edits (update) appear in the
+            # preview with exactly the content the operator reviewed.
+            op_kind = str(getattr(op, "kind", "") or "")
+            if op_kind == "delete":
+                # Delete proposals: the page should not appear in the preview.
+                # We cannot easily remove a published page from the router, so
+                # we skip injection — the published page will still show.
+                # Callers can address this edge case in a follow-up.
+                continue
+
+            op_data = getattr(op, "data", None) or {}
+            op_body = getattr(op, "body", "") or ""
+            op_slug = getattr(op, "slug", "") or ""
+            op_schema = getattr(op, "schema", "") or "page"
+            op_collection = getattr(op, "collection", "") or ""
+
+            if not op_slug:
+                continue  # Cannot build a page entry without a slug
+
+            try:
+                from types import SimpleNamespace
+                from cauldron_content.contracts import ContentStatus
+                extra_items.append(SimpleNamespace(
+                    id=op_item_id,
+                    collection=op_collection,
+                    slug=op_slug,
+                    status=ContentStatus.DRAFT,
+                    schema=op_schema,
+                    data=op_data if isinstance(op_data, dict) else {},
+                    body=op_body,
+                    hash="",
+                    provider="",
+                    source_ref="",
+                ))
+            except Exception:
+                # If ContentStatus import fails or the namespace is malformed,
+                # skip this item; the id is still in item_ids so the router
+                # will at least try to find it.
+                pass
+
+    return item_ids, extra_items
+
+
+def _extract_item_ids(content_request_ids: list[str]) -> list[str]:
+    """Return item_ids only (no extra_items).  Kept for callers that need only IDs."""
+    ids, _ = _extract_draft_items(content_request_ids)
+    return ids
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +506,13 @@ def _handle_prepare_change_set(
         )
 
     # ---- Create the SiteChangeSet in 'preparing' state --------------------
-    affected_item_ids = _extract_item_ids(content_request_ids)
+    # _extract_draft_items returns (item_ids, extra_items):
+    # - item_ids: used for scoping (include existing router drafts with these ids)
+    # - extra_items: the proposed item content extracted directly from workspace
+    #   changesets, injected into the preview so new pages (not yet in the
+    #   flatfile store) and edited pages (override router version with proposed
+    #   content) appear exactly as the operator reviewed them.
+    affected_item_ids, draft_extra_items = _extract_draft_items(content_request_ids)
     cs = SiteChangeSet.objects.create(
         status=SiteChangeSet.PREPARING,
         content_request_ids=content_request_ids,
@@ -459,6 +528,7 @@ def _handle_prepare_change_set(
         result = svc.build_preview(
             output_dir=output_dir,
             item_ids_to_include=affected_item_ids or None,
+            extra_items=draft_extra_items or None,
             theme_css=theme_css or "",
         )
     except Exception as exc:
@@ -683,6 +753,13 @@ def _handle_publish(context, *, change_set_id, confirm, **kwargs):
         validated[req_id] = v
 
     # ---- Step 2: Build (no DB or FS mutations) -----------------------------
+    # Extract proposed item content from workspace changesets so that new pages
+    # (not yet in the flatfile store) appear in the build with the exact content
+    # the operator reviewed.  The content requests are applied in Step 6 AFTER
+    # the build, so without extra_items those pages would be absent from the
+    # published output.
+    _, publish_extra_items = _extract_draft_items(cs.content_request_ids or [])
+
     tmp_build_dir = tempfile.mkdtemp(prefix="cauldron_pub_")
     output_snapshot: "Path | None" = None  # set after promote_output_with_backup
 
@@ -691,6 +768,7 @@ def _handle_publish(context, *, change_set_id, confirm, **kwargs):
             result = svc.build_preview(
                 output_dir=tmp_build_dir,
                 item_ids_to_include=cs.affected_item_ids or None,
+                extra_items=publish_extra_items or None,
                 theme_css=cs.staged_theme_css or "",
             )
         except Exception as exc:

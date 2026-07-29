@@ -195,7 +195,7 @@ def register(registry: "AdminAIToolRegistry") -> None:
                 },
                 "required": ["change_set_id", "confirm"],
             },
-            risk_level=RiskLevel.MAINTENANCE,
+            risk_level=RiskLevel.PROPOSE,
             required_permission=_PERM_MAINTAIN,
             owning_module=_OWNING_MODULE,
             timeout_seconds=300.0,

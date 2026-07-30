@@ -537,10 +537,6 @@ class AdminAISettingsView(View):
         )
 
 
-@method_decorator([
-    login_required,
-    permission_required(ADMIN_AI_PERMISSION, raise_exception=True),
-], name="dispatch")
 class AdminAIPageView(View):
     """Render the Admin AI console and accept POSTed requests.
 
@@ -552,9 +548,44 @@ class AdminAIPageView(View):
     POST is JSON-in / JSON-out. CSRF is required (Django enforces this
     against the default middleware). The view calls
     ``AdminAIService.run()`` and returns a summary of the resulting run.
+
+    Auth and permission are enforced in dispatch() so that POST requests
+    from the browser-side AI console receive structured JSON errors (401/403)
+    rather than HTML login-redirect pages that would cause a client-side
+    JSON parse failure.
     """
 
     template_name = "cauldron_ai_admin/ai_page.html"
+
+    def dispatch(self, request: HttpRequest, *args: Any, **kwargs: Any) -> HttpResponse:
+        if not request.user.is_authenticated:
+            if request.method == "POST":
+                return JsonResponse(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "auth_required",
+                            "message": "Authentication required. Please refresh the page and log in.",
+                        },
+                    },
+                    status=401,
+                )
+            from django.contrib.auth.views import redirect_to_login
+            return redirect_to_login(request.get_full_path())
+        if not request.user.has_perm(ADMIN_AI_PERMISSION):
+            if request.method == "POST":
+                return JsonResponse(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "permission_denied",
+                            "message": "You do not have permission to use Admin AI.",
+                        },
+                    },
+                    status=403,
+                )
+            raise PermissionDenied
+        return super().dispatch(request, *args, **kwargs)
 
     def get(self, request: HttpRequest) -> HttpResponse:
         from .tools import get_tool_registry
@@ -586,12 +617,21 @@ class AdminAIPageView(View):
         try:
             payload = _parse_json_body(request)
         except ValueError as exc:
-            return JsonResponse({"error": str(exc)}, status=400)
+            return JsonResponse(
+                {"ok": False, "error": {"code": "bad_request", "message": str(exc)}},
+                status=400,
+            )
         request_text = payload.get("request", "")
         correlation_id = payload.get("correlation_id", "")
         if not isinstance(request_text, str) or not request_text.strip():
             return JsonResponse(
-                {"error": "Field 'request' must be a non-empty string."},
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "bad_request",
+                        "message": "Field 'request' must be a non-empty string.",
+                    },
+                },
                 status=400,
             )
         try:
@@ -599,22 +639,43 @@ class AdminAIPageView(View):
         except Exception:
             logger.exception("Admin AI service is not configured")
             return JsonResponse(
-                {"error": "Admin AI is not available. Contact your administrator."},
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "service_unavailable",
+                        "message": "Admin AI is not available. Contact your administrator.",
+                    },
+                },
                 status=503,
             )
         try:
             run = service.run(request.user, request_text, correlation_id=correlation_id)
         except (PermissionDenied, PermissionError) as exc:
-            return JsonResponse({"error": str(exc)}, status=403)
+            return JsonResponse(
+                {
+                    "ok": False,
+                    "error": {"code": "permission_denied", "message": str(exc)},
+                },
+                status=403,
+            )
         except ValueError as exc:
-            return JsonResponse({"error": str(exc)}, status=400)
+            return JsonResponse(
+                {"ok": False, "error": {"code": "bad_request", "message": str(exc)}},
+                status=400,
+            )
         except Exception:
             logger.exception("Admin AI run raised an unexpected exception")
             return JsonResponse(
-                {"error": "Admin AI run failed. See server logs."},
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "server_error",
+                        "message": "Admin AI run failed. See server logs.",
+                    },
+                },
                 status=500,
             )
-        return JsonResponse(_serialize_run(run))
+        return JsonResponse({"ok": True, **_serialize_run(run)})
 
 
 @method_decorator([

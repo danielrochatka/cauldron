@@ -155,7 +155,11 @@ echo "--> Running system check..."
 "$CAULDRON_DIR/manage" check
 
 # 13. Start server.
+# Re-source lib.sh so any changes pulled in step 5 (e.g. new --timeout flag)
+# take effect before the server is launched.  lib.sh was sourced at startup
+# from the pre-pull version; re-sourcing here picks up the updated functions.
 echo "--> Starting server..."
+source "$CAULDRON_DIR/lib.sh"
 PORT="${CAULDRON_PORT:-8000}"
 launch_server "$CAULDRON_DIR" "$PORT"
 

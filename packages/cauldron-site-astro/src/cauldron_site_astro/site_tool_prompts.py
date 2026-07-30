@@ -101,6 +101,8 @@ _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
         boundary_examples=(
             "Do not claim the theme is live until site.publish is confirmed.",
             "Do not stage themes the user has not explicitly requested.",
+            "Do not pass css_content to site.prepare_change_set — the staged "
+            "CSS is included automatically.",
         ),
     ),
     AIToolPromptTemplate(
@@ -129,13 +131,19 @@ _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
         ),
         input_expectations=(
             "Requires 'content_request_ids' (non-empty list of strings). "
-            "Optional: 'theme_css' (string), 'description' (string)."
+            "Optional: 'description' (string). "
+            "Do NOT pass 'theme_css' — any CSS previously staged via "
+            "site.stage_theme is loaded automatically."
         ),
         result_behavior=(
-            "Returns change_set_id (UUID string) and preview_url (Django URL path). "
+            "Returns change_set_id (UUID string), preview_url (Django URL path), "
+            "and pages_built (integer). "
             "The preview shows the published baseline overlaid with only the "
             "specified drafts — unrelated in-flight drafts are excluded. "
-            "Build is asynchronous; poll with site.inspect_preview for status."
+            "The build runs synchronously; the result reflects the final "
+            "draft_ready or preview_failed state. "
+            "site.inspect_preview can be used to revisit the status of an "
+            "existing change set."
         ),
         approval_requirements=(
             "Prepare is a propose-level operation. Publishing the change set "
@@ -143,21 +151,26 @@ _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
         ),
         clarification_behavior=(
             "Always use this tool to create a preview before recommending publish. "
-            "Report the preview_url to the user for their review."
+            "Report the preview_url to the user for their review. "
+            "If the actor previously staged theme CSS, it will be included "
+            "in the preview automatically — do not ask them to re-supply it."
         ),
         refusal_behavior=(
             "Refuse if content_request_ids is empty. "
             "Refuse if any request ID is not found or invalid."
         ),
         error_guidance=(
-            "On build failure, inspect site.inspect_preview for error details. "
-            "Do not proceed to publish if the preview build failed."
+            "On build failure (success=false), report the error and do not proceed "
+            "to publish. The actor may retry site.prepare_change_set after fixing "
+            "the underlying content issue."
         ),
         positive_examples=(
             "Prepare a preview for change requests ['req-abc', 'req-def'].",
-            "Bundle two content proposals and a theme override into a change set.",
+            "Bundle two content proposals into a change set — staged theme CSS "
+            "is included automatically.",
         ),
         boundary_examples=(
+            "Do not pass theme_css — staged CSS is auto-loaded.",
             "Do not proceed to site.publish without first confirming the preview "
             "with the user.",
             "Do not include change requests that have already been published.",
@@ -190,7 +203,10 @@ _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
         ),
         approval_requirements="None; read-only.",
         clarification_behavior=(
-            "Use this tool to poll build status after site.prepare_change_set. "
+            "Use this tool to revisit a previously prepared change set or to "
+            "re-read status after returning to a workflow. "
+            "site.prepare_change_set already returns the final status synchronously, "
+            "so polling is not needed immediately after preparation. "
             "Report the preview_url to the user when status is 'draft_ready'."
         ),
         refusal_behavior=(
@@ -241,8 +257,10 @@ _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
             "Requires 'change_set_id' (UUID string) and 'confirm' (boolean, must be true)."
         ),
         result_behavior=(
-            "On success: returns published=true and the live site URL. "
-            "On build failure: returns published=false; live site is not changed. "
+            "On success: data includes published=true, live_url (the live site "
+            "root, typically '/'), pages_built (integer), and change_set_id. "
+            "On any failure: data includes published=false and change_set_id; "
+            "the live site and live theme are left untouched. "
             "Staged theme CSS is only promoted on a successful build."
         ),
         approval_requirements=(

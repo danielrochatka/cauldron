@@ -26,10 +26,11 @@ def _register_site_tools() -> None:
 
 def _register_site_tool_prompts() -> None:
     try:
-        from cauldron_site_astro.site_tool_prompts import register_builtin_site_tool_prompts
-        register_builtin_site_tool_prompts()
+        import cauldron_ai  # noqa: F401
     except ImportError:
-        pass  # cauldron-ai not installed
+        return  # cauldron-ai optional dependency not installed
+    from cauldron_site_astro.site_tool_prompts import register_builtin_site_tool_prompts
+    register_builtin_site_tool_prompts()
 
 
 def _connect_signals() -> None:

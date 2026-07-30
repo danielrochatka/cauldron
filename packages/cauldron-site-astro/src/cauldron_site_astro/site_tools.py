@@ -456,9 +456,8 @@ def _handle_stage_theme(context, *, css_content, description="", **kwargs):
             "description": description,
         },
         message=(
-            "Theme CSS staged. Attach it to a change set via "
-            "site.prepare_change_set(theme_css=...) to preview it, "
-            "then site.publish to promote it live."
+            "Theme CSS staged. Call site.prepare_change_set to build a "
+            "preview — the staged CSS is included automatically."
         ),
     )
 
@@ -504,6 +503,14 @@ def _handle_prepare_change_set(
             success=False,
             message="previews_root is not configured; cannot build preview.",
         )
+
+    # ---- Auto-load staged theme CSS if not explicitly supplied ------------
+    if not theme_css and cfg.theme_root:
+        try:
+            from cauldron_site_astro.theme import SiteThemeService
+            theme_css = SiteThemeService(cfg.theme_root).get_staged_css() or ""
+        except Exception:
+            pass
 
     # ---- Create the SiteChangeSet in 'preparing' state --------------------
     # _extract_draft_items returns (item_ids, extra_items):
@@ -928,8 +935,9 @@ def _handle_publish(context, *, change_set_id, confirm, **kwargs):
             success=True,
             data={
                 "change_set_id": str(cs.id),
+                "published": True,
                 "pages_built": result.pages_built,
-                "preview_url": "/",
+                "live_url": "/",
             },
             message=(
                 f"Change set {cs.id} published successfully "

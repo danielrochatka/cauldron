@@ -675,6 +675,21 @@ class AdminAIPageView(View):
                 },
                 status=500,
             )
+        except SystemExit:
+            # Gunicorn worker timeout (SIGABRT → sys.exit) bypasses except
+            # Exception.  Return a structured 503 so the client gets JSON
+            # instead of a dropped connection, then let the worker exit.
+            logger.warning("Admin AI run interrupted by worker shutdown signal")
+            return JsonResponse(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "service_unavailable",
+                        "message": "The request timed out. Please try again.",
+                    },
+                },
+                status=503,
+            )
         return JsonResponse({"ok": True, **_serialize_run(run)})
 
 

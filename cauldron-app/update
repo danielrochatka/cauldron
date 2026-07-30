@@ -37,18 +37,24 @@ if ! git diff --quiet HEAD 2>/dev/null || ! git diff --cached --quiet HEAD 2>/de
   exit 1
 fi
 
-# Ensure the current branch has a configured upstream.
+# Check whether the current branch has a configured upstream.
+# If not, skip the git pull — the rest of the update (packages, migrations,
+# server restart) still runs, which is useful after a manual branch switch.
+HAS_UPSTREAM=1
 if ! git rev-parse --abbrev-ref --symbolic-full-name '@{u}' &>/dev/null; then
-  echo "ERROR: No upstream branch is configured for the current branch."
-  echo "       Set one with: git branch --set-upstream-to=origin/main main"
-  exit 1
+  echo "    NOTE: No upstream branch configured — skipping git pull."
+  echo "          To pull updates, set one with:"
+  echo "          git branch --set-upstream-to=origin/main main"
+  HAS_UPSTREAM=0
 fi
 
-# Verify the remote is reachable (avoids stopping the server before a network error).
-echo "--> Checking remote reachability..."
-if ! git fetch --dry-run origin &>/dev/null; then
-  echo "ERROR: Cannot reach the remote repository. Check your network connection."
-  exit 1
+if [ "$HAS_UPSTREAM" -eq 1 ]; then
+  # Verify the remote is reachable (avoids stopping the server before a network error).
+  echo "--> Checking remote reachability..."
+  if ! git fetch --dry-run origin &>/dev/null; then
+    echo "ERROR: Cannot reach the remote repository. Check your network connection."
+    exit 1
+  fi
 fi
 
 # 2. Stop server and wait for all workers to exit.
@@ -101,10 +107,14 @@ _rollback() {
 }
 trap '_rollback' ERR
 
-# 5. Pull latest code.
-echo "--> Pulling latest Cauldron..."
-cd "$REPO_DIR"
-git pull --ff-only
+# 5. Pull latest code (only when an upstream is configured).
+if [ "$HAS_UPSTREAM" -eq 1 ]; then
+  echo "--> Pulling latest Cauldron..."
+  cd "$REPO_DIR"
+  git pull --ff-only
+else
+  echo "--> Skipping git pull (no upstream configured)."
+fi
 
 # 6. Install/upgrade all Python packages and their dependencies.
 echo "--> Upgrading dependencies..."

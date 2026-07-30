@@ -132,6 +132,7 @@ launch_server() {
       --chdir "$cauldron_dir" \
       --bind "0.0.0.0:$port" \
       --workers "${CAULDRON_WORKERS:-2}" \
+      --timeout "${CAULDRON_TIMEOUT:-300}" \
       --pid "$pid_file" \
       --access-logfile "$cauldron_dir/logs/access.log" \
       --error-logfile "$cauldron_dir/logs/error.log" \

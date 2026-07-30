@@ -344,6 +344,36 @@ def test_admin_ai_post_run_exception_returns_structured_error():
     assert "server logs" in body["error"]["message"].lower()
 
 
+def test_admin_ai_post_worker_timeout_returns_json_503():
+    """SystemExit from a gunicorn worker timeout returns structured JSON 503.
+
+    sys.exit() raises SystemExit(BaseException), not Exception, so a plain
+    except-Exception clause would miss it and leave the client with a dropped
+    connection.  The view must catch SystemExit specifically and return a tidy
+    503 so the frontend can display a human-readable message.
+    """
+    user = _make_user(
+        username="timeout-user",
+        perms=("cauldron_ai_admin.use_admin_ai",),
+    )
+    client = Client()
+    client.force_login(user)
+    fake_service = MagicMock()
+    fake_service.run.side_effect = SystemExit(1)
+    from django.urls import reverse
+    url = reverse("cauldron_ai_admin:ai-page")
+    with patch("cauldron_ai_admin.views._get_service", return_value=fake_service):
+        response = client.post(
+            url, data=json.dumps({"request": "hi"}),
+            content_type="application/json",
+        )
+    assert response.status_code == 503
+    body = response.json()
+    assert body["ok"] is False
+    assert body["error"]["code"] == "service_unavailable"
+    assert "timed out" in body["error"]["message"].lower()
+
+
 def test_admin_ai_post_permission_denied_from_service_returns_json_403():
     """PermissionDenied raised during service.run() returns structured JSON 403."""
     from django.core.exceptions import PermissionDenied

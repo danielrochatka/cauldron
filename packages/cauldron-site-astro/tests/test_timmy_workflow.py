@@ -687,7 +687,8 @@ def test_full_workflow_prepare_then_inspect_then_publish(tmp_path):
             pub = _handle_publish(ctx, change_set_id=cs_id, confirm=True)
 
     assert pub.success is True, pub.message
-    assert pub.data["preview_url"] == "/"
+    assert pub.data["published"] is True
+    assert pub.data["live_url"] == "/"
 
     cs = SiteChangeSet.objects.get(id=cs_id)
     assert cs.status == SiteChangeSet.PUBLISHED
@@ -837,3 +838,244 @@ def test_prepare_change_set_passes_extra_items_to_build_preview(tmp_path):
     call_kwargs = svc.build_preview.call_args.kwargs
     assert call_kwargs.get("item_ids_to_include") == ["new-timmy-page"]
     assert call_kwargs.get("extra_items") == [fake_item]
+
+
+# ---------------------------------------------------------------------------
+# Staged theme CSS auto-handoff (item 1)
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_change_set_auto_loads_staged_css(tmp_path):
+    """prepare_change_set automatically picks up CSS staged by stage_theme.
+
+    The model does NOT need to pass theme_css= — the handler reads the
+    staged file when the argument is omitted, so stage_theme → prepare → publish
+    forms a dependable automatic handoff.
+    """
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_site_astro.site_tools import _handle_prepare_change_set, _handle_stage_theme
+    from cauldron_site_astro.theme import SiteThemeService
+
+    ctx = _ctx("timmy-staged-css")
+    theme_dir = tmp_path / "theme"
+    previews_root = tmp_path / "previews"
+    config = _make_config(tmp_path, theme_root=str(theme_dir), previews_root=str(previews_root))
+
+    svc = MagicMock()
+    svc._config = config
+
+    def fake_build(**kwargs):
+        out = Path(kwargs["output_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "index.html").write_text("<html></html>")
+        return _make_build_result(ok=True, pages_built=1, output_dir=str(out))
+
+    svc.build_preview.side_effect = fake_build
+
+    # 1. Stage CSS via site.stage_theme
+    with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+        stage_result = _handle_stage_theme(ctx, css_content="body { color: coral; }")
+    assert stage_result.success is True
+    assert SiteThemeService(theme_dir).get_staged_css() == "body { color: coral; }"
+
+    # 2. prepare_change_set WITHOUT passing theme_css — it must auto-load
+    with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+        prep = _handle_prepare_change_set(
+            ctx,
+            content_request_ids=["req-css-handoff"],
+            # theme_css intentionally omitted
+        )
+
+    assert prep.success is True, prep.message
+    cs = SiteChangeSet.objects.get(id=prep.data["change_set_id"])
+    # Staged CSS must be captured in the change set record
+    assert cs.staged_theme_css == "body { color: coral; }", (
+        f"Expected staged CSS in change set, got: {cs.staged_theme_css!r}"
+    )
+    # build_preview must have received the CSS
+    call_kwargs = svc.build_preview.call_args.kwargs
+    assert call_kwargs.get("theme_css") == "body { color: coral; }", (
+        f"build_preview did not receive staged CSS: {call_kwargs!r}"
+    )
+
+
+def test_prepare_change_set_explicit_theme_css_overrides_staged(tmp_path):
+    """Explicit theme_css= takes priority over any previously staged CSS."""
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_site_astro.site_tools import _handle_prepare_change_set
+    from cauldron_site_astro.theme import SiteThemeService
+
+    ctx = _ctx("timmy-explicit-css")
+    theme_dir = tmp_path / "theme"
+    previews_root = tmp_path / "previews"
+    config = _make_config(tmp_path, theme_root=str(theme_dir), previews_root=str(previews_root))
+
+    # Pre-stage some CSS
+    SiteThemeService(theme_dir).stage_css("body { color: purple; }")
+
+    svc = MagicMock()
+    svc._config = config
+
+    def fake_build(**kwargs):
+        out = Path(kwargs["output_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "index.html").write_text("<html></html>")
+        return _make_build_result(ok=True, pages_built=1, output_dir=str(out))
+
+    svc.build_preview.side_effect = fake_build
+
+    with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+        prep = _handle_prepare_change_set(
+            ctx,
+            content_request_ids=["req-override"],
+            theme_css="body { color: gold; }",  # explicit override
+        )
+
+    assert prep.success is True, prep.message
+    cs = SiteChangeSet.objects.get(id=prep.data["change_set_id"])
+    assert cs.staged_theme_css == "body { color: gold; }", (
+        "Explicit theme_css must override staged CSS"
+    )
+    call_kwargs = svc.build_preview.call_args.kwargs
+    assert call_kwargs.get("theme_css") == "body { color: gold; }"
+
+
+def test_full_stage_then_prepare_then_publish_carries_css(tmp_path):
+    """End-to-end: stage_theme → prepare_change_set → publish promotes the CSS.
+
+    Proves the full automatic handoff chain without any manual CSS passing.
+    """
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_site_astro.site_tools import (
+        _handle_stage_theme,
+        _handle_prepare_change_set,
+        _handle_publish,
+    )
+    from cauldron_site_astro.theme import SiteThemeService
+
+    ctx = _ctx("timmy-e2e-css")
+    theme_dir = tmp_path / "theme"
+    previews_root = tmp_path / "previews"
+    config = _make_config(tmp_path, theme_root=str(theme_dir), previews_root=str(previews_root))
+
+    svc = _make_real_svc(config)
+
+    def fake_build(**kwargs):
+        out = Path(kwargs["output_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "index.html").write_text("<html></html>")
+        from cauldron_site_astro.service import BuildResult
+        return BuildResult(ok=True, pages_built=1, output_dir=str(out))
+
+    svc.build_preview = MagicMock(side_effect=fake_build)
+
+    # 1. Stage CSS
+    with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+        stage_r = _handle_stage_theme(ctx, css_content="body { background: teal; }")
+    assert stage_r.success is True
+
+    # 2. Prepare (no theme_css arg — auto-load from staged)
+    with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+        prep = _handle_prepare_change_set(
+            ctx,
+            content_request_ids=["req-e2e"],
+        )
+    assert prep.success is True, prep.message
+    cs_id = prep.data["change_set_id"]
+    cs = SiteChangeSet.objects.get(id=cs_id)
+    assert cs.staged_theme_css == "body { background: teal; }"
+    assert prep.data["preview_url"].startswith("/")
+
+    # 3. Publish
+    fake_content_svc = MagicMock()
+    fake_ok = MagicMock(ok=True, request_version=1)
+    fake_content_svc.validate_change_request.return_value = fake_ok
+    fake_content_svc.apply_change_request.return_value = fake_ok
+
+    with patch("cauldron_site_astro.site_tools._get_content_operation_service", return_value=fake_content_svc):
+        with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+            pub = _handle_publish(ctx, change_set_id=cs_id, confirm=True)
+
+    assert pub.success is True, pub.message
+    # published boolean must be True on success
+    assert pub.data["published"] is True
+    assert pub.data["live_url"] == "/"
+
+    # CSS must have been promoted to active
+    assert SiteThemeService(theme_dir).get_active_css() == "body { background: teal; }"
+
+    cs.refresh_from_db()
+    assert cs.status == SiteChangeSet.PUBLISHED
+
+
+# ---------------------------------------------------------------------------
+# published boolean in publish result (item 2)
+# ---------------------------------------------------------------------------
+
+
+def test_publish_result_has_published_true_on_success(tmp_path):
+    """Successful publish returns published=True in data."""
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_site_astro.site_tools import _handle_publish
+
+    ctx = _ctx("timmy-pub-bool")
+    config = _make_config(tmp_path)
+
+    cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        content_request_ids=["req-bool"],
+        affected_item_ids=["item-bool"],
+    )
+
+    svc = _make_real_svc(config)
+    svc.build_preview = MagicMock(side_effect=_fake_build_ok())
+
+    fake_ok = MagicMock(ok=True, request_version=1)
+    fake_content_svc = MagicMock()
+    fake_content_svc.validate_change_request.return_value = fake_ok
+    fake_content_svc.apply_change_request.return_value = fake_ok
+
+    with patch("cauldron_site_astro.site_tools._get_content_operation_service", return_value=fake_content_svc):
+        with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+            result = _handle_publish(ctx, change_set_id=str(cs.id), confirm=True)
+
+    assert result.success is True
+    assert result.data["published"] is True
+    assert result.data["live_url"] == "/"
+    assert "pages_built" in result.data
+    assert "change_set_id" in result.data
+
+
+def test_publish_result_has_published_false_on_build_failure(tmp_path):
+    """Failed publish (build error) returns success=False; no published key expected on failure."""
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_site_astro.site_tools import _handle_publish
+
+    ctx = _ctx("timmy-pub-fail-bool")
+    config = _make_config(tmp_path)
+
+    cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        content_request_ids=["req-fail"],
+        affected_item_ids=["item-fail"],
+    )
+
+    svc = _make_real_svc(config)
+    from cauldron_site_astro.service import BuildResult
+    svc.build_preview = MagicMock(return_value=BuildResult(
+        ok=False, pages_built=0, output_dir="", error="Astro crashed",
+    ))
+
+    fake_ok = MagicMock(ok=True, request_version=1)
+    fake_content_svc = MagicMock()
+    fake_content_svc.validate_change_request.return_value = fake_ok
+
+    with patch("cauldron_site_astro.site_tools._get_content_operation_service", return_value=fake_content_svc):
+        with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+            result = _handle_publish(ctx, change_set_id=str(cs.id), confirm=True)
+
+    assert result.success is False
+    assert "change_set_id" in result.data
+    # live_url and published=True must not appear on failure
+    assert result.data.get("published") is not True
+    assert "live_url" not in result.data

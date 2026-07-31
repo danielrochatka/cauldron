@@ -14,6 +14,16 @@ _manifest = ModuleManifest(
         "content.changesets",
         "content.validation",
     ),
+    namespaces=("cauldron_content",),
+    public_api=(
+        "cauldron_content.contracts",
+        "cauldron_content.pages",
+        "cauldron_content.homepage",
+        "cauldron_content.registry",
+        "cauldron_content.router",
+        "cauldron_content.site",
+        "cauldron_content.hashing",
+    ),
 )
 
 module = BaseModule(_manifest)

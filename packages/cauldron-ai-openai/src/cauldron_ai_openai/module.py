@@ -12,6 +12,10 @@ _manifest = ModuleManifest(
     provides=(
         "ai.provider.openai",
     ),
+    namespaces=("cauldron_ai_openai",),
+    public_api=(
+        "cauldron_ai_openai.provider",
+    ),
 )
 
 module = BaseModule(_manifest)

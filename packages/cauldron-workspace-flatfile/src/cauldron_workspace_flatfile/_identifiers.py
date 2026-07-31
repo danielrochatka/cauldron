@@ -1,12 +1,12 @@
 """Identifier segment validation used by the flat-file reversible adapter.
 
-Thin re-export of ``cauldron_content._identifiers.validate_identifier_segment``
-so the workspace package shares a single validator with the rest of the
-control plane.
+Re-exports from the public ``cauldron_content.contracts`` API so the workspace
+package shares a single validator with the rest of the control plane without
+depending on private modules.
 """
 from __future__ import annotations
 
-from cauldron_content._identifiers import (
+from cauldron_content.contracts import (
     MAX_IDENTIFIER_LENGTH,
     validate_identifier_segment,
 )

@@ -15,6 +15,11 @@ _manifest = ModuleManifest(
         "content.httpapi",
         "content.httpapi.v1",
     ),
+    namespaces=("cauldron_content_api",),
+    public_api=(
+        "cauldron_content_api.views",
+        "cauldron_content_api.urls",
+    ),
 )
 
 module = BaseModule(_manifest)

@@ -14,6 +14,13 @@ _manifest = ModuleManifest(
         "workspace.snapshots",
         "workspace.preview",
     ),
+    namespaces=("cauldron_workspace_flatfile",),
+    public_api=(
+        "cauldron_workspace_flatfile.store",
+        "cauldron_workspace_flatfile.config",
+        "cauldron_workspace_flatfile.reversible",
+        "cauldron_workspace_flatfile.snapshots",
+    ),
 )
 
 module = BaseModule(_manifest)

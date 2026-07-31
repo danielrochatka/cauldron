@@ -5,6 +5,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional, Protocol, runtime_checkable
 
+# Re-export identifier validation so sibling packages can use the public API
+# rather than importing from the private _identifiers module.
+from cauldron_content._identifiers import (  # noqa: F401
+    MAX_IDENTIFIER_LENGTH,
+    validate_identifier_segment,
+)
+
 
 class ContentStatus(str, Enum):
     DRAFT = "draft"

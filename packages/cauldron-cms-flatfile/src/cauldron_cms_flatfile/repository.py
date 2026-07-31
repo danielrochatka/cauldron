@@ -34,7 +34,7 @@ def _valid_identifier_segment(value: str) -> bool:
 
     Returns ``True`` iff the segment passes the shared safety rules.
     """
-    from cauldron_content._identifiers import validate_identifier_segment
+    from cauldron_content.contracts import validate_identifier_segment
     try:
         validate_identifier_segment(value, "segment")
     except Exception:

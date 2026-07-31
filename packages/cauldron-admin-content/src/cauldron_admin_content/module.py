@@ -20,6 +20,13 @@ _manifest = ModuleManifest(
         "admin.content.changerequests",
         "admin.content.audit",
     ),
+    namespaces=("cauldron_admin_content",),
+    public_api=(
+        "cauldron_admin_content.views",
+        "cauldron_admin_content.urls",
+        "cauldron_admin_content.forms",
+        "cauldron_admin_content.service_factory",
+    ),
 )
 
 module = BaseModule(_manifest)

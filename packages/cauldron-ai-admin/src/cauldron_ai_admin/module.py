@@ -26,6 +26,13 @@ _manifest = ModuleManifest(
         "admin.ai.audit",
         "admin.ai.health",
     ),
+    namespaces=("cauldron_ai_admin",),
+    public_api=(
+        "cauldron_ai_admin.tools",
+        "cauldron_ai_admin.views",
+        "cauldron_ai_admin.service",
+        "cauldron_ai_admin.builtin_tools",
+    ),
 )
 
 module = BaseModule(_manifest)

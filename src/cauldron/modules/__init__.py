@@ -10,6 +10,7 @@ from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, Version
 
 _SLUG_RE = re.compile(r"^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)*$")
+_NAMESPACE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
 
 
 def _validate_slug(value: str, field_name: str) -> None:
@@ -83,6 +84,8 @@ class ModuleManifest:
     requires: tuple[ModuleRequirement, ...] = field(default_factory=tuple)
     optional: tuple[ModuleRequirement, ...] = field(default_factory=tuple)
     provides: tuple[str, ...] = field(default_factory=tuple)
+    namespaces: tuple[str, ...] = field(default_factory=tuple)
+    public_api: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         _validate_slug(self.slug, "ModuleManifest.slug")
@@ -107,6 +110,16 @@ class ModuleManifest:
                 )
         for cap in self.provides:
             _validate_slug(cap, "ModuleManifest.provides entry")
+        for ns in self.namespaces:
+            if not ns or not _NAMESPACE_RE.match(ns):
+                raise ValueError(
+                    f"ModuleManifest.namespaces entry {ns!r} must be a valid dotted Python identifier."
+                )
+        for path in self.public_api:
+            if not path or not _NAMESPACE_RE.match(path):
+                raise ValueError(
+                    f"ModuleManifest.public_api entry {path!r} must be a valid dotted Python import path."
+                )
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable representation of this manifest."""
@@ -122,6 +135,8 @@ class ModuleManifest:
             "requires": [r.to_dict() for r in self.requires],
             "optional": [r.to_dict() for r in self.optional],
             "provides": list(self.provides),
+            "namespaces": list(self.namespaces),
+            "public_api": list(self.public_api),
         }
 
     @classmethod
@@ -143,6 +158,8 @@ class ModuleManifest:
                 ModuleRequirement.from_dict(r) for r in data.get("optional", [])
             ),
             provides=tuple(data.get("provides", [])),
+            namespaces=tuple(data.get("namespaces", [])),
+            public_api=tuple(data.get("public_api", [])),
         )
 
 

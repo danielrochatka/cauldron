@@ -12,6 +12,14 @@ _manifest = ModuleManifest(
         "ai.model.providers",
         "ai.toolcalling",
     ),
+    namespaces=("cauldron_ai",),
+    public_api=(
+        "cauldron_ai.contracts",
+        "cauldron_ai.providers",
+        "cauldron_ai.prompt_templates",
+        "cauldron_ai.provider_configuration",
+        "cauldron_ai.testing",
+    ),
 )
 
 module = BaseModule(_manifest)

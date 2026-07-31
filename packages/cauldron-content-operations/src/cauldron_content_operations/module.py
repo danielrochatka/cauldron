@@ -23,6 +23,16 @@ _manifest = ModuleManifest(
         "content.audit",
         "content.reconciliation",
     ),
+    namespaces=("cauldron_content_operations",),
+    public_api=(
+        "cauldron_content_operations.service",
+        "cauldron_content_operations.config",
+        "cauldron_content_operations.lifecycle",
+        "cauldron_content_operations.models",
+        "cauldron_content_operations.reversible",
+        "cauldron_content_operations.signals",
+        "cauldron_content_operations.audit",
+    ),
 )
 
 module = BaseModule(_manifest)

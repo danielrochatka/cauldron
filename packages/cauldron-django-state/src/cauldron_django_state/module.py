@@ -13,6 +13,11 @@ _manifest = ModuleManifest(
         "django.transactions",
         "django.migrations",
     ),
+    namespaces=("cauldron_django_state",),
+    public_api=(
+        "cauldron_django_state.checks",
+        "cauldron_django_state.config",
+    ),
 )
 
 module = BaseModule(_manifest)

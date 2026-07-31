@@ -28,6 +28,14 @@ _manifest = ModuleManifest(
         "admin.navigation",
         "admin.ui.overrides",
     ),
+    namespaces=("cauldron_django_admin",),
+    public_api=(
+        "cauldron_django_admin.navigation",
+        "cauldron_django_admin.override_store",
+        "cauldron_django_admin.module_settings",
+        "cauldron_django_admin.views",
+        "cauldron_django_admin.urls",
+    ),
 )
 
 module = BaseModule(_manifest)

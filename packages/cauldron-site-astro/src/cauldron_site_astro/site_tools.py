@@ -282,7 +282,8 @@ def _extract_draft_items(
 
     item_ids: list[str] = []
     extra_items: list = []
-    seen_ids: set[str] = set()
+    seen_item_ids: set[str] = set()
+    seen_inject_ids: set[str] = set()
 
     for req_id in content_request_ids:
         try:
@@ -314,38 +315,39 @@ def _extract_draft_items(
 
         for op in ops_to_process:
             op_item_id = str(getattr(op, "item_id", "") or "")
-            if not op_item_id:
-                continue
-
-            if op_item_id not in seen_ids:
-                seen_ids.add(op_item_id)
-                item_ids.append(op_item_id)
-
-            # Build an extra_item from the operation's proposed content so that
-            # both new pages (create) and proposed edits (update) appear in the
-            # preview with exactly the content the operator reviewed.
             op_kind = str(getattr(op, "kind", "") or "")
-            if op_kind == "delete":
-                # Delete proposals: the page should not appear in the preview.
-                # We cannot easily remove a published page from the router, so
-                # we skip injection — the published page will still show.
-                # Callers can address this edge case in a follow-up.
-                continue
-
             op_data = getattr(op, "data", None) or {}
             op_body = getattr(op, "body", "") or ""
             op_slug = getattr(op, "slug", "") or ""
             op_schema = getattr(op, "schema", "") or "page"
             op_collection = getattr(op, "collection", "") or ""
 
+            # For updates to existing items, tell the router to include their
+            # draft version.  Create operations have no item_id yet so we only
+            # add it when present.
+            if op_item_id and op_item_id not in seen_item_ids:
+                seen_item_ids.add(op_item_id)
+                item_ids.append(op_item_id)
+
+            # Delete proposals: skip injection — published page stays visible.
+            if op_kind == "delete":
+                continue
+
             if not op_slug:
                 continue  # Cannot build a page entry without a slug
+
+            # For create operations there is no item_id yet; use the slug as
+            # the deduplication key so the build injects the proposed page.
+            inject_id = op_item_id or op_slug
+            if inject_id in seen_inject_ids:
+                continue
+            seen_inject_ids.add(inject_id)
 
             try:
                 from types import SimpleNamespace
                 from cauldron_content.contracts import ContentStatus
                 extra_items.append(SimpleNamespace(
-                    id=op_item_id,
+                    id=inject_id,
                     collection=op_collection,
                     slug=op_slug,
                     status=ContentStatus.DRAFT,

@@ -796,6 +796,52 @@ def test_extract_draft_items_delete_operations_skipped(tmp_path):
     assert items == []
 
 
+def test_extract_draft_items_create_without_item_id(tmp_path):
+    """Create operations with no item_id are injected as extra_items via slug.
+
+    This is the real-world path: content.create_proposal returns item_id=''
+    for brand-new pages that have never been published.  The old code did
+    ``if not op_item_id: continue`` and silently dropped every create op,
+    producing pages_built=0 for any all-new site.
+    """
+    from types import SimpleNamespace
+    from cauldron_site_astro.site_tools import _extract_draft_items
+
+    fake_op = SimpleNamespace(
+        kind="create",
+        item_id="",        # empty — not yet assigned
+        slug="index",
+        collection="pages",
+        schema="page",
+        data={"title": "Home"},
+        body="<h1>Welcome</h1>",
+    )
+    fake_changeset = SimpleNamespace(operations=[fake_op])
+    fake_workspace = MagicMock()
+    fake_workspace.load_changeset.return_value = fake_changeset
+
+    fake_cr = SimpleNamespace(workspace_changeset_id="ws-new")
+    fake_service = MagicMock()
+    fake_service._workspace = fake_workspace
+
+    with patch("cauldron_site_astro.site_tools._get_content_operation_service", return_value=fake_service):
+        with patch(
+            "cauldron_content_operations.models.ContentChangeRequest.objects.get",
+            return_value=fake_cr,
+        ):
+            ids, items = _extract_draft_items(["req-new-1"])
+
+    # No real item_id → nothing in item_ids (no existing item to scope)
+    assert ids == []
+    # BUT the page IS injected as an extra_item via its slug
+    assert len(items) == 1
+    item = items[0]
+    assert item.slug == "index"
+    assert item.id == "index"      # slug used as synthetic id
+    assert item.body == "<h1>Welcome</h1>"
+    assert item.data == {"title": "Home"}
+
+
 def test_prepare_change_set_passes_extra_items_to_build_preview(tmp_path):
     """_handle_prepare_change_set passes extra_items from workspace ops to build_preview."""
     from types import SimpleNamespace

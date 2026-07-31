@@ -339,9 +339,12 @@ class FlatFileRepository:
                 provider=PROVIDER_NAME,
                 source_ref=str(target),
             )
-            vr = self.validate(result_item)
-            if not vr.valid:
-                return list(vr.issues)
+            # Only run schema validation when a schema name is present; an
+            # empty schema means the AI omitted it and we write the file as-is.
+            if result_item.schema:
+                vr = self.validate(result_item)
+                if not vr.valid:
+                    return list(vr.issues)
             return (target, _serialize_content_item(result_item), result_item)
 
         if op.kind == ContentOperationKind.UPDATE:

@@ -538,7 +538,7 @@ def test_validation_calls_repository_validate():
     service, mock_repo = _make_service_with_repo()
     r = service.create_change_request(
         user=user,
-        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}}],
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "schema": "pages", "data": {}}],
         provider_name="flatfile",
     )
     assert r.ok
@@ -558,7 +558,7 @@ def test_validation_repo_issues_fail_validation():
     service, _ = _make_service_with_repo(validate_return=bad_vr)
     r = service.create_change_request(
         user=user,
-        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}}],
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "schema": "pages", "data": {}}],
         provider_name="flatfile",
     )
     assert r.ok
@@ -1836,7 +1836,7 @@ def test_validate_failure_includes_structured_issues_in_meta():
     service, _ = _make_service_with_repo(validate_return=bad_vr)
     r = service.create_change_request(
         user=user,
-        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}}],
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "schema": "pages", "data": {}}],
         provider_name="flatfile",
     )
     assert r.ok
@@ -1939,7 +1939,7 @@ def test_validate_failure_meta_contains_all_issues_not_truncated():
     user = _make_user(is_superuser=True, username="trunc_test")
     r = service.create_change_request(
         user=user,
-        operations=[{"kind": "create", "collection": "pages", "item_id": "px", "slug": "px", "data": {}}],
+        operations=[{"kind": "create", "collection": "pages", "item_id": "px", "slug": "px", "schema": "pages", "data": {}}],
         provider_name="flatfile",
     )
     assert r.ok

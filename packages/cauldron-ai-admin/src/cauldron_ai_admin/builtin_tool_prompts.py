@@ -215,9 +215,15 @@ _BUILTIN_TEMPLATES: tuple[AIToolPromptTemplate, ...] = (
             "Read-only inspection has been done first to verify intent.",
         ),
         input_expectations=(
-            "Requires 'operations' (non-empty list). Each operation needs 'kind' "
-            "(create|update|delete) and 'collection'. Optional: 'idempotency_key', "
-            "'description', 'provider_name'."
+            "Requires 'operations' (non-empty list). Each operation requires: "
+            "'kind' (create|update|delete), 'collection' (collection name), "
+            "'schema' (the schema name for the collection — always include this; "
+            "get it from content.list_collections), 'slug' (URL-safe identifier). "
+            "For 'data': include ONLY fields listed in the collection's "
+            "'allowed_data_fields' from content.list_collections — the server "
+            "enforces strict schema validation and will reject unknown fields. "
+            "For 'update'/'delete', also include 'item_id' and 'expected_hash'. "
+            "Top-level optional: 'idempotency_key', 'description', 'provider_name'."
         ),
         result_behavior=(
             "Returns a proposal ID and status='proposed'. The proposal always "

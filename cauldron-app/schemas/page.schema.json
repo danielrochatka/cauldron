@@ -12,6 +12,10 @@
       "minLength": 1,
       "maxLength": 200
     },
+    "description": {
+      "type": "string",
+      "maxLength": 500
+    },
     "navigation_title": {
       "type": "string",
       "maxLength": 100

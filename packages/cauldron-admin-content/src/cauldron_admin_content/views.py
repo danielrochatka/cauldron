@@ -469,10 +469,10 @@ class PageDetailView(View):
             raise Http404
 
         title = item.data.get("title", item.id)
-        # Only offer the Edit action for schema=="page" items. Items with other
-        # schemas in the pages collection are not safe to edit through this form
-        # because the page schema uses additionalProperties:false.
-        can_edit = can_propose and item.schema == _PAGE_SCHEMA
+        # Offer the Edit action for schema=="page" items and empty-schema items.
+        # Empty schema indicates an AI-created page that hasn't been upgraded yet;
+        # the UPDATE operation will set schema to "page" on apply.
+        can_edit = can_propose and item.schema in (_PAGE_SCHEMA, "")
         from cauldron_content_operations.config import get_operations_config
         cfg = get_operations_config()
         return render(request, self.template_name, {
@@ -516,7 +516,7 @@ class PageDetailView(View):
         if item is None:
             raise Http404
 
-        if item.schema != _PAGE_SCHEMA:
+        if item.schema not in (_PAGE_SCHEMA, ""):
             raise Http404
 
         if item.status == "published":
@@ -532,6 +532,7 @@ class PageDetailView(View):
             title=data.get("title", ""),
             body=item.body,
             expected_hash=item.hash,
+            description=data.get("description", ""),
             navigation_title=data.get("navigation_title", ""),
             summary=data.get("summary", ""),
             seo_title=data.get("seo_title", ""),
@@ -636,7 +637,9 @@ class PageEditView(View):
         # Guard against editing pages with non-page schemas. Merging page-form
         # data into an item that uses a different schema (e.g. "pages") could
         # corrupt existing fields not present in page.schema.json.
-        if item.schema != _PAGE_SCHEMA:
+        # Empty schema ("") is treated as "page" — AI-generated items have no
+        # schema set yet, and the UPDATE operation will upgrade it to "page".
+        if item.schema not in (_PAGE_SCHEMA, ""):
             raise Http404
 
         data = item.data
@@ -694,7 +697,7 @@ class PageEditView(View):
         if item is None:
             raise Http404
 
-        if item.schema != _PAGE_SCHEMA:
+        if item.schema not in (_PAGE_SCHEMA, ""):
             raise Http404
 
         if not form.is_valid():

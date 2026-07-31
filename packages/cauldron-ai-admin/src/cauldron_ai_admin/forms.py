@@ -312,13 +312,13 @@ class RuntimeSettingsForm(forms.Form):
     )
     max_argument_bytes = forms.IntegerField(
         label="Max argument bytes",
-        min_value=1024, max_value=1048576, initial=4096,
+        min_value=1024, max_value=1048576, initial=131072,
         help_text="Reject tool calls with argument payloads above this size.",
     )
     max_result_bytes = forms.IntegerField(
         label="Max result bytes",
-        min_value=1024, max_value=1048576, initial=8192,
-        help_text="Reject tool results above this size.",
+        min_value=1024, max_value=1048576, initial=262144,
+        help_text="Reject provider responses and tool call arguments above this size.",
     )
     include_content_tools = forms.BooleanField(
         label="Enable content tools",

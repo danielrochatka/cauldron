@@ -538,7 +538,7 @@ def test_validation_calls_repository_validate():
     service, mock_repo = _make_service_with_repo()
     r = service.create_change_request(
         user=user,
-        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}}],
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "schema": "pages", "data": {}}],
         provider_name="flatfile",
     )
     assert r.ok
@@ -558,7 +558,7 @@ def test_validation_repo_issues_fail_validation():
     service, _ = _make_service_with_repo(validate_return=bad_vr)
     r = service.create_change_request(
         user=user,
-        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}}],
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "schema": "pages", "data": {}}],
         provider_name="flatfile",
     )
     assert r.ok
@@ -1836,7 +1836,7 @@ def test_validate_failure_includes_structured_issues_in_meta():
     service, _ = _make_service_with_repo(validate_return=bad_vr)
     r = service.create_change_request(
         user=user,
-        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "data": {}}],
+        operations=[{"kind": "create", "collection": "pages", "item_id": "p1", "slug": "p1", "schema": "pages", "data": {}}],
         provider_name="flatfile",
     )
     assert r.ok
@@ -1865,6 +1865,24 @@ def test_validate_failure_changeset_issues_in_meta():
     result = service.validate_change_request(r.request_id, user=user, expected_version=1)
     if not result.ok:
         assert "validation_issues" in result.meta
+
+
+def test_validate_create_without_item_id_does_not_fail_missing_item_id():
+    """CREATE operations with empty item_id must NOT raise missing_item_id validation error."""
+    user = _make_user(is_superuser=True, username="create_no_id")
+    service, _ = _make_service_with_repo()
+    r = service.create_change_request(
+        user=user,
+        operations=[{"kind": "create", "collection": "pages", "item_id": "", "slug": "new-page", "data": {}}],
+        provider_name="flatfile",
+    )
+    assert r.ok, r
+    result = service.validate_change_request(r.request_id, user=user, expected_version=1)
+    # The validation may fail for schema reasons but NOT for missing_item_id.
+    issues = result.meta.get("validation_issues", [])
+    assert not any(i.get("code") == "missing_item_id" for i in issues), (
+        f"missing_item_id must not be raised for CREATE ops; got: {issues}"
+    )
 
 
 def test_validate_success_has_empty_or_no_issues_in_meta():
@@ -1921,7 +1939,7 @@ def test_validate_failure_meta_contains_all_issues_not_truncated():
     user = _make_user(is_superuser=True, username="trunc_test")
     r = service.create_change_request(
         user=user,
-        operations=[{"kind": "create", "collection": "pages", "item_id": "px", "slug": "px", "data": {}}],
+        operations=[{"kind": "create", "collection": "pages", "item_id": "px", "slug": "px", "schema": "pages", "data": {}}],
         provider_name="flatfile",
     )
     assert r.ok

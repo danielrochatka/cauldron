@@ -24,6 +24,7 @@ def pytest_configure(config):
                 "django.contrib.admin",
                 "django.contrib.staticfiles",
                 "cauldron_content",
+                "cauldron_cms_flatfile",
                 "cauldron_workspace_flatfile",
                 "cauldron_content_operations",
                 "cauldron_django_admin",

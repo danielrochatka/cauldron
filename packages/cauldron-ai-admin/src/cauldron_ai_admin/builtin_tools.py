@@ -108,6 +108,39 @@ def _check_deadline(
     return None
 
 
+def _schema_allowed_fields(svc: Any, schema_name: str | None) -> list[str] | None:
+    """Return the sorted list of allowed top-level property names for a schema.
+
+    Walks the router's registered repositories looking for one that can load
+    the named schema.  Returns None on any error so callers omit the field
+    gracefully rather than failing the tool call.
+    """
+    if not schema_name:
+        return None
+    try:
+        router = getattr(svc, "_router", None)
+        if router is None:
+            return None
+        registry = getattr(router, "_registry", None)
+        if registry is None:
+            return None
+        repos = getattr(registry, "_repos", {})
+        for repo in repos.values():
+            try:
+                schema_dir = getattr(getattr(repo, "_config", None), "schema_dir", None)
+                if schema_dir is None:
+                    continue
+                from cauldron_cms_flatfile.validator import SchemaError, load_schema
+                schema = load_schema(schema_dir, schema_name)
+                props = schema.get("properties", {})
+                return sorted(props.keys()) if props else None
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # content.list_collections
 # ---------------------------------------------------------------------------
@@ -143,15 +176,19 @@ def _handle_list_collections(context: AdminAIToolContext, **kwargs) -> Any:
             error_code="content.list_collections_failed",
             message=redact_exception(exc, max_bytes=200),
         )
-    collections = [
-        {
+    collections = []
+    for info in (infos or []):
+        entry: dict = {
             "name": info.name,
             "schema": info.schema or None,
             "provider": info.provider or None,
             "item_count": info.item_count,
         }
-        for info in (infos or [])
-    ]
+        # Expose allowed data field names so the AI can build valid proposals.
+        allowed = _schema_allowed_fields(svc, info.schema)
+        if allowed is not None:
+            entry["allowed_data_fields"] = allowed
+        collections.append(entry)
     return AdminAIToolResult(
         tool_name="content.list_collections",
         success=True,

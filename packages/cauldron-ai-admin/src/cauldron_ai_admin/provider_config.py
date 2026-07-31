@@ -23,8 +23,8 @@ Versioned document format (version 1)::
             "max_tool_calls": 5,
             "tool_timeout_seconds": 10.0,
             "run_timeout_seconds": 30.0,
-            "max_argument_bytes": 4096,
-            "max_result_bytes": 8192,
+            "max_argument_bytes": 131072,
+            "max_result_bytes": 262144,
             "include_content_tools": true
         },
         "providers": {

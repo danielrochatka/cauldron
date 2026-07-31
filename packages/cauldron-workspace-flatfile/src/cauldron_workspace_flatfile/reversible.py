@@ -552,12 +552,17 @@ class FlatFileReversibleMutationAdapter:
             snap_name = f"snap_{i}.bin"
             kind_value = op.kind.value if hasattr(op.kind, "value") else str(op.kind)
             existed = canonical.exists()
+            # CREATE operations from AI proposals may have item_id=""; fall
+            # back to slug (the same convention used by the flatfile repo).
+            effective_item_id = op.item_id
+            if not effective_item_id and kind_value == "create":
+                effective_item_id = getattr(op, "slug", "") or ""
             entry: dict = {
                 "op_index": i,
                 "snap_name": snap_name,
                 "rel_path": rel,
                 "collection": op.collection,
-                "item_id": op.item_id,
+                "item_id": effective_item_id,
                 "kind": kind_value,
                 "existed": bool(existed),
                 "pre_hash": self._file_hash(canonical) if existed else "",

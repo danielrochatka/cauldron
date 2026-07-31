@@ -32,6 +32,7 @@ _manifest = ModuleManifest(
     public_api=(
         "cauldron_django_admin.navigation",
         "cauldron_django_admin.override_store",
+        "cauldron_django_admin.override_views",
         "cauldron_django_admin.module_settings",
         "cauldron_django_admin.views",
         "cauldron_django_admin.urls",

@@ -53,8 +53,8 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 from cauldron_ai.contracts import (
-    _assert_json_compatible,
-    _deep_freeze,
+    assert_json_compatible,
+    deep_freeze,
     is_json_serialisable,
 )
 
@@ -151,14 +151,14 @@ class AdminAIToolDefinition:
             raise TypeError("AdminAIToolDefinition.argument_schema must be a mapping")
         # Reject non-JSON compatible values (NaN, Infinity, non-string keys,
         # unknown types) before we even validate as JSON Schema.
-        _assert_json_compatible(dict(self.argument_schema))
+        assert_json_compatible(dict(self.argument_schema))
         # JSON Schema Draft-07 validity check runs against the raw dict
         # form; jsonschema doesn't accept MappingProxyType directly.
         raw_schema = {str(k): _to_plain(v) for k, v in self.argument_schema.items()}
         _check_schema(raw_schema)
         # Deep freeze so callers cannot mutate the exposed schema.
         object.__setattr__(
-            self, "argument_schema", _deep_freeze(raw_schema),
+            self, "argument_schema", deep_freeze(raw_schema),
         )
         # ----- risk_level
         if not isinstance(self.risk_level, RiskLevel):
@@ -544,7 +544,7 @@ def validate_tool_arguments(schema: Any, arguments: Any) -> None:
         raise RuntimeError("jsonschema is required for AdminAI tools") from exc
 
     try:
-        _assert_json_compatible(arguments)
+        assert_json_compatible(arguments)
     except ValueError:
         raise ToolArgumentValidationError(
             "Tool arguments must be JSON-compatible (no NaN/Infinity/non-string keys)."

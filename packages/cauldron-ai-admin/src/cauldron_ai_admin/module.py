@@ -18,6 +18,10 @@ _manifest = ModuleManifest(
         ModuleRequirement(slug="django.state", kind="capability"),
         ModuleRequirement(slug="identity.authentication", kind="capability"),
         ModuleRequirement(slug="identity.permissions", kind="capability"),
+        ModuleRequirement(slug="cauldron.admin.content", kind="module"),
+    ),
+    optional=(
+        ModuleRequirement(slug="cauldron.cms.flatfile", kind="module"),
     ),
     provides=(
         "admin.ai",

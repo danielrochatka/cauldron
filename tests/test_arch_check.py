@@ -115,41 +115,58 @@ def _make_fake_package(
     slug: str,
     namespace: str,
     public_api: list[str],
+    capability_implementations: list[str] | None = None,
+    provides: list[str] | None = None,
+    requires: list[tuple[str, str]] | None = None,  # [(slug, kind), ...]
     pyproject_deps: list[str] | None = None,
     src_files: dict[str, str] | None = None,
+    test_files: dict[str, str] | None = None,
 ) -> None:
     """Create a minimal fake Cauldron package in root/packages/<pkg_name>/."""
     pkg_dir = root / "packages" / pkg_name
     src_ns_dir = pkg_dir / "src" / namespace
     src_ns_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write module.py
-    deps_str = ", ".join(f'"{d}"' for d in (pyproject_deps or []))
     public_api_str = ", ".join(f'"{p}"' for p in public_api)
+    cap_impl_str = ", ".join(f'"{p}"' for p in (capability_implementations or []))
+    provides_str = ", ".join(f'"{p}"' for p in (provides or []))
+
+    requires_lines = ""
+    if requires:
+        req_items = ", ".join(
+            f'ModuleRequirement(slug="{s}", kind="{k}")' for s, k in requires
+        )
+        requires_lines = f"    requires=({req_items},),\n"
+
     module_py = src_ns_dir / "module.py"
     module_py.write_text(
-        f'from cauldron.modules import BaseModule, ModuleManifest\n'
+        f'from cauldron.modules import BaseModule, ModuleManifest, ModuleRequirement\n'
         f'_manifest = ModuleManifest(\n'
         f'    slug="{slug}",\n'
         f'    label="{pkg_name}",\n'
         f'    namespaces=("{namespace}",),\n'
         f'    public_api=({public_api_str},),\n'
-        f')\n'
+        + (f'    capability_implementations=({cap_impl_str},),\n' if capability_implementations else "")
+        + (f'    provides=({provides_str},),\n' if provides else "")
+        + requires_lines
+        + f')\n'
         f'module = BaseModule(_manifest)\n',
         encoding="utf-8",
     )
 
-    # Write __init__.py
     (src_ns_dir / "__init__.py").write_text("", encoding="utf-8")
 
-    # Write extra src files
     for filename, content in (src_files or {}).items():
         (src_ns_dir / filename).write_text(content, encoding="utf-8")
 
-    # Write pyproject.toml
+    if test_files:
+        tests_dir = pkg_dir / "tests"
+        tests_dir.mkdir(exist_ok=True)
+        for filename, content in test_files.items():
+            (tests_dir / filename).write_text(content, encoding="utf-8")
+
     if pyproject_deps is None:
         pyproject_deps = []
-    dep_lines = "\n".join(f'    "cauldron>=0.1.0",' + ("\n" if not pyproject_deps else ""))
     extra_deps = "".join(f'    "{d}>=0.1.0",\n' for d in pyproject_deps)
     pyproject_toml = pkg_dir / "pyproject.toml"
     pyproject_toml.write_text(
@@ -165,4 +182,235 @@ def _make_fake_package(
         f'{extra_deps}'
         f']\n',
         encoding="utf-8",
+    )
+
+
+def test_arch002b_detected_for_private_name_import():
+    """ARCH002 fires for 'from pkg import _private_name' even when the module path is clean."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        _make_fake_package(
+            root, pkg_name="cauldron-provider", slug="cauldron.provider",
+            namespace="cauldron_provider",
+            public_api=["cauldron_provider.contracts"],
+            src_files={"contracts.py": "def _reset_for_tests(): pass\n"},
+        )
+
+        _make_fake_package(
+            root, pkg_name="cauldron-consumer", slug="cauldron.consumer",
+            namespace="cauldron_consumer",
+            public_api=["cauldron_consumer.api"],
+            pyproject_deps=["cauldron-provider"],
+            requires=[("cauldron.provider", "module")],
+            src_files={
+                "api.py": "from cauldron_provider.contracts import _reset_for_tests\n",
+            },
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 1
+    assert "ARCH002" in result.stdout
+    assert "_reset_for_tests" in result.stdout
+
+
+def test_arch003_detected_for_capability_implementation_import():
+    """ARCH003 fires when a package imports a path listed in capability_implementations."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        _make_fake_package(
+            root, pkg_name="cauldron-site", slug="cauldron.site",
+            namespace="cauldron_site",
+            public_api=["cauldron_site.contracts", "cauldron_site.impl"],
+            capability_implementations=["cauldron_site.impl"],
+            provides=["site.public"],
+            src_files={
+                "contracts.py": "class SiteProvider: pass\n",
+                "impl.py": "class ConcreteSiteProvider: pass\n",
+            },
+        )
+
+        _make_fake_package(
+            root, pkg_name="cauldron-consumer", slug="cauldron.consumer",
+            namespace="cauldron_consumer",
+            public_api=["cauldron_consumer.api"],
+            pyproject_deps=["cauldron-site"],
+            requires=[("site.public", "capability")],
+            src_files={
+                "api.py": "from cauldron_site.impl import ConcreteSiteProvider\n",
+            },
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 1
+    assert "ARCH003" in result.stdout
+    assert "cauldron_site.impl" in result.stdout
+
+
+def test_arch003_not_raised_for_contract_import():
+    """ARCH003 does not fire for paths NOT listed in capability_implementations."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        _make_fake_package(
+            root, pkg_name="cauldron-site", slug="cauldron.site",
+            namespace="cauldron_site",
+            public_api=["cauldron_site.contracts", "cauldron_site.impl"],
+            capability_implementations=["cauldron_site.impl"],
+            provides=["site.public"],
+            src_files={
+                "contracts.py": "class SiteProvider: pass\n",
+                "impl.py": "class ConcreteSiteProvider: pass\n",
+            },
+        )
+
+        _make_fake_package(
+            root, pkg_name="cauldron-consumer", slug="cauldron.consumer",
+            namespace="cauldron_consumer",
+            public_api=["cauldron_consumer.api"],
+            pyproject_deps=["cauldron-site"],
+            requires=[("site.public", "capability")],
+            src_files={
+                "api.py": "from cauldron_site.contracts import SiteProvider\n",
+            },
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 0, f"Unexpected violations:\n{result.stdout}"
+
+
+def test_arch004_pyproject_has_dep_missing_from_manifest():
+    """ARCH004 fires when pyproject main deps include a package absent from the manifest."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        _make_fake_package(
+            root, pkg_name="cauldron-base", slug="cauldron.base",
+            namespace="cauldron_base",
+            public_api=["cauldron_base.api"],
+            provides=["base.capability"],
+            src_files={"api.py": ""},
+        )
+
+        _make_fake_package(
+            root, pkg_name="cauldron-consumer", slug="cauldron.consumer",
+            namespace="cauldron_consumer",
+            public_api=["cauldron_consumer.api"],
+            pyproject_deps=["cauldron-base"],  # in pyproject main deps
+            # deliberately no requires= in manifest
+            src_files={"api.py": ""},
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 1
+    assert "ARCH004" in result.stdout
+    assert "cauldron-base" in result.stdout
+
+
+def test_arch004_optional_dep_not_flagged():
+    """ARCH004 direction B does not fire for optional-only pyproject deps."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        _make_fake_package(
+            root, pkg_name="cauldron-plugin", slug="cauldron.plugin",
+            namespace="cauldron_plugin",
+            public_api=["cauldron_plugin.api"],
+            provides=["plugin.cap"],
+            src_files={"api.py": ""},
+        )
+
+        # cauldron-consumer lists cauldron-plugin only in optional-dependencies,
+        # not in main dependencies — ARCH004 direction B should not fire.
+        pkg_dir = root / "packages" / "cauldron-consumer"
+        src_ns_dir = pkg_dir / "src" / "cauldron_consumer"
+        src_ns_dir.mkdir(parents=True)
+        (src_ns_dir / "__init__.py").write_text("", encoding="utf-8")
+        (src_ns_dir / "module.py").write_text(
+            'from cauldron.modules import BaseModule, ModuleManifest\n'
+            '_manifest = ModuleManifest(\n'
+            '    slug="cauldron.consumer", label="Consumer",\n'
+            '    namespaces=("cauldron_consumer",),\n'
+            '    public_api=("cauldron_consumer.api",),\n'
+            ')\n'
+            'module = BaseModule(_manifest)\n',
+            encoding="utf-8",
+        )
+        (src_ns_dir / "api.py").write_text("", encoding="utf-8")
+        (pkg_dir / "pyproject.toml").write_text(
+            '[project]\nname = "cauldron-consumer"\nversion = "0.1.0"\n'
+            'requires-python = ">=3.11"\ndependencies = ["cauldron>=0.1.0"]\n'
+            '[project.optional-dependencies]\nplugin = ["cauldron-plugin>=0.1.0"]\n',
+            encoding="utf-8",
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 0, f"Unexpected violations:\n{result.stdout}"
+
+
+def test_duplicate_namespace_is_config_error():
+    """Two packages claiming the same namespace produces a config error (exit 1)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        _make_fake_package(
+            root, pkg_name="cauldron-alpha", slug="cauldron.alpha",
+            namespace="cauldron_shared",
+            public_api=["cauldron_shared.api"],
+            src_files={"api.py": ""},
+        )
+
+        _make_fake_package(
+            root, pkg_name="cauldron-beta", slug="cauldron.beta",
+            namespace="cauldron_shared",  # same namespace!
+            public_api=["cauldron_shared.api"],
+            src_files={"api.py": ""},
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 1
+    assert "DUPLICATE NAMESPACE" in result.stderr or "DUPLICATE NAMESPACE" in result.stdout
+
+
+def test_test_files_are_exempt_from_arch001_and_arch002():
+    """Files in tests/ directories are not checked for ARCH001 or ARCH002."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        _make_fake_package(
+            root, pkg_name="cauldron-internal", slug="cauldron.internal",
+            namespace="cauldron_internal",
+            public_api=["cauldron_internal.pub"],
+            src_files={
+                "pub.py": "",
+                "_private.py": "SECRET = 1\n",
+            },
+        )
+
+        _make_fake_package(
+            root, pkg_name="cauldron-consumer", slug="cauldron.consumer",
+            namespace="cauldron_consumer",
+            public_api=["cauldron_consumer.api"],
+            # No pyproject_deps, no manifest requires — would trigger ARCH001 in src
+            # but test files should be exempt.
+            src_files={"api.py": ""},
+            test_files={
+                "test_something.py": (
+                    "from cauldron_internal._private import SECRET\n"
+                    "from cauldron_internal.pub import something\n"
+                ),
+            },
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 0, (
+        f"Test files should be exempt from ARCH001/ARCH002, but got:\n{result.stdout}"
     )

@@ -9,10 +9,12 @@ _manifest = ModuleManifest(
     django_apps=("cauldron_site_astro",),
     requires=(
         ModuleRequirement(slug="content.routing", kind="capability"),
+        ModuleRequirement(slug="cauldron.content.operations", kind="module"),
     ),
     optional=(
         ModuleRequirement(slug="cauldron.ai.admin"),
         ModuleRequirement(slug="cauldron.admin.content"),
+        ModuleRequirement(slug="cauldron.ai", kind="module"),
     ),
     provides=("site.public", "site.build"),
     namespaces=("cauldron_site_astro",),
@@ -22,6 +24,11 @@ _manifest = ModuleManifest(
         "cauldron_site_astro.public_url",
         "cauldron_site_astro.site_tools",
         "cauldron_site_astro.urls",
+    ),
+    capability_implementations=(
+        # Concrete SitePublicUrlProvider — external callers use
+        # cauldron_content.site.get_public_url() not this class directly.
+        "cauldron_site_astro.public_url",
     ),
 )
 

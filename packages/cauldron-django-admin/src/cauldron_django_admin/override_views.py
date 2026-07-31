@@ -8,7 +8,7 @@ from django.http import HttpRequest, HttpResponse
 from django.views import View
 
 
-def _get_override_root() -> Path | None:
+def get_override_root() -> Path | None:
     from django.conf import settings
     override_dir = getattr(settings, "CAULDRON_UI_OVERRIDES_DIR", None)
     if override_dir is None:
@@ -32,7 +32,7 @@ class CSSOverrideView(View):
             TraversalError, InvalidFileError, InvalidScopeError, FileSizeError,
         )
 
-        root = _get_override_root()
+        root = get_override_root()
         if root is None or not root.is_dir():
             return HttpResponse(b"", content_type="text/css; charset=utf-8", status=200)
 

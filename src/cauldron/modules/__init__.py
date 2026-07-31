@@ -86,6 +86,10 @@ class ModuleManifest:
     provides: tuple[str, ...] = field(default_factory=tuple)
     namespaces: tuple[str, ...] = field(default_factory=tuple)
     public_api: tuple[str, ...] = field(default_factory=tuple)
+    # Paths that are technically public but represent concrete implementations;
+    # only the owning module's own files may import them. External consumers must
+    # use the capability contract (e.g. get_public_url()) instead.
+    capability_implementations: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         _validate_slug(self.slug, "ModuleManifest.slug")
@@ -120,6 +124,15 @@ class ModuleManifest:
                 raise ValueError(
                     f"ModuleManifest.public_api entry {path!r} must be a valid dotted Python import path."
                 )
+        for path in self.capability_implementations:
+            if not path or not _NAMESPACE_RE.match(path):
+                raise ValueError(
+                    f"ModuleManifest.capability_implementations entry {path!r} must be a valid dotted Python import path."
+                )
+            if path not in self.public_api:
+                raise ValueError(
+                    f"ModuleManifest.capability_implementations entry {path!r} must also appear in public_api."
+                )
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable representation of this manifest."""
@@ -137,6 +150,7 @@ class ModuleManifest:
             "provides": list(self.provides),
             "namespaces": list(self.namespaces),
             "public_api": list(self.public_api),
+            "capability_implementations": list(self.capability_implementations),
         }
 
     @classmethod
@@ -160,6 +174,7 @@ class ModuleManifest:
             provides=tuple(data.get("provides", [])),
             namespaces=tuple(data.get("namespaces", [])),
             public_api=tuple(data.get("public_api", [])),
+            capability_implementations=tuple(data.get("capability_implementations", [])),
         )
 
 

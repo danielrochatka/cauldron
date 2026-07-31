@@ -11,6 +11,7 @@ _manifest = ModuleManifest(
         ModuleRequirement(slug="content.operations", kind="capability"),
         ModuleRequirement(slug="identity.authentication", kind="capability"),
         ModuleRequirement(slug="cauldron.content", kind="module"),
+        ModuleRequirement(slug="cauldron.content.operations", kind="module"),
         ModuleRequirement(slug="cauldron.workspace.flatfile", kind="module"),
     ),
     provides=(

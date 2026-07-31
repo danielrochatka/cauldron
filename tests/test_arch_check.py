@@ -251,7 +251,12 @@ def test_arch003_detected_for_capability_implementation_import():
 
 
 def test_arch003_not_raised_for_contract_import():
-    """ARCH003 does not fire for paths NOT listed in capability_implementations."""
+    """ARCH003 does not fire for paths NOT listed in capability_implementations.
+
+    A consumer with a kind='module' dep on cauldron-site may import from
+    cauldron_site.contracts (public API, not a capability_implementation) without
+    triggering ARCH003. ARCH003 is reserved for cauldron_site.impl paths.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
 
@@ -272,7 +277,8 @@ def test_arch003_not_raised_for_contract_import():
             namespace="cauldron_consumer",
             public_api=["cauldron_consumer.api"],
             pyproject_deps=["cauldron-site"],
-            requires=[("site.public", "capability")],
+            # kind='module' is required because the consumer does direct Python imports
+            requires=[("cauldron.site", "module")],
             src_files={
                 "api.py": "from cauldron_site.contracts import SiteProvider\n",
             },
@@ -281,6 +287,7 @@ def test_arch003_not_raised_for_contract_import():
         result = _run_arch_check(root)
 
     assert result.returncode == 0, f"Unexpected violations:\n{result.stdout}"
+    assert "ARCH003" not in result.stdout
 
 
 def test_arch004_pyproject_has_dep_missing_from_manifest():

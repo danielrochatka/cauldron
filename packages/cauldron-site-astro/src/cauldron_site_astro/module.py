@@ -9,6 +9,7 @@ _manifest = ModuleManifest(
     django_apps=("cauldron_site_astro",),
     requires=(
         ModuleRequirement(slug="content.routing", kind="capability"),
+        ModuleRequirement(slug="cauldron.content", kind="module"),
         ModuleRequirement(slug="cauldron.content.operations", kind="module"),
     ),
     optional=(

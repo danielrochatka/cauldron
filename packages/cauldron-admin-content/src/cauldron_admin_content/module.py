@@ -14,7 +14,9 @@ _manifest = ModuleManifest(
         # depend on that capability explicitly so misconfigured deployments
         # fail loudly at resolution time.
         ModuleRequirement(slug="admin.shell", kind="capability"),
+        ModuleRequirement(slug="cauldron.django.admin", kind="module"),
         ModuleRequirement(slug="cauldron.content", kind="module"),
+        ModuleRequirement(slug="cauldron.content.operations", kind="module"),
         ModuleRequirement(slug="cauldron.workspace.flatfile", kind="module"),
     ),
     provides=(

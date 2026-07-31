@@ -239,6 +239,28 @@ def _pyproject_name(pyproject: Path) -> str:
     return data.get("project", {}).get("name", "")
 
 
+def _validate_api_paths(
+    namespaces: list[str],
+    public_api: list[str],
+    capability_implementations: list[str],
+    pkg_label: str,
+    config_errors: list[str],
+) -> None:
+    """Validate that public_api and capability_implementations paths are under owned namespaces."""
+    for path in public_api:
+        if not any(path == ns or path.startswith(ns + ".") for ns in namespaces):
+            config_errors.append(
+                f"BAD public_api: '{path}' in '{pkg_label}' is not under any owned namespace "
+                f"({', '.join(namespaces) or '(none)'})."
+            )
+    for path in capability_implementations:
+        if not any(path == ns or path.startswith(ns + ".") for ns in namespaces):
+            config_errors.append(
+                f"BAD capability_implementations: '{path}' in '{pkg_label}' is not under any owned namespace "
+                f"({', '.join(namespaces) or '(none)'})."
+            )
+
+
 def discover_packages(packages_dir: Path) -> tuple[list[PackageInfo], list[str]]:
     """Find all packages with a module.py and return (packages, config_errors)."""
     infos: list[PackageInfo] = []
@@ -267,8 +289,12 @@ def discover_packages(packages_dir: Path) -> tuple[list[PackageInfo], list[str]]
             if not slug and not fields.get("namespaces"):
                 continue
 
+            namespaces = fields.get("namespaces", [])
+            public_api = fields.get("public_api", [])
+            cap_impls = fields.get("capability_implementations", [])
+
             # Detect duplicate namespace ownership
-            for ns in fields.get("namespaces", []):
+            for ns in namespaces:
                 if ns in namespace_seen:
                     config_errors.append(
                         f"DUPLICATE NAMESPACE: '{ns}' is claimed by both "
@@ -278,13 +304,16 @@ def discover_packages(packages_dir: Path) -> tuple[list[PackageInfo], list[str]]
                 else:
                     namespace_seen[ns] = pkg_name
 
+            # Validate public_api and capability_implementations belong to owned namespaces
+            _validate_api_paths(namespaces, public_api, cap_impls, pkg_name, config_errors)
+
             infos.append(PackageInfo(
                 slug=slug,
                 name=pkg_name,
                 root=pkg_dir,
-                namespaces=fields.get("namespaces", []),
-                public_api=set(fields.get("public_api", [])),
-                capability_implementations=set(fields.get("capability_implementations", [])),
+                namespaces=namespaces,
+                public_api=set(public_api),
+                capability_implementations=set(cap_impls),
                 requires_slugs=set(fields.get("requires_slugs", [])),
                 requires_module_slugs=set(fields.get("requires_module_slugs", [])),
                 provides=set(fields.get("provides", [])),
@@ -338,16 +367,81 @@ def extract_imports(source: str, filename: str = "<unknown>") -> list[ImportRef]
 # Manifest dependency check helpers
 # ---------------------------------------------------------------------------
 
-def _manifest_declares(owning_pkg: PackageInfo, import_pkg: PackageInfo) -> bool:
-    """Return True if owning_pkg's manifest declares a dependency on import_pkg.
+def _manifest_declares_module(owning_pkg: PackageInfo, import_pkg: PackageInfo) -> bool:
+    """Return True if owning_pkg has an explicit kind='module' dep on import_pkg.
 
-    Accepted forms:
-    - import_pkg.slug appears in owning_pkg.requires_slugs (kind="module")
-    - Any capability that import_pkg provides appears in owning_pkg.requires_slugs
+    Only kind='module' requirements authorize direct Python imports from
+    a sibling package. Capability requirements (kind='capability') authorize
+    using the runtime capability contract, not static imports.
+    """
+    return import_pkg.slug in owning_pkg.requires_module_slugs
+
+
+def _manifest_declares(owning_pkg: PackageInfo, import_pkg: PackageInfo) -> bool:
+    """Return True if owning_pkg's manifest mentions import_pkg in any form.
+
+    Used by ARCH004 direction-B: if the dep appears anywhere in the manifest
+    (module OR capability) the pair is consistent. A separate ARCH001 check
+    enforces that direct imports specifically need kind='module'.
     """
     if import_pkg.slug in owning_pkg.requires_slugs:
         return True
     return bool(owning_pkg.requires_slugs & import_pkg.provides)
+
+
+# ---------------------------------------------------------------------------
+# ARCH003 helper — checks both exact paths and root-namespace from-imports
+# ---------------------------------------------------------------------------
+
+def _arch003_violations(
+    imp: "ImportRef",
+    import_pkg: "Optional[PackageInfo]",
+    py_file: Path,
+) -> "list[Violation]":
+    """Return ARCH003 violations for a single import statement.
+
+    Checks two forms:
+    - Exact path:  ``import cauldron_x.impl`` / ``from cauldron_x.impl import …``
+    - Root import: ``from cauldron_x import impl`` where ``cauldron_x.impl`` is
+      in capability_implementations (bypasses the dotted-path check).
+    """
+    if not import_pkg or not import_pkg.capability_implementations:
+        return []
+
+    violations: list[Violation] = []
+    cap_impls = import_pkg.capability_implementations
+
+    def _fire(path: str) -> None:
+        violations.append(Violation(
+            code="ARCH003",
+            file=py_file,
+            line=imp.line,
+            message=(
+                f"Import from '{path}' accesses a concrete capability implementation "
+                f"of '{import_pkg.slug}'."
+            ),
+            fix=(
+                f"Use the capability contract instead of the concrete implementation.\n"
+                f"       '{path}' is declared as a capability_implementation — "
+                f"external callers must not import it directly."
+            ),
+        ))
+
+    # Exact sub-module path: ``import cauldron_x.impl`` or ``from cauldron_x.impl import …``
+    if imp.module in cap_impls:
+        _fire(imp.module)
+
+    # Root-namespace from-import: ``from cauldron_x import impl``
+    # Construct synthetic path and check against capability_implementations.
+    if imp.is_from and "." not in imp.module:
+        for name in imp.names:
+            if name.startswith("_"):
+                continue  # private names handled by ARCH002b
+            synthetic = f"{imp.module}.{name}"
+            if synthetic in cap_impls:
+                _fire(synthetic)
+
+    return violations
 
 
 # ---------------------------------------------------------------------------
@@ -360,13 +454,6 @@ def check_file(
     ns_to_pkg: dict[str, PackageInfo],
     is_test: bool,
 ) -> list[Violation]:
-    # Tests can freely import from private helpers, fixtures, and undeclared-in-manifest
-    # packages. Architecture boundary enforcement applies only to shipped source code.
-    if is_test:
-        return []
-
-    violations: list[Violation] = []
-
     try:
         source = py_file.read_text(encoding="utf-8")
     except OSError:
@@ -374,20 +461,32 @@ def check_file(
 
     imports = extract_imports(source, str(py_file))
     own_namespaces = set(owning_pkg.namespaces)
+    violations: list[Violation] = []
 
     for imp in imports:
         ns_root = _ns_root(imp.module)
 
-        # Skip non-cauldron and platform namespaces
         if not _is_cauldron_namespace(ns_root):
             continue
         if _is_platform(ns_root):
             continue
-        # Skip self-imports
         if ns_root in own_namespaces:
             continue
 
         import_pkg = ns_to_pkg.get(ns_root)
+
+        # ------------------------------------------------------------------
+        # ARCH003 — runs for BOTH test and source files.
+        # Tests may import private helpers and undeclared deps freely, but
+        # must not hardcode concrete capability implementations (that is the
+        # drift path ARCH003 is designed to prevent regardless of context).
+        # ------------------------------------------------------------------
+        violations.extend(_arch003_violations(imp, import_pkg, py_file))
+
+        if is_test:
+            # Tests exempt from ARCH001 (manifest/pyproject declarations) and
+            # ARCH002 (private-path enforcement). Only ARCH003 applies (above).
+            continue
 
         # ------------------------------------------------------------------
         # ARCH002a — _-prefixed segment in the module path itself
@@ -422,49 +521,51 @@ def check_file(
         # ------------------------------------------------------------------
         # ARCH002c — Sub-module path absent from sibling's declared public_api
         # ------------------------------------------------------------------
-        if import_pkg and import_pkg.public_api and "." in imp.module:
-            # Only check sub-module paths (not root namespace imports)
-            if imp.module not in import_pkg.public_api:
-                violations.append(Violation(
-                    code="ARCH002",
-                    file=py_file,
-                    line=imp.line,
-                    message=f"Import '{imp.module}' is not in the declared public_api of '{import_pkg.slug}'.",
-                    fix=(
-                        f"Only import from paths listed in the public_api of '{import_pkg.slug}'.\n"
-                        f"       Public paths: {', '.join(sorted(import_pkg.public_api)) or '(none)'}"
-                    ),
-                ))
-                continue  # ARCH001 is not meaningful if the path itself is non-public
+        if import_pkg and import_pkg.public_api:
+            if "." in imp.module:
+                # Dotted path: validate directly
+                if imp.module not in import_pkg.public_api:
+                    violations.append(Violation(
+                        code="ARCH002",
+                        file=py_file,
+                        line=imp.line,
+                        message=f"Import '{imp.module}' is not in the declared public_api of '{import_pkg.slug}'.",
+                        fix=(
+                            f"Only import from paths listed in the public_api of '{import_pkg.slug}'.\n"
+                            f"       Public paths: {', '.join(sorted(import_pkg.public_api)) or '(none)'}"
+                        ),
+                    ))
+                    continue  # ARCH001 is not meaningful if the path itself is non-public
+            elif imp.is_from:
+                # Root-namespace from-import: ``from cauldron_x import name``
+                # Each imported name synthesizes a sub-module path for validation.
+                for name in imp.names:
+                    if name.startswith("_"):
+                        continue  # already handled by ARCH002b
+                    synthetic = f"{imp.module}.{name}"
+                    if synthetic not in import_pkg.public_api:
+                        violations.append(Violation(
+                            code="ARCH002",
+                            file=py_file,
+                            line=imp.line,
+                            message=(
+                                f"'from {imp.module} import {name}' resolves to '{synthetic}' "
+                                f"which is not in the declared public_api of '{import_pkg.slug}'."
+                            ),
+                            fix=(
+                                f"Only import from paths listed in the public_api of '{import_pkg.slug}'.\n"
+                                f"       Public paths: {', '.join(sorted(import_pkg.public_api)) or '(none)'}"
+                            ),
+                        ))
 
         # ------------------------------------------------------------------
-        # ARCH003 — Concrete capability implementation imported by external package
-        # ------------------------------------------------------------------
-        if import_pkg and import_pkg.capability_implementations:
-            if imp.module in import_pkg.capability_implementations:
-                violations.append(Violation(
-                    code="ARCH003",
-                    file=py_file,
-                    line=imp.line,
-                    message=(
-                        f"Import from '{imp.module}' accesses a concrete capability implementation "
-                        f"of '{import_pkg.slug}'."
-                    ),
-                    fix=(
-                        f"Use the capability contract instead of the concrete implementation.\n"
-                        f"       '{imp.module}' is declared as a capability_implementation — "
-                        f"external callers must not import it directly."
-                    ),
-                    note=f"Find the contract in cauldron_content.site or the relevant framework module.",
-                ))
-                # Still check ARCH001 below
-
-        # ------------------------------------------------------------------
-        # ARCH001 — Import undeclared in BOTH pyproject AND manifest
+        # ARCH001 — Direct import not declared in BOTH pyproject AND manifest.
+        # Manifest check requires kind='module'; capability deps authorize the
+        # runtime contract only, not static Python imports.
         # ------------------------------------------------------------------
         pkg_name = import_pkg.name if import_pkg else _pkg_name_from_namespace(ns_root)
         in_pyproject = pkg_name in owning_pkg.pyproject_deps
-        in_manifest = import_pkg is not None and _manifest_declares(owning_pkg, import_pkg)
+        in_manifest = import_pkg is not None and _manifest_declares_module(owning_pkg, import_pkg)
 
         if not in_pyproject or not in_manifest:
             owner_label = import_pkg.slug if import_pkg else ns_root
@@ -476,14 +577,14 @@ def check_file(
                 )
             if not in_manifest:
                 fix_parts.append(
-                    f"Add ModuleRequirement(slug='{owner_label}') to requires/optional in "
+                    f"Add ModuleRequirement(slug='{owner_label}', kind='module') to requires/optional in "
                     f"{_rel(owning_pkg.root / 'src', owning_pkg.root.parent.parent)}/.../module.py"
                 )
             missing = []
             if not in_pyproject:
                 missing.append("pyproject.toml")
             if not in_manifest:
-                missing.append("module.py manifest")
+                missing.append("module.py manifest (kind='module' required)")
             violations.append(Violation(
                 code="ARCH001",
                 file=py_file,
@@ -493,7 +594,7 @@ def check_file(
                     f"which is undeclared in: {', '.join(missing)}."
                 ),
                 fix="\n       ".join(fix_parts),
-                note=f"pyproject declared: {in_pyproject} | manifest declared: {in_manifest}",
+                note=f"pyproject declared: {in_pyproject} | manifest kind='module' declared: {in_manifest}",
             ))
 
     return violations
@@ -559,28 +660,81 @@ def check_arch004(
 
 
 # ---------------------------------------------------------------------------
-# Root package scan
+# Root package scan (configurable — works for core framework and instances)
 # ---------------------------------------------------------------------------
 
-def _root_package_info(repo_root: Path) -> Optional[PackageInfo]:
-    """Return a PackageInfo for the root cauldron framework package, if src/ exists."""
+def _root_package_infos(
+    repo_root: Path,
+    config_errors: list[str],
+) -> list[PackageInfo]:
+    """Discover module PackageInfos from the repo-root src/ directory.
+
+    Scans src/ for module.py files (supporting project-owned module roots in
+    Cauldron instances alongside the core framework). If no module.py is found
+    (e.g. the Cauldron framework itself), a synthetic bare entry is created so
+    outgoing imports from src/ and tests/ are still checked.
+    """
     src_dir = repo_root / "src"
     if not src_dir.exists():
-        return None
+        return []
+
     root_pyproject = repo_root / "pyproject.toml"
-    return PackageInfo(
-        slug="cauldron",
-        name=_pyproject_name(root_pyproject) if root_pyproject.exists() else "cauldron",
-        root=repo_root,
-        namespaces=["cauldron"],
-        public_api=set(),   # root framework is always public to itself
-        capability_implementations=set(),
-        requires_slugs=set(),
-        requires_module_slugs=set(),
-        provides=set(),
-        pyproject_deps=_pyproject_cauldron_deps(root_pyproject) if root_pyproject.exists() else set(),
-        pyproject_main_deps=_pyproject_main_cauldron_deps(root_pyproject) if root_pyproject.exists() else set(),
-    )
+    pyproject_deps = _pyproject_cauldron_deps(root_pyproject) if root_pyproject.exists() else set()
+    pyproject_main_deps = _pyproject_main_cauldron_deps(root_pyproject) if root_pyproject.exists() else set()
+    pkg_name = _pyproject_name(root_pyproject) if root_pyproject.exists() else "cauldron"
+
+    infos: list[PackageInfo] = []
+    for module_py in sorted(src_dir.rglob("module.py")):
+        if _should_skip(module_py):
+            continue
+        fields = _extract_manifest_fields(module_py)
+        slug = fields.get("slug", "")
+        if not slug:
+            continue
+
+        namespaces = fields.get("namespaces", [])
+        public_api = fields.get("public_api", [])
+        cap_impls = fields.get("capability_implementations", [])
+
+        _validate_api_paths(namespaces, public_api, cap_impls, pkg_name, config_errors)
+
+        infos.append(PackageInfo(
+            slug=slug,
+            name=pkg_name,
+            root=repo_root,
+            namespaces=namespaces,
+            public_api=set(public_api),
+            capability_implementations=set(cap_impls),
+            requires_slugs=set(fields.get("requires_slugs", [])),
+            requires_module_slugs=set(fields.get("requires_module_slugs", [])),
+            provides=set(fields.get("provides", [])),
+            pyproject_deps=pyproject_deps,
+            pyproject_main_deps=pyproject_main_deps,
+        ))
+
+    if not infos:
+        # No module.py — synthesise a root package so src/ is still scanned.
+        # Determine the primary namespace from the first package dir in src/.
+        primary_ns = "cauldron"
+        for child in sorted(src_dir.iterdir()):
+            if child.is_dir() and not child.name.startswith(".") and (child / "__init__.py").exists():
+                primary_ns = child.name
+                break
+        infos.append(PackageInfo(
+            slug=pkg_name,
+            name=pkg_name,
+            root=repo_root,
+            namespaces=[primary_ns],
+            public_api=set(),
+            capability_implementations=set(),
+            requires_slugs=set(),
+            requires_module_slugs=set(),
+            provides=set(),
+            pyproject_deps=pyproject_deps,
+            pyproject_main_deps=pyproject_main_deps,
+        ))
+
+    return infos
 
 
 # ---------------------------------------------------------------------------
@@ -605,24 +759,28 @@ def _find_py_files(directory: Path) -> list[tuple[Path, bool]]:
 def run_checks(repo_root: Path) -> tuple[list[Violation], list[str]]:
     """Run all checks. Returns (violations, config_errors)."""
     packages_dir = repo_root / "packages"
-    if not packages_dir.exists():
-        return [], [f"ERROR: packages/ directory not found at {packages_dir}"]
+    config_errors: list[str] = []
 
-    packages, config_errors = discover_packages(packages_dir)
+    packages: list[PackageInfo] = []
+    if packages_dir.exists():
+        discovered, pkg_errors = discover_packages(packages_dir)
+        packages = discovered
+        config_errors.extend(pkg_errors)
 
-    # Include root framework package in scan
-    root_pkg = _root_package_info(repo_root)
+    # Discover project-owned module roots from src/ (supports both the core
+    # framework and configurable Cauldron instances with their own modules).
+    root_pkgs = _root_package_infos(repo_root, config_errors)
+
     all_scan_targets: list[tuple[PackageInfo, list[Path]]] = []
     for pkg in packages:
         dirs = [pkg.root / "src", pkg.root / "tests"]
         all_scan_targets.append((pkg, dirs))
-    if root_pkg:
-        root_scan_dirs = [repo_root / "src", repo_root / "tests"]
-        all_scan_targets.append((root_pkg, root_scan_dirs))
+    for root_pkg in root_pkgs:
+        all_scan_targets.append((root_pkg, [repo_root / "src", repo_root / "tests"]))
 
     ns_to_pkg = build_namespace_map(packages)
-    # Root package owns "cauldron" (not cauldron_*, those are feature packages)
-    # The root namespace is already in _PLATFORM_PREFIXES so won't be flagged.
+    # Root namespace(s) are in _PLATFORM_PREFIXES so they won't be flagged as
+    # cross-boundary imports.
 
     pkg_by_slug = {p.slug: p for p in packages}
     pkg_by_name = {p.name: p for p in packages}
@@ -636,8 +794,8 @@ def run_checks(repo_root: Path) -> tuple[list[Violation], list[str]]:
                     check_file(py_file, pkg, ns_to_pkg, is_test)
                 )
 
-        # ARCH004 — skip root package (it has no manifest requirements to check)
-        if pkg.slug != "cauldron":
+        # ARCH004 — run for packages/ packages only; root pkgs use repo pyproject
+        if pkg in packages:
             all_violations.extend(check_arch004(pkg, pkg_by_slug, pkg_by_name))
 
     return all_violations, config_errors

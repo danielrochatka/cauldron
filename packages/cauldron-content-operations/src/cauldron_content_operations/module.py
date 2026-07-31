@@ -15,6 +15,8 @@ _manifest = ModuleManifest(
         ModuleRequirement(slug="django.state", kind="capability"),
         ModuleRequirement(slug="identity.authentication", kind="capability"),
         ModuleRequirement(slug="identity.permissions", kind="capability"),
+        ModuleRequirement(slug="cauldron.content", kind="module"),
+        ModuleRequirement(slug="cauldron.workspace.flatfile", kind="module"),
     ),
     provides=(
         "content.operations",

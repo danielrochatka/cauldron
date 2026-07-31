@@ -40,7 +40,7 @@
   <table class="cui-table">
     <thead>
       {% if is_pages_collection %}
-      <tr><th>Title</th><th>Slug</th><th>Status</th><th>Schema</th><th>Hash</th>{% if can_propose %}<th>Actions</th>{% endif %}</tr>
+      <tr><th>Title</th><th>Slug</th><th>Status</th><th>Schema</th><th>Hash</th><th>Actions</th></tr>
       {% else %}
       <tr><th>ID</th><th>Slug</th><th>Status</th><th>Provider</th><th>Hash</th></tr>
       {% endif %}
@@ -60,8 +60,13 @@
         <td>{% include "cauldron_admin/includes/status_badge.html" with status=item.status %}</td>
         <td>{{ item.schema|escape }}</td>
         <td><code>{{ item.hash|escape|slice:":12" }}…</code></td>
-        {% if can_propose and item.schema == page_schema %}
         <td>
+          {% if item.status == "published" %}
+          <a href="/{{ item.slug|escape }}/" target="_blank" rel="noopener noreferrer" class="cui-button cui-button--sm cui-button--secondary">View</a>
+          {% elif item.status == "draft" %}
+          <a href="{% url 'cauldron_admin_content:page-detail' item.id %}" class="cui-button cui-button--sm cui-button--secondary">Preview</a>
+          {% endif %}
+          {% if can_propose and item.schema == page_schema %}
           <a href="{% url 'cauldron_admin_content:page-edit' item.id %}" class="cui-button cui-button--sm">Edit</a>
           {% if item.status == "draft" and can_publish %}
           <form method="post" action="{% url 'cauldron_admin_content:page-detail' item.id %}" style="display:inline">
@@ -70,10 +75,8 @@
             <button type="submit" class="cui-button cui-button--sm">Publish</button>
           </form>
           {% endif %}
+          {% endif %}
         </td>
-        {% elif can_propose %}
-        <td></td>
-        {% endif %}
         {% else %}
         <td>{{ item.id|escape }}</td>
         <td>{{ item.slug|escape }}</td>

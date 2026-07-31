@@ -282,6 +282,9 @@ class FlatFileRepository:
 
         if op.kind == ContentOperationKind.CREATE:
             slug = op.slug
+            # item_id may be absent when the AI proposes a new page; fall back
+            # to slug (flatfile convention: id == slug for new items).
+            effective_item_id = op.item_id or slug
             if not _valid_identifier_segment(slug):
                 return [
                     ValidationIssue(
@@ -312,18 +315,18 @@ class FlatFileRepository:
                     )
                 ]
             for existing_item in self._load_collection(op.collection, include_drafts=True):
-                if existing_item.id == op.item_id:
+                if existing_item.id == effective_item_id:
                     return [
                         ValidationIssue(
                             code="duplicate_id",
-                            message=f"Item ID {op.item_id!r} already exists in collection {op.collection!r}",
+                            message=f"Item ID {effective_item_id!r} already exists in collection {op.collection!r}",
                             collection=op.collection,
-                            item_id=op.item_id,
+                            item_id=effective_item_id,
                         )
                     ]
             body = normalize_body(op.body)
             result_item = ContentItem(
-                id=op.item_id,
+                id=effective_item_id,
                 collection=op.collection,
                 slug=slug,
                 status=op.status,
@@ -331,7 +334,7 @@ class FlatFileRepository:
                 data=dict(op.data),
                 body=body,
                 hash=compute_content_hash(
-                    op.item_id, op.collection, slug, op.status.value, op.schema, op.data, body
+                    effective_item_id, op.collection, slug, op.status.value, op.schema, op.data, body
                 ),
                 provider=PROVIDER_NAME,
                 source_ref=str(target),

@@ -965,7 +965,9 @@ class ContentOperationService:
             for op in changeset.operations:
                 if not op.collection:
                     validation_issues.append({"code": "missing_collection", "item_id": op.item_id})
-                if not op.item_id:
+                op_kind = op.kind.value if hasattr(op.kind, "value") else str(op.kind)
+                if not op.item_id and op_kind != "create":
+                    # CREATE operations legitimately have no item_id yet.
                     validation_issues.append({"code": "missing_item_id", "collection": op.collection})
 
             if validation_issues:
@@ -1009,9 +1011,12 @@ class ContentOperationService:
                         from cauldron_content.contracts import ContentItem
                         from cauldron_content.hashing import compute_content_hash
                         _slug = op.slug or _item_id
+                        # CREATE operations may omit item_id; fall back to slug
+                        # (flatfile convention: id == slug for new items).
+                        _effective_id = _item_id or _slug
                         _status_val = op.status.value if hasattr(op.status, "value") else str(op.status)
-                        _h = compute_content_hash(item_id=_item_id, collection=_coll, slug=_slug, status=_status_val, schema=op.schema, data=dict(op.data), body=op.body)
-                        _candidate = ContentItem(id=_item_id, collection=_coll, slug=_slug, status=op.status, schema=op.schema, data=dict(op.data), body=op.body, hash=_h, provider=_prov)
+                        _h = compute_content_hash(item_id=_effective_id, collection=_coll, slug=_slug, status=_status_val, schema=op.schema, data=dict(op.data), body=op.body)
+                        _candidate = ContentItem(id=_effective_id, collection=_coll, slug=_slug, status=op.status, schema=op.schema, data=dict(op.data), body=op.body, hash=_h, provider=_prov)
                         _vr = _repo.validate(_candidate)
                         if not _vr.valid:
                             for _issue in _vr.issues:

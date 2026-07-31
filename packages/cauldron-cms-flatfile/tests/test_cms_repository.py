@@ -163,6 +163,35 @@ def test_create_invalid_slug(temp_site: Path):
     assert "invalid_slug" in codes
 
 
+def test_create_without_item_id_uses_slug(temp_site: Path):
+    """CREATE with empty item_id falls back to slug as the item's id."""
+    repo = _make_repo(temp_site)
+    cs = ContentChangeSet(
+        id="cs.no-id",
+        operations=(
+            ContentOperation(
+                kind=ContentOperationKind.CREATE,
+                provider=PROVIDER_NAME,
+                collection="pages",
+                item_id="",  # AI proposals omit this for new items
+                slug="lantern",
+                data={"title": "Lantern", "description": "New page."},
+                body="# Lantern\n\nBody.\n",
+                schema="pages",
+                status=ContentStatus.DRAFT,
+            ),
+        ),
+    )
+    result = repo.apply(cs)
+    assert result.success, result
+    new_file = temp_site / "content" / "pages" / "lantern.md"
+    assert new_file.exists()
+    fetched = repo.get_by_id("lantern", include_drafts=True)
+    assert fetched is not None
+    assert fetched.id == "lantern"
+    assert fetched.slug == "lantern"
+
+
 def test_update_operation(temp_site: Path):
     repo = _make_repo(temp_site)
     existing = repo.get_by_id("page.home")

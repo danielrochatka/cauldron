@@ -27,9 +27,22 @@ import pytest
 # Fixtures
 # ---------------------------------------------------------------------------
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-PARITY_FIXTURES = REPO_ROOT / "fixtures" / "content-parity"
-CAULDRON_APP = REPO_ROOT / "cauldron-app"
+# Attempt to locate the canonical page schema from the monorepo's cauldron-app
+# reference implementation; fall back to a minimal embedded schema so these
+# tests are self-contained even outside the monorepo layout.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+_CANONICAL_PAGE_SCHEMA = _REPO_ROOT / "cauldron-app" / "schemas" / "page.schema.json"
+
+_MINIMAL_PAGE_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "required": ["title"],
+    "properties": {
+        "title": {"type": "string"},
+        "description": {"type": "string"},
+    },
+    "additionalProperties": False,
+}
 
 
 def _make_user(username: str = "integ_user"):
@@ -48,26 +61,11 @@ def site(tmp_path: Path) -> Path:
     s = tmp_path / "site"
     (s / "content" / "pages").mkdir(parents=True)
     (s / "schemas").mkdir(parents=True)
-    # Copy the real page.schema.json so schema validation runs against
-    # the same file the production server uses.
-    page_schema = CAULDRON_APP / "schemas" / "page.schema.json"
-    if page_schema.exists():
-        shutil.copy2(page_schema, s / "schemas" / "page.schema.json")
+    schema_dest = s / "schemas" / "page.schema.json"
+    if _CANONICAL_PAGE_SCHEMA.exists():
+        shutil.copy2(_CANONICAL_PAGE_SCHEMA, schema_dest)
     else:
-        # Fallback: minimal schema that only requires title.
-        (s / "schemas" / "page.schema.json").write_text(
-            json.dumps({
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
-                "type": "object",
-                "required": ["title"],
-                "properties": {
-                    "title": {"type": "string"},
-                    "description": {"type": "string"},
-                },
-                "additionalProperties": False,
-            }),
-            encoding="utf-8",
-        )
+        schema_dest.write_text(json.dumps(_MINIMAL_PAGE_SCHEMA), encoding="utf-8")
     return s
 
 
@@ -192,11 +190,11 @@ def test_single_create_without_item_id_reaches_applied(site, real_service):
 
 @pytest.mark.django_db
 def test_multi_page_create_without_item_id_all_reach_applied(site, real_service):
-    """Six CREATE ops (like the AI's Lantern & Loom run) all land on disk."""
+    """Six CREATE ops in a single change set all land on disk at APPLIED."""
     from cauldron_content_operations.lifecycle import LifecycleState
 
     user = _make_user("integ_multi")
-    slugs = ["index", "retreats", "the-farmhouse", "about", "faq", "contact"]
+    slugs = ["home", "products", "about", "team", "blog", "contact"]
     ops = _ops_without_item_id(*slugs)
 
     r_create = real_service.create_change_request(

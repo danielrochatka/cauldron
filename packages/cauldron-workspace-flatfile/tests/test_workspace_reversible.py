@@ -844,6 +844,31 @@ def test_item9_duplicate_targets_rejected_by_prepare(tmp_path):
         adapter.prepare("cs.item9", changeset)
 
 
+def test_prepare_create_without_item_id_uses_slug(tmp_path):
+    """prepare() records slug as item_id when item_id is empty for CREATE ops."""
+    adapter, cfg, content = _make_adapter(tmp_path)
+    (content / "pages").mkdir()
+    op = ContentOperation(
+        kind=ContentOperationKind.CREATE,
+        provider="flatfile",
+        collection="pages",
+        item_id="",   # AI proposals omit item_id for new pages
+        slug="lantern",
+        data={},
+        body="",
+        schema="",
+        status=ContentStatus.PUBLISHED,
+    )
+    changeset = ContentChangeSet(id="cs.no-id", operations=(op,))
+    prep = adapter.prepare("cs.no-id", changeset)
+    assert prep.entry_count == 1
+    import json as _json
+    art = _json.loads(
+        (cfg.snapshots_dir / "cs.no-id" / "rollback_artifact.json").read_text(encoding="utf-8")
+    )
+    assert art["files"][0]["item_id"] == "lantern"  # slug used, not ""
+
+
 # ---------------------------------------------------------------------------
 # Item 12: symlink escape hardening on discovered .md files
 # ---------------------------------------------------------------------------

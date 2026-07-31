@@ -15,6 +15,8 @@ _manifest = ModuleManifest(
         ModuleRequirement(slug="django.state", kind="capability"),
         ModuleRequirement(slug="identity.authentication", kind="capability"),
         ModuleRequirement(slug="identity.permissions", kind="capability"),
+        ModuleRequirement(slug="cauldron.content", kind="module"),
+        ModuleRequirement(slug="cauldron.workspace.flatfile", kind="module"),
     ),
     provides=(
         "content.operations",
@@ -22,6 +24,16 @@ _manifest = ModuleManifest(
         "content.approvals",
         "content.audit",
         "content.reconciliation",
+    ),
+    namespaces=("cauldron_content_operations",),
+    public_api=(
+        "cauldron_content_operations.service",
+        "cauldron_content_operations.config",
+        "cauldron_content_operations.lifecycle",
+        "cauldron_content_operations.models",
+        "cauldron_content_operations.reversible",
+        "cauldron_content_operations.signals",
+        "cauldron_content_operations.audit",
     ),
 )
 

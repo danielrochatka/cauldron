@@ -72,9 +72,29 @@ def _mock_service(items):
     return svc
 
 
+class FakeSitePublicUrlProvider:
+    """Local fake that mirrors AstroPublicUrlProvider behaviour.
+
+    Used in tests to avoid importing the concrete provider from a sibling
+    package (ARCH003).  Implements the same rules:
+    - Non-pages collections → None
+    - Homepage item → "/"
+    - All other pages → "/{slug}/"
+    """
+
+    _PAGE_COLLECTION = "pages"
+    _HOMEPAGE_ITEM_ID = "homepage"
+
+    def get_public_url(self, *, item_id: str, slug: str, collection: str) -> str | None:
+        if collection != self._PAGE_COLLECTION:
+            return None
+        if item_id == self._HOMEPAGE_ITEM_ID:
+            return "/"
+        return f"/{slug}/"
+
+
 def _astro_provider():
-    from cauldron_site_astro.public_url import AstroPublicUrlProvider
-    return AstroPublicUrlProvider()
+    return FakeSitePublicUrlProvider()
 
 
 # ---------------------------------------------------------------------------

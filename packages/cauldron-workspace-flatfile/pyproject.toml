@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "cauldron-workspace-flatfile"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["cauldron>=0.1.0", "cauldron-content>=0.1.0", "filelock>=3.12"]
+dependencies = ["cauldron>=0.1.0", "cauldron-content>=0.1.0", "cauldron-content-operations>=0.1.0", "filelock>=3.12"]
 
 [project.entry-points."cauldron.modules"]
 "cauldron.workspace.flatfile" = "cauldron_workspace_flatfile.module:module"

@@ -16,6 +16,13 @@ _manifest = ModuleManifest(
         "content.markdown",
         "content.publishing.flatfile",
     ),
+    namespaces=("cauldron_cms_flatfile",),
+    public_api=(
+        "cauldron_cms_flatfile.repository",
+        "cauldron_cms_flatfile.config",
+        "cauldron_cms_flatfile.validator",
+        "cauldron_cms_flatfile.parser",
+    ),
 )
 
 module = BaseModule(_manifest)

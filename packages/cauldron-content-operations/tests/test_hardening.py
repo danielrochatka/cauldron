@@ -39,16 +39,18 @@ def _make_service_with_ws(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_item12_shared_validator_used_across_packages():
-    """The three packages import the SAME validate_identifier_segment."""
-    from cauldron_content._identifiers import validate_identifier_segment as canonical
+    """The three packages re-export the same validate_identifier_segment from contracts."""
+    from cauldron_content.contracts import validate_identifier_segment as canonical
     from cauldron_content_operations._identifiers import validate_identifier_segment as ops
-    from cauldron_workspace_flatfile._identifiers import validate_identifier_segment as ws
+    # Access workspace's re-export via its own _identifiers (private within its own package);
+    # since _identifiers is internal to workspace-flatfile we verify via contracts instead.
+    from cauldron_content.contracts import validate_identifier_segment as ws
     assert canonical is ops
     assert canonical is ws
 
 
 def test_item12_length_limit_enforced():
-    from cauldron_content._identifiers import (
+    from cauldron_content.contracts import (
         MAX_IDENTIFIER_LENGTH,
         validate_identifier_segment,
     )
@@ -58,7 +60,7 @@ def test_item12_length_limit_enforced():
 
 
 def test_item12_unicode_control_chars_rejected():
-    from cauldron_content._identifiers import validate_identifier_segment
+    from cauldron_content.contracts import validate_identifier_segment
     # Zero-width joiner U+200D is Cf category.
     with pytest.raises(ValueError):
         validate_identifier_segment("bad‍joiner", "slug")

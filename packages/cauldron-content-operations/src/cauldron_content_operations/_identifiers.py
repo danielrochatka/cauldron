@@ -1,11 +1,11 @@
 """Identifier segment validation used across the content control plane.
 
-This module is a thin re-export of the canonical implementation in
-``cauldron_content._identifiers`` so all packages share a single validator.
+Re-exports from the public ``cauldron_content.contracts`` API rather than the
+private ``_identifiers`` module so this package does not access internals.
 """
 from __future__ import annotations
 
-from cauldron_content._identifiers import (
+from cauldron_content.contracts import (
     MAX_IDENTIFIER_LENGTH,
     validate_identifier_segment,
 )

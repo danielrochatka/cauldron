@@ -56,7 +56,7 @@ from cauldron_ai.contracts import (
     AIModelResponse,
     AIModelToolCall,
     AIModelToolDefinition,
-    _assert_json_compatible,
+    assert_json_compatible,
 )
 from cauldron_ai.provider_configuration import (
     AIProviderAuthenticationError,
@@ -1374,7 +1374,7 @@ def _validate_result_contract(
     * ``tool_name`` is a non-empty str matching ``expected_name`` exactly.
     * ``success`` is exactly ``True`` (not truthy).
     * ``message`` is a str (any length, including empty).
-    * ``data`` passes ``_assert_json_compatible`` when not None.
+    * ``data`` passes ``assert_json_compatible`` when not None.
     """
     if not isinstance(outcome.tool_name, str) or not outcome.tool_name:
         return "AdminAIToolResult.tool_name must be a non-empty string."
@@ -1386,7 +1386,7 @@ def _validate_result_contract(
         return "AdminAIToolResult.message must be a string."
     if outcome.data is not None:
         try:
-            _assert_json_compatible(outcome.data)
+            assert_json_compatible(outcome.data)
         except (TypeError, ValueError):
             return "AdminAIToolResult.data is not JSON-compatible."
     return None

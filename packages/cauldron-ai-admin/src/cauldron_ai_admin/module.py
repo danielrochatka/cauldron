@@ -18,6 +18,12 @@ _manifest = ModuleManifest(
         ModuleRequirement(slug="django.state", kind="capability"),
         ModuleRequirement(slug="identity.authentication", kind="capability"),
         ModuleRequirement(slug="identity.permissions", kind="capability"),
+        ModuleRequirement(slug="cauldron.ai", kind="module"),
+        ModuleRequirement(slug="cauldron.django.admin", kind="module"),
+        ModuleRequirement(slug="cauldron.admin.content", kind="module"),
+    ),
+    optional=(
+        ModuleRequirement(slug="cauldron.cms.flatfile", kind="module"),
     ),
     provides=(
         "admin.ai",
@@ -25,6 +31,13 @@ _manifest = ModuleManifest(
         "admin.ai.tools",
         "admin.ai.audit",
         "admin.ai.health",
+    ),
+    namespaces=("cauldron_ai_admin",),
+    public_api=(
+        "cauldron_ai_admin.tools",
+        "cauldron_ai_admin.views",
+        "cauldron_ai_admin.service",
+        "cauldron_ai_admin.builtin_tools",
     ),
 )
 

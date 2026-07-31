@@ -800,9 +800,9 @@ class UIStyleChangeDetailView(View):
         current_label = "new file"
         if proposal.base_exists:
             try:
-                from cauldron_django_admin.override_views import _get_override_root
+                from cauldron_django_admin.override_views import get_override_root
                 from cauldron_django_admin.override_store import UIOverrideStore
-                root = _get_override_root()
+                root = get_override_root()
                 if root is not None and root.is_dir():
                     store = UIOverrideStore(root)
                     current_content = store.read_file(

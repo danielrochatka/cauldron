@@ -28,6 +28,10 @@ _manifest = ModuleManifest(
         "identity.authentication",
         "identity.password.reset",
     ),
+    namespaces=("cauldron_django_auth",),
+    public_api=(
+        "cauldron_django_auth.apps",
+    ),
 )
 
 module = BaseModule(_manifest)

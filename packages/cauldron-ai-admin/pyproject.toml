@@ -16,6 +16,15 @@ dependencies = [
     "jsonschema>=4.0",
 ]
 
+[project.optional-dependencies]
+flatfile = [
+    "cauldron-cms-flatfile>=0.1.0",
+]
+test = [
+    "cauldron-workspace-flatfile>=0.1.0",
+    "cauldron-site-astro>=0.1.0",
+]
+
 [project.entry-points."cauldron.modules"]
 "cauldron.ai.admin" = "cauldron_ai_admin.module:module"
 

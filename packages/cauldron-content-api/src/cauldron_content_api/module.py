@@ -10,10 +10,18 @@ _manifest = ModuleManifest(
     requires=(
         ModuleRequirement(slug="content.operations", kind="capability"),
         ModuleRequirement(slug="identity.authentication", kind="capability"),
+        ModuleRequirement(slug="cauldron.content", kind="module"),
+        ModuleRequirement(slug="cauldron.content.operations", kind="module"),
+        ModuleRequirement(slug="cauldron.workspace.flatfile", kind="module"),
     ),
     provides=(
         "content.httpapi",
         "content.httpapi.v1",
+    ),
+    namespaces=("cauldron_content_api",),
+    public_api=(
+        "cauldron_content_api.views",
+        "cauldron_content_api.urls",
     ),
 )
 

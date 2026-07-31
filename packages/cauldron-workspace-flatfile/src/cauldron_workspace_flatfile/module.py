@@ -7,12 +7,22 @@ _manifest = ModuleManifest(
     version="0.1.0",
     cauldron_version=">=0.1.0",
     django_apps=("cauldron_workspace_flatfile",),
-    requires=(ModuleRequirement(slug="cauldron.content"),),
+    requires=(
+        ModuleRequirement(slug="cauldron.content"),
+        ModuleRequirement(slug="cauldron.content.operations", kind="module"),
+    ),
     provides=(
         "workspace.flatfile",
         "workspace.changesets",
         "workspace.snapshots",
         "workspace.preview",
+    ),
+    namespaces=("cauldron_workspace_flatfile",),
+    public_api=(
+        "cauldron_workspace_flatfile.store",
+        "cauldron_workspace_flatfile.config",
+        "cauldron_workspace_flatfile.reversible",
+        "cauldron_workspace_flatfile.snapshots",
     ),
 )
 

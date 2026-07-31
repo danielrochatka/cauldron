@@ -8,8 +8,10 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "cauldron>=0.1.0",
+    "cauldron-content>=0.1.0",
     "cauldron-content-operations>=0.1.0",
     "cauldron-django-admin>=0.1.0",
+    "cauldron-workspace-flatfile>=0.1.0",
     "django>=4.2",
 ]
 

@@ -1,7 +1,7 @@
 """Cauldron module definition for the OpenAI provider."""
 from __future__ import annotations
 
-from cauldron.modules import BaseModule, ModuleManifest
+from cauldron.modules import BaseModule, ModuleManifest, ModuleRequirement
 
 _manifest = ModuleManifest(
     slug="cauldron.ai.openai",
@@ -9,8 +9,15 @@ _manifest = ModuleManifest(
     version="0.1.0",
     cauldron_version=">=0.1.0",
     django_apps=("cauldron_ai_openai",),
+    requires=(
+        ModuleRequirement(slug="cauldron.ai", kind="module"),
+    ),
     provides=(
         "ai.provider.openai",
+    ),
+    namespaces=("cauldron_ai_openai",),
+    public_api=(
+        "cauldron_ai_openai.provider",
     ),
 )
 

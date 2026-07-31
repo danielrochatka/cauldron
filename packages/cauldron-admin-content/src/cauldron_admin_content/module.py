@@ -14,11 +14,22 @@ _manifest = ModuleManifest(
         # depend on that capability explicitly so misconfigured deployments
         # fail loudly at resolution time.
         ModuleRequirement(slug="admin.shell", kind="capability"),
+        ModuleRequirement(slug="cauldron.django.admin", kind="module"),
+        ModuleRequirement(slug="cauldron.content", kind="module"),
+        ModuleRequirement(slug="cauldron.content.operations", kind="module"),
+        ModuleRequirement(slug="cauldron.workspace.flatfile", kind="module"),
     ),
     provides=(
         "admin.content",
         "admin.content.changerequests",
         "admin.content.audit",
+    ),
+    namespaces=("cauldron_admin_content",),
+    public_api=(
+        "cauldron_admin_content.views",
+        "cauldron_admin_content.urls",
+        "cauldron_admin_content.forms",
+        "cauldron_admin_content.service_factory",
     ),
 )
 

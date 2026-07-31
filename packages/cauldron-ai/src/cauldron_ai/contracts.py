@@ -46,7 +46,7 @@ def _to_plain_for_check(value: Any) -> Any:
     return value
 
 
-def _assert_json_compatible(value: Any) -> None:
+def assert_json_compatible(value: Any) -> None:
     """Raise ``ValueError`` for values that are not strict-JSON safe.
 
     Rejects ``NaN`` / ``Infinity`` / ``-Infinity`` (via ``allow_nan=False``),
@@ -66,7 +66,7 @@ def _assert_json_compatible(value: Any) -> None:
         raise ValueError(f"Value is not JSON-compatible: {exc}") from exc
 
 
-def _deep_freeze(value: Any) -> Any:
+def deep_freeze(value: Any) -> Any:
     """Return a deeply-immutable view of *value* after JSON validation.
 
     * ``dict`` → :class:`types.MappingProxyType` wrapping frozen children
@@ -77,10 +77,10 @@ def _deep_freeze(value: Any) -> Any:
         return value
     if isinstance(value, Mapping):
         return MappingProxyType({
-            str(k): _deep_freeze(v) for k, v in value.items()
+            str(k): deep_freeze(v) for k, v in value.items()
         })
     if isinstance(value, (list, tuple)):
-        return tuple(_deep_freeze(v) for v in value)
+        return tuple(deep_freeze(v) for v in value)
     raise TypeError(
         f"Value of type {type(value).__name__!r} is not JSON-serialisable."
     )
@@ -88,7 +88,7 @@ def _deep_freeze(value: Any) -> Any:
 
 def _deep_freeze_json_value(value: Any) -> Any:
     """Legacy alias kept for backwards compatibility."""
-    return _deep_freeze(value)
+    return deep_freeze(value)
 
 
 @dataclass(frozen=True)
@@ -108,9 +108,9 @@ class AIModelToolCall:
             raise TypeError("AIModelToolCall.arguments must be a mapping")
         # Strict JSON compatibility first (rejects NaN/Infinity/non-string
         # keys/non-primitive leaves before anything is exposed).
-        _assert_json_compatible(dict(self.arguments))
+        assert_json_compatible(dict(self.arguments))
         # Deep freeze so callers can't mutate the record after construction.
-        object.__setattr__(self, "arguments", _deep_freeze(dict(self.arguments)))
+        object.__setattr__(self, "arguments", deep_freeze(dict(self.arguments)))
 
 
 @dataclass(frozen=True)
@@ -181,10 +181,10 @@ class AIModelToolDefinition:
             raise TypeError("AIModelToolDefinition.description must be a string")
         if not isinstance(self.parameters, Mapping):
             raise TypeError("AIModelToolDefinition.parameters must be a mapping")
-        _assert_json_compatible(dict(self.parameters))
+        assert_json_compatible(dict(self.parameters))
         # Deep freeze so nested schema mutations don't leak in.
         object.__setattr__(
-            self, "parameters", _deep_freeze(dict(self.parameters))
+            self, "parameters", deep_freeze(dict(self.parameters))
         )
 
 

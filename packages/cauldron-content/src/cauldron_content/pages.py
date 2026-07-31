@@ -23,6 +23,7 @@ def build_page_operation(
     title: str,
     body: str,
     expected_hash: str = "",
+    description: str = "",
     navigation_title: str = "",
     summary: str = "",
     seo_title: str = "",
@@ -47,6 +48,23 @@ def build_page_operation(
             f"Invalid kind {kind!r}. Must be one of {sorted(_VALID_KINDS)}."
         )
 
+    data: dict[str, Any] = {
+        "title": title,
+        "navigation_title": navigation_title,
+        "summary": summary,
+        "seo_title": seo_title,
+        "meta_description": meta_description,
+        "canonical_url": canonical_url,
+        "robots_index": robots_index,
+        "robots_follow": robots_follow,
+        "social_title": social_title,
+        "social_description": social_description,
+        "social_image": social_image,
+        "template": template,
+    }
+    if description:
+        data["description"] = description
+
     op: dict[str, Any] = {
         "kind": kind,
         "collection": PAGE_COLLECTION,
@@ -55,20 +73,7 @@ def build_page_operation(
         "slug": slug,
         "status": status,
         "body": body,
-        "data": {
-            "title": title,
-            "navigation_title": navigation_title,
-            "summary": summary,
-            "seo_title": seo_title,
-            "meta_description": meta_description,
-            "canonical_url": canonical_url,
-            "robots_index": robots_index,
-            "robots_follow": robots_follow,
-            "social_title": social_title,
-            "social_description": social_description,
-            "social_image": social_image,
-            "template": template,
-        },
+        "data": data,
     }
 
     if kind == "update" and expected_hash:

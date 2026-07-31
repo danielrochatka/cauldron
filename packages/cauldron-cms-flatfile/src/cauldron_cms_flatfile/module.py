@@ -1,5 +1,5 @@
 """Cauldron flat-file CMS module definition."""
-from cauldron.modules import BaseModule, ModuleManifest, ModuleRequirement
+from cauldron.modules import BaseModule, ModuleManifest, ModuleRequirement, ModuleSettingsDeclaration
 
 _manifest = ModuleManifest(
     slug="cauldron.cms.flatfile",
@@ -22,6 +22,23 @@ _manifest = ModuleManifest(
         "cauldron_cms_flatfile.config",
         "cauldron_cms_flatfile.validator",
         "cauldron_cms_flatfile.parser",
+    ),
+    settings_declarations=(
+        ModuleSettingsDeclaration(
+            key="site_root",
+            required=True,
+            description="Absolute path to the flat-file site root directory.",
+        ),
+        ModuleSettingsDeclaration(
+            key="content_root",
+            required=False,
+            description="Path to content directory relative to site_root. Defaults to 'content'.",
+        ),
+        ModuleSettingsDeclaration(
+            key="schema_root",
+            required=False,
+            description="Path to schema directory relative to site_root. Defaults to 'schemas'.",
+        ),
     ),
 )
 

@@ -1,5 +1,10 @@
 """Cauldron Admin Content module definition."""
-from cauldron.modules import BaseModule, ModuleManifest, ModuleRequirement
+from cauldron.modules import (
+    BaseModule,
+    ModuleManifest,
+    ModuleNavigationDeclaration,
+    ModuleRequirement,
+)
 
 _manifest = ModuleManifest(
     slug="cauldron.admin.content",
@@ -30,6 +35,34 @@ _manifest = ModuleManifest(
         "cauldron_admin_content.urls",
         "cauldron_admin_content.forms",
         "cauldron_admin_content.service_factory",
+    ),
+    navigation=(
+        ModuleNavigationDeclaration(key="content", label="Content"),
+        ModuleNavigationDeclaration(
+            key="cauldron.admin.content.browser",
+            label="Content Browser",
+            section="content",
+        ),
+        ModuleNavigationDeclaration(
+            key="cauldron.admin.content.homepage",
+            label="Homepage",
+            section="content",
+        ),
+        ModuleNavigationDeclaration(
+            key="cauldron.admin.content.page-create",
+            label="New Page",
+            section="content",
+        ),
+        ModuleNavigationDeclaration(
+            key="cauldron.admin.content.change-requests",
+            label="Change Requests",
+            section="content",
+        ),
+        ModuleNavigationDeclaration(
+            key="cauldron.admin.content.audit",
+            label="Audit Log",
+            section="content",
+        ),
     ),
 )
 

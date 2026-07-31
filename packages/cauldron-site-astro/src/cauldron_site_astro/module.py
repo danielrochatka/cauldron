@@ -1,5 +1,11 @@
 """Cauldron Site Astro module definition."""
-from cauldron.modules import BaseModule, ModuleManifest, ModuleRequirement
+from cauldron.modules import (
+    BaseModule,
+    ModuleManifest,
+    ModuleMigrationDeclaration,
+    ModuleRequirement,
+    ModuleSettingsDeclaration,
+)
 
 _manifest = ModuleManifest(
     slug="cauldron.site.astro",
@@ -30,6 +36,40 @@ _manifest = ModuleManifest(
         # Concrete SitePublicUrlProvider — external callers use
         # cauldron_content.site.get_public_url() not this class directly.
         "cauldron_site_astro.public_url",
+    ),
+    settings_declarations=(
+        ModuleSettingsDeclaration(
+            key="output_root",
+            required=True,
+            description="Absolute path to the Astro build output directory.",
+        ),
+        ModuleSettingsDeclaration(
+            key="frontend_root",
+            required=True,
+            description="Absolute path to the Astro frontend source directory.",
+        ),
+        ModuleSettingsDeclaration(
+            key="previews_root",
+            required=False,
+            description="Absolute path for preview build output. Required only if preview builds are used.",
+        ),
+    ),
+    migration_apps=(
+        ModuleMigrationDeclaration(app_label="cauldron_site_astro"),
+    ),
+    ai_tools=(
+        "site.inspect",
+        "site.stage_theme",
+        "site.prepare_change_set",
+        "site.inspect_preview",
+        "site.publish",
+    ),
+    prompt_templates=(
+        "site.inspect",
+        "site.stage_theme",
+        "site.prepare_change_set",
+        "site.inspect_preview",
+        "site.publish",
     ),
 )
 

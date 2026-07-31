@@ -1,5 +1,11 @@
 """Cauldron Content Operations module definition."""
-from cauldron.modules import BaseModule, ModuleManifest, ModuleRequirement
+from cauldron.modules import (
+    BaseModule,
+    ModuleManifest,
+    ModuleMigrationDeclaration,
+    ModulePermissionDeclaration,
+    ModuleRequirement,
+)
 
 _manifest = ModuleManifest(
     slug="cauldron.content.operations",
@@ -34,6 +40,61 @@ _manifest = ModuleManifest(
         "cauldron_content_operations.reversible",
         "cauldron_content_operations.signals",
         "cauldron_content_operations.audit",
+    ),
+    migration_apps=(
+        ModuleMigrationDeclaration(app_label="cauldron_content_operations"),
+    ),
+    permissions=(
+        ModulePermissionDeclaration(
+            codename="view_published_content",
+            name="Can view published content",
+            app_label="cauldron_content_operations",
+        ),
+        ModulePermissionDeclaration(
+            codename="view_draft_content",
+            name="Can view draft content",
+            app_label="cauldron_content_operations",
+        ),
+        ModulePermissionDeclaration(
+            codename="view_content_change_requests",
+            name="Can view content change requests",
+            app_label="cauldron_content_operations",
+        ),
+        ModulePermissionDeclaration(
+            codename="propose_content_changes",
+            name="Can propose content changes",
+            app_label="cauldron_content_operations",
+        ),
+        ModulePermissionDeclaration(
+            codename="validate_content_changes",
+            name="Can validate content changes",
+            app_label="cauldron_content_operations",
+        ),
+        ModulePermissionDeclaration(
+            codename="approve_content_changes",
+            name="Can approve content changes",
+            app_label="cauldron_content_operations",
+        ),
+        ModulePermissionDeclaration(
+            codename="reject_content_changes",
+            name="Can reject content changes",
+            app_label="cauldron_content_operations",
+        ),
+        ModulePermissionDeclaration(
+            codename="apply_content_changes",
+            name="Can apply content changes",
+            app_label="cauldron_content_operations",
+        ),
+        ModulePermissionDeclaration(
+            codename="rollback_content_changes",
+            name="Can roll back content changes",
+            app_label="cauldron_content_operations",
+        ),
+        ModulePermissionDeclaration(
+            codename="view_content_audit",
+            name="Can view content audit history",
+            app_label="cauldron_content_operations",
+        ),
     ),
 )
 

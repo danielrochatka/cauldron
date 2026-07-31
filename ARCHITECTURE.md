@@ -121,7 +121,67 @@ violations = run_checks(Path("."))
 
 ---
 
-## 6. Error Codes
+## 6. ModuleManifest Contract
+
+`ModuleManifest` (in `src/cauldron/modules/__init__.py`) is the single source
+of truth for what a Cauldron module declares about itself. It is a frozen
+dataclass — all fields are validated at construction time and the object is
+immutable thereafter.
+
+### What belongs in ModuleManifest
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `settings_declarations` | `tuple[ModuleSettingsDeclaration, ...]` | Settings keys this module owns and reads from `CAULDRON_MODULES[slug]`. Consumed by the settings page (#33) to validate configuration and show required/optional status. |
+| `migration_apps` | `tuple[ModuleMigrationDeclaration, ...]` | Django `app_label`s that hold database migrations. Consumed by startup projection (#38) to determine whether `migrate` is needed. |
+| `permissions` | `tuple[ModulePermissionDeclaration, ...]` | Permission codenames the module introduces. Consumed by install/enable flows (#38) to create permissions before first use. |
+| `navigation` | `tuple[ModuleNavigationDeclaration, ...]` | Nav sections and items this module contributes to the admin shell. Consumed by the admin shell (#66) to build the sidebar. |
+| `ai_tools` | `tuple[str, ...]` | Tool names this module registers in the AI tool-calling pipeline. Consumed by AI orchestration to validate tool availability. |
+| `prompt_templates` | `tuple[str, ...]` | Prompt template names this module provides. Consumed by AI orchestration (#66). |
+| `provided_capabilities` | `tuple[ProvidedCapability, ...]` | Rich metadata for each capability slug in `provides`. Each slug must already appear in `provides`. |
+
+The derived property `requires_restart` is computed from `django_apps`,
+`django_middleware`, and `django_context_processors` — it is **not** stored.
+
+### What does NOT belong in ModuleManifest
+
+- **Django model schema** — `AppConfig`, `Meta`, field definitions. Django owns
+  the database schema; the manifest only declares which `app_label`s contain
+  migrations.
+- **Permission objects** — `ModulePermissionDeclaration` names a codename; the
+  actual `Permission` row is created by Django's `post_migrate` signal. Don't
+  duplicate `Meta.permissions`.
+- **Route tables / URL patterns** — modules register URLs via `include()` at
+  startup, not in the manifest.
+- **Signal handlers, middleware configuration** — runtime wiring, not metadata.
+- **Anything derivable from code** — if you can read it from the existing
+  `AppConfig` or `pyproject.toml`, do not duplicate it in the manifest.
+
+### Validation rules
+
+- **Settings keys** — flat lowercase identifiers (`^[a-z][a-z0-9_]*$`). No
+  dots. Two declarations may not share the same key within a manifest.
+- **Migration app_labels** — must appear in `django_apps`. No duplicates.
+- **Permission codenames** — lowercase identifiers (`^[a-z][a-z0-9_]*$`). The
+  `app_label` must appear in `django_apps`. No duplicate codenames.
+- **Navigation keys** — dotted lowercase, hyphens allowed after the first
+  character of each segment (e.g. `cauldron.admin.content.page-create`). No
+  duplicates.
+- **AI tool / prompt template names** — dotted lowercase, underscores allowed
+  in segments (e.g. `content.list_collections`). No duplicates within each
+  tuple.
+- **ProvidedCapability slugs** — must appear in `provides`. No duplicate slugs
+  within `provided_capabilities`.
+
+### Serialization
+
+Every value object and `ModuleManifest` itself supports `to_dict()` and
+`from_dict()`. All fields have backward-compatible defaults so that old
+serialized dicts (without the new fields) deserialize cleanly.
+
+---
+
+## 7. Error Codes
 
 | Code | Description |
 |------|-------------|

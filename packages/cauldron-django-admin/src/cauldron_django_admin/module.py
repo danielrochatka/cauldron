@@ -1,5 +1,11 @@
 """Cauldron Django Admin module definition."""
-from cauldron.modules import BaseModule, ModuleManifest, ModuleRequirement
+from cauldron.modules import (
+    BaseModule,
+    ModuleManifest,
+    ModuleNavigationDeclaration,
+    ModuleRequirement,
+    ModuleSettingsDeclaration,
+)
 
 _manifest = ModuleManifest(
     slug="cauldron.django.admin",
@@ -36,6 +42,27 @@ _manifest = ModuleManifest(
         "cauldron_django_admin.module_settings",
         "cauldron_django_admin.views",
         "cauldron_django_admin.urls",
+    ),
+    settings_declarations=(
+        ModuleSettingsDeclaration(
+            key="ui_overrides_dir",
+            required=False,
+            description="Absolute path to a directory of admin CSS/JS override files.",
+        ),
+    ),
+    navigation=(
+        ModuleNavigationDeclaration(key="overview", label="Overview"),
+        ModuleNavigationDeclaration(
+            key="cauldron.dashboard",
+            label="Dashboard",
+            section="overview",
+        ),
+        ModuleNavigationDeclaration(key="system", label="System"),
+        ModuleNavigationDeclaration(
+            key="cauldron.modules",
+            label="Modules",
+            section="system",
+        ),
     ),
 )
 

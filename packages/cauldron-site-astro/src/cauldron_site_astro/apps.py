@@ -13,6 +13,13 @@ class CauldronSiteAstroConfig(AppConfig):
         _connect_signals()
         _register_site_tools()
         _register_site_tool_prompts()
+        _register_public_url_provider()
+
+
+def _register_public_url_provider() -> None:
+    from cauldron_content.site import register_public_url_provider
+    from cauldron_site_astro.public_url import AstroPublicUrlProvider
+    register_public_url_provider(AstroPublicUrlProvider())
 
 
 def _register_site_tools() -> None:

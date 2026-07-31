@@ -246,12 +246,15 @@ class ContentBrowserView(View):
                 items_raw = service.list_items(collection, user=request.user, include_drafts=include_drafts)
                 items = [item.to_dict() for item in items_raw]
                 if collection == PAGE_COLLECTION:
-                    from cauldron_content.homepage import HOMEPAGE_ITEM_ID, HOMEPAGE_ROUTE
+                    from cauldron_content.site import get_public_url
                     for item in items:
-                        if item["id"] == HOMEPAGE_ITEM_ID:
-                            item["public_url"] = HOMEPAGE_ROUTE
-                        else:
-                            item["public_url"] = f"/{item['slug']}/"
+                        url = get_public_url(
+                            item_id=item["id"],
+                            slug=item["slug"],
+                            collection=collection,
+                        )
+                        if url is not None:
+                            item["public_url"] = url
             except Exception as exc:
                 error = html.escape(str(exc)[:200])
 

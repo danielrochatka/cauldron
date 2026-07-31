@@ -61,7 +61,7 @@
         <td>{{ item.schema|escape }}</td>
         <td><code>{{ item.hash|escape|slice:":12" }}…</code></td>
         <td>
-          {% if item.status == "published" %}
+          {% if item.status == "published" and item.public_url %}
           <a href="{{ item.public_url }}" target="_blank" rel="noopener noreferrer" class="cui-button cui-button--sm cui-button--secondary">View</a>
           {% elif item.status == "draft" %}
           <a href="{% url 'cauldron_admin_content:page-detail' item.id %}" class="cui-button cui-button--sm cui-button--secondary">Preview</a>

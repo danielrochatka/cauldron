@@ -571,7 +571,16 @@ class AdminAIPageView(View):
                     status=401,
                 )
             from django.contrib.auth.views import redirect_to_login
-            return redirect_to_login(request.get_full_path())
+            from django.conf import settings as django_settings
+            from urllib.parse import urlparse
+            login_url = django_settings.LOGIN_URL
+            login_host = urlparse(login_url).netloc
+            next_url = (
+                request.build_absolute_uri()
+                if login_host and login_host != request.get_host()
+                else request.get_full_path()
+            )
+            return redirect_to_login(next_url)
         if not request.user.has_perm(ADMIN_AI_PERMISSION):
             if request.method == "POST":
                 return JsonResponse(

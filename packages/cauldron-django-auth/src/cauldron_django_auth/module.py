@@ -1,5 +1,5 @@
 """Cauldron Django Auth module definition."""
-from cauldron.modules import BaseModule, ModuleManifest, ModuleRequirement
+from cauldron.modules import BaseModule, ModuleManifest, ModuleMigrationDeclaration, ModuleRequirement
 
 _manifest = ModuleManifest(
     slug="cauldron.django.auth",
@@ -31,6 +31,15 @@ _manifest = ModuleManifest(
     namespaces=("cauldron_django_auth",),
     public_api=(
         "cauldron_django_auth.apps",
+    ),
+    migration_apps=(
+        # Django's built-in app labels differ from their dotted app paths.
+        # "contenttypes" → django.contrib.contenttypes
+        # "auth"         → django.contrib.auth
+        # "sessions"     → django.contrib.sessions
+        ModuleMigrationDeclaration(app_label="contenttypes"),
+        ModuleMigrationDeclaration(app_label="auth"),
+        ModuleMigrationDeclaration(app_label="sessions"),
     ),
 )
 

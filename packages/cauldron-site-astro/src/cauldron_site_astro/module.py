@@ -39,19 +39,49 @@ _manifest = ModuleManifest(
     ),
     settings_declarations=(
         ModuleSettingsDeclaration(
-            key="output_root",
-            required=True,
-            description="Absolute path to the Astro build output directory.",
-        ),
-        ModuleSettingsDeclaration(
             key="frontend_root",
             required=True,
             description="Absolute path to the Astro frontend source directory.",
         ),
         ModuleSettingsDeclaration(
+            key="output_root",
+            required=True,
+            description="Absolute path to the Astro build output directory.",
+        ),
+        ModuleSettingsDeclaration(
+            key="homepage_item_id",
+            required=False,
+            description="Navigation item ID for the homepage; defaults to 'homepage'.",
+        ),
+        ModuleSettingsDeclaration(
+            key="npm_command",
+            required=False,
+            description="npm CLI command to invoke for Astro builds; defaults to 'npm'.",
+        ),
+        ModuleSettingsDeclaration(
+            key="build_timeout",
+            required=False,
+            description="Maximum seconds to wait for an Astro build before timing out; defaults to 120.",
+        ),
+        ModuleSettingsDeclaration(
+            key="manage_py_path",
+            required=False,
+            description="Absolute path to manage.py, required when Astro builds invoke Django management commands.",
+        ),
+        ModuleSettingsDeclaration(
+            key="build_log_file",
+            required=False,
+            description="Absolute path to write Astro build log output; defaults to stderr.",
+        ),
+        ModuleSettingsDeclaration(
+            key="theme_root",
+            required=False,
+            description="Absolute path to the theme directory where active.css and staged.css are stored.",
+        ),
+        ModuleSettingsDeclaration(
             key="previews_root",
             required=False,
-            description="Absolute path for preview build output. Required only if preview builds are used.",
+            description="Absolute path for preview build output. Required when preview builds are used.",
         ),
     ),
     migration_apps=(

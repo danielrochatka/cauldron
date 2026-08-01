@@ -14,6 +14,7 @@ from cauldron.modules import (
     ModuleRequirement,
     ModuleSettingsDeclaration,
     ProvidedCapability,
+    RuntimeRequirement,
 )
 
 
@@ -119,10 +120,64 @@ class TestModuleSettingsDeclaration:
         d = ModuleSettingsDeclaration.from_dict({"key": "foo"})
         assert d.required is False
         assert d.description == ""
+        assert d.setting_path == ""
+
+    def test_setting_path_top_level_django_setting(self):
+        d = ModuleSettingsDeclaration(
+            key="ui_overrides_dir",
+            required=False,
+            description="Override dir.",
+            setting_path="CAULDRON_UI_OVERRIDES_DIR",
+        )
+        assert d.setting_path == "CAULDRON_UI_OVERRIDES_DIR"
+
+    def test_invalid_setting_path_lowercase_raises(self):
+        with pytest.raises(ValueError, match="UPPER_SNAKE_CASE"):
+            ModuleSettingsDeclaration(key="mykey", setting_path="lowercase_path")
+
+    def test_setting_path_round_trip(self):
+        d = ModuleSettingsDeclaration(key="dir", setting_path="SOME_DIR")
+        assert ModuleSettingsDeclaration.from_dict(d.to_dict()) == d
 
     def test_to_dict_json_serializable(self):
         d = ModuleSettingsDeclaration(key="database_alias", description="DB alias.")
         json.dumps(d.to_dict())  # must not raise
+
+
+class TestRuntimeRequirement:
+    def test_basic(self):
+        r = RuntimeRequirement(kind="database")
+        assert r.kind == "database"
+        assert r.alias == ""
+        assert r.description == ""
+
+    def test_full(self):
+        r = RuntimeRequirement(kind="cache", alias="sessions", description="Used for session caching.")
+        assert r.kind == "cache"
+        assert r.alias == "sessions"
+        assert r.description == "Used for session caching."
+
+    def test_frozen(self):
+        r = RuntimeRequirement(kind="database")
+        with pytest.raises(Exception):
+            r.kind = "cache"  # type: ignore[misc]
+
+    def test_empty_kind_raises(self):
+        with pytest.raises(ValueError, match="non-empty"):
+            RuntimeRequirement(kind="")
+
+    def test_round_trip(self):
+        r = RuntimeRequirement(kind="worker", alias="celery", description="Background task queue.")
+        assert RuntimeRequirement.from_dict(r.to_dict()) == r
+
+    def test_from_dict_defaults(self):
+        r = RuntimeRequirement.from_dict({"kind": "storage"})
+        assert r.alias == ""
+        assert r.description == ""
+
+    def test_to_dict_json_serializable(self):
+        r = RuntimeRequirement(kind="database")
+        json.dumps(r.to_dict())  # must not raise
 
 
 class TestModuleMigrationDeclaration:
@@ -140,7 +195,7 @@ class TestModuleMigrationDeclaration:
             ModuleMigrationDeclaration(app_label="")
 
     def test_invalid_app_label_raises(self):
-        with pytest.raises(ValueError, match="valid Python identifier"):
+        with pytest.raises(ValueError, match="valid Django app label"):
             ModuleMigrationDeclaration(app_label="bad app")
 
     def test_round_trip(self):
@@ -211,6 +266,12 @@ class TestModuleNavigationDeclaration:
         assert n.key == "content"
         assert n.label == "Content"
         assert n.section == ""
+        assert n.url_name == ""
+        assert n.order == 0
+        assert n.permission == ""
+        assert n.url_prefix == ""
+        assert n.url_prefix_exact is False
+        assert n.description == ""
 
     def test_item(self):
         n = ModuleNavigationDeclaration(
@@ -219,6 +280,35 @@ class TestModuleNavigationDeclaration:
             section="content",
         )
         assert n.section == "content"
+
+    def test_full_item(self):
+        n = ModuleNavigationDeclaration(
+            key="cauldron.ai.admin.page",
+            label="AI Assistant",
+            section="ai",
+            url_name="cauldron_ai_admin:ai-page",
+            order=10,
+            permission="cauldron_ai_admin.use_admin_ai",
+            url_prefix="/cauldron/admin/ai/",
+            description="Interact with the Admin AI assistant",
+        )
+        assert n.url_name == "cauldron_ai_admin:ai-page"
+        assert n.order == 10
+        assert n.permission == "cauldron_ai_admin.use_admin_ai"
+        assert n.url_prefix == "/cauldron/admin/ai/"
+        assert n.url_prefix_exact is False
+        assert n.description == "Interact with the Admin AI assistant"
+
+    def test_url_prefix_exact(self):
+        n = ModuleNavigationDeclaration(
+            key="cauldron.dashboard",
+            label="Dashboard",
+            section="overview",
+            url_name="cauldron:dashboard",
+            url_prefix="/cauldron/",
+            url_prefix_exact=True,
+        )
+        assert n.url_prefix_exact is True
 
     def test_key_with_hyphens(self):
         n = ModuleNavigationDeclaration(
@@ -245,20 +335,45 @@ class TestModuleNavigationDeclaration:
         with pytest.raises(ValueError, match="non-empty"):
             ModuleNavigationDeclaration(key="mykey", label="")
 
+    def test_invalid_permission_format_raises(self):
+        with pytest.raises(ValueError, match="app_label.codename"):
+            ModuleNavigationDeclaration(
+                key="mykey", label="My Key",
+                permission="just_codename_no_dot",
+            )
+
+    def test_empty_permission_allowed(self):
+        n = ModuleNavigationDeclaration(key="mykey", label="My Key", permission="")
+        assert n.permission == ""
+
     def test_round_trip(self):
         n = ModuleNavigationDeclaration(
             key="cauldron.admin.content.change-requests",
             label="Change Requests",
             section="content",
+            url_name="cauldron_admin_content:change-request-list",
+            order=30,
+            permission="cauldron_content_operations.view_content_change_requests",
+            url_prefix="/cauldron/content/change-requests/",
+            description="Review content change requests",
         )
         assert ModuleNavigationDeclaration.from_dict(n.to_dict()) == n
 
     def test_from_dict_defaults_section_empty(self):
         n = ModuleNavigationDeclaration.from_dict({"key": "overview", "label": "Overview"})
         assert n.section == ""
+        assert n.url_name == ""
+        assert n.order == 0
+        assert n.permission == ""
+        assert n.url_prefix == ""
+        assert n.url_prefix_exact is False
+        assert n.description == ""
 
     def test_to_dict_json_serializable(self):
-        n = ModuleNavigationDeclaration(key="mykey", label="My Key")
+        n = ModuleNavigationDeclaration(
+            key="mykey", label="My Key",
+            url_name="ns:view-name", order=10,
+        )
         json.dumps(n.to_dict())  # must not raise
 
 
@@ -511,6 +626,35 @@ class TestModuleManifestNewFieldDefaults:
         m = ModuleManifest(slug="a", label="A", django_context_processors=("some.processor",))
         assert m.requires_restart is True
 
+    def test_restart_required_defaults_false(self):
+        assert self._minimal().restart_required is False
+
+    def test_runtime_requirements_default_empty(self):
+        assert self._minimal().runtime_requirements == ()
+
+    def test_restart_required_explicit_true(self):
+        m = ModuleManifest(slug="a", label="A", restart_required=True)
+        assert m.restart_required is True
+        assert m.requires_restart is True
+
+    def test_requires_restart_true_from_explicit_flag(self):
+        # No django_apps but restart_required set explicitly.
+        m = ModuleManifest(slug="a", label="A", restart_required=True)
+        assert m.django_apps == ()
+        assert m.requires_restart is True
+
+    def test_runtime_requirements_accepted(self):
+        m = ModuleManifest(
+            slug="a", label="A",
+            runtime_requirements=(
+                RuntimeRequirement(kind="database"),
+                RuntimeRequirement(kind="cache", alias="sessions"),
+            ),
+        )
+        assert len(m.runtime_requirements) == 2
+        assert m.runtime_requirements[0].kind == "database"
+        assert m.runtime_requirements[1].alias == "sessions"
+
     def test_backwards_compat_from_dict_without_new_fields(self):
         # Old serialised manifests (missing new keys) must still deserialise.
         m = ModuleManifest.from_dict({"slug": "a", "label": "A"})
@@ -521,6 +665,8 @@ class TestModuleManifestNewFieldDefaults:
         assert m.ai_tools == ()
         assert m.prompt_templates == ()
         assert m.provided_capabilities == ()
+        assert m.restart_required is False
+        assert m.runtime_requirements == ()
 
 
 # ---------------------------------------------------------------------------
@@ -556,12 +702,32 @@ class TestModuleManifestMigrationValidation:
         assert len(m.migration_apps) == 1
 
     def test_migration_app_not_in_django_apps_raises(self):
-        with pytest.raises(ValueError, match="must appear in django_apps"):
+        with pytest.raises(ValueError, match="does not correspond to any entry in django_apps"):
             ModuleManifest(
                 slug="a", label="A",
                 django_apps=("otherapp",),
                 migration_apps=(ModuleMigrationDeclaration(app_label="myapp"),),
             )
+
+    def test_django_builtin_app_label_accepted(self):
+        # "auth" is the label for "django.contrib.auth" — last dotted segment.
+        m = ModuleManifest(
+            slug="a", label="A",
+            django_apps=("django.contrib.auth",),
+            migration_apps=(ModuleMigrationDeclaration(app_label="auth"),),
+        )
+        assert m.migration_apps[0].app_label == "auth"
+
+    def test_contenttypes_label_accepted(self):
+        m = ModuleManifest(
+            slug="a", label="A",
+            django_apps=("django.contrib.contenttypes", "django.contrib.auth"),
+            migration_apps=(
+                ModuleMigrationDeclaration(app_label="contenttypes"),
+                ModuleMigrationDeclaration(app_label="auth"),
+            ),
+        )
+        assert len(m.migration_apps) == 2
 
     def test_duplicate_migration_app_raises(self):
         with pytest.raises(ValueError, match="duplicate app_label"):
@@ -587,7 +753,7 @@ class TestModuleManifestPermissionsValidation:
         assert len(m.permissions) == 1
 
     def test_permission_app_not_in_django_apps_raises(self):
-        with pytest.raises(ValueError, match="must appear in django_apps"):
+        with pytest.raises(ValueError, match="does not correspond to any entry in django_apps"):
             ModuleManifest(
                 slug="a", label="A",
                 django_apps=("myapp",),
@@ -726,6 +892,54 @@ class TestModuleManifestProvidedCapabilitiesValidation:
         )
         assert m.provided_capabilities[0].contract == "cauldron_content.site.SitePublicUrlProvider"
 
+    def test_contract_in_own_namespace_must_be_in_public_api(self):
+        # Contract namespace "myapp" is in the module's own namespaces but the
+        # path "myapp._internal.MyProtocol" is NOT under public_api.
+        with pytest.raises(ValueError, match="not under public_api"):
+            ModuleManifest(
+                slug="a", label="A",
+                namespaces=("myapp",),
+                public_api=("myapp.api",),
+                provides=("my.cap",),
+                provided_capabilities=(
+                    ProvidedCapability(
+                        slug="my.cap",
+                        contract="myapp._internal.MyProtocol",
+                    ),
+                ),
+            )
+
+    def test_contract_in_own_namespace_under_public_api_passes(self):
+        m = ModuleManifest(
+            slug="a", label="A",
+            namespaces=("myapp",),
+            public_api=("myapp.contracts",),
+            provides=("my.cap",),
+            provided_capabilities=(
+                ProvidedCapability(
+                    slug="my.cap",
+                    contract="myapp.contracts.MyProtocol",
+                ),
+            ),
+        )
+        assert m.provided_capabilities[0].contract == "myapp.contracts.MyProtocol"
+
+    def test_contract_in_dependency_namespace_always_passes(self):
+        # Contract in a dependency's namespace — no cross-manifest validation possible.
+        m = ModuleManifest(
+            slug="a", label="A",
+            namespaces=("provider_app",),
+            public_api=("provider_app.impl",),
+            provides=("my.cap",),
+            provided_capabilities=(
+                ProvidedCapability(
+                    slug="my.cap",
+                    contract="dependency_pkg.contracts.MyProtocol",
+                ),
+            ),
+        )
+        assert m.provided_capabilities[0].contract == "dependency_pkg.contracts.MyProtocol"
+
 
 # ---------------------------------------------------------------------------
 # ModuleManifest — round-trip with all new fields
@@ -844,12 +1058,20 @@ class TestAllCurrentModulesLoad:
     def test_cauldron_django_auth(self):
         m = self._import_module("cauldron_django_auth.module")
         assert m.slug == "cauldron.django.auth"
+        assert len(m.migration_apps) == 3
+        labels = {d.app_label for d in m.migration_apps}
+        assert labels == {"contenttypes", "auth", "sessions"}
 
     def test_cauldron_django_admin(self):
         m = self._import_module("cauldron_django_admin.module")
         assert m.slug == "cauldron.django.admin"
         assert len(m.settings_declarations) == 1
+        assert m.settings_declarations[0].setting_path == "CAULDRON_UI_OVERRIDES_DIR"
         assert len(m.navigation) == 4
+        nav_by_key = {n.key: n for n in m.navigation}
+        assert nav_by_key["cauldron.dashboard"].url_name == "cauldron:dashboard"
+        assert nav_by_key["cauldron.dashboard"].url_prefix_exact is True
+        assert nav_by_key["cauldron.modules"].url_prefix == "/cauldron/modules/"
 
     def test_cauldron_content(self):
         m = self._import_module("cauldron_content.module")
@@ -905,7 +1127,7 @@ class TestAllCurrentModulesLoad:
     def test_cauldron_site_astro(self):
         m = self._import_module("cauldron_site_astro.module")
         assert m.slug == "cauldron.site.astro"
-        assert len(m.settings_declarations) == 3
+        assert len(m.settings_declarations) == 9
         assert len(m.migration_apps) == 1
         assert len(m.ai_tools) == 5
         assert len(m.prompt_templates) == 5

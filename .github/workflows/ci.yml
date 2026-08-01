@@ -52,6 +52,22 @@ jobs:
           pip install -e packages/cauldron-workspace-flatfile
           pip install -e packages/cauldron-cms-flatfile
 
+      - name: Install content operations modules
+        run: |
+          pip install -e packages/cauldron-content-operations
+          pip install -e packages/cauldron-content-api
+          pip install -e packages/cauldron-admin-content
+
+      - name: Install AI modules
+        run: |
+          pip install -e packages/cauldron-ai
+          pip install -e packages/cauldron-ai-openai
+          pip install -e packages/cauldron-ai-admin
+
+      - name: Install site modules
+        run: |
+          pip install -e packages/cauldron-site-astro
+
       - name: Test (core)
         run: pytest tests/ -v
 
@@ -108,12 +124,6 @@ jobs:
           python -m build packages/cauldron-workspace-flatfile
           python -m build packages/cauldron-cms-flatfile
 
-      - name: Install content operations modules
-        run: |
-          pip install -e packages/cauldron-content-operations
-          pip install -e packages/cauldron-content-api
-          pip install -e packages/cauldron-admin-content
-
       - name: Test (cauldron-content-operations)
         run: pytest packages/cauldron-content-operations/tests/ -v
 
@@ -123,16 +133,17 @@ jobs:
       - name: Test (cauldron-admin-content)
         run: pytest packages/cauldron-admin-content/tests/ -v
 
-      - name: Install Admin AI modules
-        run: |
-          pip install -e packages/cauldron-ai
-          pip install -e packages/cauldron-ai-admin
-
       - name: Test (cauldron-ai)
         run: pytest packages/cauldron-ai/tests/ -v
 
+      - name: Test (cauldron-ai-openai)
+        run: pytest packages/cauldron-ai-openai/tests/ -v
+
       - name: Test (cauldron-ai-admin)
         run: pytest packages/cauldron-ai-admin/tests/ -v
+
+      - name: Test (cauldron-site-astro)
+        run: pytest packages/cauldron-site-astro/tests/ -v
 
       - name: Build content operations wheels
         run: |
@@ -143,7 +154,9 @@ jobs:
       - name: Build Admin AI wheels
         run: |
           python -m build packages/cauldron-ai
+          python -m build packages/cauldron-ai-openai
           python -m build packages/cauldron-ai-admin
+          python -m build packages/cauldron-site-astro
 
       - name: Clean-wheel cauldron-ai
         run: |
@@ -206,7 +219,9 @@ jobs:
           .venv-wheel/bin/pip install packages/cauldron-content-api/dist/cauldron_content_api-*.whl
           .venv-wheel/bin/pip install packages/cauldron-admin-content/dist/cauldron_admin_content-*.whl
           .venv-wheel/bin/pip install packages/cauldron-ai/dist/cauldron_ai-*.whl
+          .venv-wheel/bin/pip install packages/cauldron-ai-openai/dist/cauldron_ai_openai-*.whl
           .venv-wheel/bin/pip install packages/cauldron-ai-admin/dist/cauldron_ai_admin-*.whl
+          .venv-wheel/bin/pip install packages/cauldron-site-astro/dist/cauldron_site_astro-*.whl
           .venv-wheel/bin/pip install pytest pytest-django
 
       - name: Content control plane example: migrate (wheel)

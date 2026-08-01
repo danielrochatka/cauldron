@@ -18,10 +18,14 @@ _NAV_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(\.[a-z][a-z0-9-]*)*$")
 _TOOL_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$")
 # Permission codenames: lowercase identifier with underscores.
 _CODENAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
-# Settings keys: simple lowercase identifier (no dots — top-level CAULDRON_MODULES key).
+# Navigation item permissions: "app_label.codename" form.
+_NAV_PERMISSION_RE = re.compile(r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")
+# Settings keys: simple lowercase identifier (no dots).
 _SETTINGS_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
-# App labels follow Python identifier rules.
-_APP_LABEL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
+# App labels follow Django convention: last segment of the dotted app path.
+_APP_LABEL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Top-level Django setting names: UPPER_SNAKE_CASE.
+_DJANGO_SETTING_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
 def _validate_slug(value: str, field_name: str) -> None:
@@ -50,6 +54,22 @@ def _validate_version(value: str, field_name: str) -> None:
         Version(value)
     except InvalidVersion as exc:
         raise ValueError(f"{field_name} {value!r} is not a valid PEP 440 version: {exc}") from exc
+
+
+def _app_label_in_django_apps(app_label: str, django_apps: tuple[str, ...]) -> bool:
+    """Return True if *app_label* corresponds to any entry in *django_apps*.
+
+    Django's AppConfig.label defaults to the last segment of the dotted app
+    path (e.g. ``"auth"`` for ``"django.contrib.auth"``).  An exact match of
+    the whole path (e.g. ``"cauldron_ai_admin"``) also qualifies.
+    """
+    for app in django_apps:
+        if app == app_label:
+            return True
+        # Last dotted segment — Django's default label derivation
+        if "." in app and app.rsplit(".", 1)[-1] == app_label:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -90,19 +110,20 @@ class ModuleRequirement:
 
 @dataclass(frozen=True)
 class ModuleSettingsDeclaration:
-    """Declares a top-level configuration key under ``CAULDRON_MODULES[slug]``.
+    """Declares a configuration key read by this module.
 
-    The *key* is the name used inside the module's settings dict, e.g.
-    ``"site_root"`` for ``CAULDRON_MODULES["cauldron.cms.flatfile"]["site_root"]``.
-
-    This is ownership metadata: it describes what configuration the module reads
-    and whether that configuration is required.  Defaults, validation logic, and
-    forms are owned by the module itself.
+    By default the key lives under ``CAULDRON_MODULES[slug][key]``.  Set
+    ``setting_path`` to the name of a top-level Django setting when the module
+    reads from the global settings namespace instead
+    (e.g. ``setting_path="CAULDRON_UI_OVERRIDES_DIR"``).
     """
 
     key: str
     required: bool = False
     description: str = ""
+    # If non-empty: the name of a top-level Django setting (UPPER_SNAKE_CASE).
+    # If empty: the setting lives at CAULDRON_MODULES[slug][key].
+    setting_path: str = ""
 
     def __post_init__(self) -> None:
         if not self.key:
@@ -112,9 +133,19 @@ class ModuleSettingsDeclaration:
                 f"ModuleSettingsDeclaration.key {self.key!r} must be a lowercase identifier "
                 "(letters, digits, and underscores; must start with a letter)."
             )
+        if self.setting_path and not _DJANGO_SETTING_RE.match(self.setting_path):
+            raise ValueError(
+                f"ModuleSettingsDeclaration.setting_path {self.setting_path!r} must be a "
+                "top-level Django setting name (UPPER_SNAKE_CASE)."
+            )
 
     def to_dict(self) -> dict[str, Any]:
-        return {"key": self.key, "required": self.required, "description": self.description}
+        return {
+            "key": self.key,
+            "required": self.required,
+            "description": self.description,
+            "setting_path": self.setting_path,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ModuleSettingsDeclaration:
@@ -122,16 +153,22 @@ class ModuleSettingsDeclaration:
             key=data["key"],
             required=data.get("required", False),
             description=data.get("description", ""),
+            setting_path=data.get("setting_path", ""),
         )
 
 
 @dataclass(frozen=True)
 class ModuleMigrationDeclaration:
-    """Declares that a Django app contributed by this module has database migrations.
+    """Declares that a Django app contributed (or installed) by this module has
+    database migrations.
 
-    ``app_label`` must appear in ``ModuleManifest.django_apps``.  The declaration
-    communicates to management tooling (module inventory, deploy previews) that
-    enabling this module will require running ``migrate``.
+    ``app_label`` is the Django app label (the ``AppConfig.label`` attribute),
+    which is the last segment of the dotted app path for Django's built-in apps
+    (e.g. ``"auth"`` for ``"django.contrib.auth"``) or the full Python package
+    name for first-party apps (e.g. ``"cauldron_site_astro"``).
+
+    The manifest validator checks that ``app_label`` corresponds to an entry in
+    ``django_apps`` either by exact match or by matching the last dotted segment.
     """
 
     app_label: str
@@ -142,7 +179,7 @@ class ModuleMigrationDeclaration:
         if not _APP_LABEL_RE.match(self.app_label):
             raise ValueError(
                 f"ModuleMigrationDeclaration.app_label {self.app_label!r} must be a valid "
-                "Python identifier (letters, digits, underscores, dots)."
+                "Django app label (letters, digits, and underscores)."
             )
 
     def to_dict(self) -> dict[str, str]:
@@ -157,14 +194,16 @@ class ModuleMigrationDeclaration:
 class ModulePermissionDeclaration:
     """Declares a Django permission owned by this module.
 
-    ``app_label`` must appear in ``ModuleManifest.django_apps``.
     ``codename`` must be a valid lowercase permission codename (no spaces).
     ``name`` is the human-readable description shown in admin UIs.
+    ``app_label`` is the Django app label that owns the permission — validated
+    against ``django_apps`` using the same label-derivation rules as
+    ``ModuleMigrationDeclaration``.
 
-    This is ownership metadata that mirrors what the module's model
-    ``Meta.permissions`` defines, allowing the inventory to list permissions
-    without importing Django models.  Django AppConfig remains authoritative
-    for actual permission creation and enforcement.
+    This mirrors the module's model ``Meta.permissions`` as static metadata,
+    allowing the inventory and install flows to enumerate permissions without
+    importing Django models.  Django AppConfig remains authoritative for actual
+    permission creation and enforcement.
     """
 
     codename: str
@@ -183,6 +222,11 @@ class ModulePermissionDeclaration:
             raise ValueError("ModulePermissionDeclaration.name must be non-empty.")
         if not self.app_label:
             raise ValueError("ModulePermissionDeclaration.app_label must be non-empty.")
+        if not _APP_LABEL_RE.match(self.app_label):
+            raise ValueError(
+                f"ModulePermissionDeclaration.app_label {self.app_label!r} must be a valid "
+                "Django app label (letters, digits, and underscores)."
+            )
 
     def to_dict(self) -> dict[str, str]:
         return {"codename": self.codename, "name": self.name, "app_label": self.app_label}
@@ -200,18 +244,36 @@ class ModulePermissionDeclaration:
 class ModuleNavigationDeclaration:
     """Declares a navigation contribution by this module.
 
-    Used for both navigation sections (``section=""``  means "this IS a
-    section") and navigation items (``section`` is the key of the containing
-    section).
+    Covers both navigation **sections** (``section=""`` means "this IS a
+    section") and navigation **items** (``section`` is the key of the
+    containing section).
 
-    The ``key`` uniquely identifies the nav section or item across all modules.
+    The ``key`` uniquely identifies the section or item across all modules.
     Segments may contain hyphens after the first character, e.g.
     ``"cauldron.admin.content.page-create"``.
+
+    Fields that map directly onto the runtime ``AdminNavigationSection`` /
+    ``AdminNavigationItem`` registration — keeping the manifest and the
+    ``AppConfig.ready()`` registration in sync:
+
+    - ``url_name``: Django URL name (items only; ``namespace:name`` form).
+    - ``order``: display order within the section (lower = higher up).
+    - ``permission``: ``"app_label.codename"`` required to see this item,
+      or ``""`` for items visible to all authenticated users.
+    - ``url_prefix``: URL prefix used for active-state highlighting.
+    - ``url_prefix_exact``: if True, the item is only active on the exact URL.
+    - ``description``: one-line tooltip / accessible description.
     """
 
     key: str
     label: str
     section: str = ""
+    url_name: str = ""
+    order: int = 0
+    permission: str = ""
+    url_prefix: str = ""
+    url_prefix_exact: bool = False
+    description: str = ""
 
     def __post_init__(self) -> None:
         if not self.key:
@@ -223,9 +285,24 @@ class ModuleNavigationDeclaration:
             )
         if not self.label:
             raise ValueError("ModuleNavigationDeclaration.label must be non-empty.")
+        if self.permission and not _NAV_PERMISSION_RE.match(self.permission):
+            raise ValueError(
+                f"ModuleNavigationDeclaration.permission {self.permission!r} must be "
+                "in 'app_label.codename' form or empty."
+            )
 
-    def to_dict(self) -> dict[str, str]:
-        return {"key": self.key, "label": self.label, "section": self.section}
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "key": self.key,
+            "label": self.label,
+            "section": self.section,
+            "url_name": self.url_name,
+            "order": self.order,
+            "permission": self.permission,
+            "url_prefix": self.url_prefix,
+            "url_prefix_exact": self.url_prefix_exact,
+            "description": self.description,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ModuleNavigationDeclaration:
@@ -233,6 +310,46 @@ class ModuleNavigationDeclaration:
             key=data["key"],
             label=data["label"],
             section=data.get("section", ""),
+            url_name=data.get("url_name", ""),
+            order=data.get("order", 0),
+            permission=data.get("permission", ""),
+            url_prefix=data.get("url_prefix", ""),
+            url_prefix_exact=data.get("url_prefix_exact", False),
+            description=data.get("description", ""),
+        )
+
+
+@dataclass(frozen=True)
+class RuntimeRequirement:
+    """Declares an external runtime dependency this module needs at startup.
+
+    ``kind`` identifies the resource category: ``"database"``, ``"cache"``,
+    ``"worker"``, ``"storage"``, or a project-specific string.
+
+    ``alias`` refines the requirement when multiple resources of the same kind
+    exist (e.g. the name of a non-default database alias or cache backend).
+
+    ``description`` is a human-readable note for operations teams about what
+    the module uses this resource for.
+    """
+
+    kind: str
+    alias: str = ""
+    description: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.kind:
+            raise ValueError("RuntimeRequirement.kind must be non-empty.")
+
+    def to_dict(self) -> dict[str, str]:
+        return {"kind": self.kind, "alias": self.alias, "description": self.description}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RuntimeRequirement:
+        return cls(
+            kind=data["kind"],
+            alias=data.get("alias", ""),
+            description=data.get("description", ""),
         )
 
 
@@ -240,15 +357,14 @@ class ModuleNavigationDeclaration:
 class ProvidedCapability:
     """Richer metadata for a capability listed in ``ModuleManifest.provides``.
 
-    The ``slug`` must appear in the manifest's ``provides`` tuple.  Every
-    provided capability must still be listed there; ``provided_capabilities``
-    enriches those entries with an optional contract path and description.
+    The ``slug`` must appear in the manifest's ``provides`` tuple.
 
     ``contract`` — dotted Python path to the protocol or abstract base class
     that defines the capability's interface (e.g.
-    ``"cauldron_content.site.SitePublicUrlProvider"``).  This path typically
-    lives in a *dependency* module, not in the provider itself.  It is
-    informational: no runtime import is performed.
+    ``"cauldron_content.site.SitePublicUrlProvider"``).  This path is typically
+    in a *dependency* module's ``public_api``, not in the implementing module.
+    When the contract class lives in the implementing module's own namespaces,
+    the manifest validator checks that the path falls under ``public_api``.
 
     ``description`` — one-line human-readable summary for module-management UIs.
     """
@@ -290,7 +406,7 @@ class ModuleManifest:
     Identity
         slug, label, version, cauldron_version
 
-    Django integration (determines restart requirement)
+    Django integration (contributes to restart requirement)
         django_apps, django_middleware, django_context_processors
 
     Settings
@@ -301,6 +417,9 @@ class ModuleManifest:
 
     Namespace and public-API contract (used by the architecture checker)
         namespaces, public_api, capability_implementations
+
+    Runtime and activation
+        restart_required, runtime_requirements
 
     Operational metadata (consumed by module inventory, #33 / #38 / #66)
         migration_apps, permissions, navigation,
@@ -331,9 +450,16 @@ class ModuleManifest:
     namespaces: tuple[str, ...] = field(default_factory=tuple)
     public_api: tuple[str, ...] = field(default_factory=tuple)
     # Paths that are technically public but represent concrete implementations;
-    # only the owning module's own files may import them. External consumers must
-    # use the capability contract (e.g. get_public_url()) instead.
+    # only the owning module's own files may import them.
     capability_implementations: tuple[str, ...] = field(default_factory=tuple)
+
+    # --- runtime and activation ---
+    # Explicit override: set True when the module requires restart for reasons
+    # beyond django_apps / django_middleware / django_context_processors
+    # (e.g. it registers signal handlers at import time or starts background
+    # threads in AppConfig.ready()).
+    restart_required: bool = False
+    runtime_requirements: tuple[RuntimeRequirement, ...] = field(default_factory=tuple)
 
     # --- operational metadata ---
     migration_apps: tuple[ModuleMigrationDeclaration, ...] = field(default_factory=tuple)
@@ -351,10 +477,17 @@ class ModuleManifest:
     def requires_restart(self) -> bool:
         """True if enabling or disabling this module requires a server restart.
 
-        Derived from whether the module registers Django apps, middleware, or
-        context processors — all of which take effect only at process startup.
+        True when the module registers Django apps, middleware, or context
+        processors (which take effect only at process startup), or when
+        ``restart_required`` is explicitly set to signal other startup-time
+        side effects (signal handlers, background threads, etc.).
         """
-        return bool(self.django_apps or self.django_middleware or self.django_context_processors)
+        return bool(
+            self.django_apps
+            or self.django_middleware
+            or self.django_context_processors
+            or self.restart_required
+        )
 
     # ------------------------------------------------------------------
     # Validation
@@ -414,7 +547,8 @@ class ModuleManifest:
                 )
             _seen.add(decl.key)
 
-        # migration_apps: unique app_labels; must be in django_apps
+        # migration_apps: unique app_labels; must correspond to an entry in django_apps
+        # (exact match or last-segment match for Django's built-in apps).
         _seen = set()
         for m in self.migration_apps:
             if m.app_label in _seen:
@@ -422,12 +556,14 @@ class ModuleManifest:
                     f"ModuleManifest.migration_apps has duplicate app_label {m.app_label!r}."
                 )
             _seen.add(m.app_label)
-            if m.app_label not in self.django_apps:
+            if not _app_label_in_django_apps(m.app_label, self.django_apps):
                 raise ValueError(
-                    f"ModuleManifest.migration_apps app_label {m.app_label!r} must appear in django_apps."
+                    f"ModuleManifest.migration_apps app_label {m.app_label!r} does not "
+                    "correspond to any entry in django_apps (checked by exact match and "
+                    "by last dotted segment)."
                 )
 
-        # permissions: unique codenames; app_label must be in django_apps
+        # permissions: unique codenames; app_label must correspond to an entry in django_apps
         _seen = set()
         for p in self.permissions:
             if p.codename in _seen:
@@ -435,10 +571,10 @@ class ModuleManifest:
                     f"ModuleManifest.permissions has duplicate codename {p.codename!r}."
                 )
             _seen.add(p.codename)
-            if p.app_label not in self.django_apps:
+            if not _app_label_in_django_apps(p.app_label, self.django_apps):
                 raise ValueError(
                     f"ModuleManifest.permissions app_label {p.app_label!r} for codename "
-                    f"{p.codename!r} must appear in django_apps."
+                    f"{p.codename!r} does not correspond to any entry in django_apps."
                 )
 
         # navigation: unique keys
@@ -478,7 +614,8 @@ class ModuleManifest:
                 )
             _seen.add(tmpl)
 
-        # provided_capabilities: slug must be in provides; unique slugs
+        # provided_capabilities: slug must be in provides; unique slugs;
+        # if contract refers to a namespace owned by this module it must be under public_api.
         provides_set = set(self.provides)
         _seen = set()
         for cap in self.provided_capabilities:
@@ -491,6 +628,19 @@ class ModuleManifest:
                     f"ModuleManifest.provided_capabilities has duplicate slug {cap.slug!r}."
                 )
             _seen.add(cap.slug)
+            if cap.contract:
+                contract_root = cap.contract.split(".")[0]
+                if contract_root in self.namespaces:
+                    # Contract is in this module's own code — must be reachable via public_api.
+                    under_public = any(
+                        cap.contract == api or cap.contract.startswith(api + ".")
+                        for api in self.public_api
+                    )
+                    if not under_public:
+                        raise ValueError(
+                            f"ProvidedCapability.contract {cap.contract!r} is in namespace "
+                            f"{contract_root!r} owned by this module but is not under public_api."
+                        )
 
     # ------------------------------------------------------------------
     # Serialization
@@ -514,6 +664,8 @@ class ModuleManifest:
             "namespaces": list(self.namespaces),
             "public_api": list(self.public_api),
             "capability_implementations": list(self.capability_implementations),
+            "restart_required": self.restart_required,
+            "runtime_requirements": [r.to_dict() for r in self.runtime_requirements],
             "migration_apps": [m.to_dict() for m in self.migration_apps],
             "permissions": [p.to_dict() for p in self.permissions],
             "navigation": [n.to_dict() for n in self.navigation],
@@ -548,6 +700,11 @@ class ModuleManifest:
             namespaces=tuple(data.get("namespaces", [])),
             public_api=tuple(data.get("public_api", [])),
             capability_implementations=tuple(data.get("capability_implementations", [])),
+            restart_required=data.get("restart_required", False),
+            runtime_requirements=tuple(
+                RuntimeRequirement.from_dict(r)
+                for r in data.get("runtime_requirements", [])
+            ),
             migration_apps=tuple(
                 ModuleMigrationDeclaration.from_dict(m)
                 for m in data.get("migration_apps", [])

@@ -101,13 +101,13 @@ def test_site_tools_register_is_idempotent():
 
 
 def test_site_inspect_success_live_build_absent(tmp_path: Path):
-    from cauldron_site_astro.site_tools import _handle_site_inspect
+    from cauldron_site_astro.site_tools import handle_site_inspect
 
     config = _make_config(tmp_path)
     svc = _make_mock_svc(config)
 
     with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
-        result = _handle_site_inspect(_ctx())
+        result = handle_site_inspect(_ctx())
 
     assert result.success is True
     assert result.data["live_build_exists"] is False
@@ -120,7 +120,7 @@ def test_site_inspect_success_live_build_absent(tmp_path: Path):
 
 
 def test_site_inspect_success_live_build_present(tmp_path: Path):
-    from cauldron_site_astro.site_tools import _handle_site_inspect
+    from cauldron_site_astro.site_tools import handle_site_inspect
 
     output = tmp_path / "output"
     output.mkdir()
@@ -136,14 +136,14 @@ def test_site_inspect_success_live_build_present(tmp_path: Path):
     svc = _make_mock_svc(config)
 
     with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
-        result = _handle_site_inspect(_ctx())
+        result = handle_site_inspect(_ctx())
 
     assert result.success is True
     assert result.data["live_build_exists"] is True
 
 
 def test_site_inspect_staged_theme_pending(tmp_path: Path):
-    from cauldron_site_astro.site_tools import _handle_site_inspect
+    from cauldron_site_astro.site_tools import handle_site_inspect
     from cauldron_site_astro.theme import SiteThemeService
 
     theme_dir = tmp_path / "theme"
@@ -153,17 +153,17 @@ def test_site_inspect_staged_theme_pending(tmp_path: Path):
     svc = _make_mock_svc(config)
 
     with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
-        result = _handle_site_inspect(_ctx())
+        result = handle_site_inspect(_ctx())
 
     assert result.success is True
     assert result.data["staged_theme_pending"] is True
 
 
 def test_site_inspect_get_build_service_error():
-    from cauldron_site_astro.site_tools import _handle_site_inspect
+    from cauldron_site_astro.site_tools import handle_site_inspect
 
     with patch("cauldron_site_astro.site_tools.get_build_service", side_effect=Exception("boom")):
-        result = _handle_site_inspect(_ctx())
+        result = handle_site_inspect(_ctx())
 
     assert result.success is False
     assert "boom" in result.message
@@ -175,20 +175,20 @@ def test_site_inspect_get_build_service_error():
 
 
 def test_stage_theme_no_theme_root_returns_error(tmp_path: Path):
-    from cauldron_site_astro.site_tools import _handle_stage_theme
+    from cauldron_site_astro.site_tools import handle_stage_theme
 
     config = _make_config(tmp_path, theme_root="")
     svc = _make_mock_svc(config)
 
     with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
-        result = _handle_stage_theme(_ctx(), css_content="body {}")
+        result = handle_stage_theme(_ctx(), css_content="body {}")
 
     assert result.success is False
     assert "theme_root" in result.message
 
 
 def test_stage_theme_success(tmp_path: Path):
-    from cauldron_site_astro.site_tools import _handle_stage_theme
+    from cauldron_site_astro.site_tools import handle_stage_theme
     from cauldron_site_astro.theme import SiteThemeService
 
     theme_dir = tmp_path / "theme"
@@ -196,7 +196,7 @@ def test_stage_theme_success(tmp_path: Path):
     svc = _make_mock_svc(config)
 
     with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
-        result = _handle_stage_theme(_ctx(), css_content="nav { color: red; }")
+        result = handle_stage_theme(_ctx(), css_content="nav { color: red; }")
 
     assert result.success is True
     assert result.data["staged"] is True
@@ -207,10 +207,10 @@ def test_stage_theme_success(tmp_path: Path):
 
 
 def test_stage_theme_get_build_service_error():
-    from cauldron_site_astro.site_tools import _handle_stage_theme
+    from cauldron_site_astro.site_tools import handle_stage_theme
 
     with patch("cauldron_site_astro.site_tools.get_build_service", side_effect=Exception("no config")):
-        result = _handle_stage_theme(_ctx(), css_content="body {}")
+        result = handle_stage_theme(_ctx(), css_content="body {}")
 
     assert result.success is False
     assert "no config" in result.message
@@ -222,27 +222,27 @@ def test_stage_theme_get_build_service_error():
 
 
 def test_prepare_change_set_requires_content_request_ids(tmp_path: Path):
-    from cauldron_site_astro.site_tools import _handle_prepare_change_set
+    from cauldron_site_astro.site_tools import handle_prepare_change_set
 
     previews_root = tmp_path / "previews"
     config = _make_config(tmp_path, previews_root=str(previews_root))
     svc = _make_mock_svc(config)
 
     with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
-        result = _handle_prepare_change_set(_ctx(), content_request_ids=[])
+        result = handle_prepare_change_set(_ctx(), content_request_ids=[])
 
     assert result.success is False
     assert "content_request_ids" in result.message
 
 
 def test_prepare_change_set_no_previews_root_returns_error(tmp_path: Path):
-    from cauldron_site_astro.site_tools import _handle_prepare_change_set
+    from cauldron_site_astro.site_tools import handle_prepare_change_set
 
     config = _make_config(tmp_path, previews_root="")
     svc = _make_mock_svc(config)
 
     with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
-        result = _handle_prepare_change_set(
+        result = handle_prepare_change_set(
             _ctx(), content_request_ids=["req-1"],
         )
 
@@ -251,7 +251,7 @@ def test_prepare_change_set_no_previews_root_returns_error(tmp_path: Path):
 
 
 def test_prepare_change_set_success_persists_draft_ready(tmp_path: Path):
-    from cauldron_site_astro.site_tools import _handle_prepare_change_set
+    from cauldron_site_astro.site_tools import handle_prepare_change_set
     from cauldron_site_astro.models import SiteChangeSet
 
     previews_root = tmp_path / "previews"
@@ -260,7 +260,7 @@ def test_prepare_change_set_success_persists_draft_ready(tmp_path: Path):
     svc = _make_mock_svc(config, pages_result=build_result)
 
     with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
-        result = _handle_prepare_change_set(
+        result = handle_prepare_change_set(
             _ctx(),
             content_request_ids=["req-a", "req-b"],
             theme_css="body { color: blue; }",
@@ -280,7 +280,7 @@ def test_prepare_change_set_success_persists_draft_ready(tmp_path: Path):
 
 
 def test_prepare_change_set_preview_failed_persists_status(tmp_path: Path):
-    from cauldron_site_astro.site_tools import _handle_prepare_change_set
+    from cauldron_site_astro.site_tools import handle_prepare_change_set
     from cauldron_site_astro.models import SiteChangeSet
 
     previews_root = tmp_path / "previews"
@@ -289,7 +289,7 @@ def test_prepare_change_set_preview_failed_persists_status(tmp_path: Path):
     svc = _make_mock_svc(config, pages_result=build_result)
 
     with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
-        result = _handle_prepare_change_set(
+        result = handle_prepare_change_set(
             _ctx(), content_request_ids=["req-x"],
         )
 
@@ -300,7 +300,7 @@ def test_prepare_change_set_preview_failed_persists_status(tmp_path: Path):
 
 
 def test_prepare_change_set_forwards_theme_css_to_build(tmp_path: Path):
-    from cauldron_site_astro.site_tools import _handle_prepare_change_set
+    from cauldron_site_astro.site_tools import handle_prepare_change_set
 
     previews_root = tmp_path / "previews"
     config = _make_config(tmp_path, previews_root=str(previews_root))
@@ -316,7 +316,7 @@ def test_prepare_change_set_forwards_theme_css_to_build(tmp_path: Path):
     svc.build_preview.side_effect = capture_preview
 
     with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
-        result = _handle_prepare_change_set(
+        result = handle_prepare_change_set(
             _ctx(),
             content_request_ids=["req-1"],
             theme_css="body { background: blue; }",
@@ -333,16 +333,16 @@ def test_prepare_change_set_forwards_theme_css_to_build(tmp_path: Path):
 
 def test_inspect_preview_not_found(tmp_path: Path):
     import uuid as _uuid
-    from cauldron_site_astro.site_tools import _handle_inspect_preview
+    from cauldron_site_astro.site_tools import handle_inspect_preview
 
-    result = _handle_inspect_preview(_ctx(), change_set_id=str(_uuid.uuid4()))
+    result = handle_inspect_preview(_ctx(), change_set_id=str(_uuid.uuid4()))
 
     assert result.success is False
     assert "not found" in result.message
 
 
 def test_inspect_preview_success(tmp_path: Path):
-    from cauldron_site_astro.site_tools import _handle_inspect_preview
+    from cauldron_site_astro.site_tools import handle_inspect_preview
     from cauldron_site_astro.models import SiteChangeSet
 
     previews_root = tmp_path / "previews"
@@ -363,7 +363,7 @@ def test_inspect_preview_success(tmp_path: Path):
     svc = _make_mock_svc(config)
 
     with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
-        result = _handle_inspect_preview(_ctx(), change_set_id=str(cs.id))
+        result = handle_inspect_preview(_ctx(), change_set_id=str(cs.id))
 
     assert result.success is True
     assert result.data["change_set_id"] == str(cs.id)
@@ -378,9 +378,9 @@ def test_inspect_preview_success(tmp_path: Path):
 
 
 def test_publish_not_confirmed_returns_error():
-    from cauldron_site_astro.site_tools import _handle_publish
+    from cauldron_site_astro.site_tools import handle_publish
 
-    result = _handle_publish(
+    result = handle_publish(
         _ctx(), change_set_id="00000000-0000-0000-0000-000000000000", confirm=False,
     )
 
@@ -389,18 +389,18 @@ def test_publish_not_confirmed_returns_error():
 
 
 def test_publish_rejects_non_draft_ready_status(tmp_path: Path):
-    from cauldron_site_astro.site_tools import _handle_publish
+    from cauldron_site_astro.site_tools import handle_publish
     from cauldron_site_astro.models import SiteChangeSet
 
     cs = SiteChangeSet.objects.create(status=SiteChangeSet.PREPARING)
-    result = _handle_publish(_ctx(), change_set_id=str(cs.id), confirm=True)
+    result = handle_publish(_ctx(), change_set_id=str(cs.id), confirm=True)
     assert result.success is False
     assert "draft_ready" in result.message
 
 
 def test_publish_success_with_no_content_requests(tmp_path: Path):
     """Publish succeeds when the change set is theme-only (no content requests)."""
-    from cauldron_site_astro.site_tools import _handle_publish
+    from cauldron_site_astro.site_tools import handle_publish
     from cauldron_site_astro.models import SiteChangeSet
 
     cs = SiteChangeSet.objects.create(
@@ -413,7 +413,7 @@ def test_publish_success_with_no_content_requests(tmp_path: Path):
     svc = _make_mock_svc(config, pages_result=build_result)
 
     with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
-        result = _handle_publish(_ctx(), change_set_id=str(cs.id), confirm=True)
+        result = handle_publish(_ctx(), change_set_id=str(cs.id), confirm=True)
 
     assert result.success is True
     assert result.data["pages_built"] == 3
@@ -426,7 +426,7 @@ def test_publish_success_with_no_content_requests(tmp_path: Path):
 
 
 def test_publish_promotes_staged_theme_only_after_successful_build(tmp_path: Path):
-    from cauldron_site_astro.site_tools import _handle_publish
+    from cauldron_site_astro.site_tools import handle_publish
     from cauldron_site_astro.models import SiteChangeSet
     from cauldron_site_astro.theme import SiteThemeService
 
@@ -442,7 +442,7 @@ def test_publish_promotes_staged_theme_only_after_successful_build(tmp_path: Pat
     svc = _make_mock_svc(config, pages_result=build_result)
 
     with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
-        result = _handle_publish(_ctx(), change_set_id=str(cs.id), confirm=True)
+        result = handle_publish(_ctx(), change_set_id=str(cs.id), confirm=True)
 
     assert result.success is True
     # active.css should now hold what was staged on the change set.
@@ -451,7 +451,7 @@ def test_publish_promotes_staged_theme_only_after_successful_build(tmp_path: Pat
 
 
 def test_publish_build_failure_leaves_active_css_untouched(tmp_path: Path):
-    from cauldron_site_astro.site_tools import _handle_publish
+    from cauldron_site_astro.site_tools import handle_publish
     from cauldron_site_astro.models import SiteChangeSet
     from cauldron_site_astro.theme import SiteThemeService
 
@@ -471,7 +471,7 @@ def test_publish_build_failure_leaves_active_css_untouched(tmp_path: Path):
     svc = _make_mock_svc(config, pages_result=build_result)
 
     with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
-        result = _handle_publish(_ctx(), change_set_id=str(cs.id), confirm=True)
+        result = handle_publish(_ctx(), change_set_id=str(cs.id), confirm=True)
 
     assert result.success is False
     theme_svc = SiteThemeService(theme_dir)
@@ -482,7 +482,7 @@ def test_publish_build_failure_leaves_active_css_untouched(tmp_path: Path):
 
 
 def test_publish_get_build_service_error():
-    from cauldron_site_astro.site_tools import _handle_publish
+    from cauldron_site_astro.site_tools import handle_publish
     from cauldron_site_astro.models import SiteChangeSet
 
     cs = SiteChangeSet.objects.create(status=SiteChangeSet.DRAFT_READY)
@@ -490,7 +490,7 @@ def test_publish_get_build_service_error():
         "cauldron_site_astro.site_tools.get_build_service",
         side_effect=Exception("config missing"),
     ):
-        result = _handle_publish(_ctx(), change_set_id=str(cs.id), confirm=True)
+        result = handle_publish(_ctx(), change_set_id=str(cs.id), confirm=True)
 
     assert result.success is False
     assert "config missing" in result.message

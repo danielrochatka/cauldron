@@ -104,20 +104,33 @@ python tools/arch_check.py
 
 Exits with code `0` if no violations are found, `1` otherwise.
 
+To include project-owned module directories (additional module roots beyond `packages/`):
+
+```bash
+python tools/arch_check.py --module-root path/to/modules
+```
+
+Multiple roots may be supplied; each is scanned like `packages/`.
+
 To generate a JSON report of all violations:
 
 ```bash
 python tools/arch_check.py --fix-report violations.json
 ```
 
-The checker can also be imported as a library:
+---
 
-```python
-from tools.arch_check import run_checks
-from pathlib import Path
+## 8. Test Boundaries
 
-violations = run_checks(Path("."))
-```
+Test files follow the same architecture boundaries as production code with one exception:
+test files importing from packages listed **only** in `[project.optional-dependencies]` (not in `[project.dependencies]`) do not require a `ModuleRequirement` manifest entry — optional test extras are not runtime module dependencies. However:
+
+- Private names (`_` prefix) are still rejected in test imports.
+- Non-public paths (absent from the sibling's `public_api`) are still rejected.
+- Concrete capability implementations are still rejected.
+- Direct imports from production dependencies (packages in `[project.dependencies]`) still require a `kind='module'` manifest declaration, even in tests.
+
+Use local fakes or move provider-specific tests to the provider package rather than adding runtime manifest requirements for test-only needs.
 
 ---
 

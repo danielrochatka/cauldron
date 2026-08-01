@@ -11,8 +11,8 @@ from cauldron_ai.prompt_templates import (
     AIPromptTemplateRegistry,
     PromptAssemblyTooLargeError,
     PromptTemplateMissingError,
-    _reset_prompt_registry_for_tests,
 )
+from cauldron_ai.testing import reset_prompt_registry_for_tests
 from cauldron_ai_admin.models import AdminAIRun
 from cauldron_ai_admin.prompt_assembly import PromptAssemblyService, _MAX_ASSEMBLY_BYTES
 from cauldron_ai_admin.service import AdminAIService
@@ -83,9 +83,9 @@ def _make_tool_def(name: str, permission: str = "cauldron_ai_admin.use_admin_ai"
 
 @pytest.fixture(autouse=True)
 def reset_registry():
-    _reset_prompt_registry_for_tests()
+    reset_prompt_registry_for_tests()
     yield
-    _reset_prompt_registry_for_tests()
+    reset_prompt_registry_for_tests()
 
 
 # ---------------------------------------------------------------------------

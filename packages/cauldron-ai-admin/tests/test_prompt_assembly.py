@@ -7,8 +7,8 @@ from cauldron_ai.prompt_templates import (
     AIPromptTemplateRegistry,
     PromptAssemblyTooLargeError,
     PromptTemplateMissingError,
-    _reset_prompt_registry_for_tests,
 )
+from cauldron_ai.testing import reset_prompt_registry_for_tests
 from cauldron_ai_admin.prompt_assembly import PromptAssemblyService, _MAX_ASSEMBLY_BYTES
 from cauldron_ai_admin.tools import AdminAIToolDefinition, RiskLevel
 
@@ -72,9 +72,9 @@ def _make_global_prompt(body: str = "Global operating instructions.") -> AIGloba
 
 @pytest.fixture(autouse=True)
 def reset_registry():
-    _reset_prompt_registry_for_tests()
+    reset_prompt_registry_for_tests()
     yield
-    _reset_prompt_registry_for_tests()
+    reset_prompt_registry_for_tests()
 
 
 def _fresh_registry() -> AIPromptTemplateRegistry:

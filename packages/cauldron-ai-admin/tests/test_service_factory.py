@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 from django.core.exceptions import ImproperlyConfigured
 
-from cauldron_ai.providers import _reset_registry_for_tests
+from cauldron_ai.testing import reset_provider_registry_for_tests
 
 
 pytestmark = pytest.mark.django_db
@@ -19,9 +19,9 @@ pytestmark = pytest.mark.django_db
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
-    _reset_registry_for_tests()
+    reset_provider_registry_for_tests()
     yield
-    _reset_registry_for_tests()
+    reset_provider_registry_for_tests()
 
 
 @pytest.fixture()

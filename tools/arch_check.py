@@ -79,6 +79,7 @@ class PackageInfo:
     provides: set[str]                 # capability slugs this module provides
     pyproject_deps: set[str]           # cauldron-* packages from pyproject (req + optional)
     pyproject_main_deps: set[str]      # cauldron-* packages from [project.dependencies] only
+    pyproject_optional_deps: set[str]  # cauldron-* only in optional-deps, NOT in main
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +112,15 @@ def _is_private_segment(seg: str) -> bool:
 def _has_private_subpath(dotted: str) -> bool:
     """Return True if any segment after the root is _-prefixed."""
     return any(_is_private_segment(seg) for seg in dotted.split(".")[1:])
+
+
+def _under_prefix(path: str, prefixes: set[str]) -> bool:
+    """True if *path* equals any prefix or is a dotted descendant of one.
+
+    ``cauldron_x.contracts`` covers ``cauldron_x.contracts.types`` but not
+    ``cauldron_x.contracts_extra``.
+    """
+    return any(path == p or path.startswith(p + ".") for p in prefixes)
 
 
 def _pkg_name_from_namespace(ns: str) -> str:
@@ -231,6 +241,13 @@ def _pyproject_main_cauldron_deps(pyproject: Path) -> set[str]:
     return _extract_cauldron_pkg_names(project.get("dependencies", []))
 
 
+def _pyproject_optional_only_cauldron_deps(pyproject: Path) -> set[str]:
+    """Packages in optional-deps but NOT in main [project.dependencies]."""
+    all_deps = _pyproject_cauldron_deps(pyproject)
+    main_deps = _pyproject_main_cauldron_deps(pyproject)
+    return all_deps - main_deps
+
+
 def _pyproject_name(pyproject: Path) -> str:
     try:
         data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
@@ -261,11 +278,15 @@ def _validate_api_paths(
             )
 
 
-def discover_packages(packages_dir: Path) -> tuple[list[PackageInfo], list[str]]:
+def discover_packages(
+    packages_dir: Path,
+    namespace_seen: Optional[dict[str, str]] = None,
+) -> tuple[list[PackageInfo], list[str]]:
     """Find all packages with a module.py and return (packages, config_errors)."""
     infos: list[PackageInfo] = []
     config_errors: list[str] = []
-    namespace_seen: dict[str, str] = {}  # ns → first pkg name
+    if namespace_seen is None:
+        namespace_seen = {}  # ns → first pkg name
 
     for pkg_dir in sorted(packages_dir.iterdir()):
         if not pkg_dir.is_dir():
@@ -282,6 +303,7 @@ def discover_packages(packages_dir: Path) -> tuple[list[PackageInfo], list[str]]
         pkg_name = _pyproject_name(pyproject) if pyproject.exists() else pkg_dir.name
         pyproject_deps = _pyproject_cauldron_deps(pyproject) if pyproject.exists() else set()
         pyproject_main_deps = _pyproject_main_cauldron_deps(pyproject) if pyproject.exists() else set()
+        pyproject_optional_deps = _pyproject_optional_only_cauldron_deps(pyproject) if pyproject.exists() else set()
 
         for module_py in module_files:
             fields = _extract_manifest_fields(module_py)
@@ -319,6 +341,7 @@ def discover_packages(packages_dir: Path) -> tuple[list[PackageInfo], list[str]]
                 provides=set(fields.get("provides", [])),
                 pyproject_deps=pyproject_deps,
                 pyproject_main_deps=pyproject_main_deps,
+                pyproject_optional_deps=pyproject_optional_deps,
             ))
 
     return infos, config_errors
@@ -428,8 +451,10 @@ def _arch003_violations(
         ))
 
     # Exact sub-module path: ``import cauldron_x.impl`` or ``from cauldron_x.impl import …``
-    if imp.module in cap_impls:
-        _fire(imp.module)
+    for impl in cap_impls:
+        if imp.module == impl or imp.module.startswith(impl + "."):
+            _fire(imp.module)
+            break
 
     # Root-namespace from-import: ``from cauldron_x import impl``
     # Construct synthetic path and check against capability_implementations.
@@ -438,7 +463,7 @@ def _arch003_violations(
             if name.startswith("_"):
                 continue  # private names handled by ARCH002b
             synthetic = f"{imp.module}.{name}"
-            if synthetic in cap_impls:
+            if any(synthetic == impl or synthetic.startswith(impl + ".") for impl in cap_impls):
                 _fire(synthetic)
 
     return violations
@@ -483,11 +508,6 @@ def check_file(
         # ------------------------------------------------------------------
         violations.extend(_arch003_violations(imp, import_pkg, py_file))
 
-        if is_test:
-            # Tests exempt from ARCH001 (manifest/pyproject declarations) and
-            # ARCH002 (private-path enforcement). Only ARCH003 applies (above).
-            continue
-
         # ------------------------------------------------------------------
         # ARCH002a — _-prefixed segment in the module path itself
         # ------------------------------------------------------------------
@@ -524,7 +544,7 @@ def check_file(
         if import_pkg and import_pkg.public_api:
             if "." in imp.module:
                 # Dotted path: validate directly
-                if imp.module not in import_pkg.public_api:
+                if not _under_prefix(imp.module, import_pkg.public_api):
                     violations.append(Violation(
                         code="ARCH002",
                         file=py_file,
@@ -543,7 +563,7 @@ def check_file(
                     if name.startswith("_"):
                         continue  # already handled by ARCH002b
                     synthetic = f"{imp.module}.{name}"
-                    if synthetic not in import_pkg.public_api:
+                    if not _under_prefix(synthetic, import_pkg.public_api):
                         violations.append(Violation(
                             code="ARCH002",
                             file=py_file,
@@ -564,11 +584,37 @@ def check_file(
         # runtime contract only, not static Python imports.
         # ------------------------------------------------------------------
         pkg_name = import_pkg.name if import_pkg else _pkg_name_from_namespace(ns_root)
+        owner_label = import_pkg.slug if import_pkg else ns_root
         in_pyproject = pkg_name in owning_pkg.pyproject_deps
         in_manifest = import_pkg is not None and _manifest_declares_module(owning_pkg, import_pkg)
 
-        if not in_pyproject or not in_manifest:
-            owner_label = import_pkg.slug if import_pkg else ns_root
+        # For test files importing from packages in optional-only pyproject deps,
+        # only the pyproject declaration is required — no manifest entry needed
+        # (test-only extras are not runtime module dependencies).
+        test_optional_only = (
+            is_test
+            and pkg_name in owning_pkg.pyproject_optional_deps
+            and pkg_name not in owning_pkg.pyproject_main_deps
+        )
+
+        if test_optional_only:
+            if not in_pyproject:
+                violations.append(Violation(
+                    code="ARCH001",
+                    file=py_file,
+                    line=imp.line,
+                    message=(
+                        f"Import '{imp.module}' depends on '{owner_label}' "
+                        f"which is not in any pyproject.toml dependency section."
+                    ),
+                    fix=(
+                        f"Add '{pkg_name}>=0.1.0' to [project.optional-dependencies] test in "
+                        f"{_rel(owning_pkg.root / 'pyproject.toml', owning_pkg.root.parent.parent)}"
+                    ),
+                    note=f"Test-only import: add to pyproject optional-dependencies, no manifest entry required.",
+                ))
+        elif not in_pyproject or not in_manifest:
+            # Production code (or test imports from main-dep packages): both required.
             fix_parts = []
             if not in_pyproject:
                 fix_parts.append(
@@ -681,6 +727,7 @@ def _root_package_infos(
     root_pyproject = repo_root / "pyproject.toml"
     pyproject_deps = _pyproject_cauldron_deps(root_pyproject) if root_pyproject.exists() else set()
     pyproject_main_deps = _pyproject_main_cauldron_deps(root_pyproject) if root_pyproject.exists() else set()
+    pyproject_optional_deps = _pyproject_optional_only_cauldron_deps(root_pyproject) if root_pyproject.exists() else set()
     pkg_name = _pyproject_name(root_pyproject) if root_pyproject.exists() else "cauldron"
 
     infos: list[PackageInfo] = []
@@ -710,6 +757,7 @@ def _root_package_infos(
             provides=set(fields.get("provides", [])),
             pyproject_deps=pyproject_deps,
             pyproject_main_deps=pyproject_main_deps,
+            pyproject_optional_deps=pyproject_optional_deps,
         ))
 
     if not infos:
@@ -732,7 +780,92 @@ def _root_package_infos(
             provides=set(),
             pyproject_deps=pyproject_deps,
             pyproject_main_deps=pyproject_main_deps,
+            pyproject_optional_deps=pyproject_optional_deps,
         ))
+
+    return infos
+
+
+# ---------------------------------------------------------------------------
+# Project module discovery
+# ---------------------------------------------------------------------------
+
+def discover_project_modules(
+    module_root: Path,
+    config_errors: list[str],
+    namespace_seen: dict[str, str],
+) -> list[PackageInfo]:
+    """Discover project-owned modules under *module_root*.
+
+    Each immediate subdirectory of *module_root* that contains a ``src/``
+    directory with a ``module.py`` is treated as a project-owned module.
+    These participate in namespace-ownership detection and are validated
+    with the same rules as packaged modules.
+
+    *namespace_seen* is shared with the caller so duplicate namespace
+    detection spans both packaged and project-owned modules.
+    """
+    infos: list[PackageInfo] = []
+    if not module_root.exists():
+        config_errors.append(
+            f"PROJECT MODULE ROOT does not exist: '{module_root}'. "
+            "Check your --module-root argument."
+        )
+        return infos
+
+    for mod_dir in sorted(module_root.iterdir()):
+        if not mod_dir.is_dir():
+            continue
+        src_dir = mod_dir / "src"
+        if not src_dir.exists():
+            continue
+
+        module_files = list(src_dir.rglob("module.py"))
+        if not module_files:
+            continue
+
+        pyproject = mod_dir / "pyproject.toml"
+        pkg_name = _pyproject_name(pyproject) if pyproject.exists() else mod_dir.name
+        pyproject_deps = _pyproject_cauldron_deps(pyproject) if pyproject.exists() else set()
+        pyproject_main_deps = _pyproject_main_cauldron_deps(pyproject) if pyproject.exists() else set()
+        pyproject_optional_deps = _pyproject_optional_only_cauldron_deps(pyproject) if pyproject.exists() else set()
+
+        for module_py in module_files:
+            fields = _extract_manifest_fields(module_py)
+            slug = fields.get("slug", "")
+            if not slug and not fields.get("namespaces"):
+                continue
+
+            namespaces = fields.get("namespaces", [])
+            public_api = fields.get("public_api", [])
+            cap_impls = fields.get("capability_implementations", [])
+
+            for ns in namespaces:
+                if ns in namespace_seen:
+                    config_errors.append(
+                        f"DUPLICATE NAMESPACE: '{ns}' is claimed by both "
+                        f"'{namespace_seen[ns]}' and '{pkg_name}' (project module). "
+                        f"Each Python namespace must have exactly one owner."
+                    )
+                else:
+                    namespace_seen[ns] = pkg_name
+
+            _validate_api_paths(namespaces, public_api, cap_impls, pkg_name, config_errors)
+
+            infos.append(PackageInfo(
+                slug=slug,
+                name=pkg_name,
+                root=mod_dir,
+                namespaces=namespaces,
+                public_api=set(public_api),
+                capability_implementations=set(cap_impls),
+                requires_slugs=set(fields.get("requires_slugs", [])),
+                requires_module_slugs=set(fields.get("requires_module_slugs", [])),
+                provides=set(fields.get("provides", [])),
+                pyproject_deps=pyproject_deps,
+                pyproject_main_deps=pyproject_main_deps,
+                pyproject_optional_deps=pyproject_optional_deps,
+            ))
 
     return infos
 
@@ -756,16 +889,26 @@ def _find_py_files(directory: Path) -> list[tuple[Path, bool]]:
     return result
 
 
-def run_checks(repo_root: Path) -> tuple[list[Violation], list[str]]:
+def run_checks(
+    repo_root: Path,
+    project_module_roots: list[Path] | None = None,
+) -> tuple[list[Violation], list[str]]:
     """Run all checks. Returns (violations, config_errors)."""
     packages_dir = repo_root / "packages"
     config_errors: list[str] = []
+    namespace_seen: dict[str, str] = {}
 
     packages: list[PackageInfo] = []
     if packages_dir.exists():
-        discovered, pkg_errors = discover_packages(packages_dir)
+        discovered, pkg_errors = discover_packages(packages_dir, namespace_seen)
         packages = discovered
         config_errors.extend(pkg_errors)
+
+    # Discover project-owned modules from any extra module roots.
+    project_pkgs: list[PackageInfo] = []
+    for mod_root in (project_module_roots or []):
+        proj_infos = discover_project_modules(mod_root, config_errors, namespace_seen)
+        project_pkgs.extend(proj_infos)
 
     # Discover project-owned module roots from src/ (supports both the core
     # framework and configurable Cauldron instances with their own modules).
@@ -775,15 +918,19 @@ def run_checks(repo_root: Path) -> tuple[list[Violation], list[str]]:
     for pkg in packages:
         dirs = [pkg.root / "src", pkg.root / "tests"]
         all_scan_targets.append((pkg, dirs))
+    for proj_pkg in project_pkgs:
+        dirs = [proj_pkg.root / "src", proj_pkg.root / "tests"]
+        all_scan_targets.append((proj_pkg, dirs))
     for root_pkg in root_pkgs:
         all_scan_targets.append((root_pkg, [repo_root / "src", repo_root / "tests"]))
 
-    ns_to_pkg = build_namespace_map(packages)
+    all_known_packages = packages + project_pkgs
+    ns_to_pkg = build_namespace_map(all_known_packages)
     # Root namespace(s) are in _PLATFORM_PREFIXES so they won't be flagged as
     # cross-boundary imports.
 
-    pkg_by_slug = {p.slug: p for p in packages}
-    pkg_by_name = {p.name: p for p in packages}
+    pkg_by_slug = {p.slug: p for p in all_known_packages}
+    pkg_by_name = {p.name: p for p in all_known_packages}
 
     all_violations: list[Violation] = []
 
@@ -807,11 +954,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="Write a JSON summary of violations to FILE")
     parser.add_argument("--root", default=None,
                         help="Repo root (default: parent of this script's directory)")
+    parser.add_argument("--module-root", action="append", default=[],
+                        metavar="DIR",
+                        help="Path to a directory of project-owned module subdirectories (may be repeated)")
     args = parser.parse_args(argv)
 
     repo_root = Path(args.root).resolve() if args.root else Path(__file__).resolve().parent.parent
+    project_roots = [Path(r).resolve() for r in args.module_root]
 
-    violations, config_errors = run_checks(repo_root)
+    violations, config_errors = run_checks(repo_root, project_module_roots=project_roots or None)
 
     if config_errors:
         for err in config_errors:

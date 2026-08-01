@@ -31,6 +31,8 @@ _manifest = ModuleManifest(
         "cauldron_site_astro.public_url",
         "cauldron_site_astro.site_tools",
         "cauldron_site_astro.urls",
+        "cauldron_site_astro.theme",
+        "cauldron_site_astro.models",
     ),
     capability_implementations=(
         # Concrete SitePublicUrlProvider — external callers use

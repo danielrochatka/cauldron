@@ -35,6 +35,7 @@ _manifest = ModuleManifest(
         "cauldron_admin_content.urls",
         "cauldron_admin_content.forms",
         "cauldron_admin_content.service_factory",
+        "cauldron_admin_content.checks",
     ),
     navigation=(
         ModuleNavigationDeclaration(key="content", label="Content", order=200),

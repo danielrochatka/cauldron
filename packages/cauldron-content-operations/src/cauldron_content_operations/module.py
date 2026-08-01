@@ -40,6 +40,7 @@ _manifest = ModuleManifest(
         "cauldron_content_operations.reversible",
         "cauldron_content_operations.signals",
         "cauldron_content_operations.audit",
+        "cauldron_content_operations.results",
     ),
     migration_apps=(
         ModuleMigrationDeclaration(app_label="cauldron_content_operations"),

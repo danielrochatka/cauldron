@@ -29,7 +29,7 @@ from django.contrib.auth.models import Permission
 from django.test import Client
 from django.urls import reverse
 
-from cauldron_ai.providers import _reset_registry_for_tests
+from cauldron_ai.testing import reset_provider_registry_for_tests
 
 pytestmark = pytest.mark.django_db
 
@@ -41,9 +41,9 @@ pytestmark = pytest.mark.django_db
 
 @pytest.fixture(autouse=True)
 def reset_registry():
-    _reset_registry_for_tests()
+    reset_provider_registry_for_tests()
     yield
-    _reset_registry_for_tests()
+    reset_provider_registry_for_tests()
 
 
 def _make_user(username, perms=()):

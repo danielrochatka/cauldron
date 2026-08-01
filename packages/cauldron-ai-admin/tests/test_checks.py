@@ -10,7 +10,8 @@ from cauldron_ai_admin.checks import (
     check_reserved_namespace_violation,
     check_tool_zero_timeouts,
 )
-from cauldron_ai.providers import _reset_registry_for_tests, register_provider
+from cauldron_ai.testing import reset_provider_registry_for_tests
+from cauldron_ai.providers import register_provider
 
 
 class _P:
@@ -29,9 +30,9 @@ class _P2:
 
 @pytest.fixture(autouse=True)
 def reset_ai_registry():
-    _reset_registry_for_tests()
+    reset_provider_registry_for_tests()
     yield
-    _reset_registry_for_tests()
+    reset_provider_registry_for_tests()
 
 
 def test_e001_fires_when_no_provider():

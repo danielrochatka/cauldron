@@ -56,7 +56,7 @@ def register(registry: "AdminAIToolRegistry") -> None:
             required_permission=_PERM_VIEW,
             owning_module=_OWNING_MODULE,
         ),
-        _handle_site_inspect,
+        handle_site_inspect,
     )
 
     # ------------------------------------------------------------------
@@ -89,7 +89,7 @@ def register(registry: "AdminAIToolRegistry") -> None:
             required_permission=_PERM_PROPOSE,
             owning_module=_OWNING_MODULE,
         ),
-        _handle_stage_theme,
+        handle_stage_theme,
     )
 
     # ------------------------------------------------------------------
@@ -136,7 +136,7 @@ def register(registry: "AdminAIToolRegistry") -> None:
             owning_module=_OWNING_MODULE,
             timeout_seconds=180.0,
         ),
-        _handle_prepare_change_set,
+        handle_prepare_change_set,
     )
 
     # ------------------------------------------------------------------
@@ -164,7 +164,7 @@ def register(registry: "AdminAIToolRegistry") -> None:
             required_permission=_PERM_VIEW,
             owning_module=_OWNING_MODULE,
         ),
-        _handle_inspect_preview,
+        handle_inspect_preview,
     )
 
     # ------------------------------------------------------------------
@@ -200,7 +200,7 @@ def register(registry: "AdminAIToolRegistry") -> None:
             owning_module=_OWNING_MODULE,
             timeout_seconds=300.0,
         ),
-        _handle_publish,
+        handle_publish,
     )
 
 
@@ -378,7 +378,7 @@ def _extract_item_ids(content_request_ids: list[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _handle_site_inspect(context, **kwargs):
+def handle_site_inspect(context, **kwargs):
     from pathlib import Path
 
     from cauldron_ai_admin.tools import AdminAIToolResult
@@ -419,7 +419,7 @@ def _handle_site_inspect(context, **kwargs):
     )
 
 
-def _handle_stage_theme(context, *, css_content, description="", **kwargs):
+def handle_stage_theme(context, *, css_content, description="", **kwargs):
     from cauldron_ai_admin.tools import AdminAIToolResult
 
     try:
@@ -464,7 +464,7 @@ def _handle_stage_theme(context, *, css_content, description="", **kwargs):
     )
 
 
-def _handle_prepare_change_set(
+def handle_prepare_change_set(
     context,
     *,
     content_request_ids,
@@ -588,7 +588,7 @@ def _handle_prepare_change_set(
     )
 
 
-def _handle_inspect_preview(context, *, change_set_id, **kwargs):
+def handle_inspect_preview(context, *, change_set_id, **kwargs):
     from pathlib import Path
 
     from cauldron_ai_admin.tools import AdminAIToolResult
@@ -632,7 +632,7 @@ def _handle_inspect_preview(context, *, change_set_id, **kwargs):
     )
 
 
-def _handle_publish(context, *, change_set_id, confirm, **kwargs):
+def handle_publish(context, *, change_set_id, confirm, **kwargs):
     """Publish a draft-ready SiteChangeSet to the live site.
 
     Execution order and rollback guarantees

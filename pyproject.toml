@@ -22,6 +22,10 @@ dependencies = ["Django>=5.0,<6.0", "packaging>=23.0"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-django>=4.8", "build>=1.0"]
+test = [
+    "cauldron-fixture-alpha>=0.1.0",
+    "cauldron-fixture-beta>=0.1.0",
+]
 
 [project.urls]
 Documentation = "https://procyonsoft.invalid/cauldron/docs"

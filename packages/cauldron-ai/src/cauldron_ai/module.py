@@ -1,5 +1,5 @@
 """Cauldron AI module definition."""
-from cauldron.modules import BaseModule, ModuleManifest
+from cauldron.modules import BaseModule, ModuleManifest, ProvidedCapability
 
 _manifest = ModuleManifest(
     slug="cauldron.ai",
@@ -19,6 +19,20 @@ _manifest = ModuleManifest(
         "cauldron_ai.prompt_templates",
         "cauldron_ai.provider_configuration",
         "cauldron_ai.testing",
+    ),
+    provided_capabilities=(
+        ProvidedCapability(
+            slug="ai.model.contracts",
+            description="Typed contracts for AI model requests, responses, and tool definitions.",
+        ),
+        ProvidedCapability(
+            slug="ai.model.providers",
+            description="Registry of AI model provider adapters for tool-calling pipelines.",
+        ),
+        ProvidedCapability(
+            slug="ai.toolcalling",
+            description="Tool-calling orchestration and prompt template registry.",
+        ),
     ),
 )
 

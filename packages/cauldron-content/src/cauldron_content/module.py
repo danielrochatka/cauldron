@@ -1,5 +1,5 @@
 """Cauldron Content module definition."""
-from cauldron.modules import BaseModule, ModuleManifest
+from cauldron.modules import BaseModule, ModuleManifest, ModuleSettingsDeclaration
 
 _manifest = ModuleManifest(
     slug="cauldron.content",
@@ -23,6 +23,13 @@ _manifest = ModuleManifest(
         "cauldron_content.router",
         "cauldron_content.site",
         "cauldron_content.hashing",
+    ),
+    settings_declarations=(
+        ModuleSettingsDeclaration(
+            key="routing",
+            required=True,
+            description="Content routing configuration. Maps URL patterns to content collections.",
+        ),
     ),
 )
 

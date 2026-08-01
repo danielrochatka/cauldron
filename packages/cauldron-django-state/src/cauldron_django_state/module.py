@@ -1,5 +1,5 @@
 """Cauldron Django State module definition."""
-from cauldron.modules import BaseModule, ModuleManifest
+from cauldron.modules import BaseModule, ModuleManifest, ModuleSettingsDeclaration
 
 _manifest = ModuleManifest(
     slug="cauldron.django.state",
@@ -17,6 +17,13 @@ _manifest = ModuleManifest(
     public_api=(
         "cauldron_django_state.checks",
         "cauldron_django_state.config",
+    ),
+    settings_declarations=(
+        ModuleSettingsDeclaration(
+            key="database_alias",
+            required=False,
+            description="Override the database alias used for Cauldron state tables. Defaults to 'default'.",
+        ),
     ),
 )
 

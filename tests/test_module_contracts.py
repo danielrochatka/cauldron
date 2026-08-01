@@ -859,6 +859,15 @@ class TestModuleManifestNavigationValidation:
                 ),
             )
 
+    def test_section_with_url_prefix_raises(self):
+        with pytest.raises(ValueError, match="item-only"):
+            ModuleManifest(
+                slug="a", label="A",
+                navigation=(
+                    ModuleNavigationDeclaration(key="overview", label="Overview", url_prefix="/cauldron/"),
+                ),
+            )
+
     def test_section_with_url_prefix_exact_raises(self):
         with pytest.raises(ValueError, match="item-only"):
             ModuleManifest(
@@ -1283,7 +1292,7 @@ class TestAllCurrentModulesLoad:
         assert len(m.prompt_templates) == 5
 
     def test_all_modules_requires_restart_consistent(self):
-        """Every module with django_apps has requires_restart=True."""
+        """Every module's requires_restart property matches its restart inputs."""
         module_paths = [
             "cauldron_django_state.module",
             "cauldron_django_auth.module",

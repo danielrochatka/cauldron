@@ -762,8 +762,8 @@ class TestModuleManifestPermissionsValidation:
                 ),
             )
 
-    def test_duplicate_codename_raises(self):
-        with pytest.raises(ValueError, match="duplicate codename"):
+    def test_duplicate_codename_same_app_raises(self):
+        with pytest.raises(ValueError, match="duplicate.*app_label.*codename"):
             ModuleManifest(
                 slug="a", label="A",
                 django_apps=("myapp",),
@@ -772,6 +772,19 @@ class TestModuleManifestPermissionsValidation:
                     ModulePermissionDeclaration(codename="do_thing", name="Do it too", app_label="myapp"),
                 ),
             )
+
+    def test_same_codename_in_different_apps_accepted(self):
+        # The same codename in two distinct Django apps is a valid combination;
+        # uniqueness is enforced on the (app_label, codename) pair, not codename alone.
+        m = ModuleManifest(
+            slug="a", label="A",
+            django_apps=("myapp", "otherapp"),
+            permissions=(
+                ModulePermissionDeclaration(codename="do_thing", name="Do it in myapp", app_label="myapp"),
+                ModulePermissionDeclaration(codename="do_thing", name="Do it in otherapp", app_label="otherapp"),
+            ),
+        )
+        assert len(m.permissions) == 2
 
     def test_multiple_permissions_different_codenames_accepted(self):
         m = ModuleManifest(
@@ -791,7 +804,10 @@ class TestModuleManifestNavigationValidation:
             slug="a", label="A",
             navigation=(
                 ModuleNavigationDeclaration(key="overview", label="Overview"),
-                ModuleNavigationDeclaration(key="cauldron.dashboard", label="Dashboard", section="overview"),
+                ModuleNavigationDeclaration(
+                    key="cauldron.dashboard", label="Dashboard",
+                    section="overview", url_name="cauldron:dashboard",
+                ),
             ),
         )
         assert len(m.navigation) == 2
@@ -814,6 +830,57 @@ class TestModuleManifestNavigationValidation:
             ),
         )
         assert m.navigation[0].key == "cauldron.content.page-create"
+
+    def test_item_without_url_name_raises(self):
+        with pytest.raises(ValueError, match="url_name"):
+            ModuleManifest(
+                slug="a", label="A",
+                navigation=(
+                    ModuleNavigationDeclaration(key="overview", label="Overview"),
+                    ModuleNavigationDeclaration(key="cauldron.dashboard", label="Dashboard", section="overview"),
+                ),
+            )
+
+    def test_section_with_url_name_raises(self):
+        with pytest.raises(ValueError, match="item-only"):
+            ModuleManifest(
+                slug="a", label="A",
+                navigation=(
+                    ModuleNavigationDeclaration(key="overview", label="Overview", url_name="cauldron:home"),
+                ),
+            )
+
+    def test_section_with_permission_raises(self):
+        with pytest.raises(ValueError, match="item-only"):
+            ModuleManifest(
+                slug="a", label="A",
+                navigation=(
+                    ModuleNavigationDeclaration(key="overview", label="Overview", permission="myapp.view_x"),
+                ),
+            )
+
+    def test_section_with_url_prefix_exact_raises(self):
+        with pytest.raises(ValueError, match="item-only"):
+            ModuleManifest(
+                slug="a", label="A",
+                navigation=(
+                    ModuleNavigationDeclaration(key="overview", label="Overview", url_prefix_exact=True),
+                ),
+            )
+
+    def test_item_references_section_in_another_module(self):
+        # Items may reference sections that live in a different module's manifest.
+        m = ModuleManifest(
+            slug="a", label="A",
+            navigation=(
+                ModuleNavigationDeclaration(
+                    key="cauldron.dashboard", label="Dashboard",
+                    section="overview",           # "overview" defined by another module
+                    url_name="cauldron:dashboard",
+                ),
+            ),
+        )
+        assert m.navigation[0].section == "overview"
 
 
 class TestModuleManifestAIToolsValidation:
@@ -940,6 +1007,89 @@ class TestModuleManifestProvidedCapabilitiesValidation:
         )
         assert m.provided_capabilities[0].contract == "dependency_pkg.contracts.MyProtocol"
 
+    # -- boundary-aware namespace ownership --
+
+    def test_contract_in_dotted_owned_namespace_under_public_api_passes(self):
+        # Namespace "myapp.core" is dotted; contract "myapp.core.contracts.MyProtocol"
+        # is owned and under public_api.
+        m = ModuleManifest(
+            slug="a", label="A",
+            namespaces=("myapp.core",),
+            public_api=("myapp.core.contracts",),
+            provides=("my.cap",),
+            provided_capabilities=(
+                ProvidedCapability(
+                    slug="my.cap",
+                    contract="myapp.core.contracts.MyProtocol",
+                ),
+            ),
+        )
+        assert m.provided_capabilities[0].contract == "myapp.core.contracts.MyProtocol"
+
+    def test_contract_in_dotted_owned_namespace_outside_public_api_raises(self):
+        # Namespace "myapp.core" owns the contract but "myapp.core._internal.X"
+        # is not under public_api.
+        with pytest.raises(ValueError, match="not under public_api"):
+            ModuleManifest(
+                slug="a", label="A",
+                namespaces=("myapp.core",),
+                public_api=("myapp.core.contracts",),
+                provides=("my.cap",),
+                provided_capabilities=(
+                    ProvidedCapability(
+                        slug="my.cap",
+                        contract="myapp.core._internal.MyProtocol",
+                    ),
+                ),
+            )
+
+    def test_similarly_prefixed_namespace_not_treated_as_owned(self):
+        # "myapp_extra" starts with "myapp" but is NOT in namespace "myapp".
+        # The contract "myapp_extra.contracts.X" must NOT trigger the public_api check.
+        m = ModuleManifest(
+            slug="a", label="A",
+            namespaces=("myapp",),
+            public_api=("myapp.api",),
+            provides=("my.cap",),
+            provided_capabilities=(
+                ProvidedCapability(
+                    slug="my.cap",
+                    contract="myapp_extra.contracts.MyProtocol",
+                ),
+            ),
+        )
+        assert m.provided_capabilities[0].contract == "myapp_extra.contracts.MyProtocol"
+
+    def test_top_level_owned_namespace_contract_under_public_api_passes(self):
+        m = ModuleManifest(
+            slug="a", label="A",
+            namespaces=("myapp",),
+            public_api=("myapp.contracts",),
+            provides=("my.cap",),
+            provided_capabilities=(
+                ProvidedCapability(
+                    slug="my.cap",
+                    contract="myapp.contracts.MyProtocol",
+                ),
+            ),
+        )
+        assert m.provided_capabilities[0].contract == "myapp.contracts.MyProtocol"
+
+    def test_top_level_owned_namespace_contract_outside_public_api_raises(self):
+        with pytest.raises(ValueError, match="not under public_api"):
+            ModuleManifest(
+                slug="a", label="A",
+                namespaces=("myapp",),
+                public_api=("myapp.contracts",),
+                provides=("my.cap",),
+                provided_capabilities=(
+                    ProvidedCapability(
+                        slug="my.cap",
+                        contract="myapp.internal.MyProtocol",
+                    ),
+                ),
+            )
+
 
 # ---------------------------------------------------------------------------
 # ModuleManifest — round-trip with all new fields
@@ -964,7 +1114,7 @@ class TestModuleManifestRoundTrip:
             ),
             navigation=(
                 ModuleNavigationDeclaration(key="mymodule", label="My Module"),
-                ModuleNavigationDeclaration(key="mymodule.home", label="Home", section="mymodule"),
+                ModuleNavigationDeclaration(key="mymodule.home", label="Home", section="mymodule", url_name="mymodule:home"),
             ),
             ai_tools=("mymodule.inspect",),
             prompt_templates=("mymodule.inspect",),
@@ -1154,9 +1304,15 @@ class TestAllCurrentModulesLoad:
             m = self._try_import_manifest(dotted)
             if m is None:
                 continue
-            expected = bool(m.django_apps or m.django_middleware or m.django_context_processors)
+            expected = bool(
+                m.django_apps
+                or m.django_middleware
+                or m.django_context_processors
+                or m.restart_required
+            )
             assert m.requires_restart == expected, (
-                f"{m.slug}: requires_restart={m.requires_restart!r} but django_apps={m.django_apps!r}"
+                f"{m.slug}: requires_restart={m.requires_restart!r} but "
+                f"django_apps={m.django_apps!r}, restart_required={m.restart_required!r}"
             )
             checked += 1
         assert checked > 0, "No modules were importable — check package installation"

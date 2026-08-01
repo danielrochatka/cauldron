@@ -563,21 +563,26 @@ class ModuleManifest:
                     "by last dotted segment)."
                 )
 
-        # permissions: unique codenames; app_label must correspond to an entry in django_apps
-        _seen = set()
+        # permissions: unique (app_label, codename) pairs; same codename in two
+        # different declared apps is fine (each app owns its own permission table).
+        _seen_perms: set[tuple[str, str]] = set()
         for p in self.permissions:
-            if p.codename in _seen:
+            key = (p.app_label, p.codename)
+            if key in _seen_perms:
                 raise ValueError(
-                    f"ModuleManifest.permissions has duplicate codename {p.codename!r}."
+                    f"ModuleManifest.permissions has duplicate (app_label, codename) "
+                    f"({p.app_label!r}, {p.codename!r})."
                 )
-            _seen.add(p.codename)
+            _seen_perms.add(key)
             if not _app_label_in_django_apps(p.app_label, self.django_apps):
                 raise ValueError(
                     f"ModuleManifest.permissions app_label {p.app_label!r} for codename "
                     f"{p.codename!r} does not correspond to any entry in django_apps."
                 )
 
-        # navigation: unique keys
+        # navigation: unique keys + structural validation.
+        # Items (non-empty section) must declare a url_name.
+        # Sections (empty section) must not carry item-only routing fields.
         _seen = set()
         for n in self.navigation:
             if n.key in _seen:
@@ -585,6 +590,18 @@ class ModuleManifest:
                     f"ModuleManifest.navigation has duplicate key {n.key!r}."
                 )
             _seen.add(n.key)
+            is_item = bool(n.section)
+            if is_item and not n.url_name:
+                raise ValueError(
+                    f"ModuleManifest.navigation item {n.key!r} has a non-empty section "
+                    "but no url_name. Navigation items must declare a url_name."
+                )
+            if not is_item and (n.url_name or n.permission or n.url_prefix or n.url_prefix_exact):
+                raise ValueError(
+                    f"ModuleManifest.navigation section {n.key!r} must not set "
+                    "url_name, permission, url_prefix, or url_prefix_exact "
+                    "(those are item-only fields)."
+                )
 
         # ai_tools: valid tool names; unique
         _seen = set()
@@ -629,8 +646,16 @@ class ModuleManifest:
                 )
             _seen.add(cap.slug)
             if cap.contract:
-                contract_root = cap.contract.split(".")[0]
-                if contract_root in self.namespaces:
+                # Boundary-aware ownership: the contract belongs to a namespace
+                # when it equals the namespace or is a direct sub-path of it.
+                # This prevents "myapp_extra.X" from being treated as owned by
+                # namespace "myapp", and correctly identifies ownership for
+                # dotted namespaces like "myapp.core".
+                owned = any(
+                    cap.contract == ns or cap.contract.startswith(ns + ".")
+                    for ns in self.namespaces
+                )
+                if owned:
                     # Contract is in this module's own code — must be reachable via public_api.
                     under_public = any(
                         cap.contract == api or cap.contract.startswith(api + ".")
@@ -638,8 +663,8 @@ class ModuleManifest:
                     )
                     if not under_public:
                         raise ValueError(
-                            f"ProvidedCapability.contract {cap.contract!r} is in namespace "
-                            f"{contract_root!r} owned by this module but is not under public_api."
+                            f"ProvidedCapability.contract {cap.contract!r} is in a namespace "
+                            "owned by this module but is not under public_api."
                         )
 
     # ------------------------------------------------------------------

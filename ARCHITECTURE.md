@@ -132,16 +132,26 @@ immutable thereafter.
 
 | Field | Type | Purpose |
 |-------|------|---------|
-| `settings_declarations` | `tuple[ModuleSettingsDeclaration, ...]` | Settings keys this module owns and reads from `CAULDRON_MODULES[slug]`. Consumed by the settings page (#33) to validate configuration and show required/optional status. |
+| `settings_declarations` | `tuple[ModuleSettingsDeclaration, ...]` | Settings keys this module reads. By default each key lives at `CAULDRON_MODULES[slug][key]`; set `setting_path` to a top-level Django setting name (e.g. `"CAULDRON_UI_OVERRIDES_DIR"`) when the module reads from the global settings namespace instead. Consumed by the settings page (#33). |
 | `migration_apps` | `tuple[ModuleMigrationDeclaration, ...]` | Django `app_label`s that hold database migrations. Consumed by startup projection (#38) to determine whether `migrate` is needed. |
-| `permissions` | `tuple[ModulePermissionDeclaration, ...]` | Permission codenames the module introduces. Consumed by install/enable flows (#38) to create permissions before first use. |
+| `permissions` | `tuple[ModulePermissionDeclaration, ...]` | Permission `(app_label, codename)` pairs the module introduces. Consumed by install/enable flows (#38) to create permissions before first use. |
 | `navigation` | `tuple[ModuleNavigationDeclaration, ...]` | Nav sections and items this module contributes to the admin shell. Consumed by the admin shell (#66) to build the sidebar. |
 | `ai_tools` | `tuple[str, ...]` | Tool names this module registers in the AI tool-calling pipeline. Consumed by AI orchestration to validate tool availability. |
 | `prompt_templates` | `tuple[str, ...]` | Prompt template names this module provides. Consumed by AI orchestration (#66). |
 | `provided_capabilities` | `tuple[ProvidedCapability, ...]` | Rich metadata for each capability slug in `provides`. Each slug must already appear in `provides`. |
+| `restart_required` | `bool` | **Stored field.** Explicitly declare that enabling or disabling this module requires a server restart for reasons beyond the Django integration tuples (e.g. the module starts background threads or registers signal handlers in `AppConfig.ready()`). Defaults to `False`. |
+| `runtime_requirements` | `tuple[RuntimeRequirement, ...]` | External runtime dependencies (database aliases, cache backends, task workers) needed at startup. Consumed by operational tooling for pre-flight checks. |
 
-The derived property `requires_restart` is computed from `django_apps`,
-`django_middleware`, and `django_context_processors` — it is **not** stored.
+**`requires_restart`** is a **derived property** (not serialized). It returns `True`
+when any of the following hold:
+
+- `django_apps` is non-empty, **or**
+- `django_middleware` is non-empty, **or**
+- `django_context_processors` is non-empty, **or**
+- `restart_required` is `True`
+
+Use `restart_required=True` only when the module's startup-time side effects are
+not expressed by the Django integration tuples.
 
 ### What does NOT belong in ModuleManifest
 
@@ -161,17 +171,28 @@ The derived property `requires_restart` is computed from `django_apps`,
 
 - **Settings keys** — flat lowercase identifiers (`^[a-z][a-z0-9_]*$`). No
   dots. Two declarations may not share the same key within a manifest.
-- **Migration app_labels** — must appear in `django_apps`. No duplicates.
-- **Permission codenames** — lowercase identifiers (`^[a-z][a-z0-9_]*$`). The
-  `app_label` must appear in `django_apps`. No duplicate codenames.
+  If `setting_path` is set it must be an `UPPER_SNAKE_CASE` Django setting name.
+- **Migration app_labels** — must correspond to an entry in `django_apps` (exact
+  match or last dotted segment, e.g. `"auth"` for `"django.contrib.auth"`). No
+  duplicates.
+- **Permissions** — codenames are lowercase identifiers (`^[a-z][a-z0-9_]*$`).
+  Uniqueness is enforced on the `(app_label, codename)` pair: the same codename
+  in two different declared apps is valid. Each `app_label` must correspond to
+  an entry in `django_apps`.
 - **Navigation keys** — dotted lowercase, hyphens allowed after the first
   character of each segment (e.g. `cauldron.admin.content.page-create`). No
-  duplicates.
+  duplicates. Items (non-empty `section`) must declare a `url_name`. Sections
+  (empty `section`) must not set item-only fields (`url_name`, `permission`,
+  `url_prefix`, `url_prefix_exact`). Referenced sections need not exist in the
+  same manifest — they may be contributed by another module.
 - **AI tool / prompt template names** — dotted lowercase, underscores allowed
   in segments (e.g. `content.list_collections`). No duplicates within each
   tuple.
 - **ProvidedCapability slugs** — must appear in `provides`. No duplicate slugs
-  within `provided_capabilities`.
+  within `provided_capabilities`. If `contract` is set and the contract path
+  is owned by a namespace declared in this manifest, it must fall under one of
+  the manifest's `public_api` entries (boundary-aware: `"myapp_extra"` is not
+  treated as owned by namespace `"myapp"`).
 
 ### Serialization
 

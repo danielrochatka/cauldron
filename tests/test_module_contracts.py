@@ -1276,7 +1276,7 @@ class TestAllCurrentModulesLoad:
     def test_cauldron_ai_admin(self):
         m = self._import_module("cauldron_ai_admin.module")
         assert m.slug == "cauldron.ai.admin"
-        assert len(m.settings_declarations) == 2
+        assert len(m.settings_declarations) == 9
         assert len(m.migration_apps) == 1
         assert len(m.permissions) == 8
         assert len(m.navigation) == 5

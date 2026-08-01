@@ -58,6 +58,41 @@ _manifest = ModuleManifest(
             required=False,
             description="Provider-specific configuration dict keyed by provider name.",
         ),
+        ModuleSettingsDeclaration(
+            key="max_model_turns",
+            required=False,
+            description="Maximum number of model turns per run before the run is aborted.",
+        ),
+        ModuleSettingsDeclaration(
+            key="max_tool_calls",
+            required=False,
+            description="Maximum number of tool calls per run before the run is aborted.",
+        ),
+        ModuleSettingsDeclaration(
+            key="tool_timeout_seconds",
+            required=False,
+            description="Per-tool execution timeout in seconds.",
+        ),
+        ModuleSettingsDeclaration(
+            key="run_timeout_seconds",
+            required=False,
+            description="Wall-clock timeout for an entire run in seconds.",
+        ),
+        ModuleSettingsDeclaration(
+            key="max_argument_bytes",
+            required=False,
+            description="Maximum byte size of a single tool call argument payload.",
+        ),
+        ModuleSettingsDeclaration(
+            key="max_result_bytes",
+            required=False,
+            description="Maximum byte size of a single tool call result payload.",
+        ),
+        ModuleSettingsDeclaration(
+            key="include_content_tools",
+            required=False,
+            description="Whether to include content-management tools in the AI tool set.",
+        ),
     ),
     migration_apps=(
         ModuleMigrationDeclaration(app_label="cauldron_ai_admin"),

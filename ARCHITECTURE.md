@@ -11,16 +11,29 @@ Each package in `packages/cauldron-*/` owns one or more Python namespaces,
 declared in its `ModuleManifest.namespaces` field. A package may only import
 from a sibling namespace if:
 
-1. The sibling package is listed in `[project.dependencies]` in its
-   `pyproject.toml`, **and**
-2. The corresponding `ModuleRequirement` is declared in the manifest
-   `requires` or `optional` field.
+1. The sibling package is listed in `[project.dependencies]` (main) or a
+   runtime `[project.optional-dependencies]` group in its `pyproject.toml`, **and**
+2. The corresponding `ModuleRequirement(kind='module')` is declared in the manifest
+   `requires` or `optional` field with the correct level (see §4).
 
-Both declarations must be kept in sync. The architecture checker (see below)
-enforces this at CI time.
+Both declarations must be kept in sync and at the correct level. The architecture
+checker (see §5) enforces this at CI time.
 
 **Platform namespaces** (`cauldron` core, `django`) are always allowed and
 do not need explicit declarations.
+
+### Dotted namespace ownership
+
+A namespace may be dotted (e.g. `myapp.core`). Ownership rules:
+
+- A module owning `myapp.core` also owns `myapp.core.api` and every deeper
+  sub-path (`myapp.core.startswith("myapp.core.")`).
+- It does **not** own `myapp.core_extra` (different root segment after stripping the dot).
+- **Sibling dotted namespaces** — `myapp.core` and `myapp.extensions` may be owned
+  by different modules without conflict.
+- **Parent/child ownership conflict** — one module owning `myapp` and another owning
+  `myapp.core` is ambiguous and produces a configuration error. All sub-paths of
+  `myapp` belong to the `myapp` owner unless no deeper owner exists.
 
 ---
 
@@ -71,26 +84,74 @@ This keeps tests isolated and avoids cross-boundary coupling.
 
 ## 4. Declaring Dependencies
 
-When adding a dependency on a sibling Cauldron package, **both** files must
-be updated together:
+### Dependency categories
 
-1. **`pyproject.toml`** — add the package to `[project.dependencies]`:
+| Category | pyproject location | manifest location | Who may import |
+|----------|-------------------|-------------------|----------------|
+| **Required** | `[project.dependencies]` | `requires=(ModuleRequirement(..., kind='module'),)` | Any file |
+| **Runtime-optional** | `[project.optional-dependencies].<group>` (non-`test`) | `optional=(ModuleRequirement(..., kind='module'),)` | Any file (feature must be absent-safe) |
+| **Test-only** | `[project.optional-dependencies].test` | *(no manifest entry)* | Test files only |
+
+The level must match in both files:
+- A package in `[project.dependencies]` **must** have its slug under manifest `requires=`.
+- A package in a runtime optional group **must** have its slug under manifest `optional=`.
+- A package in the `test` optional group needs **no manifest entry** — it is not part of the deployed module contract.
+
+Mismatches (e.g. main dep declared as `optional=` in the manifest, or a runtime-optional dep declared as `requires=`) are reported as **ARCH004**.
+
+### Adding a required dependency
+
+Both files must be updated together:
+
+1. **`pyproject.toml`** — add to `[project.dependencies]`:
    ```toml
    dependencies = [
        "cauldron-content>=0.1.0",
    ]
    ```
 
-2. **`module.py`** — add a `ModuleRequirement` to the manifest:
+2. **`module.py`** — add to manifest `requires=`:
    ```python
    requires=(
-       ModuleRequirement(slug="cauldron.content"),
+       ModuleRequirement(slug="cauldron.content", kind="module"),
    ),
    ```
 
-For truly optional dependencies (e.g. loaded inside `try/except ImportError`):
-- Add to `[project.optional-dependencies]` in `pyproject.toml`
-- Add to `optional=(...)` in the manifest
+### Adding a runtime-optional dependency
+
+For features that are activated only when the package is present (e.g. loaded
+inside `try/except ImportError`):
+
+```toml
+[project.optional-dependencies]
+flatfile = ["cauldron-cms-flatfile>=0.1.0"]
+```
+
+```python
+optional=(
+    ModuleRequirement(slug="cauldron.cms.flatfile", kind="module"),
+),
+```
+
+### Adding a test-only dependency
+
+For packages needed only in tests (not shipped with the module):
+
+```toml
+[project.optional-dependencies]
+test = ["cauldron-site-astro>=0.1.0"]
+```
+
+No manifest entry is needed. Test files may import from the package without
+a `ModuleRequirement` declaration. Only the `test` group is automatically
+treated as test-only; other optional groups are runtime-optional.
+
+### Public API is for supported consumers only
+
+`public_api` entries authorize cross-module imports. Add a path to `public_api`
+only when there is a real, supported runtime consumer in another module. Do not
+widen `public_api` to accommodate misplaced tests. Move the test to the correct
+package instead.
 
 ---
 
@@ -122,15 +183,49 @@ python tools/arch_check.py --fix-report violations.json
 
 ## 8. Test Boundaries
 
-Test files follow the same architecture boundaries as production code with one exception:
-test files importing from packages listed **only** in `[project.optional-dependencies]` (not in `[project.dependencies]`) do not require a `ModuleRequirement` manifest entry — optional test extras are not runtime module dependencies. However:
+### Package tests
 
-- Private names (`_` prefix) are still rejected in test imports.
-- Non-public paths (absent from the sibling's `public_api`) are still rejected.
-- Concrete capability implementations are still rejected.
-- Direct imports from production dependencies (packages in `[project.dependencies]`) still require a `kind='module'` manifest declaration, even in tests.
+Test files in `packages/cauldron-*/tests/` follow the same boundaries as production
+code with one extension: importing a package listed **only** in
+`[project.optional-dependencies].test` (not in main deps or any runtime optional group)
+is allowed without a `ModuleRequirement` manifest entry — test extras are not part of
+the deployed module contract.
 
-Use local fakes or move provider-specific tests to the provider package rather than adding runtime manifest requirements for test-only needs.
+The following rules still apply in test files:
+
+- Private names (`_` prefix) are rejected (ARCH002b).
+- Non-public paths absent from the sibling's `public_api` are rejected (ARCH002c).
+- Concrete capability implementations are rejected (ARCH003).
+- Imports from packages in main `[project.dependencies]` still require `kind='module'`
+  under manifest `requires=`, not `optional=` (ARCH001 / ARCH004).
+- Imports from runtime-optional packages still require `kind='module'` under manifest
+  `optional=` (ARCH001 / ARCH004).
+
+### Provider-specific test ownership
+
+When a test exercises a concrete provider implementation (e.g. tool handlers, models,
+or services from a specific provider package), the test belongs in that provider's own
+test suite — not in the consumer's. Moving the test:
+
+- Eliminates false cross-package dependencies.
+- Avoids widening the provider's `public_api` for test-only callers.
+- Keeps private implementation details (`_handle_*`, internal models) private.
+
+### Framework integration tests
+
+Test files in the root `tests/` directory are framework integration tests — they verify
+the module system, registry, and discovery across all packages. These tests may import
+from any discovered Cauldron package without pyproject declarations, because the monorepo
+checkout is the declaration. ARCH002 (private names) and ARCH003 (capability implementations)
+still apply.
+
+Fixture packages used exclusively by integration tests (e.g. `cauldron_fixture_alpha`)
+belong in `tests/fixtures/`, not in `packages/`, and are **not** listed in the root
+`pyproject.toml`. Adding fixture names to published metadata solely to silence the
+architecture checker is explicitly prohibited.
+
+Use local fakes, correctly owned tests, or `--module-root` rather than widening
+production APIs or adding synthetic pyproject entries.
 
 ---
 

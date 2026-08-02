@@ -29,10 +29,10 @@ _manifest = ModuleManifest(
         ModuleRequirement(slug="cauldron.ai", kind="module"),
         ModuleRequirement(slug="cauldron.django.admin", kind="module"),
         ModuleRequirement(slug="cauldron.admin.content", kind="module"),
+        ModuleRequirement(slug="cauldron.content.operations", kind="module"),
     ),
     optional=(
         ModuleRequirement(slug="cauldron.cms.flatfile", kind="module"),
-        ModuleRequirement(slug="cauldron.content.operations", kind="module"),
     ),
     provides=(
         "admin.ai",

@@ -118,7 +118,9 @@ def _make_fake_package(
     capability_implementations: list[str] | None = None,
     provides: list[str] | None = None,
     requires: list[tuple[str, str]] | None = None,  # [(slug, kind), ...]
+    optional_requires: list[tuple[str, str]] | None = None,  # for manifest optional=
     pyproject_deps: list[str] | None = None,
+    pyproject_optional_groups: dict[str, list[str]] | None = None,  # for optional dep groups
     src_files: dict[str, str] | None = None,
     test_files: dict[str, str] | None = None,
 ) -> None:
@@ -138,6 +140,13 @@ def _make_fake_package(
         )
         requires_lines = f"    requires=({req_items},),\n"
 
+    optional_requires_lines = ""
+    if optional_requires:
+        opt_items = ", ".join(
+            f'ModuleRequirement(slug="{s}", kind="{k}")' for s, k in optional_requires
+        )
+        optional_requires_lines = f"    optional=({opt_items},),\n"
+
     module_py = src_ns_dir / "module.py"
     module_py.write_text(
         f'from cauldron.modules import BaseModule, ModuleManifest, ModuleRequirement\n'
@@ -149,6 +158,7 @@ def _make_fake_package(
         + (f'    capability_implementations=({cap_impl_str},),\n' if capability_implementations else "")
         + (f'    provides=({provides_str},),\n' if provides else "")
         + requires_lines
+        + optional_requires_lines
         + f')\n'
         f'module = BaseModule(_manifest)\n',
         encoding="utf-8",
@@ -168,6 +178,14 @@ def _make_fake_package(
     if pyproject_deps is None:
         pyproject_deps = []
     extra_deps = "".join(f'    "{d}>=0.1.0",\n' for d in pyproject_deps)
+
+    optional_groups_toml = ""
+    if pyproject_optional_groups:
+        optional_groups_toml = "\n[project.optional-dependencies]\n"
+        for group_name, group_deps in pyproject_optional_groups.items():
+            deps_list = ", ".join(f'"{d}>=0.1.0"' for d in group_deps)
+            optional_groups_toml += f'{group_name} = [{deps_list}]\n'
+
     pyproject_toml = pkg_dir / "pyproject.toml"
     pyproject_toml.write_text(
         f'[build-system]\n'
@@ -180,7 +198,8 @@ def _make_fake_package(
         f'dependencies = [\n'
         f'    "cauldron>=0.1.0",\n'
         f'{extra_deps}'
-        f']\n',
+        f']\n'
+        + optional_groups_toml,
         encoding="utf-8",
     )
 
@@ -689,3 +708,547 @@ def test_duplicate_namespace_project_and_packaged():
 
     assert result.returncode == 1
     assert "DUPLICATE NAMESPACE" in (result.stdout + result.stderr)
+
+
+# ---------------------------------------------------------------------------
+# New tests for dotted namespaces, overlapping namespaces, and new ARCH004 checks
+# ---------------------------------------------------------------------------
+
+def test_dotted_namespace_self_import_allowed():
+    """A package owning a cauldron_* namespace can import within itself freely."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        # Package owns cauldron_myapp_core namespace (cauldron-prefixed so the checker inspects it)
+        pkg_dir = root / "packages" / "cauldron-myapp-core"
+        src_ns_dir = pkg_dir / "src" / "cauldron_myapp_core"
+        src_ns_dir.mkdir(parents=True, exist_ok=True)
+        (src_ns_dir / "__init__.py").write_text("", encoding="utf-8")
+        (src_ns_dir / "module.py").write_text(
+            'from cauldron.modules import BaseModule, ModuleManifest\n'
+            '_manifest = ModuleManifest(\n'
+            '    slug="cauldron.myapp.core",\n'
+            '    label="MyApp Core",\n'
+            '    namespaces=("cauldron_myapp_core",),\n'
+            '    public_api=("cauldron_myapp_core.api", "cauldron_myapp_core.utils"),\n'
+            ')\n'
+            'module = BaseModule(_manifest)\n',
+            encoding="utf-8",
+        )
+        # File in cauldron_myapp_core.api imports from cauldron_myapp_core.utils (same package)
+        (src_ns_dir / "api.py").write_text(
+            "from cauldron_myapp_core.utils import helper\n",
+            encoding="utf-8",
+        )
+        (src_ns_dir / "utils.py").write_text(
+            "def helper(): pass\n",
+            encoding="utf-8",
+        )
+        (pkg_dir / "pyproject.toml").write_text(
+            '[project]\nname = "cauldron-myapp-core"\nversion = "0.1.0"\n'
+            'requires-python = ">=3.11"\ndependencies = ["cauldron>=0.1.0"]\n',
+            encoding="utf-8",
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 0, f"Self-import within same namespace should be allowed:\n{result.stdout}"
+
+
+def test_dotted_namespace_cross_module_import():
+    """Package A importing from Package B's namespace without a dep declaration raises ARCH001."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        # Package B owns cauldron_myapp_core namespace
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-myapp-core",
+            slug="cauldron.myapp.core",
+            namespace="cauldron_myapp_core",
+            public_api=["cauldron_myapp_core.utils"],
+            src_files={"utils.py": "class Thing: pass\n"},
+        )
+
+        # Package A owns cauldron_myapp_api namespace and imports from cauldron_myapp_core without any dep
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-myapp-api",
+            slug="cauldron.myapp.api",
+            namespace="cauldron_myapp_api",
+            public_api=["cauldron_myapp_api.views"],
+            pyproject_deps=[],  # no dep on cauldron-myapp-core!
+            src_files={
+                "views.py": "from cauldron_myapp_core.utils import Thing\n",
+            },
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 1, f"Expected ARCH001 for undeclared cross-module import:\n{result.stdout}"
+    assert "ARCH001" in result.stdout
+
+
+def test_parent_child_namespace_conflict():
+    """Package A claiming 'myapp' and Package B claiming 'myapp.core' produces a config error."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        # Package A claims myapp namespace
+        pkg_a_dir = root / "packages" / "cauldron-myapp"
+        src_a_dir = pkg_a_dir / "src" / "myapp"
+        src_a_dir.mkdir(parents=True, exist_ok=True)
+        (src_a_dir / "__init__.py").write_text("", encoding="utf-8")
+        (src_a_dir / "module.py").write_text(
+            'from cauldron.modules import BaseModule, ModuleManifest\n'
+            '_manifest = ModuleManifest(\n'
+            '    slug="cauldron.myapp",\n'
+            '    label="MyApp",\n'
+            '    namespaces=("myapp",),\n'
+            '    public_api=("myapp.api",),\n'
+            ')\n'
+            'module = BaseModule(_manifest)\n',
+            encoding="utf-8",
+        )
+        (pkg_a_dir / "pyproject.toml").write_text(
+            '[project]\nname = "cauldron-myapp"\nversion = "0.1.0"\n'
+            'requires-python = ">=3.11"\ndependencies = ["cauldron>=0.1.0"]\n',
+            encoding="utf-8",
+        )
+
+        # Package B claims myapp.core namespace (child of myapp)
+        pkg_b_dir = root / "packages" / "cauldron-myapp-core"
+        src_b_dir = pkg_b_dir / "src" / "myapp_core"
+        src_b_dir.mkdir(parents=True, exist_ok=True)
+        (src_b_dir / "__init__.py").write_text("", encoding="utf-8")
+        (src_b_dir / "module.py").write_text(
+            'from cauldron.modules import BaseModule, ModuleManifest\n'
+            '_manifest = ModuleManifest(\n'
+            '    slug="cauldron.myapp.core",\n'
+            '    label="MyApp Core",\n'
+            '    namespaces=("myapp", "myapp.core"),\n'
+            '    public_api=("myapp.core.api",),\n'
+            ')\n'
+            'module = BaseModule(_manifest)\n',
+            encoding="utf-8",
+        )
+        (pkg_b_dir / "pyproject.toml").write_text(
+            '[project]\nname = "cauldron-myapp-core"\nversion = "0.1.0"\n'
+            'requires-python = ">=3.11"\ndependencies = ["cauldron>=0.1.0"]\n',
+            encoding="utf-8",
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 1, "Expected config error for overlapping namespaces"
+    combined = result.stdout + result.stderr
+    assert "OVERLAPPING NAMESPACE" in combined or "DUPLICATE NAMESPACE" in combined, (
+        f"Expected namespace conflict error, got:\n{combined}"
+    )
+
+
+def test_sibling_dotted_namespaces_allowed():
+    """Package A claiming 'myapp.core' and Package B claiming 'myapp.extensions' is fine."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        # Package A claims myapp_core namespace
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-myapp-core",
+            slug="cauldron.myapp.core",
+            namespace="myapp_core",
+            public_api=["myapp_core.api"],
+            src_files={"api.py": ""},
+        )
+
+        # Package B claims myapp_extensions namespace (sibling, not parent/child)
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-myapp-extensions",
+            slug="cauldron.myapp.extensions",
+            namespace="myapp_extensions",
+            public_api=["myapp_extensions.api"],
+            src_files={"api.py": ""},
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 0, (
+        f"Sibling dotted namespaces should not produce a config error:\n{result.stdout}\n{result.stderr}"
+    )
+    assert "OVERLAPPING NAMESPACE" not in (result.stdout + result.stderr)
+
+
+def test_similarly_prefixed_namespace_not_parent_child():
+    """Package A claiming 'myapp' and Package B claiming 'myapp_extra' is NOT a conflict."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        # Package A claims myapp namespace
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-myapp",
+            slug="cauldron.myapp",
+            namespace="myapp",
+            public_api=["myapp.api"],
+            src_files={"api.py": ""},
+        )
+
+        # Package B claims myapp_extra namespace (different root, not a child)
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-myapp-extra",
+            slug="cauldron.myapp.extra",
+            namespace="myapp_extra",
+            public_api=["myapp_extra.api"],
+            src_files={"api.py": ""},
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 0, (
+        f"Similarly-prefixed but separate namespaces should not conflict:\n{result.stdout}\n{result.stderr}"
+    )
+    assert "OVERLAPPING NAMESPACE" not in (result.stdout + result.stderr)
+
+
+def test_arch004_main_dep_in_optional_manifest_raises():
+    """ARCH004 fires when a main dep is declared as optional= in the manifest."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-base",
+            slug="cauldron.base",
+            namespace="cauldron_base",
+            public_api=["cauldron_base.api"],
+            src_files={"api.py": ""},
+        )
+
+        # cauldron-consumer has cauldron-base in MAIN deps but manifest puts it in optional=
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-consumer",
+            slug="cauldron.consumer",
+            namespace="cauldron_consumer",
+            public_api=["cauldron_consumer.api"],
+            pyproject_deps=["cauldron-base"],  # main dep
+            optional_requires=[("cauldron.base", "module")],  # but manifest says optional=!
+            src_files={"api.py": ""},
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 1, (
+        f"Expected ARCH004 for main dep in optional= manifest:\n{result.stdout}"
+    )
+    assert "ARCH004" in result.stdout, f"Expected ARCH004 in output:\n{result.stdout}"
+
+
+def test_arch004_runtime_optional_dep_in_requires_manifest_raises():
+    """ARCH004 fires when a runtime-optional dep is declared under requires= in the manifest."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-base",
+            slug="cauldron.base",
+            namespace="cauldron_base",
+            public_api=["cauldron_base.api"],
+            src_files={"api.py": ""},
+        )
+
+        # cauldron-consumer has cauldron-base in runtime-optional group (not main deps)
+        # but manifest puts it in requires= (which is for main deps)
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-consumer",
+            slug="cauldron.consumer",
+            namespace="cauldron_consumer",
+            public_api=["cauldron_consumer.api"],
+            pyproject_deps=[],  # NOT in main deps
+            pyproject_optional_groups={"extras": ["cauldron-base"]},  # only in non-test optional
+            requires=[("cauldron.base", "module")],  # but manifest says requires=!
+            src_files={"api.py": ""},
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 1, (
+        f"Expected ARCH004 for runtime-optional dep in requires= manifest:\n{result.stdout}"
+    )
+    assert "ARCH004" in result.stdout, f"Expected ARCH004 in output:\n{result.stdout}"
+
+
+def test_project_module_arch004_violation():
+    """Project module with pyproject.toml and undeclared manifest dep raises ARCH004."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        # A packaged module that is referenced
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-core",
+            slug="cauldron.core",
+            namespace="cauldron_core",
+            public_api=["cauldron_core.api"],
+            src_files={"api.py": ""},
+        )
+
+        # A project module with pyproject.toml that has main dep on cauldron-core
+        # but no manifest declaration
+        mod_dir = root / "modules" / "my-project-module"
+        src_ns = mod_dir / "src" / "my_project_module"
+        src_ns.mkdir(parents=True)
+        (src_ns / "__init__.py").write_text("", encoding="utf-8")
+        (src_ns / "module.py").write_text(
+            'from cauldron.modules import BaseModule, ModuleManifest\n'
+            '_manifest = ModuleManifest(\n'
+            '    slug="my.project.module", label="My Project Module",\n'
+            '    namespaces=("my_project_module",),\n'
+            '    public_api=("my_project_module.api",),\n'
+            # No requires= declared!
+            ')\n'
+            'module = BaseModule(_manifest)\n',
+            encoding="utf-8",
+        )
+        (src_ns / "api.py").write_text("", encoding="utf-8")
+        # Project module has pyproject.toml with main dep on cauldron-core
+        (mod_dir / "pyproject.toml").write_text(
+            '[project]\nname = "my-project-module"\nversion = "0.1.0"\n'
+            'requires-python = ">=3.11"\n'
+            'dependencies = ["cauldron>=0.1.0", "cauldron-core>=0.1.0"]\n',
+            encoding="utf-8",
+        )
+
+        arch_check = Path(__file__).resolve().parent.parent / "tools" / "arch_check.py"
+        result = subprocess.run(
+            [sys.executable, str(arch_check), "--root", str(root),
+             "--module-root", str(root / "modules")],
+            capture_output=True, text=True,
+        )
+
+    assert result.returncode == 1, (
+        f"Expected ARCH004 for project module with undeclared manifest dep:\n{result.stdout}"
+    )
+    assert "ARCH004" in result.stdout, f"Expected ARCH004 in output:\n{result.stdout}"
+
+
+def test_project_module_arch004_clean():
+    """Project module with correct pyproject + manifest declarations passes cleanly."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        # A packaged module that is referenced
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-core",
+            slug="cauldron.core",
+            namespace="cauldron_core",
+            public_api=["cauldron_core.api"],
+            src_files={"api.py": ""},
+        )
+
+        # A project module with pyproject.toml that correctly declares cauldron-core
+        mod_dir = root / "modules" / "my-project-module"
+        src_ns = mod_dir / "src" / "my_project_module"
+        src_ns.mkdir(parents=True)
+        (src_ns / "__init__.py").write_text("", encoding="utf-8")
+        (src_ns / "module.py").write_text(
+            'from cauldron.modules import BaseModule, ModuleManifest, ModuleRequirement\n'
+            '_manifest = ModuleManifest(\n'
+            '    slug="my.project.module", label="My Project Module",\n'
+            '    namespaces=("my_project_module",),\n'
+            '    public_api=("my_project_module.api",),\n'
+            '    requires=(ModuleRequirement(slug="cauldron.core", kind="module"),),\n'
+            ')\n'
+            'module = BaseModule(_manifest)\n',
+            encoding="utf-8",
+        )
+        (src_ns / "api.py").write_text("", encoding="utf-8")
+        (mod_dir / "pyproject.toml").write_text(
+            '[project]\nname = "my-project-module"\nversion = "0.1.0"\n'
+            'requires-python = ">=3.11"\n'
+            'dependencies = ["cauldron>=0.1.0", "cauldron-core>=0.1.0"]\n',
+            encoding="utf-8",
+        )
+
+        arch_check = Path(__file__).resolve().parent.parent / "tools" / "arch_check.py"
+        result = subprocess.run(
+            [sys.executable, str(arch_check), "--root", str(root),
+             "--module-root", str(root / "modules")],
+            capture_output=True, text=True,
+        )
+
+    assert result.returncode == 0, (
+        f"Expected clean result for project module with correct declarations:\n{result.stdout}"
+    )
+
+
+def test_unpackaged_project_module_no_arch004():
+    """Project module with no pyproject.toml does not fire ARCH004."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        # A packaged module that is referenced
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-core",
+            slug="cauldron.core",
+            namespace="cauldron_core",
+            public_api=["cauldron_core.api"],
+            src_files={"api.py": ""},
+        )
+
+        # A project module WITHOUT pyproject.toml, but with a manifest dep on cauldron-core
+        mod_dir = root / "modules" / "my-project-module"
+        src_ns = mod_dir / "src" / "my_project_module"
+        src_ns.mkdir(parents=True)
+        (src_ns / "__init__.py").write_text("", encoding="utf-8")
+        (src_ns / "module.py").write_text(
+            'from cauldron.modules import BaseModule, ModuleManifest, ModuleRequirement\n'
+            '_manifest = ModuleManifest(\n'
+            '    slug="my.project.module", label="My Project Module",\n'
+            '    namespaces=("my_project_module",),\n'
+            '    public_api=("my_project_module.api",),\n'
+            '    requires=(ModuleRequirement(slug="cauldron.core", kind="module"),),\n'
+            ')\n'
+            'module = BaseModule(_manifest)\n',
+            encoding="utf-8",
+        )
+        (src_ns / "api.py").write_text("", encoding="utf-8")
+        # No pyproject.toml here!
+
+        arch_check = Path(__file__).resolve().parent.parent / "tools" / "arch_check.py"
+        result = subprocess.run(
+            [sys.executable, str(arch_check), "--root", str(root),
+             "--module-root", str(root / "modules")],
+            capture_output=True, text=True,
+        )
+
+    assert result.returncode == 0, (
+        f"Project module without pyproject.toml should NOT fire ARCH004:\n{result.stdout}"
+    )
+
+
+def test_overlapping_module_roots_stable():
+    """Two --module-root flags pointing to directories sharing the same module namespace produce a stable config error."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        # Create two module roots that both have a module claiming the same namespace
+        for root_name in ("modules_a", "modules_b"):
+            mod_dir = root / root_name / "shared-module"
+            src_ns = mod_dir / "src" / "cauldron_shared"
+            src_ns.mkdir(parents=True)
+            (src_ns / "__init__.py").write_text("", encoding="utf-8")
+            (src_ns / "module.py").write_text(
+                'from cauldron.modules import BaseModule, ModuleManifest\n'
+                '_manifest = ModuleManifest(\n'
+                '    slug="cauldron.shared",\n'
+                '    label="Shared Module",\n'
+                '    namespaces=("cauldron_shared",),\n'
+                '    public_api=("cauldron_shared.api",),\n'
+                ')\n'
+                'module = BaseModule(_manifest)\n',
+                encoding="utf-8",
+            )
+            (src_ns / "api.py").write_text("", encoding="utf-8")
+
+        arch_check = Path(__file__).resolve().parent.parent / "tools" / "arch_check.py"
+        result = subprocess.run(
+            [sys.executable, str(arch_check), "--root", str(root),
+             "--module-root", str(root / "modules_a"),
+             "--module-root", str(root / "modules_b")],
+            capture_output=True, text=True,
+        )
+
+    # Should produce a config error (DUPLICATE NAMESPACE), not crash
+    assert result.returncode == 1, (
+        f"Expected config error for overlapping module roots:\n{result.stdout}\n{result.stderr}"
+    )
+    combined = result.stdout + result.stderr
+    assert "DUPLICATE NAMESPACE" in combined, (
+        f"Expected DUPLICATE NAMESPACE error:\n{combined}"
+    )
+
+
+def test_root_checker_clean_without_fixture_pyproject_entries():
+    """Integration root test files can import from any discovered package (no ARCH001)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        # Root has no cauldron deps, a discovered package exists
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-util",
+            slug="cauldron.util",
+            namespace="cauldron_util",
+            public_api=["cauldron_util.api"],
+            src_files={"api.py": ""},
+        )
+
+        # Create root/src/cauldron/__init__.py (the framework, no module.py)
+        root_src = root / "src" / "cauldron"
+        root_src.mkdir(parents=True)
+        (root_src / "__init__.py").write_text("", encoding="utf-8")
+
+        # Root test file imports from cauldron_util without any pyproject declaration
+        root_tests = root / "tests"
+        root_tests.mkdir()
+        (root_tests / "test_something.py").write_text(
+            "from cauldron_util.api import Thing\n",  # no pyproject decl
+            encoding="utf-8",
+        )
+
+        # Root pyproject has no cauldron-* deps
+        (root / "pyproject.toml").write_text(
+            '[project]\nname="cauldron"\nversion="0.1.0"\n'
+            'dependencies=["Django>=5.0"]\n',  # no cauldron-* deps
+            encoding="utf-8",
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 0, (
+        f"Integration root test should be allowed:\n{result.stdout}"
+    )
+
+
+def test_root_checker_clean_undiscovered_fixture_import():
+    """Integration root tests may import from fixture packages not in packages/ (no ARCH001).
+
+    Fixtures like cauldron_fixture_alpha live in tests/fixtures/, not packages/.
+    They are not discovered by the default scan and have no pyproject entry in the
+    root. The checker must still pass — the repo checkout is the declaration.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        # No packages/ at all — simulates importing from a fixture not in packages/
+        root_src = root / "src" / "cauldron"
+        root_src.mkdir(parents=True)
+        (root_src / "__init__.py").write_text("", encoding="utf-8")
+
+        root_tests = root / "tests"
+        root_tests.mkdir()
+        # Import from cauldron_fixture_alpha — NOT a discovered package
+        (root_tests / "test_discovery.py").write_text(
+            "from cauldron_fixture_alpha import module as alpha_module\n",
+            encoding="utf-8",
+        )
+
+        (root / "pyproject.toml").write_text(
+            '[project]\nname="cauldron"\nversion="0.1.0"\n'
+            'dependencies=["Django>=5.0"]\n',
+            encoding="utf-8",
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 0, (
+        f"Integration root fixture import should be allowed without pyproject entry:\n{result.stdout}"
+    )

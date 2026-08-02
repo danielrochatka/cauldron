@@ -69,17 +69,22 @@ class Violation:
 @dataclass
 class PackageInfo:
     slug: str
-    name: str                          # pyproject name, e.g. "cauldron-content"
-    root: Path                         # packages/cauldron-content/
+    name: str                                   # pyproject name, e.g. "cauldron-content"
+    root: Path                                  # packages/cauldron-content/
     namespaces: list[str]
     public_api: set[str]
     capability_implementations: set[str]
-    requires_slugs: set[str]           # ALL slugs from requires + optional (both kinds)
-    requires_module_slugs: set[str]    # slugs from kind="module" requirements only
-    provides: set[str]                 # capability slugs this module provides
-    pyproject_deps: set[str]           # cauldron-* packages from pyproject (req + optional)
-    pyproject_main_deps: set[str]      # cauldron-* packages from [project.dependencies] only
-    pyproject_optional_deps: set[str]  # cauldron-* only in optional-deps, NOT in main
+    requires_slugs: set[str]                    # ALL slugs from requires + optional (both kinds)
+    requires_module_slugs: set[str]             # slugs from kind="module" requirements only (both requires= and optional=)
+    provides: set[str]                          # capability slugs this module provides
+    pyproject_deps: set[str]                    # cauldron-* packages from pyproject (req + optional)
+    pyproject_main_deps: set[str]               # cauldron-* packages from [project.dependencies] only
+    pyproject_optional_deps: set[str]           # cauldron-* only in optional-deps, NOT in main
+    manifest_requires_module_slugs: set[str]    # kind='module' from requires= only
+    manifest_optional_module_slugs: set[str]    # kind='module' from optional= only
+    pyproject_test_deps: set[str]               # packages ONLY in [project.optional-dependencies].test
+    pyproject_runtime_optional_deps: set[str]   # packages in other optional groups (not test), NOT in main deps
+    has_module_manifest: bool = True            # True when a real module.py was found
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +133,16 @@ def _pkg_name_from_namespace(ns: str) -> str:
     return ns.replace("_", "-")
 
 
+def _find_owner(import_path: str, ns_to_pkg: dict[str, PackageInfo]) -> PackageInfo | None:
+    """Return the PackageInfo that owns *import_path*, using boundary-aware longest-prefix matching."""
+    best_ns: str | None = None
+    for ns in ns_to_pkg:
+        if import_path == ns or import_path.startswith(ns + "."):
+            if best_ns is None or len(ns) > len(best_ns):
+                best_ns = ns
+    return ns_to_pkg[best_ns] if best_ns else None
+
+
 # ---------------------------------------------------------------------------
 # Discovery: AST-based manifest parsing
 # ---------------------------------------------------------------------------
@@ -147,6 +162,8 @@ def _extract_manifest_fields(module_py: Path) -> dict:
         "capability_implementations": [],
         "requires_slugs": [],
         "requires_module_slugs": [],
+        "manifest_requires_module_slugs": [],
+        "manifest_optional_module_slugs": [],
         "provides": [],
     }
 
@@ -183,6 +200,7 @@ def _extract_manifest_fields(module_py: Path) -> dict:
                     ]
 
             elif kw.arg in ("requires", "optional"):
+                is_optional = (kw.arg == "optional")
                 if isinstance(kw.value, (ast.Tuple, ast.List)):
                     for elt in kw.value.elts:
                         if not isinstance(elt, ast.Call):
@@ -202,6 +220,10 @@ def _extract_manifest_fields(module_py: Path) -> dict:
                             result["requires_slugs"].append(slug_val)
                             if kind_val == "module":
                                 result["requires_module_slugs"].append(slug_val)
+                                if is_optional:
+                                    result["manifest_optional_module_slugs"].append(slug_val)
+                                else:
+                                    result["manifest_requires_module_slugs"].append(slug_val)
 
     return result
 
@@ -248,6 +270,37 @@ def _pyproject_optional_only_cauldron_deps(pyproject: Path) -> set[str]:
     return all_deps - main_deps
 
 
+def _pyproject_test_cauldron_deps(pyproject: Path) -> set[str]:
+    """Packages in the 'test' optional group ONLY (not in main deps)."""
+    try:
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return set()
+    project = data.get("project", {})
+    test_deps = _extract_cauldron_pkg_names(
+        project.get("optional-dependencies", {}).get("test", [])
+    )
+    main_deps = _extract_cauldron_pkg_names(project.get("dependencies", []))
+    return test_deps - main_deps
+
+
+def _pyproject_runtime_optional_cauldron_deps(pyproject: Path) -> set[str]:
+    """Packages in optional groups OTHER than 'test', not in main deps."""
+    try:
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return set()
+    project = data.get("project", {})
+    main_deps = _extract_cauldron_pkg_names(project.get("dependencies", []))
+    opt_groups = project.get("optional-dependencies", {})
+    runtime_optional: set[str] = set()
+    for group_name, group_deps in opt_groups.items():
+        if group_name == "test":
+            continue
+        runtime_optional |= _extract_cauldron_pkg_names(group_deps)
+    return runtime_optional - main_deps
+
+
 def _pyproject_name(pyproject: Path) -> str:
     try:
         data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
@@ -278,6 +331,33 @@ def _validate_api_paths(
             )
 
 
+def _register_namespace(
+    ns: str,
+    pkg_name: str,
+    namespace_seen: dict[str, str],
+    config_errors: list[str],
+) -> None:
+    """Register a namespace, checking for exact duplicates and parent/child overlaps."""
+    if ns in namespace_seen:
+        config_errors.append(
+            f"DUPLICATE NAMESPACE: '{ns}' is claimed by both "
+            f"'{namespace_seen[ns]}' and '{pkg_name}'. "
+            f"Each Python namespace must have exactly one owner."
+        )
+    else:
+        # Check for parent/child overlap with existing namespaces
+        for existing_ns, existing_pkg in list(namespace_seen.items()):
+            if existing_pkg == pkg_name:
+                continue
+            if existing_ns.startswith(ns + ".") or ns.startswith(existing_ns + "."):
+                config_errors.append(
+                    f"OVERLAPPING NAMESPACE: '{ns}' (in '{pkg_name}') and "
+                    f"'{existing_ns}' (in '{existing_pkg}') have a parent/child "
+                    f"relationship; ownership is ambiguous."
+                )
+        namespace_seen[ns] = pkg_name
+
+
 def discover_packages(
     packages_dir: Path,
     namespace_seen: Optional[dict[str, str]] = None,
@@ -304,6 +384,8 @@ def discover_packages(
         pyproject_deps = _pyproject_cauldron_deps(pyproject) if pyproject.exists() else set()
         pyproject_main_deps = _pyproject_main_cauldron_deps(pyproject) if pyproject.exists() else set()
         pyproject_optional_deps = _pyproject_optional_only_cauldron_deps(pyproject) if pyproject.exists() else set()
+        pyproject_test_deps = _pyproject_test_cauldron_deps(pyproject) if pyproject.exists() else set()
+        pyproject_runtime_optional_deps = _pyproject_runtime_optional_cauldron_deps(pyproject) if pyproject.exists() else set()
 
         for module_py in module_files:
             fields = _extract_manifest_fields(module_py)
@@ -315,16 +397,9 @@ def discover_packages(
             public_api = fields.get("public_api", [])
             cap_impls = fields.get("capability_implementations", [])
 
-            # Detect duplicate namespace ownership
+            # Detect duplicate and overlapping namespace ownership
             for ns in namespaces:
-                if ns in namespace_seen:
-                    config_errors.append(
-                        f"DUPLICATE NAMESPACE: '{ns}' is claimed by both "
-                        f"'{namespace_seen[ns]}' and '{pkg_name}'. "
-                        f"Each Python namespace must have exactly one owner."
-                    )
-                else:
-                    namespace_seen[ns] = pkg_name
+                _register_namespace(ns, pkg_name, namespace_seen, config_errors)
 
             # Validate public_api and capability_implementations belong to owned namespaces
             _validate_api_paths(namespaces, public_api, cap_impls, pkg_name, config_errors)
@@ -342,6 +417,11 @@ def discover_packages(
                 pyproject_deps=pyproject_deps,
                 pyproject_main_deps=pyproject_main_deps,
                 pyproject_optional_deps=pyproject_optional_deps,
+                manifest_requires_module_slugs=set(fields.get("manifest_requires_module_slugs", [])),
+                manifest_optional_module_slugs=set(fields.get("manifest_optional_module_slugs", [])),
+                pyproject_test_deps=pyproject_test_deps,
+                pyproject_runtime_optional_deps=pyproject_runtime_optional_deps,
+                has_module_manifest=True,
             ))
 
     return infos, config_errors
@@ -495,10 +575,10 @@ def check_file(
             continue
         if _is_platform(ns_root):
             continue
-        if ns_root in own_namespaces:
+        if _under_prefix(imp.module, own_namespaces):
             continue
 
-        import_pkg = ns_to_pkg.get(ns_root)
+        import_pkg = _find_owner(imp.module, ns_to_pkg)
 
         # ------------------------------------------------------------------
         # ARCH003 — runs for BOTH test and source files.
@@ -585,63 +665,86 @@ def check_file(
         # ------------------------------------------------------------------
         pkg_name = import_pkg.name if import_pkg else _pkg_name_from_namespace(ns_root)
         owner_label = import_pkg.slug if import_pkg else ns_root
-        in_pyproject = pkg_name in owning_pkg.pyproject_deps
-        in_manifest = import_pkg is not None and _manifest_declares_module(owning_pkg, import_pkg)
 
-        # For test files importing from packages in optional-only pyproject deps,
-        # only the pyproject declaration is required — no manifest entry needed
-        # (test-only extras are not runtime module dependencies).
-        test_optional_only = (
-            is_test
-            and pkg_name in owning_pkg.pyproject_optional_deps
-            and pkg_name not in owning_pkg.pyproject_main_deps
-        )
+        in_main = pkg_name in owning_pkg.pyproject_main_deps
+        in_runtime_opt = pkg_name in owning_pkg.pyproject_runtime_optional_deps
+        in_test_only = pkg_name in owning_pkg.pyproject_test_deps
+        in_manifest_requires = import_pkg is not None and import_pkg.slug in owning_pkg.manifest_requires_module_slugs
+        in_manifest_optional = import_pkg is not None and import_pkg.slug in owning_pkg.manifest_optional_module_slugs
+        in_manifest_any = in_manifest_requires or in_manifest_optional
 
-        if test_optional_only:
-            if not in_pyproject:
+        if is_test and not owning_pkg.has_module_manifest:
+            # Framework integration root (no module.py): its tests/ is an integration test
+            # suite for the whole framework. Cauldron namespace imports are allowed without
+            # pyproject declarations — the repo checkout is the declaration.
+            pass  # allowed
+        elif is_test and in_test_only:
+            # Test-only dep (only in test extra, no manifest needed)
+            pass  # allowed — no ARCH001
+        elif in_main and in_manifest_requires:
+            pass  # correct: main dep declared as requires= module
+        elif in_runtime_opt and in_manifest_optional:
+            pass  # correct: runtime-optional dep declared as optional= module
+        elif in_main and in_manifest_optional:
+            # Misplaced: main dep satisfied by optional= manifest entry
+            violations.append(Violation(
+                code="ARCH001",
+                file=py_file,
+                line=imp.line,
+                message=(
+                    f"Import '{imp.module}' from '{owner_label}' is a main dependency "
+                    f"but its module requirement is under manifest optional= instead of requires=."
+                ),
+                fix=(
+                    f"Move ModuleRequirement(slug='{owner_label}', kind='module') from "
+                    f"optional= to requires= in module.py."
+                ),
+                note=f"'{pkg_name}' is in main [project.dependencies]; manifest requires= is required.",
+            ))
+        elif in_runtime_opt and in_manifest_requires:
+            # Misplaced: runtime-optional dep declared under requires= (would force it as a required dep)
+            violations.append(Violation(
+                code="ARCH001",
+                file=py_file,
+                line=imp.line,
+                message=(
+                    f"Import '{imp.module}' from '{owner_label}' is a runtime-optional dependency "
+                    f"but its module requirement is under manifest requires= instead of optional=."
+                ),
+                fix=(
+                    f"Move ModuleRequirement(slug='{owner_label}', kind='module') from "
+                    f"requires= to optional= in module.py, or promote the package to main [project.dependencies]."
+                ),
+                note=f"'{pkg_name}' is only in a non-test optional-dependency group.",
+            ))
+        else:
+            # Missing declarations
+            fix_parts = []
+            missing = []
+            if not (in_main or in_runtime_opt or in_test_only):
+                fix_parts.append(
+                    f"Add '{pkg_name}>=0.1.0' to [project.dependencies] in "
+                    f"{_rel(owning_pkg.root / 'pyproject.toml', owning_pkg.root.parent.parent)}"
+                )
+                missing.append("pyproject.toml")
+            if not in_manifest_any:
+                fix_parts.append(
+                    f"Add ModuleRequirement(slug='{owner_label}', kind='module') to requires/optional in "
+                    f"{_rel(owning_pkg.root / 'src', owning_pkg.root.parent.parent)}/.../module.py"
+                )
+                missing.append("module.py manifest (kind='module' required)")
+            if missing:
                 violations.append(Violation(
                     code="ARCH001",
                     file=py_file,
                     line=imp.line,
                     message=(
                         f"Import '{imp.module}' depends on '{owner_label}' "
-                        f"which is not in any pyproject.toml dependency section."
+                        f"which is undeclared in: {', '.join(missing)}."
                     ),
-                    fix=(
-                        f"Add '{pkg_name}>=0.1.0' to [project.optional-dependencies] test in "
-                        f"{_rel(owning_pkg.root / 'pyproject.toml', owning_pkg.root.parent.parent)}"
-                    ),
-                    note=f"Test-only import: add to pyproject optional-dependencies, no manifest entry required.",
+                    fix="\n       ".join(fix_parts),
+                    note=f"pyproject main: {in_main} | runtime-opt: {in_runtime_opt} | test-only: {in_test_only} | manifest: {in_manifest_any}",
                 ))
-        elif not in_pyproject or not in_manifest:
-            # Production code (or test imports from main-dep packages): both required.
-            fix_parts = []
-            if not in_pyproject:
-                fix_parts.append(
-                    f"Add '{pkg_name}>=0.1.0' to [project.dependencies] in "
-                    f"{_rel(owning_pkg.root / 'pyproject.toml', owning_pkg.root.parent.parent)}"
-                )
-            if not in_manifest:
-                fix_parts.append(
-                    f"Add ModuleRequirement(slug='{owner_label}', kind='module') to requires/optional in "
-                    f"{_rel(owning_pkg.root / 'src', owning_pkg.root.parent.parent)}/.../module.py"
-                )
-            missing = []
-            if not in_pyproject:
-                missing.append("pyproject.toml")
-            if not in_manifest:
-                missing.append("module.py manifest (kind='module' required)")
-            violations.append(Violation(
-                code="ARCH001",
-                file=py_file,
-                line=imp.line,
-                message=(
-                    f"Import '{imp.module}' depends on '{owner_label}' "
-                    f"which is undeclared in: {', '.join(missing)}."
-                ),
-                fix="\n       ".join(fix_parts),
-                note=f"pyproject declared: {in_pyproject} | manifest kind='module' declared: {in_manifest}",
-            ))
 
     return violations
 
@@ -672,6 +775,45 @@ def check_arch004(
                     f"but '{req_pkg.name}' is absent from pyproject.toml dependencies."
                 ),
                 fix=f"Add '{req_pkg.name}>=0.1.0' to [project.dependencies] in {pkg.name}/pyproject.toml.",
+            ))
+
+    # Direction A additional: manifest requires_module_slugs must correspond to main deps
+    for req_slug in pkg.manifest_requires_module_slugs:
+        req_pkg = pkg_by_slug.get(req_slug)
+        if req_pkg is None:
+            continue
+        if req_pkg.name in pkg.pyproject_runtime_optional_deps:
+            violations.append(Violation(
+                code="ARCH004",
+                file=pkg.root / "pyproject.toml",
+                line=0,
+                message=(
+                    f"Manifest requires= declares kind='module' for '{req_slug}' "
+                    f"but '{req_pkg.name}' is only a runtime-optional pyproject dependency, not a main dep."
+                ),
+                fix=(
+                    f"Either promote '{req_pkg.name}' to main [project.dependencies] "
+                    f"or move its ModuleRequirement to optional= in module.py."
+                ),
+            ))
+
+    # Direction A: manifest optional_module_slugs must correspond to runtime-optional deps
+    for opt_slug in pkg.manifest_optional_module_slugs:
+        opt_pkg = pkg_by_slug.get(opt_slug)
+        if opt_pkg is None:
+            continue
+        if opt_pkg.name in pkg.pyproject_main_deps:
+            violations.append(Violation(
+                code="ARCH004",
+                file=pkg.root / "pyproject.toml",
+                line=0,
+                message=(
+                    f"Manifest optional= declares kind='module' for '{opt_slug}' "
+                    f"but '{opt_pkg.name}' is a main pyproject dependency, not runtime-optional."
+                ),
+                fix=(
+                    f"Move ModuleRequirement(slug='{opt_slug}', kind='module') from optional= to requires= in module.py."
+                ),
             ))
 
     # Direction B: pyproject main deps have cauldron-X but manifest makes no mention of it.
@@ -728,6 +870,8 @@ def _root_package_infos(
     pyproject_deps = _pyproject_cauldron_deps(root_pyproject) if root_pyproject.exists() else set()
     pyproject_main_deps = _pyproject_main_cauldron_deps(root_pyproject) if root_pyproject.exists() else set()
     pyproject_optional_deps = _pyproject_optional_only_cauldron_deps(root_pyproject) if root_pyproject.exists() else set()
+    pyproject_test_deps = _pyproject_test_cauldron_deps(root_pyproject) if root_pyproject.exists() else set()
+    pyproject_runtime_optional_deps = _pyproject_runtime_optional_cauldron_deps(root_pyproject) if root_pyproject.exists() else set()
     pkg_name = _pyproject_name(root_pyproject) if root_pyproject.exists() else "cauldron"
 
     infos: list[PackageInfo] = []
@@ -758,6 +902,11 @@ def _root_package_infos(
             pyproject_deps=pyproject_deps,
             pyproject_main_deps=pyproject_main_deps,
             pyproject_optional_deps=pyproject_optional_deps,
+            manifest_requires_module_slugs=set(fields.get("manifest_requires_module_slugs", [])),
+            manifest_optional_module_slugs=set(fields.get("manifest_optional_module_slugs", [])),
+            pyproject_test_deps=pyproject_test_deps,
+            pyproject_runtime_optional_deps=pyproject_runtime_optional_deps,
+            has_module_manifest=True,
         ))
 
     if not infos:
@@ -781,6 +930,11 @@ def _root_package_infos(
             pyproject_deps=pyproject_deps,
             pyproject_main_deps=pyproject_main_deps,
             pyproject_optional_deps=pyproject_optional_deps,
+            manifest_requires_module_slugs=set(),
+            manifest_optional_module_slugs=set(),
+            pyproject_test_deps=pyproject_test_deps,
+            pyproject_runtime_optional_deps=pyproject_runtime_optional_deps,
+            has_module_manifest=False,
         ))
 
     return infos
@@ -829,6 +983,8 @@ def discover_project_modules(
         pyproject_deps = _pyproject_cauldron_deps(pyproject) if pyproject.exists() else set()
         pyproject_main_deps = _pyproject_main_cauldron_deps(pyproject) if pyproject.exists() else set()
         pyproject_optional_deps = _pyproject_optional_only_cauldron_deps(pyproject) if pyproject.exists() else set()
+        pyproject_test_deps = _pyproject_test_cauldron_deps(pyproject) if pyproject.exists() else set()
+        pyproject_runtime_optional_deps = _pyproject_runtime_optional_cauldron_deps(pyproject) if pyproject.exists() else set()
 
         for module_py in module_files:
             fields = _extract_manifest_fields(module_py)
@@ -841,14 +997,7 @@ def discover_project_modules(
             cap_impls = fields.get("capability_implementations", [])
 
             for ns in namespaces:
-                if ns in namespace_seen:
-                    config_errors.append(
-                        f"DUPLICATE NAMESPACE: '{ns}' is claimed by both "
-                        f"'{namespace_seen[ns]}' and '{pkg_name}' (project module). "
-                        f"Each Python namespace must have exactly one owner."
-                    )
-                else:
-                    namespace_seen[ns] = pkg_name
+                _register_namespace(ns, pkg_name, namespace_seen, config_errors)
 
             _validate_api_paths(namespaces, public_api, cap_impls, pkg_name, config_errors)
 
@@ -865,6 +1014,11 @@ def discover_project_modules(
                 pyproject_deps=pyproject_deps,
                 pyproject_main_deps=pyproject_main_deps,
                 pyproject_optional_deps=pyproject_optional_deps,
+                manifest_requires_module_slugs=set(fields.get("manifest_requires_module_slugs", [])),
+                manifest_optional_module_slugs=set(fields.get("manifest_optional_module_slugs", [])),
+                pyproject_test_deps=pyproject_test_deps,
+                pyproject_runtime_optional_deps=pyproject_runtime_optional_deps,
+                has_module_manifest=True,
             ))
 
     return infos
@@ -941,8 +1095,8 @@ def run_checks(
                     check_file(py_file, pkg, ns_to_pkg, is_test)
                 )
 
-        # ARCH004 — run for packages/ packages only; root pkgs use repo pyproject
-        if pkg in packages:
+        # ARCH004 — run for packages/ packages and project modules with pyproject.toml
+        if pkg in packages or (pkg in project_pkgs and (pkg.root / "pyproject.toml").exists()):
             all_violations.extend(check_arch004(pkg, pkg_by_slug, pkg_by_name))
 
     return all_violations, config_errors

@@ -18,8 +18,23 @@ def _ctx():
     from django.contrib.auth import get_user_model
     from cauldron_ai_admin.tools import AdminAIToolContext
     User = get_user_model()
-    user, _ = User.objects.get_or_create(username="site-tools-user")
+    user, _ = User.objects.get_or_create(
+        username="site-tools-user",
+        defaults={"is_superuser": True, "is_staff": True},
+    )
+    if not user.is_superuser:
+        user.is_superuser = True
+        user.save(update_fields=["is_superuser"])
     return AdminAIToolContext(actor=user, run_id="r1", correlation_id="c1")
+
+
+def _ctx_deny(*perms_to_deny):
+    """Context whose actor denies the specified permissions."""
+    from types import SimpleNamespace
+    from cauldron_ai_admin.tools import AdminAIToolContext
+    denied = set(perms_to_deny)
+    actor = SimpleNamespace(has_perm=lambda perm: perm not in denied)
+    return AdminAIToolContext(actor=actor, run_id="r1", correlation_id="c1")
 
 
 def _make_build_result(ok=True, pages_built=1, output_dir="/tmp/out", error="", build_log=""):
@@ -79,8 +94,10 @@ def test_site_tools_register_into_fresh_registry():
     site_tools.register(reg)
 
     names = {d.name for d in reg.all_definitions()}
+    assert "site.verify_root" in names
     assert "site.inspect" in names
     assert "site.stage_theme" in names
+    assert "site.propose_homepage" in names
     assert "site.prepare_change_set" in names
     assert "site.inspect_preview" in names
     assert "site.publish" in names
@@ -417,8 +434,8 @@ def test_publish_success_with_no_content_requests(tmp_path: Path):
 
     assert result.success is True
     assert result.data["pages_built"] == 3
-    # preview_url for a published site is the live site root, not a fs path.
-    assert result.data["preview_url"] == "/"
+    # live_url for a published site is the live site root, not a fs path.
+    assert result.data["live_url"] == "/"
 
     cs.refresh_from_db()
     assert cs.status == SiteChangeSet.PUBLISHED
@@ -494,3 +511,473 @@ def test_publish_get_build_service_error():
 
     assert result.success is False
     assert "config missing" in result.message
+
+
+# ---------------------------------------------------------------------------
+# site.verify_root
+# ---------------------------------------------------------------------------
+
+
+def test_verify_root_success_returns_diagnostics(tmp_path: Path):
+    from cauldron_site_astro.site_tools import _handle_verify_root as handle_verify_root
+
+    config = _make_config(tmp_path)
+    svc = _make_mock_svc(config)
+
+    mock_diag = {
+        "healthy": True,
+        "checks": {
+            "homepage_content": {"status": "published", "ok": True},
+            "root_artifact": {"status": "ok", "ok": True},
+            "root_route": {"status": "ok", "ok": True, "http_status": 200},
+        },
+    }
+
+    with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+        with patch(
+            "cauldron_site_astro.site_tools.run_site_diagnostics",
+            return_value=mock_diag,
+        ):
+            result = handle_verify_root(_ctx())
+
+    assert result.success is True
+    assert result.data["healthy"] is True
+    assert "checks" in result.data
+
+
+def test_verify_root_build_service_error_still_runs(tmp_path: Path):
+    """Even when get_build_service fails, diagnostics run with output_root=None."""
+    from cauldron_site_astro.site_tools import _handle_verify_root as handle_verify_root
+
+    mock_diag = {
+        "healthy": False,
+        "checks": {
+            "homepage_content": {"status": "unavailable", "ok": False},
+            "root_artifact": {"status": "unconfigured", "ok": False},
+            "root_route": {"status": "route_not_found", "ok": False},
+        },
+    }
+
+    with patch(
+        "cauldron_site_astro.site_tools.get_build_service",
+        side_effect=Exception("no config"),
+    ):
+        with patch(
+            "cauldron_site_astro.site_tools.run_site_diagnostics",
+            return_value=mock_diag,
+        ) as mock_run:
+            result = handle_verify_root(_ctx())
+
+    assert result.success is True
+    assert result.data["healthy"] is False
+    # output_root must have been passed as None when build service failed
+    call_kwargs = mock_run.call_args.kwargs
+    assert call_kwargs["output_root"] is None
+
+
+def test_verify_root_diagnostics_exception_returns_failure(tmp_path: Path):
+    from cauldron_site_astro.site_tools import _handle_verify_root as handle_verify_root
+
+    config = _make_config(tmp_path)
+    svc = _make_mock_svc(config)
+
+    with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+        with patch(
+            "cauldron_site_astro.site_tools.run_site_diagnostics",
+            side_effect=RuntimeError("unexpected"),
+        ):
+            result = handle_verify_root(_ctx())
+
+    assert result.success is False
+    assert "unexpected" in result.message
+
+
+# ---------------------------------------------------------------------------
+# site.propose_homepage
+# ---------------------------------------------------------------------------
+
+
+def _make_change_request_result(ok=True, request_id="cr-uuid-1"):
+    from types import SimpleNamespace
+    err_ns = None
+    if not ok:
+        err_ns = SimpleNamespace(message="proposal failed", code="ops.error")
+    return SimpleNamespace(ok=ok, request_id=request_id, error=err_ns)
+
+
+def test_propose_homepage_service_unavailable():
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=None,
+    ):
+        result = handle_propose_homepage(_ctx(), title="Home", body="Welcome!")
+
+    assert result.success is False
+    assert "unavailable" in result.message.lower()
+
+
+def test_propose_homepage_create_success():
+    """When no existing homepage, kind='create' and cs_id is returned."""
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    mock_svc.get_item.return_value = None
+    mock_svc.create_change_request.return_value = _make_change_request_result(
+        ok=True, request_id="new-cr-id"
+    )
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        result = handle_propose_homepage(_ctx(), title="Home", body="Welcome!")
+
+    assert result.success is True
+    assert result.data["cs_id"] == "new-cr-id"
+    assert result.data["kind"] == "create"
+    assert result.data["status"] == "proposed"
+
+
+def test_propose_homepage_update_uses_expected_hash():
+    """When homepage exists, kind='update' and expected_hash from existing item."""
+    from types import SimpleNamespace
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    existing_item = SimpleNamespace(status="published", hash="existing-hash-abc")
+    mock_svc = MagicMock()
+    mock_svc.get_item.return_value = existing_item
+    mock_svc.create_change_request.return_value = _make_change_request_result(
+        ok=True, request_id="update-cr-id"
+    )
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        result = handle_propose_homepage(_ctx(), title="Updated Home", body="New body.")
+
+    assert result.success is True
+    assert result.data["kind"] == "update"
+    assert result.data["cs_id"] == "update-cr-id"
+
+    # Verify expected_hash was passed to build_homepage_operation via create_change_request
+    call_kwargs = mock_svc.create_change_request.call_args.kwargs
+    ops = call_kwargs["operations"]
+    assert len(ops) == 1
+    assert ops[0]["expected_hash"] == "existing-hash-abc"
+
+
+def test_propose_homepage_proposal_failure():
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    mock_svc.get_item.return_value = None
+    mock_svc.create_change_request.return_value = _make_change_request_result(ok=False)
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        result = handle_propose_homepage(_ctx(), title="Home", body="Welcome!")
+
+    assert result.success is False
+    assert "proposal failed" in result.message.lower()
+
+
+def test_propose_homepage_singleton_fields_are_fixed():
+    """Item ID, slug, collection, schema, template must not be caller-overrideable."""
+    from cauldron_content.homepage import (
+        HOMEPAGE_ITEM_ID,
+        HOMEPAGE_COLLECTION,
+        HOMEPAGE_SCHEMA,
+        HOMEPAGE_TEMPLATE,
+    )
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    mock_svc.get_item.return_value = None
+    mock_svc.create_change_request.return_value = _make_change_request_result(
+        ok=True, request_id="singleton-cr"
+    )
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        handle_propose_homepage(_ctx(), title="T", body="B")
+
+    call_kwargs = mock_svc.create_change_request.call_args.kwargs
+    op = call_kwargs["operations"][0]
+
+    assert op["item_id"] == HOMEPAGE_ITEM_ID
+    assert op["slug"] == HOMEPAGE_ITEM_ID
+    assert op["collection"] == HOMEPAGE_COLLECTION
+    assert op["schema"] == HOMEPAGE_SCHEMA
+    assert op["data"]["template"] == HOMEPAGE_TEMPLATE
+
+
+def test_propose_homepage_optional_fields_passed():
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    mock_svc.get_item.return_value = None
+    mock_svc.create_change_request.return_value = _make_change_request_result(ok=True)
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        handle_propose_homepage(
+            _ctx(),
+            title="Home",
+            body="Body",
+            navigation_title="Nav",
+            summary="Sum",
+            seo_title="SEO",
+            meta_description="Meta",
+        )
+
+    call_kwargs = mock_svc.create_change_request.call_args.kwargs
+    op = call_kwargs["operations"][0]
+    data = op.get("data", {})
+    assert data.get("navigation_title") == "Nav"
+    assert data.get("summary") == "Sum"
+    assert data.get("seo_title") == "SEO"
+    assert data.get("meta_description") == "Meta"
+
+
+def test_propose_homepage_create_request_exception():
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    mock_svc.get_item.return_value = None
+    mock_svc.create_change_request.side_effect = RuntimeError("DB failure")
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        result = handle_propose_homepage(_ctx(), title="Home", body="Welcome!")
+
+    assert result.success is False
+    assert "DB failure" in result.message
+
+
+# ---------------------------------------------------------------------------
+# site.propose_homepage — Section 6 additions
+# ---------------------------------------------------------------------------
+
+
+def test_propose_homepage_lacks_view_published_perm():
+    """Actor without view_published_content → tool failure, no create_change_request."""
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    ctx = _ctx_deny("cauldron_content_operations.view_published_content")
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        result = handle_propose_homepage(ctx, title="T", body="B")
+
+    assert result.success is False
+    assert "view_published_content" in result.message
+    mock_svc.create_change_request.assert_not_called()
+
+
+def test_propose_homepage_lacks_view_draft_perm():
+    """Actor without view_draft_content → tool failure, no create_change_request."""
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    ctx = _ctx_deny("cauldron_content_operations.view_draft_content")
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        result = handle_propose_homepage(ctx, title="T", body="B")
+
+    assert result.success is False
+    assert "view_draft_content" in result.message
+    mock_svc.create_change_request.assert_not_called()
+
+
+def test_propose_homepage_lookup_failure_is_tool_failure():
+    """get_item raising never silently falls through to a create operation."""
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    mock_svc.get_item.side_effect = RuntimeError("DB timeout")
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        result = handle_propose_homepage(_ctx(), title="Home", body="Body")
+
+    assert result.success is False
+    assert "lookup failed" in result.message.lower() or "DB timeout" in result.message
+    mock_svc.create_change_request.assert_not_called()
+
+
+def test_propose_homepage_draft_homepage_produces_update():
+    """Draft homepage detected via include_drafts=True → kind='update'."""
+    from types import SimpleNamespace
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    draft_item = SimpleNamespace(status="draft", hash="draft-hash-xyz")
+    mock_svc = MagicMock()
+    mock_svc.get_item.return_value = draft_item
+    mock_svc.create_change_request.return_value = _make_change_request_result(
+        ok=True, request_id="cr-draft-update"
+    )
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        result = handle_propose_homepage(_ctx(), title="T", body="B")
+
+    assert result.success is True
+    assert result.data["kind"] == "update"
+
+    call_kwargs = mock_svc.get_item.call_args.kwargs
+    assert call_kwargs.get("include_drafts") is True
+
+    op_kwargs = mock_svc.create_change_request.call_args.kwargs
+    assert op_kwargs["operations"][0]["expected_hash"] == "draft-hash-xyz"
+
+
+def test_propose_homepage_get_item_called_with_include_drafts_true():
+    """get_item is always called with include_drafts=True."""
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    mock_svc.get_item.return_value = None
+    mock_svc.create_change_request.return_value = _make_change_request_result(ok=True)
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        handle_propose_homepage(_ctx(), title="T", body="B")
+
+    call_kwargs = mock_svc.get_item.call_args.kwargs
+    assert call_kwargs.get("include_drafts") is True
+
+
+def test_propose_homepage_provider_name_is_empty():
+    """provider_name must be '' so content routing selects the authoritative provider."""
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    mock_svc.get_item.return_value = None
+    mock_svc.create_change_request.return_value = _make_change_request_result(ok=True)
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        handle_propose_homepage(_ctx(), title="T", body="B")
+
+    call_kwargs = mock_svc.create_change_request.call_args.kwargs
+    assert call_kwargs["provider_name"] == ""
+
+
+def test_propose_homepage_idempotency_key_forwarded():
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    mock_svc.get_item.return_value = None
+    mock_svc.create_change_request.return_value = _make_change_request_result(ok=True)
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        handle_propose_homepage(_ctx(), title="T", body="B", idempotency_key="my-key")
+
+    call_kwargs = mock_svc.create_change_request.call_args.kwargs
+    assert call_kwargs["idempotency_key"] == "my-key"
+
+
+def test_propose_homepage_caller_description_forwarded():
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    mock_svc.get_item.return_value = None
+    mock_svc.create_change_request.return_value = _make_change_request_result(ok=True)
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        handle_propose_homepage(_ctx(), title="T", body="B", description="My custom desc")
+
+    call_kwargs = mock_svc.create_change_request.call_args.kwargs
+    assert call_kwargs["description"] == "My custom desc"
+
+
+def test_propose_homepage_generated_description_when_no_caller_desc():
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    mock_svc.get_item.return_value = None
+    mock_svc.create_change_request.return_value = _make_change_request_result(ok=True)
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        handle_propose_homepage(_ctx(), title="My Homepage", body="B")
+
+    call_kwargs = mock_svc.create_change_request.call_args.kwargs
+    assert "My Homepage" in call_kwargs["description"]
+
+
+def test_propose_homepage_schema_has_additional_properties_false():
+    from cauldron_ai_admin.tools import AdminAIToolRegistry
+    from cauldron_site_astro import site_tools
+
+    reg = AdminAIToolRegistry()
+    site_tools.register(reg)
+
+    defn = next(d for d in reg.all_definitions() if d.name == "site.propose_homepage")
+    assert defn.argument_schema.get("additionalProperties") is False
+
+
+def test_propose_homepage_all_seo_fields_passed():
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    mock_svc.get_item.return_value = None
+    mock_svc.create_change_request.return_value = _make_change_request_result(ok=True)
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        handle_propose_homepage(
+            _ctx(),
+            title="T",
+            body="B",
+            canonical_url="https://example.com/",
+            robots_index=False,
+            robots_follow=False,
+            social_title="Social T",
+            social_description="Social D",
+            social_image="/img/social.jpg",
+        )
+
+    call_kwargs = mock_svc.create_change_request.call_args.kwargs
+    data = call_kwargs["operations"][0].get("data", {})
+    assert data.get("canonical_url") == "https://example.com/"
+    assert data.get("robots_index") is False
+    assert data.get("robots_follow") is False
+    assert data.get("social_title") == "Social T"
+    assert data.get("social_description") == "Social D"
+    assert data.get("social_image") == "/img/social.jpg"

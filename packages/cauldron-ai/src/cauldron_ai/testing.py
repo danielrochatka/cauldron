@@ -70,3 +70,34 @@ class FakeAIModelProvider:
     def reset(self) -> None:
         self._responses.clear()
         self._requests.clear()
+
+
+def reset_provider_registry_for_tests() -> None:
+    """Clear the global AI provider registry between test runs."""
+    from .providers import _reset_registry_for_tests
+    _reset_registry_for_tests()
+
+
+def reset_prompt_registry_for_tests() -> None:
+    """Clear the global prompt template registry between test runs."""
+    from .prompt_templates import _reset_prompt_registry_for_tests
+    _reset_prompt_registry_for_tests()
+
+
+def plant_factory_bypassing_validation(name: str, factory: object) -> None:
+    """Plant a provider factory in the registry without normal validation.
+
+    For tests that need to exercise error-handling paths that would not be
+    reachable through the normal registration API (e.g. a factory missing
+    required methods). Returns a cleanup callable.
+    """
+    from .providers import _registry
+    with _registry._lock:
+        _registry._factories[name] = factory  # type: ignore[attr-defined]
+
+
+def remove_factory_bypassed(name: str) -> None:
+    """Remove a factory that was planted via plant_factory_bypassing_validation."""
+    from .providers import _registry
+    with _registry._lock:
+        _registry._factories.pop(name, None)  # type: ignore[attr-defined]

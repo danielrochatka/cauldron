@@ -130,7 +130,10 @@ def _schema_allowed_fields(svc: Any, schema_name: str | None) -> list[str] | Non
                 schema_dir = getattr(getattr(repo, "_config", None), "schema_dir", None)
                 if schema_dir is None:
                     continue
-                from cauldron_cms_flatfile.validator import SchemaError, load_schema
+                try:
+                    from cauldron_cms_flatfile.validator import SchemaError, load_schema
+                except ImportError:
+                    continue
                 schema = load_schema(schema_dir, schema_name)
                 props = schema.get("properties", {})
                 return sorted(props.keys()) if props else None

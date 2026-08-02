@@ -6,8 +6,8 @@ from cauldron_ai.prompt_templates import (
     AIGlobalOperatingPrompt,
     AIToolPromptTemplate,
     AIPromptTemplateRegistry,
-    _reset_prompt_registry_for_tests,
 )
+from cauldron_ai.testing import reset_prompt_registry_for_tests
 from cauldron_ai_admin.tools import (
     AdminAIToolDefinition,
     AdminAIToolRegistry,
@@ -71,9 +71,9 @@ def _noop_handler(context, **kwargs):
 
 @pytest.fixture(autouse=True)
 def reset_registry():
-    _reset_prompt_registry_for_tests()
+    reset_prompt_registry_for_tests()
     yield
-    _reset_prompt_registry_for_tests()
+    reset_prompt_registry_for_tests()
 
 
 # ---------------------------------------------------------------------------

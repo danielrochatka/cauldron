@@ -23,6 +23,7 @@ flatfile = [
 test = [
     "cauldron-workspace-flatfile>=0.1.0",
     "cauldron-site-astro>=0.1.0",
+    "cauldron-content>=0.1.0",
 ]
 
 [project.entry-points."cauldron.modules"]

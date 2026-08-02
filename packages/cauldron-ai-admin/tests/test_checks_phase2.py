@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from django.test.utils import override_settings
 
-from cauldron_ai.providers import _reset_registry_for_tests
+from cauldron_ai.testing import reset_provider_registry_for_tests
 
 
 ACTIVE_MODULES = {
@@ -20,9 +20,9 @@ ACTIVE_MODULES = {
 
 @pytest.fixture(autouse=True)
 def clean_registry():
-    _reset_registry_for_tests()
+    reset_provider_registry_for_tests()
     yield
-    _reset_registry_for_tests()
+    reset_provider_registry_for_tests()
 
 
 @pytest.fixture()
@@ -167,8 +167,8 @@ def test_e011_no_error_when_no_factories(isolated_store):
 @pytest.mark.django_db
 def test_e011_error_when_factory_missing_test_connection(isolated_store):
     """A misregistered factory is caught before request-time."""
-    from cauldron_ai.providers import _registry
     from cauldron_ai.provider_configuration import AIProviderConfigurationSpec
+    from cauldron_ai.testing import plant_factory_bypassing_validation, remove_factory_bypassed
     from cauldron_ai_admin.checks import check_provider_factory_contracts
 
     class _Broken:
@@ -186,15 +186,13 @@ def test_e011_error_when_factory_missing_test_connection(isolated_store):
         # Missing test_connection intentionally.
 
     # Bypass the registry validation to plant a corrupt factory.
-    with _registry._lock:
-        _registry._factories["broken"] = _Broken()
+    plant_factory_bypassing_validation("broken", _Broken())
     try:
         with override_settings(CAULDRON_MODULES=ACTIVE_MODULES):
             errors = check_provider_factory_contracts(None)
         assert any(e.id == "admin_ai.E011" for e in errors)
     finally:
-        with _registry._lock:
-            _registry._factories.pop("broken", None)
+        remove_factory_bypassed("broken")
 
 
 # ---------------------------------------------------------------------------

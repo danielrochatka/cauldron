@@ -19,6 +19,9 @@ ai = [
     "cauldron-ai-admin>=0.1.0",
     "cauldron-admin-content>=0.1.0",
 ]
+test = [
+    "cauldron-ai-admin>=0.1.0",
+]
 
 [project.entry-points."cauldron.modules"]
 "cauldron.site.astro" = "cauldron_site_astro.module:module"

@@ -43,7 +43,8 @@ def _get_builtin_templates() -> tuple:
             required_permission="cauldron_content_operations.view_published_content",
             risk_level="READ_ONLY",
             read_scope=(
-                "Homepage content item status (published/draft/missing). "
+                "Homepage content item status "
+                "(published/draft/missing/not_published/unavailable/error). "
                 "Whether root index.html exists and is non-empty. "
                 "HTTP response code for GET '/'. No file contents or paths returned."
             ),
@@ -71,13 +72,25 @@ def _get_builtin_templates() -> tuple:
                 "Use this tool at the start of any site-creation workflow to "
                 "determine what state the site is in before proposing changes. "
                 "Use it again after a successful publish to confirm the site is live. "
-                "If homepage_content is 'missing' or 'not_published', call "
-                "site.propose_homepage next. "
-                "'not_published' means nothing is published but the actor cannot "
-                "see drafts — do not assume the item is absent. "
+                "homepage_content guidance by status:\n"
+                "  'published' — Homepage is live. Preserve it unless the user "
+                "explicitly requests an update.\n"
+                "  'draft' — A Homepage exists but is not published. Treat it as "
+                "present; call site.propose_homepage only when the user requests "
+                "a change or a new publish proposal.\n"
+                "  'missing' — The actor has draft visibility and no Homepage exists "
+                "at all; call site.propose_homepage to create one.\n"
+                "  'not_published' — The actor lacks view_draft_content; absence "
+                "cannot be safely determined. Report that draft visibility is "
+                "required. Do NOT call site.propose_homepage, because that tool "
+                "also requires view_draft_content.\n"
+                "  'unavailable' or 'error' — Report the diagnostic problem and "
+                "stop; do not proceed to content proposals.\n"
                 "If root_artifact is 'missing', a publish has not yet occurred. "
-                "If root_route is 'route_not_found', the public URL routing may not "
-                "be configured — do not infer the site is down."
+                "If root_route is 'route_not_found', no Django URL pattern resolves "
+                "'/' — this is a configuration gap, not a site outage. "
+                "If root_route is 'not_found', the root view resolved but returned "
+                "a 404 — commonly because the generated Homepage artifact is absent."
             ),
             refusal_behavior=(
                 "Refuse if the actor lacks view_published_content permission."
@@ -94,8 +107,12 @@ def _get_builtin_templates() -> tuple:
             ),
             boundary_examples=(
                 "Do not expose filesystem paths from check results.",
-                "Do not treat root_route 'not_found' as a site outage — "
-                "the route may simply not be configured in the URL conf.",
+                "Distinguish route_not_found (no Django URL pattern for '/') from "
+                "not_found (the root view resolved but returned 404 or raised "
+                "Http404 — commonly because the Homepage artifact is absent).",
+                "Do not call site.propose_homepage when homepage_content is "
+                "'not_published' — the actor lacks view_draft_content, which "
+                "site.propose_homepage also requires.",
                 "Do not skip this check before recommending site.propose_homepage.",
             ),
         ),

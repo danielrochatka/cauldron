@@ -365,6 +365,63 @@ def test_resolve_root_does_not_raise():
 
 
 # ---------------------------------------------------------------------------
+# Real URLconf integration tests (no _resolve_root mock)
+# ---------------------------------------------------------------------------
+
+def _root_200_view(request):
+    from django.http import HttpResponse
+    return HttpResponse("<html><body>Home</body></html>", content_type="text/html")
+
+
+def _root_404_view(request):
+    from django.http import Http404
+    raise Http404("not found")
+
+
+# Module-level urlpatterns that override_settings can point at.
+_urlpatterns_200 = [
+    __import__("django.urls", fromlist=["path"]).path("", _root_200_view),
+]
+_urlpatterns_404 = [
+    __import__("django.urls", fromlist=["path"]).path("", _root_404_view),
+]
+
+
+def test_check_root_route_real_urlconf_ok():
+    """Real URLconf with a 200 text/html root view → status 'ok', no _resolve_root mock."""
+    from django.test import override_settings
+    from cauldron_site_astro.site_diagnostics import check_root_route
+
+    urlconf_module = type(
+        "RootOKConf", (), {"urlpatterns": _urlpatterns_200}
+    )
+
+    with override_settings(ROOT_URLCONF=urlconf_module):
+        result = check_root_route()
+
+    assert result["status"] == "ok"
+    assert result["ok"] is True
+    assert result["http_status"] == 200
+
+
+def test_check_root_route_real_urlconf_http404():
+    """Real URLconf whose root view raises Http404 → status 'not_found', not 'route_not_found'."""
+    from django.test import override_settings
+    from cauldron_site_astro.site_diagnostics import check_root_route
+
+    urlconf_module = type(
+        "RootHttp404Conf", (), {"urlpatterns": _urlpatterns_404}
+    )
+
+    with override_settings(ROOT_URLCONF=urlconf_module):
+        result = check_root_route()
+
+    assert result["status"] == "not_found"
+    assert result["ok"] is False
+    assert result["http_status"] == 404
+
+
+# ---------------------------------------------------------------------------
 # run_site_diagnostics
 # ---------------------------------------------------------------------------
 

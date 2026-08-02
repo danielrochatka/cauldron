@@ -126,8 +126,15 @@ def _make_fake_package(
 ) -> None:
     """Create a minimal fake Cauldron package in root/packages/<pkg_name>/."""
     pkg_dir = root / "packages" / pkg_name
-    src_ns_dir = pkg_dir / "src" / namespace
-    src_ns_dir.mkdir(parents=True, exist_ok=True)
+    ns_parts = namespace.split(".")
+    src_ns_dir = pkg_dir / "src" / Path(*ns_parts)
+    # Create each ancestor directory with __init__.py
+    parent = pkg_dir / "src"
+    parent.mkdir(parents=True, exist_ok=True)
+    for part in ns_parts:
+        parent = parent / part
+        parent.mkdir(parents=True, exist_ok=True)
+        (parent / "__init__.py").write_text("", encoding="utf-8")
 
     public_api_str = ", ".join(f'"{p}"' for p in public_api)
     cap_impl_str = ", ".join(f'"{p}"' for p in (capability_implementations or []))
@@ -163,8 +170,6 @@ def _make_fake_package(
         f'module = BaseModule(_manifest)\n',
         encoding="utf-8",
     )
-
-    (src_ns_dir / "__init__.py").write_text("", encoding="utf-8")
 
     for filename, content in (src_files or {}).items():
         (src_ns_dir / filename).write_text(content, encoding="utf-8")
@@ -715,39 +720,21 @@ def test_duplicate_namespace_project_and_packaged():
 # ---------------------------------------------------------------------------
 
 def test_dotted_namespace_self_import_allowed():
-    """A package owning a cauldron_* namespace can import within itself freely."""
+    """A package owning a genuine dotted namespace can import within itself freely."""
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
 
-        # Package owns cauldron_myapp_core namespace (cauldron-prefixed so the checker inspects it)
-        pkg_dir = root / "packages" / "cauldron-myapp-core"
-        src_ns_dir = pkg_dir / "src" / "cauldron_myapp_core"
-        src_ns_dir.mkdir(parents=True, exist_ok=True)
-        (src_ns_dir / "__init__.py").write_text("", encoding="utf-8")
-        (src_ns_dir / "module.py").write_text(
-            'from cauldron.modules import BaseModule, ModuleManifest\n'
-            '_manifest = ModuleManifest(\n'
-            '    slug="cauldron.myapp.core",\n'
-            '    label="MyApp Core",\n'
-            '    namespaces=("cauldron_myapp_core",),\n'
-            '    public_api=("cauldron_myapp_core.api", "cauldron_myapp_core.utils"),\n'
-            ')\n'
-            'module = BaseModule(_manifest)\n',
-            encoding="utf-8",
-        )
-        # File in cauldron_myapp_core.api imports from cauldron_myapp_core.utils (same package)
-        (src_ns_dir / "api.py").write_text(
-            "from cauldron_myapp_core.utils import helper\n",
-            encoding="utf-8",
-        )
-        (src_ns_dir / "utils.py").write_text(
-            "def helper(): pass\n",
-            encoding="utf-8",
-        )
-        (pkg_dir / "pyproject.toml").write_text(
-            '[project]\nname = "cauldron-myapp-core"\nversion = "0.1.0"\n'
-            'requires-python = ">=3.11"\ndependencies = ["cauldron>=0.1.0"]\n',
-            encoding="utf-8",
+        # Package owns myapp.core dotted namespace
+        _make_fake_package(
+            root,
+            pkg_name="myapp-core",
+            slug="myapp.core",
+            namespace="myapp.core",
+            public_api=["myapp.core.api", "myapp.core.utils"],
+            src_files={
+                "api.py": "from myapp.core.utils import helper\n",
+                "utils.py": "def helper(): pass\n",
+            },
         )
 
         result = _run_arch_check(root)
@@ -756,30 +743,30 @@ def test_dotted_namespace_self_import_allowed():
 
 
 def test_dotted_namespace_cross_module_import():
-    """Package A importing from Package B's namespace without a dep declaration raises ARCH001."""
+    """Package A importing from Package B's dotted namespace without a dep declaration raises ARCH001."""
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
 
-        # Package B owns cauldron_myapp_core namespace
+        # Package B owns myapp.core dotted namespace
         _make_fake_package(
             root,
-            pkg_name="cauldron-myapp-core",
-            slug="cauldron.myapp.core",
-            namespace="cauldron_myapp_core",
-            public_api=["cauldron_myapp_core.utils"],
+            pkg_name="myapp-core",
+            slug="myapp.core",
+            namespace="myapp.core",
+            public_api=["myapp.core.utils"],
             src_files={"utils.py": "class Thing: pass\n"},
         )
 
-        # Package A owns cauldron_myapp_api namespace and imports from cauldron_myapp_core without any dep
+        # Package A owns myapp.api and imports from myapp.core without any dep
         _make_fake_package(
             root,
-            pkg_name="cauldron-myapp-api",
-            slug="cauldron.myapp.api",
-            namespace="cauldron_myapp_api",
-            public_api=["cauldron_myapp_api.views"],
-            pyproject_deps=[],  # no dep on cauldron-myapp-core!
+            pkg_name="myapp-api",
+            slug="myapp.api",
+            namespace="myapp.api",
+            public_api=["myapp.api.views"],
+            pyproject_deps=[],  # no dep on myapp-core!
             src_files={
-                "views.py": "from cauldron_myapp_core.utils import Thing\n",
+                "views.py": "from myapp.core.utils import Thing\n",
             },
         )
 
@@ -1252,3 +1239,558 @@ def test_root_checker_clean_undiscovered_fixture_import():
     assert result.returncode == 0, (
         f"Integration root fixture import should be allowed without pyproject entry:\n{result.stdout}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Part 1: Dotted-namespace ownership resolution
+# ---------------------------------------------------------------------------
+
+def test_private_path_under_dotted_namespace():
+    """ARCH002 fires for _-prefixed subpath under a genuinely dotted namespace."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        _make_fake_package(
+            root,
+            pkg_name="myapp-core",
+            slug="myapp.core",
+            namespace="myapp.core",
+            public_api=["myapp.core.api"],
+            src_files={
+                "api.py": "",
+                "_internal.py": "X = 1\n",
+            },
+        )
+
+        _make_fake_package(
+            root,
+            pkg_name="myapp-consumer",
+            slug="myapp.consumer",
+            namespace="myapp.consumer",
+            public_api=["myapp.consumer.api"],
+            pyproject_deps=["myapp-core"],
+            requires=[("myapp.core", "module")],
+            src_files={
+                "api.py": "from myapp.core._internal import X\n",
+            },
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 1, f"Expected ARCH002 for private path:\n{result.stdout}"
+    assert "ARCH002" in result.stdout
+
+
+def test_non_public_path_under_dotted_namespace():
+    """ARCH002 fires for a subpath outside public_api under a dotted namespace."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        _make_fake_package(
+            root,
+            pkg_name="myapp-core",
+            slug="myapp.core",
+            namespace="myapp.core",
+            public_api=["myapp.core.api"],
+            src_files={
+                "api.py": "",
+                "internals.py": "X = 1\n",
+            },
+        )
+
+        _make_fake_package(
+            root,
+            pkg_name="myapp-consumer",
+            slug="myapp.consumer",
+            namespace="myapp.consumer",
+            public_api=["myapp.consumer.api"],
+            pyproject_deps=["myapp-core"],
+            requires=[("myapp.core", "module")],
+            src_files={
+                "api.py": "from myapp.core.internals import X\n",
+            },
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 1, f"Expected ARCH002 for non-public path:\n{result.stdout}"
+    assert "ARCH002" in result.stdout
+
+
+def test_inbound_import_non_cauldron_namespace():
+    """ARCH001 fires even when the imported namespace does not begin with 'cauldron_'."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        _make_fake_package(
+            root,
+            pkg_name="myapp-core",
+            slug="myapp.core",
+            namespace="myapp.core",
+            public_api=["myapp.core.api"],
+            src_files={"api.py": "class Thing: pass\n"},
+        )
+
+        # Package B imports myapp.core.api WITHOUT declaring the dep
+        _make_fake_package(
+            root,
+            pkg_name="myapp-consumer",
+            slug="myapp.consumer",
+            namespace="myapp.consumer",
+            public_api=["myapp.consumer.api"],
+            pyproject_deps=[],  # undeclared!
+            src_files={
+                "api.py": "from myapp.core.api import Thing\n",
+            },
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 1, (
+        f"Expected ARCH001 for undeclared cross-package non-cauldron import:\n{result.stdout}"
+    )
+    assert "ARCH001" in result.stdout
+
+
+def test_parent_child_namespace_conflict_overlapping():
+    """Package A claiming 'myapp' and Package B claiming 'myapp.core' produces OVERLAPPING NAMESPACE."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        _make_fake_package(
+            root,
+            pkg_name="myapp-root",
+            slug="myapp.root",
+            namespace="myapp",
+            public_api=["myapp.api"],
+            src_files={"api.py": ""},
+        )
+
+        _make_fake_package(
+            root,
+            pkg_name="myapp-core",
+            slug="myapp.core",
+            namespace="myapp.core",
+            public_api=["myapp.core.api"],
+            src_files={"api.py": ""},
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 1, (
+        f"Expected config error for parent/child namespace overlap:\n{result.stdout}\n{result.stderr}"
+    )
+    assert "OVERLAPPING NAMESPACE" in (result.stdout + result.stderr), (
+        f"Expected OVERLAPPING NAMESPACE in output, got:\n{result.stdout}\n{result.stderr}"
+    )
+
+
+def test_sibling_dotted_namespaces_no_conflict():
+    """Package A claiming 'myapp.core' and Package B claiming 'myapp.extensions' is fine."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        _make_fake_package(
+            root,
+            pkg_name="myapp-core",
+            slug="myapp.core",
+            namespace="myapp.core",
+            public_api=["myapp.core.api"],
+            src_files={"api.py": ""},
+        )
+
+        _make_fake_package(
+            root,
+            pkg_name="myapp-extensions",
+            slug="myapp.extensions",
+            namespace="myapp.extensions",
+            public_api=["myapp.extensions.api"],
+            src_files={"api.py": ""},
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 0, (
+        f"Sibling dotted namespaces should be allowed:\n{result.stdout}\n{result.stderr}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Part 2: has_package_metadata / unpackaged project modules
+# ---------------------------------------------------------------------------
+
+def test_unpackaged_project_module_with_manifest_import_allowed():
+    """Unpackaged project module with correct manifest dep is allowed."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-core",
+            slug="cauldron.core",
+            namespace="cauldron_core",
+            public_api=["cauldron_core.api"],
+            src_files={"api.py": "class Thing: pass\n"},
+        )
+
+        # Project module WITHOUT pyproject.toml
+        mod_dir = root / "modules" / "my-module"
+        src_ns = mod_dir / "src" / "myapp"
+        src_ns.mkdir(parents=True)
+        (src_ns / "__init__.py").write_text("", encoding="utf-8")
+        (src_ns / "module.py").write_text(
+            'from cauldron.modules import BaseModule, ModuleManifest, ModuleRequirement\n'
+            '_manifest = ModuleManifest(\n'
+            '    slug="my.module", label="My Module",\n'
+            '    namespaces=("myapp",),\n'
+            '    public_api=("myapp.api",),\n'
+            '    requires=(ModuleRequirement(slug="cauldron.core", kind="module"),),\n'
+            ')\n'
+            'module = BaseModule(_manifest)\n',
+            encoding="utf-8",
+        )
+        (src_ns / "api.py").write_text(
+            "from cauldron_core.api import Thing\n",
+            encoding="utf-8",
+        )
+        # NO pyproject.toml in mod_dir
+
+        arch_check = Path(__file__).resolve().parent.parent / "tools" / "arch_check.py"
+        result = subprocess.run(
+            [sys.executable, str(arch_check), "--root", str(root),
+             "--module-root", str(root / "modules")],
+            capture_output=True, text=True,
+        )
+
+    assert result.returncode == 0, (
+        f"Unpackaged project module with manifest dep should be allowed:\n{result.stdout}"
+    )
+
+
+def test_unpackaged_project_module_without_manifest_dep_rejected():
+    """Unpackaged project module without a manifest dep declaration raises ARCH001."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-core",
+            slug="cauldron.core",
+            namespace="cauldron_core",
+            public_api=["cauldron_core.api"],
+            src_files={"api.py": "class Thing: pass\n"},
+        )
+
+        mod_dir = root / "modules" / "my-module"
+        src_ns = mod_dir / "src" / "myapp"
+        src_ns.mkdir(parents=True)
+        (src_ns / "__init__.py").write_text("", encoding="utf-8")
+        (src_ns / "module.py").write_text(
+            'from cauldron.modules import BaseModule, ModuleManifest\n'
+            '_manifest = ModuleManifest(\n'
+            '    slug="my.module", label="My Module",\n'
+            '    namespaces=("myapp",),\n'
+            '    public_api=("myapp.api",),\n'
+            # No requires — should trigger ARCH001
+            ')\n'
+            'module = BaseModule(_manifest)\n',
+            encoding="utf-8",
+        )
+        (src_ns / "api.py").write_text(
+            "from cauldron_core.api import Thing\n",
+            encoding="utf-8",
+        )
+        # NO pyproject.toml
+
+        arch_check = Path(__file__).resolve().parent.parent / "tools" / "arch_check.py"
+        result = subprocess.run(
+            [sys.executable, str(arch_check), "--root", str(root),
+             "--module-root", str(root / "modules")],
+            capture_output=True, text=True,
+        )
+
+    assert result.returncode == 1, (
+        f"Unpackaged project module without manifest dep should raise ARCH001:\n{result.stdout}"
+    )
+    assert "ARCH001" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Part 3: Complete dependency-level parity (capabilities + test-only)
+# ---------------------------------------------------------------------------
+
+def test_arch001_runtime_optional_dep_missing_manifest_optional():
+    """ARCH001 fires when a runtime-optional pyproject dep has no manifest optional= entry."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-plugin",
+            slug="cauldron.plugin",
+            namespace="cauldron_plugin",
+            public_api=["cauldron_plugin.api"],
+            src_files={"api.py": "class X: pass\n"},
+        )
+
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-consumer",
+            slug="cauldron.consumer",
+            namespace="cauldron_consumer",
+            public_api=["cauldron_consumer.api"],
+            pyproject_deps=[],
+            pyproject_optional_groups={"extra": ["cauldron-plugin"]},
+            # No optional= in manifest
+            src_files={
+                "api.py": "from cauldron_plugin.api import X\n",
+            },
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 1, (
+        f"Expected ARCH001 for runtime-optional missing manifest optional=:\n{result.stdout}"
+    )
+    assert "ARCH001" in result.stdout
+
+
+def test_arch004_test_only_dep_in_runtime_manifest():
+    """ARCH004 fires when a test-only pyproject dep is claimed as runtime manifest entry."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-plugin",
+            slug="cauldron.plugin",
+            namespace="cauldron_plugin",
+            public_api=["cauldron_plugin.api"],
+            src_files={"api.py": ""},
+        )
+
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-consumer",
+            slug="cauldron.consumer",
+            namespace="cauldron_consumer",
+            public_api=["cauldron_consumer.api"],
+            pyproject_deps=[],
+            pyproject_optional_groups={"test": ["cauldron-plugin"]},
+            optional_requires=[("cauldron.plugin", "module")],
+            src_files={"api.py": ""},
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 1, (
+        f"Expected ARCH004 for test-only dep claimed as runtime manifest requirement:\n{result.stdout}"
+    )
+    assert "ARCH004" in result.stdout
+
+
+def test_arch001_test_only_dep_in_production_code():
+    """ARCH001 fires when a test-only pyproject dep is imported from production (non-test) code."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-plugin",
+            slug="cauldron.plugin",
+            namespace="cauldron_plugin",
+            public_api=["cauldron_plugin.api"],
+            src_files={"api.py": "class X: pass\n"},
+        )
+
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-consumer",
+            slug="cauldron.consumer",
+            namespace="cauldron_consumer",
+            public_api=["cauldron_consumer.api"],
+            pyproject_deps=[],
+            pyproject_optional_groups={"test": ["cauldron-plugin"]},
+            # Import in src (production), not test file
+            src_files={
+                "api.py": "from cauldron_plugin.api import X\n",
+            },
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 1, (
+        f"Expected ARCH001 for test-only dep imported from production code:\n{result.stdout}"
+    )
+    assert "ARCH001" in result.stdout
+
+
+def test_capability_dep_satisfies_arch001_at_requires_level():
+    """A capability requires= entry satisfies ARCH001 when importing from a main-dep provider."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-provider",
+            slug="cauldron.provider",
+            namespace="cauldron_provider",
+            public_api=["cauldron_provider.api"],
+            provides=["data.process"],
+            src_files={"api.py": "class Thing: pass\n"},
+        )
+
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-consumer",
+            slug="cauldron.consumer",
+            namespace="cauldron_consumer",
+            public_api=["cauldron_consumer.api"],
+            pyproject_deps=["cauldron-provider"],
+            requires=[("data.process", "capability")],
+            src_files={
+                "api.py": "from cauldron_provider.api import Thing\n",
+            },
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 0, (
+        f"Capability requires= should satisfy ARCH001 for main-dep provider:\n{result.stdout}"
+    )
+
+
+def test_capability_dep_wrong_level_arch004():
+    """ARCH004 fires when a main dep's capability is declared as optional= in the manifest."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-provider",
+            slug="cauldron.provider",
+            namespace="cauldron_provider",
+            public_api=["cauldron_provider.api"],
+            provides=["data.process"],
+            src_files={"api.py": "class Thing: pass\n"},
+        )
+
+        _make_fake_package(
+            root,
+            pkg_name="cauldron-consumer",
+            slug="cauldron.consumer",
+            namespace="cauldron_consumer",
+            public_api=["cauldron_consumer.api"],
+            pyproject_deps=["cauldron-provider"],  # main dep
+            optional_requires=[("data.process", "capability")],  # but claimed as optional=
+            src_files={"api.py": ""},
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 1, (
+        f"Expected ARCH004 for capability optional= referring to a main-dep provider:\n{result.stdout}"
+    )
+    assert "ARCH004" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Part 4: Guarded optional imports
+# ---------------------------------------------------------------------------
+
+def _make_runtime_optional_pair(root: Path, api_source: str) -> None:
+    """Helper: build a provider + consumer where consumer has provider as
+    runtime-optional dep declared as optional= in manifest."""
+    _make_fake_package(
+        root,
+        pkg_name="cauldron-plugin",
+        slug="cauldron.plugin",
+        namespace="cauldron_plugin",
+        public_api=["cauldron_plugin.api"],
+        src_files={"api.py": "class Thing: pass\n"},
+    )
+
+    _make_fake_package(
+        root,
+        pkg_name="cauldron-consumer",
+        slug="cauldron.consumer",
+        namespace="cauldron_consumer",
+        public_api=["cauldron_consumer.api"],
+        pyproject_deps=[],
+        pyproject_optional_groups={"extra": ["cauldron-plugin"]},
+        optional_requires=[("cauldron.plugin", "module")],
+        src_files={"api.py": api_source},
+    )
+
+
+def test_guarded_try_except_importerror_allowed():
+    """try/except ImportError-wrapped import from a runtime-optional dep is allowed."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _make_runtime_optional_pair(
+            root,
+            "try:\n"
+            "    from cauldron_plugin.api import Thing\n"
+            "except ImportError:\n"
+            "    Thing = None\n",
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 0, (
+        f"try/except ImportError guard should be allowed:\n{result.stdout}"
+    )
+
+
+def test_guarded_type_checking_import_allowed():
+    """TYPE_CHECKING-guarded import from a runtime-optional dep is allowed."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _make_runtime_optional_pair(
+            root,
+            "from typing import TYPE_CHECKING\n"
+            "if TYPE_CHECKING:\n"
+            "    from cauldron_plugin.api import Thing\n",
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 0, (
+        f"TYPE_CHECKING-guarded import should be allowed:\n{result.stdout}"
+    )
+
+
+def test_guarded_function_body_import_allowed():
+    """Import inside a function body (deferred) from a runtime-optional dep is allowed."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _make_runtime_optional_pair(
+            root,
+            "def load():\n"
+            "    from cauldron_plugin.api import Thing\n"
+            "    return Thing\n",
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 0, (
+        f"Function-body deferred import should be allowed:\n{result.stdout}"
+    )
+
+
+def test_unguarded_optional_import_production_raises():
+    """Unguarded module-level import from a runtime-optional dep raises ARCH001."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _make_runtime_optional_pair(
+            root,
+            "from cauldron_plugin.api import Thing\n",
+        )
+
+        result = _run_arch_check(root)
+
+    assert result.returncode == 1, (
+        f"Expected ARCH001 for unguarded runtime-optional import:\n{result.stdout}"
+    )
+    assert "ARCH001" in result.stdout
+    assert "Unguarded" in result.stdout

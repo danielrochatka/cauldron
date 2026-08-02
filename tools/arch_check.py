@@ -82,9 +82,12 @@ class PackageInfo:
     pyproject_optional_deps: set[str]           # cauldron-* only in optional-deps, NOT in main
     manifest_requires_module_slugs: set[str]    # kind='module' from requires= only
     manifest_optional_module_slugs: set[str]    # kind='module' from optional= only
+    manifest_requires_capability_slugs: set[str]  # kind='capability' from requires= only
+    manifest_optional_capability_slugs: set[str]  # kind='capability' from optional= only
     pyproject_test_deps: set[str]               # packages ONLY in [project.optional-dependencies].test
     pyproject_runtime_optional_deps: set[str]   # packages in other optional groups (not test), NOT in main deps
     has_module_manifest: bool = True            # True when a real module.py was found
+    has_package_metadata: bool = True           # True when a pyproject.toml was found
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +167,8 @@ def _extract_manifest_fields(module_py: Path) -> dict:
         "requires_module_slugs": [],
         "manifest_requires_module_slugs": [],
         "manifest_optional_module_slugs": [],
+        "manifest_requires_capability_slugs": [],
+        "manifest_optional_capability_slugs": [],
         "provides": [],
     }
 
@@ -224,6 +229,11 @@ def _extract_manifest_fields(module_py: Path) -> dict:
                                     result["manifest_optional_module_slugs"].append(slug_val)
                                 else:
                                     result["manifest_requires_module_slugs"].append(slug_val)
+                            elif kind_val == "capability":
+                                if is_optional:
+                                    result["manifest_optional_capability_slugs"].append(slug_val)
+                                else:
+                                    result["manifest_requires_capability_slugs"].append(slug_val)
 
     return result
 
@@ -419,9 +429,12 @@ def discover_packages(
                 pyproject_optional_deps=pyproject_optional_deps,
                 manifest_requires_module_slugs=set(fields.get("manifest_requires_module_slugs", [])),
                 manifest_optional_module_slugs=set(fields.get("manifest_optional_module_slugs", [])),
+                manifest_requires_capability_slugs=set(fields.get("manifest_requires_capability_slugs", [])),
+                manifest_optional_capability_slugs=set(fields.get("manifest_optional_capability_slugs", [])),
                 pyproject_test_deps=pyproject_test_deps,
                 pyproject_runtime_optional_deps=pyproject_runtime_optional_deps,
                 has_module_manifest=True,
+                has_package_metadata=True,
             ))
 
     return infos, config_errors
@@ -447,6 +460,104 @@ class ImportRef:
     line: int
     is_from: bool
     names: list[str] = field(default_factory=list)  # names in "from X import a, b"
+    is_guarded: bool = False
+
+
+class _ImportCollector(ast.NodeVisitor):
+    """Collect imports with guard-context tracking."""
+
+    _IMPORT_ERROR_NAMES = frozenset({"ImportError", "ModuleNotFoundError"})
+
+    def __init__(self) -> None:
+        self.imports: list[ImportRef] = []
+        self._guarded = False      # inside try/except ImportError or if TYPE_CHECKING
+        self._in_function = False  # inside a function/method body (deferred)
+
+    # -- guard helpers -------------------------------------------------------
+
+    def _catches_import_error(self, handler: ast.ExceptHandler) -> bool:
+        if handler.type is None:
+            return True
+        if isinstance(handler.type, ast.Name):
+            return handler.type.id in self._IMPORT_ERROR_NAMES
+        if isinstance(handler.type, ast.Tuple):
+            return any(
+                isinstance(t, ast.Name) and t.id in self._IMPORT_ERROR_NAMES
+                for t in handler.type.elts
+            )
+        return False
+
+    def _is_type_checking(self, node: ast.If) -> bool:
+        test = node.test
+        return (
+            (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING")
+            or (isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING")
+        )
+
+    # -- visitors ------------------------------------------------------------
+
+    def visit_Try(self, node: ast.Try) -> None:
+        is_import_guard = any(self._catches_import_error(h) for h in node.handlers)
+        old = self._guarded
+        if is_import_guard:
+            self._guarded = True
+        for stmt in node.body:
+            self.visit(stmt)
+        self._guarded = old
+        for handler in node.handlers:
+            for stmt in handler.body:
+                self.visit(stmt)
+        for stmt in node.orelse:
+            self.visit(stmt)
+        for stmt in getattr(node, "finalbody", []):
+            self.visit(stmt)
+
+    # Python 3.11 separates TryStar; keep compatibility
+    visit_TryStar = visit_Try
+
+    def visit_If(self, node: ast.If) -> None:
+        old = self._guarded
+        if self._is_type_checking(node):
+            self._guarded = True
+        for stmt in node.body:
+            self.visit(stmt)
+        self._guarded = old
+        for stmt in node.orelse:
+            self.visit(stmt)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        old = self._in_function
+        self._in_function = True
+        self.generic_visit(node)
+        self._in_function = old
+
+    visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        # Class body runs at class-definition time (not deferred)
+        # but _in_function state can pass through for nested classes
+        self.generic_visit(node)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        guarded = self._guarded or self._in_function
+        for alias in node.names:
+            self.imports.append(ImportRef(
+                module=alias.name,
+                line=node.lineno,
+                is_from=False,
+                is_guarded=guarded,
+            ))
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if node.module:
+            guarded = self._guarded or self._in_function
+            self.imports.append(ImportRef(
+                module=node.module,
+                line=node.lineno,
+                is_from=True,
+                names=[alias.name for alias in node.names],
+                is_guarded=guarded,
+            ))
 
 
 def extract_imports(source: str, filename: str = "<unknown>") -> list[ImportRef]:
@@ -454,16 +565,9 @@ def extract_imports(source: str, filename: str = "<unknown>") -> list[ImportRef]
         tree = ast.parse(source, filename=filename)
     except SyntaxError:
         return []
-
-    imports: list[ImportRef] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                imports.append(ImportRef(module=alias.name, line=node.lineno, is_from=False))
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            names = [alias.name for alias in node.names]
-            imports.append(ImportRef(module=node.module, line=node.lineno, is_from=True, names=names))
-    return imports
+    collector = _ImportCollector()
+    collector.visit(tree)
+    return collector.imports
 
 
 # ---------------------------------------------------------------------------
@@ -569,16 +673,22 @@ def check_file(
     violations: list[Violation] = []
 
     for imp in imports:
-        ns_root = _ns_root(imp.module)
-
-        if not _is_cauldron_namespace(ns_root):
-            continue
-        if _is_platform(ns_root):
-            continue
+        # 1. Skip within-package imports
         if _under_prefix(imp.module, own_namespaces):
             continue
 
+        ns_root = _ns_root(imp.module)
+
+        # 2. Platform namespaces always allowed
+        if _is_platform(ns_root):
+            continue
+
+        # 3. Resolve owner (boundary-aware; works for any namespace prefix)
         import_pkg = _find_owner(imp.module, ns_to_pkg)
+
+        # 4. Skip untracked third-party imports
+        if import_pkg is None and not _is_cauldron_namespace(ns_root):
+            continue
 
         # ------------------------------------------------------------------
         # ARCH003 — runs for BOTH test and source files.
@@ -669,11 +779,35 @@ def check_file(
         in_main = pkg_name in owning_pkg.pyproject_main_deps
         in_runtime_opt = pkg_name in owning_pkg.pyproject_runtime_optional_deps
         in_test_only = pkg_name in owning_pkg.pyproject_test_deps
-        in_manifest_requires = import_pkg is not None and import_pkg.slug in owning_pkg.manifest_requires_module_slugs
-        in_manifest_optional = import_pkg is not None and import_pkg.slug in owning_pkg.manifest_optional_module_slugs
+        in_manifest_requires = import_pkg is not None and (
+            import_pkg.slug in owning_pkg.manifest_requires_module_slugs
+            or bool(import_pkg.provides & owning_pkg.manifest_requires_capability_slugs)
+        )
+        in_manifest_optional = import_pkg is not None and (
+            import_pkg.slug in owning_pkg.manifest_optional_module_slugs
+            or bool(import_pkg.provides & owning_pkg.manifest_optional_capability_slugs)
+        )
         in_manifest_any = in_manifest_requires or in_manifest_optional
 
-        if is_test and not owning_pkg.has_module_manifest:
+        if not owning_pkg.has_package_metadata:
+            # No pyproject.toml — only manifest declaration is meaningful.
+            if not (in_manifest_requires or in_manifest_optional):
+                violations.append(Violation(
+                    code="ARCH001",
+                    file=py_file,
+                    line=imp.line,
+                    message=(
+                        f"Import '{imp.module}' from '{owner_label}' is not "
+                        f"declared in the manifest."
+                    ),
+                    fix=(
+                        f"Add ModuleRequirement(slug='{owner_label}', kind='module') "
+                        f"to requires/optional in module.py."
+                    ),
+                    note="No pyproject.toml — only manifest declaration is checked.",
+                ))
+            # else: manifest declares it — fall through cleanly
+        elif is_test and not owning_pkg.has_module_manifest:
             # Framework integration root (no module.py): its tests/ is an integration test
             # suite for the whole framework. Cauldron namespace imports are allowed without
             # pyproject declarations — the repo checkout is the declaration.
@@ -684,7 +818,40 @@ def check_file(
         elif in_main and in_manifest_requires:
             pass  # correct: main dep declared as requires= module
         elif in_runtime_opt and in_manifest_optional:
-            pass  # correct: runtime-optional dep declared as optional= module
+            if not is_test and not imp.is_guarded:
+                violations.append(Violation(
+                    code="ARCH001",
+                    file=py_file,
+                    line=imp.line,
+                    message=(
+                        f"Unguarded production import '{imp.module}' from runtime-optional "
+                        f"package '{owner_label}'. Optional dependencies may not be installed."
+                    ),
+                    fix=(
+                        "Wrap the import in: try: ... except ImportError: ...\n"
+                        "or place it inside: if TYPE_CHECKING: ...\n"
+                        "or move it inside a function body (deferred import)."
+                    ),
+                    note=f"'{pkg_name}' is in a runtime-optional dependency group.",
+                ))
+            # else: guarded or test file — allowed
+        elif in_test_only and not is_test:
+            # Test extra package used in production code
+            violations.append(Violation(
+                code="ARCH001",
+                file=py_file,
+                line=imp.line,
+                message=(
+                    f"Import '{imp.module}' from '{owner_label}' uses a test-only "
+                    f"package in production code."
+                ),
+                fix=(
+                    f"Move '{pkg_name}' from [project.optional-dependencies].test to "
+                    f"[project.dependencies] or a runtime optional group, and add a "
+                    f"manifest requirement."
+                ),
+                note=f"'{pkg_name}' is only in the test optional group.",
+            ))
         elif in_main and in_manifest_optional:
             # Misplaced: main dep satisfied by optional= manifest entry
             violations.append(Violation(
@@ -760,6 +927,9 @@ def check_arch004(
 ) -> list[Violation]:
     violations: list[Violation] = []
 
+    if not pkg.has_package_metadata:
+        return violations  # no pyproject to check parity against
+
     # Direction A: manifest requires a module slug but pyproject is missing the package
     for req_slug in pkg.requires_module_slugs:
         req_pkg = pkg_by_slug.get(req_slug)
@@ -815,6 +985,78 @@ def check_arch004(
                     f"Move ModuleRequirement(slug='{opt_slug}', kind='module') from optional= to requires= in module.py."
                 ),
             ))
+
+    # Direction A: test-only pyproject dep cannot satisfy a runtime manifest module requirement
+    for req_slug in pkg.manifest_requires_module_slugs | pkg.manifest_optional_module_slugs:
+        req_pkg = pkg_by_slug.get(req_slug)
+        if req_pkg is None:
+            continue
+        if (
+            req_pkg.name in pkg.pyproject_test_deps
+            and req_pkg.name not in pkg.pyproject_main_deps
+            and req_pkg.name not in pkg.pyproject_runtime_optional_deps
+        ):
+            violations.append(Violation(
+                code="ARCH004",
+                file=pkg.root / "pyproject.toml",
+                line=0,
+                message=(
+                    f"Manifest declares kind='module' relationship for '{req_slug}' "
+                    f"but '{req_pkg.name}' is only in the test optional group, not a runtime dependency."
+                ),
+                fix=(
+                    f"Move '{req_pkg.name}' to main [project.dependencies] or a runtime optional group, "
+                    f"or remove the ModuleRequirement from the manifest."
+                ),
+            ))
+
+    # Direction A (capability): manifest requires_capability_slugs whose providing package
+    # is only runtime-optional in pyproject → misplaced (should be optional= in manifest).
+    for req_cap_slug in pkg.manifest_requires_capability_slugs:
+        for candidate in pkg_by_slug.values():
+            if req_cap_slug not in candidate.provides:
+                continue
+            if candidate.name == pkg.name:
+                continue
+            if candidate.name in pkg.pyproject_runtime_optional_deps and candidate.name not in pkg.pyproject_main_deps:
+                violations.append(Violation(
+                    code="ARCH004",
+                    file=pkg.root / "pyproject.toml",
+                    line=0,
+                    message=(
+                        f"Manifest requires= declares kind='capability' for '{req_cap_slug}' "
+                        f"but its provider '{candidate.name}' is only a runtime-optional pyproject "
+                        f"dependency, not a main dep."
+                    ),
+                    fix=(
+                        f"Either promote '{candidate.name}' to main [project.dependencies] "
+                        f"or move the capability requirement to optional= in module.py."
+                    ),
+                ))
+
+    # Direction A (capability): manifest optional_capability_slugs whose providing package
+    # is a main pyproject dep → misplaced (should be requires= in manifest).
+    for opt_cap_slug in pkg.manifest_optional_capability_slugs:
+        for candidate in pkg_by_slug.values():
+            if opt_cap_slug not in candidate.provides:
+                continue
+            if candidate.name == pkg.name:
+                continue
+            if candidate.name in pkg.pyproject_main_deps:
+                violations.append(Violation(
+                    code="ARCH004",
+                    file=pkg.root / "pyproject.toml",
+                    line=0,
+                    message=(
+                        f"Manifest optional= declares kind='capability' for '{opt_cap_slug}' "
+                        f"but its provider '{candidate.name}' is a main pyproject dependency, "
+                        f"not runtime-optional."
+                    ),
+                    fix=(
+                        f"Move the capability requirement for '{opt_cap_slug}' from optional= "
+                        f"to requires= in module.py."
+                    ),
+                ))
 
     # Direction B: pyproject main deps have cauldron-X but manifest makes no mention of it.
     # Only main deps (not optional/test) are checked — optional features and test fixtures
@@ -904,9 +1146,12 @@ def _root_package_infos(
             pyproject_optional_deps=pyproject_optional_deps,
             manifest_requires_module_slugs=set(fields.get("manifest_requires_module_slugs", [])),
             manifest_optional_module_slugs=set(fields.get("manifest_optional_module_slugs", [])),
+            manifest_requires_capability_slugs=set(fields.get("manifest_requires_capability_slugs", [])),
+            manifest_optional_capability_slugs=set(fields.get("manifest_optional_capability_slugs", [])),
             pyproject_test_deps=pyproject_test_deps,
             pyproject_runtime_optional_deps=pyproject_runtime_optional_deps,
             has_module_manifest=True,
+            has_package_metadata=root_pyproject.exists(),
         ))
 
     if not infos:
@@ -932,9 +1177,12 @@ def _root_package_infos(
             pyproject_optional_deps=pyproject_optional_deps,
             manifest_requires_module_slugs=set(),
             manifest_optional_module_slugs=set(),
+            manifest_requires_capability_slugs=set(),
+            manifest_optional_capability_slugs=set(),
             pyproject_test_deps=pyproject_test_deps,
             pyproject_runtime_optional_deps=pyproject_runtime_optional_deps,
             has_module_manifest=False,
+            has_package_metadata=root_pyproject.exists(),
         ))
 
     return infos
@@ -1016,9 +1264,12 @@ def discover_project_modules(
                 pyproject_optional_deps=pyproject_optional_deps,
                 manifest_requires_module_slugs=set(fields.get("manifest_requires_module_slugs", [])),
                 manifest_optional_module_slugs=set(fields.get("manifest_optional_module_slugs", [])),
+                manifest_requires_capability_slugs=set(fields.get("manifest_requires_capability_slugs", [])),
+                manifest_optional_capability_slugs=set(fields.get("manifest_optional_capability_slugs", [])),
                 pyproject_test_deps=pyproject_test_deps,
                 pyproject_runtime_optional_deps=pyproject_runtime_optional_deps,
                 has_module_manifest=True,
+                has_package_metadata=pyproject.exists(),
             ))
 
     return infos

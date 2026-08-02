@@ -1,16 +1,18 @@
 """Admin AI site tools for cauldron-site-astro.
 
-Five tools drive the AI authoring workflow. Every result exposes only
+Seven tools drive the AI authoring workflow. Every result exposes only
 Django URL paths and business-safe data — filesystem paths (frontend_root,
 output_root, theme_root, previews_root) are never leaked to the model:
 
-1. ``site.inspect``            — read current build status (READ_ONLY)
-2. ``site.stage_theme``        — stage a CSS theme for the next publish (PROPOSE)
-3. ``site.prepare_change_set`` — create a SiteChangeSet + scoped preview (PROPOSE)
-4. ``site.inspect_preview``    — read a change set's preview status (READ_ONLY)
-5. ``site.publish``            — apply a draft-ready change set to live (MAINTENANCE)
+1. ``site.verify_root``        — run structured diagnostics on the live site (READ_ONLY)
+2. ``site.inspect``            — read current build status (READ_ONLY)
+3. ``site.stage_theme``        — stage a CSS theme for the next publish (PROPOSE)
+4. ``site.propose_homepage``   — propose a homepage content change (PROPOSE)
+5. ``site.prepare_change_set`` — create a SiteChangeSet + scoped preview (PROPOSE)
+6. ``site.inspect_preview``    — read a change set's preview status (READ_ONLY)
+7. ``site.publish``            — apply a draft-ready change set to live (MAINTENANCE)
 
-Tools 3-5 operate on a persisted :class:`SiteChangeSet` (keyed by
+Tools 5-7 operate on a persisted :class:`SiteChangeSet` (keyed by
 ``change_set_id``) so status transitions are durable across the multi-step
 prepare -> review -> publish flow. Previews are scoped to just the content
 requests attached to the change set, so unrelated in-flight drafts never
@@ -21,6 +23,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from cauldron_site_astro.service import get_build_service
+from cauldron_site_astro.site_diagnostics import run_site_diagnostics
 
 if TYPE_CHECKING:
     from cauldron_ai_admin.tools import AdminAIToolRegistry
@@ -44,7 +47,29 @@ def register(registry: "AdminAIToolRegistry") -> None:
     _PERM_MAINTAIN = "cauldron_content_operations.apply_content_changes"
 
     # ------------------------------------------------------------------
-    # 1. site.inspect
+    # 1. site.verify_root
+    # ------------------------------------------------------------------
+    registry.register(
+        AdminAIToolDefinition(
+            name="site.verify_root",
+            version="1.0",
+            description=(
+                "Run structured diagnostics on the live site: checks whether "
+                "the homepage content is published, whether the root index.html "
+                "artifact exists and is non-empty, and whether a GET request to "
+                "'/' returns 200 text/html. Returns healthy (boolean) and a "
+                "per-check breakdown. Read-only."
+            ),
+            argument_schema={"type": "object", "properties": {}, "required": []},
+            risk_level=RiskLevel.READ_ONLY,
+            required_permission=_PERM_VIEW,
+            owning_module=_OWNING_MODULE,
+        ),
+        _handle_verify_root,
+    )
+
+    # ------------------------------------------------------------------
+    # 2. site.inspect
     # ------------------------------------------------------------------
     registry.register(
         AdminAIToolDefinition(
@@ -63,7 +88,7 @@ def register(registry: "AdminAIToolRegistry") -> None:
     )
 
     # ------------------------------------------------------------------
-    # 2. site.stage_theme
+    # 3. site.stage_theme
     # ------------------------------------------------------------------
     registry.register(
         AdminAIToolDefinition(
@@ -96,7 +121,57 @@ def register(registry: "AdminAIToolRegistry") -> None:
     )
 
     # ------------------------------------------------------------------
-    # 3. site.prepare_change_set
+    # 4. site.propose_homepage
+    # ------------------------------------------------------------------
+    registry.register(
+        AdminAIToolDefinition(
+            name="site.propose_homepage",
+            version="1.0",
+            description=(
+                "Propose a homepage content change. Determines whether to "
+                "create or update the homepage singleton based on whether it "
+                "already exists, then creates a content change request. "
+                "Returns cs_id for use with site.prepare_change_set."
+            ),
+            argument_schema={
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Page title displayed in the browser tab and heading.",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Page body content (markdown or HTML).",
+                    },
+                    "navigation_title": {
+                        "type": "string",
+                        "description": "Short label used in navigation menus.",
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Summary for listings and link previews.",
+                    },
+                    "seo_title": {
+                        "type": "string",
+                        "description": "SEO <title> tag override; defaults to title if omitted.",
+                    },
+                    "meta_description": {
+                        "type": "string",
+                        "description": "Meta description for search engines.",
+                    },
+                },
+                "required": ["title", "body"],
+            },
+            risk_level=RiskLevel.PROPOSE,
+            required_permission=_PERM_PROPOSE,
+            owning_module=_OWNING_MODULE,
+        ),
+        _handle_propose_homepage,
+    )
+
+    # ------------------------------------------------------------------
+    # 5. site.prepare_change_set
     # ------------------------------------------------------------------
     registry.register(
         AdminAIToolDefinition(
@@ -143,7 +218,7 @@ def register(registry: "AdminAIToolRegistry") -> None:
     )
 
     # ------------------------------------------------------------------
-    # 4. site.inspect_preview
+    # 6. site.inspect_preview
     # ------------------------------------------------------------------
     registry.register(
         AdminAIToolDefinition(
@@ -171,7 +246,7 @@ def register(registry: "AdminAIToolRegistry") -> None:
     )
 
     # ------------------------------------------------------------------
-    # 5. site.publish
+    # 7. site.publish
     # ------------------------------------------------------------------
     registry.register(
         AdminAIToolDefinition(
@@ -976,3 +1051,141 @@ def _handle_publish(context, *, change_set_id, confirm, **kwargs):
                 svc.discard_output_backup(output_snapshot)
             except Exception:
                 pass
+
+
+def _handle_verify_root(context, **kwargs):
+    try:
+        from cauldron_ai_admin.tools import AdminAIToolResult
+    except ImportError:
+        return None
+
+    output_root = None
+    try:
+        svc = get_build_service()
+        cfg = svc._config
+        output_root = cfg.output_root or None
+    except Exception:
+        pass
+
+    content_service = _get_content_operation_service()
+
+    try:
+        diag = run_site_diagnostics(
+            actor=context.actor,
+            service=content_service,
+            output_root=output_root,
+        )
+    except Exception as exc:
+        return AdminAIToolResult(
+            tool_name="site.verify_root",
+            success=False,
+            message=f"Diagnostics raised an unexpected error: {_safe_exc(exc)}",
+        )
+
+    return AdminAIToolResult(
+        tool_name="site.verify_root",
+        success=True,
+        data=diag,
+    )
+
+
+def _handle_propose_homepage(
+    context,
+    *,
+    title,
+    body,
+    navigation_title="",
+    summary="",
+    seo_title="",
+    meta_description="",
+    **kwargs,
+):
+    try:
+        from cauldron_ai_admin.tools import AdminAIToolResult
+    except ImportError:
+        return None
+
+    svc = _get_content_operation_service()
+    if svc is None:
+        return AdminAIToolResult(
+            tool_name="site.propose_homepage",
+            success=False,
+            message="Content operations service is unavailable.",
+        )
+
+    try:
+        from cauldron_content.homepage import (
+            HOMEPAGE_ITEM_ID,
+            HOMEPAGE_COLLECTION,
+            build_homepage_operation,
+        )
+        from cauldron_content.contracts import ContentStatus
+    except ImportError:
+        return AdminAIToolResult(
+            tool_name="site.propose_homepage",
+            success=False,
+            message="cauldron-content package is required but not installed.",
+        )
+
+    # Determine create vs. update by looking up the current homepage.
+    kind = "create"
+    expected_hash = ""
+    try:
+        existing = svc.get_item(
+            HOMEPAGE_ITEM_ID, HOMEPAGE_COLLECTION, user=context.actor
+        )
+        if existing is not None:
+            kind = "update"
+            expected_hash = getattr(existing, "hash", "") or ""
+    except Exception:
+        pass
+
+    op = build_homepage_operation(
+        kind=kind,
+        status=ContentStatus.DRAFT,
+        title=title,
+        body=body,
+        expected_hash=expected_hash,
+        navigation_title=navigation_title,
+        summary=summary,
+        seo_title=seo_title,
+        meta_description=meta_description,
+    )
+
+    try:
+        result = svc.create_change_request(
+            user=context.actor,
+            operations=[op],
+            provider_name="cauldron_site_astro",
+            description=f"Homepage {kind}: {title[:80]}",
+        )
+    except Exception as exc:
+        return AdminAIToolResult(
+            tool_name="site.propose_homepage",
+            success=False,
+            message=f"Failed to create change request: {_safe_exc(exc)}",
+        )
+
+    if not getattr(result, "ok", False):
+        err = getattr(result, "error", None)
+        msg = getattr(err, "message", "proposal failed")
+        return AdminAIToolResult(
+            tool_name="site.propose_homepage",
+            success=False,
+            message=f"Homepage proposal failed: {msg[:_MAX_EXC_MSG]}",
+        )
+
+    cs_id = getattr(result, "request_id", "") or ""
+    return AdminAIToolResult(
+        tool_name="site.propose_homepage",
+        success=True,
+        data={
+            "cs_id": str(cs_id),
+            "status": "proposed",
+            "kind": kind,
+        },
+        message=(
+            f"Homepage {kind} proposed (cs_id={cs_id!r}). "
+            "Pass cs_id to site.prepare_change_set to build a preview."
+        ),
+    )

@@ -27,6 +27,69 @@ def _get_builtin_templates() -> tuple:
         return ()
     return (
         AIToolPromptTemplate(
+            tool_name="site.verify_root",
+            template_version="v1",
+            owning_module=_OWNING_MODULE,
+            purpose=(
+                "Run structured diagnostics on the live site. "
+                "Checks three things: (1) whether the homepage content item is "
+                "published, (2) whether the root index.html artifact exists and is "
+                "non-empty, (3) whether GET '/' returns 200 text/html. "
+                "Returns a healthy flag and a per-check breakdown."
+            ),
+            supported_tasks=(
+                "site health check", "post-publish verification", "pre-publish inspection",
+            ),
+            required_permission="cauldron_content_operations.view_published_content",
+            risk_level="READ_ONLY",
+            read_scope=(
+                "Homepage content item status (published/draft/missing). "
+                "Whether root index.html exists and is non-empty. "
+                "HTTP response code for GET '/'. No file contents or paths returned."
+            ),
+            write_scope="None.",
+            preconditions=("Actor has view_published_content permission.",),
+            input_expectations="No arguments required.",
+            result_behavior=(
+                "Returns data.healthy (boolean, True if all three checks passed) "
+                "and data.checks mapping each check name to its result dict. "
+                "Each check result has 'status' (string) and 'ok' (boolean). "
+                "homepage_content statuses: 'published', 'draft', 'missing', "
+                "'unavailable', 'error'. "
+                "root_artifact statuses: 'ok', 'empty', 'missing', 'unconfigured'. "
+                "root_route statuses: 'ok', 'not_found', 'error', 'unreachable'."
+            ),
+            approval_requirements="None; read-only.",
+            clarification_behavior=(
+                "Use this tool at the start of any site-creation workflow to "
+                "determine what state the site is in before proposing changes. "
+                "Use it again after a successful publish to confirm the site is live. "
+                "If homepage_content is 'missing', call site.propose_homepage next. "
+                "If root_artifact is 'missing', a publish has not yet occurred. "
+                "If root_route is 'not_found', the public URL routing may not be "
+                "configured — do not infer the site is down."
+            ),
+            refusal_behavior=(
+                "Refuse if the actor lacks view_published_content permission."
+            ),
+            error_guidance=(
+                "On success=false, report the error and suggest checking system logs. "
+                "A healthy=false result means diagnostics ran but found problems — "
+                "report each failing check to the user."
+            ),
+            positive_examples=(
+                "Check whether the public site is live and the homepage is published.",
+                "Verify the site after a successful publish.",
+                "Diagnose why the site might not be accessible.",
+            ),
+            boundary_examples=(
+                "Do not expose filesystem paths from check results.",
+                "Do not treat root_route 'not_found' as a site outage — "
+                "the route may simply not be configured in the URL conf.",
+                "Do not skip this check before recommending site.propose_homepage.",
+            ),
+        ),
+        AIToolPromptTemplate(
             tool_name="site.inspect",
             template_version="v1",
             owning_module=_OWNING_MODULE,
@@ -45,7 +108,7 @@ def _get_builtin_templates() -> tuple:
             preconditions=("Actor has view_published_content permission.",),
             input_expectations="No arguments required.",
             result_behavior=(
-                "Returns build_exists (boolean), staged_theme_pending (boolean), "
+                "Returns live_build_exists (boolean), staged_theme_pending (boolean), "
                 "and optional metadata about the current live build."
             ),
             approval_requirements="None; read-only.",
@@ -306,6 +369,76 @@ def _get_builtin_templates() -> tuple:
                 "Never call site.publish without explicit user confirmation.",
                 "Never claim the site is updated until published=true is returned.",
                 "Do not publish if the preview build failed.",
+            ),
+        ),
+        AIToolPromptTemplate(
+            tool_name="site.propose_homepage",
+            template_version="v1",
+            owning_module=_OWNING_MODULE,
+            purpose=(
+                "Propose a homepage content change. "
+                "Automatically detects whether this is a create or an update "
+                "by checking whether the homepage singleton already exists, "
+                "then creates a content change request. "
+                "Returns cs_id for use with site.prepare_change_set. "
+                "Does NOT validate, apply, build, or publish."
+            ),
+            supported_tasks=("homepage creation", "homepage update", "content proposal"),
+            required_permission="cauldron_content_operations.propose_content_changes",
+            risk_level="PROPOSE",
+            read_scope=(
+                "Reads the current homepage item (if any) to determine "
+                "create-vs-update and retrieve the expected hash for the update operation."
+            ),
+            write_scope=(
+                "Creates a ContentChangeRequest with a single homepage operation "
+                "in DRAFT status. No effect on the live site."
+            ),
+            preconditions=(
+                "Actor has propose_content_changes permission.",
+                "The user has explicitly requested homepage content.",
+            ),
+            input_expectations=(
+                "Required: 'title' (string), 'body' (string, markdown or HTML). "
+                "Optional: 'navigation_title' (string), 'summary' (string), "
+                "'seo_title' (string), 'meta_description' (string)."
+            ),
+            result_behavior=(
+                "Returns cs_id (string, the content change request ID), "
+                "status='proposed', and kind ('create' or 'update'). "
+                "The cs_id must be passed to site.prepare_change_set in "
+                "content_request_ids to build a preview."
+            ),
+            approval_requirements=(
+                "This is a propose-level operation. The change request must go "
+                "through site.prepare_change_set and site.publish before it "
+                "affects the live site."
+            ),
+            clarification_behavior=(
+                "Always call site.verify_root first to check whether the homepage "
+                "already exists before calling this tool. "
+                "If homepage_content is 'published', confirm with the user that "
+                "they want to update the homepage before proposing. "
+                "Confirm title and body content with the user before proposing."
+            ),
+            refusal_behavior=(
+                "Refuse if the user has not provided title and body content. "
+                "Refuse if the actor lacks propose_content_changes permission."
+            ),
+            error_guidance=(
+                "On failure, report the specific error message. "
+                "Do not retry automatically without user confirmation."
+            ),
+            positive_examples=(
+                "Propose a homepage with title 'Welcome' and a short intro body.",
+                "Update the existing homepage with revised body content.",
+            ),
+            boundary_examples=(
+                "Do not call this tool without confirming content with the user.",
+                "Do not proceed to site.prepare_change_set until cs_id is returned.",
+                "Item ID, slug, collection, schema, and template are fixed "
+                "by the homepage singleton contract — do not try to override them.",
+                "Do not validate, apply, or publish — only propose.",
             ),
         ),
     )

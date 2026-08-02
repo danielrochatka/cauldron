@@ -1288,8 +1288,8 @@ class TestAllCurrentModulesLoad:
         assert m.slug == "cauldron.site.astro"
         assert len(m.settings_declarations) == 9
         assert len(m.migration_apps) == 1
-        assert len(m.ai_tools) == 5
-        assert len(m.prompt_templates) == 5
+        assert len(m.ai_tools) == 7
+        assert len(m.prompt_templates) == 7
 
     def test_all_modules_requires_restart_consistent(self):
         """Every module's requires_restart property matches its restart inputs."""

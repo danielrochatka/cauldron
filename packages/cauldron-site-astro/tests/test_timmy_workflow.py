@@ -51,7 +51,7 @@ def _ctx(username: str, run_id: str = ""):
 
 def test_prepare_change_set_creates_db_record(tmp_path):
     from cauldron_site_astro.models import SiteChangeSet
-    from cauldron_site_astro.site_tools import handle_prepare_change_set
+    from cauldron_site_astro.site_tools import _handle_prepare_change_set as handle_prepare_change_set
 
     ctx = _ctx("timmy-test")
 
@@ -81,7 +81,7 @@ def test_prepare_change_set_creates_db_record(tmp_path):
 
 def test_prepare_change_set_preview_failure_sets_status(tmp_path):
     from cauldron_site_astro.models import SiteChangeSet
-    from cauldron_site_astro.site_tools import handle_prepare_change_set
+    from cauldron_site_astro.site_tools import _handle_prepare_change_set as handle_prepare_change_set
 
     ctx = _ctx("timmy-fail")
 
@@ -104,7 +104,7 @@ def test_prepare_change_set_preview_failure_sets_status(tmp_path):
 
 def test_inspect_preview_returns_preview_url(tmp_path):
     from cauldron_site_astro.models import SiteChangeSet
-    from cauldron_site_astro.site_tools import handle_inspect_preview
+    from cauldron_site_astro.site_tools import _handle_inspect_preview as handle_inspect_preview
 
     ctx = _ctx("timmy-inspect")
 
@@ -137,7 +137,7 @@ def test_inspect_preview_returns_preview_url(tmp_path):
 
 def test_publish_requires_draft_ready_status():
     from cauldron_site_astro.models import SiteChangeSet
-    from cauldron_site_astro.site_tools import handle_publish
+    from cauldron_site_astro.site_tools import _handle_publish as handle_publish
 
     ctx = _ctx("timmy-pub")
 
@@ -150,7 +150,7 @@ def test_publish_requires_draft_ready_status():
 def test_publish_does_not_promote_css_on_build_failure(tmp_path):
     """Staged CSS must NOT be promoted if the build fails."""
     from cauldron_site_astro.models import SiteChangeSet
-    from cauldron_site_astro.site_tools import handle_publish
+    from cauldron_site_astro.site_tools import _handle_publish as handle_publish
     from cauldron_site_astro.theme import SiteThemeService
 
     ctx = _ctx("timmy-css")
@@ -190,7 +190,7 @@ def test_content_not_published_on_build_failure(tmp_path):
     A failed build leaves the content store unchanged (items remain draft).
     """
     from cauldron_site_astro.models import SiteChangeSet
-    from cauldron_site_astro.site_tools import handle_publish
+    from cauldron_site_astro.site_tools import _handle_publish as handle_publish
 
     ctx = _ctx("timmy-atomic")
 
@@ -262,7 +262,7 @@ def test_output_promotion_failure__content_unpublished_previous_output_intact(tm
     """
     from unittest.mock import MagicMock, patch
     from cauldron_site_astro.models import SiteChangeSet
-    from cauldron_site_astro.site_tools import handle_publish
+    from cauldron_site_astro.site_tools import _handle_publish as handle_publish
 
     ctx = _ctx("p-out-fail")
     config = _make_config(tmp_path)
@@ -306,7 +306,7 @@ def test_css_promotion_failure__content_unpublished_output_restored(tmp_path):
     """
     from unittest.mock import MagicMock, patch
     from cauldron_site_astro.models import SiteChangeSet
-    from cauldron_site_astro.site_tools import handle_publish
+    from cauldron_site_astro.site_tools import _handle_publish as handle_publish
     from cauldron_site_astro.theme import SiteThemeService
 
     ctx = _ctx("p-css-fail")
@@ -356,7 +356,7 @@ def test_db_apply_failure__output_and_css_restored(tmp_path):
     """
     from unittest.mock import MagicMock, patch
     from cauldron_site_astro.models import SiteChangeSet
-    from cauldron_site_astro.site_tools import handle_publish
+    from cauldron_site_astro.site_tools import _handle_publish as handle_publish
     from cauldron_site_astro.theme import SiteThemeService
 
     ctx = _ctx("p-db-fail")
@@ -409,7 +409,7 @@ def test_retry_publish_failed_succeeds_without_double_apply(tmp_path):
     """
     from unittest.mock import MagicMock, patch
     from cauldron_site_astro.models import SiteChangeSet
-    from cauldron_site_astro.site_tools import handle_publish
+    from cauldron_site_astro.site_tools import _handle_publish as handle_publish
 
     ctx = _ctx("p-retry")
     config = _make_config(tmp_path)
@@ -622,9 +622,9 @@ def test_full_workflow_prepare_then_inspect_then_publish(tmp_path):
     """
     from cauldron_site_astro.models import SiteChangeSet
     from cauldron_site_astro.site_tools import (
-        handle_prepare_change_set,
-        handle_inspect_preview,
-        handle_publish,
+        _handle_prepare_change_set as handle_prepare_change_set,
+        _handle_inspect_preview as handle_inspect_preview,
+        _handle_publish as handle_publish,
     )
     from cauldron_site_astro.theme import SiteThemeService
 
@@ -846,7 +846,7 @@ def test_prepare_change_set_passes_extra_items_to_build_preview(tmp_path):
     """_handle_prepare_change_set passes extra_items from workspace ops to build_preview."""
     from types import SimpleNamespace
     from cauldron_site_astro.models import SiteChangeSet
-    from cauldron_site_astro.site_tools import handle_prepare_change_set
+    from cauldron_site_astro.site_tools import _handle_prepare_change_set as handle_prepare_change_set
 
     ctx = _ctx("timmy-extra-items")
     previews_root = tmp_path / "previews"
@@ -899,7 +899,10 @@ def test_prepare_change_set_auto_loads_staged_css(tmp_path):
     forms a dependable automatic handoff.
     """
     from cauldron_site_astro.models import SiteChangeSet
-    from cauldron_site_astro.site_tools import handle_prepare_change_set, handle_stage_theme
+    from cauldron_site_astro.site_tools import (
+        _handle_prepare_change_set as handle_prepare_change_set,
+        _handle_stage_theme as handle_stage_theme,
+    )
     from cauldron_site_astro.theme import SiteThemeService
 
     ctx = _ctx("timmy-staged-css")
@@ -948,7 +951,7 @@ def test_prepare_change_set_auto_loads_staged_css(tmp_path):
 def test_prepare_change_set_explicit_theme_css_overrides_staged(tmp_path):
     """Explicit theme_css= takes priority over any previously staged CSS."""
     from cauldron_site_astro.models import SiteChangeSet
-    from cauldron_site_astro.site_tools import handle_prepare_change_set
+    from cauldron_site_astro.site_tools import _handle_prepare_change_set as handle_prepare_change_set
     from cauldron_site_astro.theme import SiteThemeService
 
     ctx = _ctx("timmy-explicit-css")
@@ -993,9 +996,9 @@ def test_full_stage_then_prepare_then_publish_carries_css(tmp_path):
     """
     from cauldron_site_astro.models import SiteChangeSet
     from cauldron_site_astro.site_tools import (
-        handle_stage_theme,
-        handle_prepare_change_set,
-        handle_publish,
+        _handle_stage_theme as handle_stage_theme,
+        _handle_prepare_change_set as handle_prepare_change_set,
+        _handle_publish as handle_publish,
     )
     from cauldron_site_astro.theme import SiteThemeService
 
@@ -1062,7 +1065,7 @@ def test_full_stage_then_prepare_then_publish_carries_css(tmp_path):
 def test_publish_result_has_published_true_on_success(tmp_path):
     """Successful publish returns published=True in data."""
     from cauldron_site_astro.models import SiteChangeSet
-    from cauldron_site_astro.site_tools import handle_publish
+    from cauldron_site_astro.site_tools import _handle_publish as handle_publish
 
     ctx = _ctx("timmy-pub-bool")
     config = _make_config(tmp_path)
@@ -1095,7 +1098,7 @@ def test_publish_result_has_published_true_on_success(tmp_path):
 def test_publish_result_has_published_false_on_build_failure(tmp_path):
     """Failed publish (build error) returns success=False; no published key expected on failure."""
     from cauldron_site_astro.models import SiteChangeSet
-    from cauldron_site_astro.site_tools import handle_publish
+    from cauldron_site_astro.site_tools import _handle_publish as handle_publish
 
     ctx = _ctx("timmy-pub-fail-bool")
     config = _make_config(tmp_path)

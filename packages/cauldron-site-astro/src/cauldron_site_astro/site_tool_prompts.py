@@ -54,20 +54,30 @@ def _get_builtin_templates() -> tuple:
                 "Returns data.healthy (boolean, True if all three checks passed) "
                 "and data.checks mapping each check name to its result dict. "
                 "Each check result has 'status' (string) and 'ok' (boolean). "
-                "homepage_content statuses: 'published', 'draft', 'missing', "
-                "'unavailable', 'error'. "
-                "root_artifact statuses: 'ok', 'empty', 'missing', 'unconfigured'. "
-                "root_route statuses: 'ok', 'not_found', 'error', 'unreachable'."
+                "No hash values are included in any check result. "
+                "homepage_content statuses: 'published' (ok=true), "
+                "'draft' (item exists but unpublished), "
+                "'missing' (actor has draft visibility, no item found at all), "
+                "'not_published' (actor lacks draft visibility, nothing published), "
+                "'unavailable' (content package not installed), 'error'. "
+                "root_artifact statuses: 'ok', 'empty', 'missing', "
+                "'unconfigured', 'error'. "
+                "root_route statuses: 'ok', 'route_not_found' (no URL pattern for '/'), "
+                "'view_raised' (view threw an exception), 'not_found' (404 response or "
+                "Http404 raised), 'error' (non-200/404 or non-HTML 200), 'unreachable'."
             ),
             approval_requirements="None; read-only.",
             clarification_behavior=(
                 "Use this tool at the start of any site-creation workflow to "
                 "determine what state the site is in before proposing changes. "
                 "Use it again after a successful publish to confirm the site is live. "
-                "If homepage_content is 'missing', call site.propose_homepage next. "
+                "If homepage_content is 'missing' or 'not_published', call "
+                "site.propose_homepage next. "
+                "'not_published' means nothing is published but the actor cannot "
+                "see drafts — do not assume the item is absent. "
                 "If root_artifact is 'missing', a publish has not yet occurred. "
-                "If root_route is 'not_found', the public URL routing may not be "
-                "configured — do not infer the site is down."
+                "If root_route is 'route_not_found', the public URL routing may not "
+                "be configured — do not infer the site is down."
             ),
             refusal_behavior=(
                 "Refuse if the actor lacks view_published_content permission."
@@ -387,8 +397,9 @@ def _get_builtin_templates() -> tuple:
             required_permission="cauldron_content_operations.propose_content_changes",
             risk_level="PROPOSE",
             read_scope=(
-                "Reads the current homepage item (if any) to determine "
-                "create-vs-update and retrieve the expected hash for the update operation."
+                "Reads the current homepage item (published and draft) via "
+                "include_drafts=True to determine create-vs-update and retrieve "
+                "the expected hash for an update operation."
             ),
             write_scope=(
                 "Creates a ContentChangeRequest with a single homepage operation "
@@ -396,12 +407,22 @@ def _get_builtin_templates() -> tuple:
             ),
             preconditions=(
                 "Actor has propose_content_changes permission.",
+                "Actor has view_published_content permission "
+                "(needed to query homepage state).",
+                "Actor has view_draft_content permission "
+                "(needed to detect existing drafts and avoid duplicate creates).",
                 "The user has explicitly requested homepage content.",
             ),
             input_expectations=(
                 "Required: 'title' (string), 'body' (string, markdown or HTML). "
-                "Optional: 'navigation_title' (string), 'summary' (string), "
-                "'seo_title' (string), 'meta_description' (string)."
+                "Optional SEO/meta: 'navigation_title', 'summary', 'seo_title', "
+                "'meta_description', 'canonical_url'. "
+                "Optional robots: 'robots_index' (boolean, default true), "
+                "'robots_follow' (boolean, default true). "
+                "Optional social: 'social_title', 'social_description', 'social_image'. "
+                "Optional change-request controls: 'description' (human-readable "
+                "description for the change request; generated automatically if omitted), "
+                "'idempotency_key' (string, deduplicates proposals)."
             ),
             result_behavior=(
                 "Returns cs_id (string, the content change request ID), "
@@ -423,10 +444,17 @@ def _get_builtin_templates() -> tuple:
             ),
             refusal_behavior=(
                 "Refuse if the user has not provided title and body content. "
-                "Refuse if the actor lacks propose_content_changes permission."
+                "Refuse if the actor lacks propose_content_changes, "
+                "view_published_content, or view_draft_content permission."
             ),
             error_guidance=(
-                "On failure, report the specific error message. "
+                "On permission failure (actor lacks view_published_content or "
+                "view_draft_content), report the specific missing permission and "
+                "do not retry — an operator must grant access first. "
+                "On homepage lookup failure, report the error and do not proceed "
+                "to create_change_request — a lookup error must never be silently "
+                "converted into a create operation. "
+                "On other failures, report the specific error message. "
                 "Do not retry automatically without user confirmation."
             ),
             positive_examples=(

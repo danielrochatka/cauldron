@@ -18,8 +18,23 @@ def _ctx():
     from django.contrib.auth import get_user_model
     from cauldron_ai_admin.tools import AdminAIToolContext
     User = get_user_model()
-    user, _ = User.objects.get_or_create(username="site-tools-user")
+    user, _ = User.objects.get_or_create(
+        username="site-tools-user",
+        defaults={"is_superuser": True, "is_staff": True},
+    )
+    if not user.is_superuser:
+        user.is_superuser = True
+        user.save(update_fields=["is_superuser"])
     return AdminAIToolContext(actor=user, run_id="r1", correlation_id="c1")
+
+
+def _ctx_deny(*perms_to_deny):
+    """Context whose actor denies the specified permissions."""
+    from types import SimpleNamespace
+    from cauldron_ai_admin.tools import AdminAIToolContext
+    denied = set(perms_to_deny)
+    actor = SimpleNamespace(has_perm=lambda perm: perm not in denied)
+    return AdminAIToolContext(actor=actor, run_id="r1", correlation_id="c1")
 
 
 def _make_build_result(ok=True, pages_built=1, output_dir="/tmp/out", error="", build_log=""):
@@ -512,7 +527,7 @@ def test_verify_root_success_returns_diagnostics(tmp_path: Path):
     mock_diag = {
         "healthy": True,
         "checks": {
-            "homepage_content": {"status": "published", "ok": True, "hash": "h1"},
+            "homepage_content": {"status": "published", "ok": True},
             "root_artifact": {"status": "ok", "ok": True},
             "root_route": {"status": "ok", "ok": True, "http_status": 200},
         },
@@ -537,9 +552,9 @@ def test_verify_root_build_service_error_still_runs(tmp_path: Path):
     mock_diag = {
         "healthy": False,
         "checks": {
-            "homepage_content": {"status": "unavailable", "ok": False, "hash": ""},
+            "homepage_content": {"status": "unavailable", "ok": False},
             "root_artifact": {"status": "unconfigured", "ok": False},
-            "root_route": {"status": "not_found", "ok": False, "http_status": 404},
+            "root_route": {"status": "route_not_found", "ok": False},
         },
     }
 
@@ -748,3 +763,221 @@ def test_propose_homepage_create_request_exception():
 
     assert result.success is False
     assert "DB failure" in result.message
+
+
+# ---------------------------------------------------------------------------
+# site.propose_homepage — Section 6 additions
+# ---------------------------------------------------------------------------
+
+
+def test_propose_homepage_lacks_view_published_perm():
+    """Actor without view_published_content → tool failure, no create_change_request."""
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    ctx = _ctx_deny("cauldron_content_operations.view_published_content")
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        result = handle_propose_homepage(ctx, title="T", body="B")
+
+    assert result.success is False
+    assert "view_published_content" in result.message
+    mock_svc.create_change_request.assert_not_called()
+
+
+def test_propose_homepage_lacks_view_draft_perm():
+    """Actor without view_draft_content → tool failure, no create_change_request."""
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    ctx = _ctx_deny("cauldron_content_operations.view_draft_content")
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        result = handle_propose_homepage(ctx, title="T", body="B")
+
+    assert result.success is False
+    assert "view_draft_content" in result.message
+    mock_svc.create_change_request.assert_not_called()
+
+
+def test_propose_homepage_lookup_failure_is_tool_failure():
+    """get_item raising never silently falls through to a create operation."""
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    mock_svc.get_item.side_effect = RuntimeError("DB timeout")
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        result = handle_propose_homepage(_ctx(), title="Home", body="Body")
+
+    assert result.success is False
+    assert "lookup failed" in result.message.lower() or "DB timeout" in result.message
+    mock_svc.create_change_request.assert_not_called()
+
+
+def test_propose_homepage_draft_homepage_produces_update():
+    """Draft homepage detected via include_drafts=True → kind='update'."""
+    from types import SimpleNamespace
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    draft_item = SimpleNamespace(status="draft", hash="draft-hash-xyz")
+    mock_svc = MagicMock()
+    mock_svc.get_item.return_value = draft_item
+    mock_svc.create_change_request.return_value = _make_change_request_result(
+        ok=True, request_id="cr-draft-update"
+    )
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        result = handle_propose_homepage(_ctx(), title="T", body="B")
+
+    assert result.success is True
+    assert result.data["kind"] == "update"
+
+    call_kwargs = mock_svc.get_item.call_args.kwargs
+    assert call_kwargs.get("include_drafts") is True
+
+    op_kwargs = mock_svc.create_change_request.call_args.kwargs
+    assert op_kwargs["operations"][0]["expected_hash"] == "draft-hash-xyz"
+
+
+def test_propose_homepage_get_item_called_with_include_drafts_true():
+    """get_item is always called with include_drafts=True."""
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    mock_svc.get_item.return_value = None
+    mock_svc.create_change_request.return_value = _make_change_request_result(ok=True)
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        handle_propose_homepage(_ctx(), title="T", body="B")
+
+    call_kwargs = mock_svc.get_item.call_args.kwargs
+    assert call_kwargs.get("include_drafts") is True
+
+
+def test_propose_homepage_provider_name_is_empty():
+    """provider_name must be '' so content routing selects the authoritative provider."""
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    mock_svc.get_item.return_value = None
+    mock_svc.create_change_request.return_value = _make_change_request_result(ok=True)
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        handle_propose_homepage(_ctx(), title="T", body="B")
+
+    call_kwargs = mock_svc.create_change_request.call_args.kwargs
+    assert call_kwargs["provider_name"] == ""
+
+
+def test_propose_homepage_idempotency_key_forwarded():
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    mock_svc.get_item.return_value = None
+    mock_svc.create_change_request.return_value = _make_change_request_result(ok=True)
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        handle_propose_homepage(_ctx(), title="T", body="B", idempotency_key="my-key")
+
+    call_kwargs = mock_svc.create_change_request.call_args.kwargs
+    assert call_kwargs["idempotency_key"] == "my-key"
+
+
+def test_propose_homepage_caller_description_forwarded():
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    mock_svc.get_item.return_value = None
+    mock_svc.create_change_request.return_value = _make_change_request_result(ok=True)
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        handle_propose_homepage(_ctx(), title="T", body="B", description="My custom desc")
+
+    call_kwargs = mock_svc.create_change_request.call_args.kwargs
+    assert call_kwargs["description"] == "My custom desc"
+
+
+def test_propose_homepage_generated_description_when_no_caller_desc():
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    mock_svc.get_item.return_value = None
+    mock_svc.create_change_request.return_value = _make_change_request_result(ok=True)
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        handle_propose_homepage(_ctx(), title="My Homepage", body="B")
+
+    call_kwargs = mock_svc.create_change_request.call_args.kwargs
+    assert "My Homepage" in call_kwargs["description"]
+
+
+def test_propose_homepage_schema_has_additional_properties_false():
+    from cauldron_ai_admin.tools import AdminAIToolRegistry
+    from cauldron_site_astro import site_tools
+
+    reg = AdminAIToolRegistry()
+    site_tools.register(reg)
+
+    defn = next(d for d in reg.all_definitions() if d.name == "site.propose_homepage")
+    assert defn.argument_schema.get("additionalProperties") is False
+
+
+def test_propose_homepage_all_seo_fields_passed():
+    from cauldron_site_astro.site_tools import _handle_propose_homepage as handle_propose_homepage
+
+    mock_svc = MagicMock()
+    mock_svc.get_item.return_value = None
+    mock_svc.create_change_request.return_value = _make_change_request_result(ok=True)
+
+    with patch(
+        "cauldron_site_astro.site_tools._get_content_operation_service",
+        return_value=mock_svc,
+    ):
+        handle_propose_homepage(
+            _ctx(),
+            title="T",
+            body="B",
+            canonical_url="https://example.com/",
+            robots_index=False,
+            robots_follow=False,
+            social_title="Social T",
+            social_description="Social D",
+            social_image="/img/social.jpg",
+        )
+
+    call_kwargs = mock_svc.create_change_request.call_args.kwargs
+    data = call_kwargs["operations"][0].get("data", {})
+    assert data.get("canonical_url") == "https://example.com/"
+    assert data.get("robots_index") is False
+    assert data.get("robots_follow") is False
+    assert data.get("social_title") == "Social T"
+    assert data.get("social_description") == "Social D"
+    assert data.get("social_image") == "/img/social.jpg"

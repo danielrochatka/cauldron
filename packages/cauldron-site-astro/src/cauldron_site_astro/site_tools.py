@@ -130,8 +130,8 @@ def register(registry: "AdminAIToolRegistry") -> None:
             description=(
                 "Propose a homepage content change. Determines whether to "
                 "create or update the homepage singleton based on whether it "
-                "already exists, then creates a content change request. "
-                "Returns cs_id for use with site.prepare_change_set."
+                "already exists (including drafts), then creates a content "
+                "change request. Returns cs_id for use with site.prepare_change_set."
             ),
             argument_schema={
                 "type": "object",
@@ -160,8 +160,41 @@ def register(registry: "AdminAIToolRegistry") -> None:
                         "type": "string",
                         "description": "Meta description for search engines.",
                     },
+                    "canonical_url": {
+                        "type": "string",
+                        "description": "Canonical URL for the homepage.",
+                    },
+                    "robots_index": {
+                        "type": "boolean",
+                        "description": "Whether search engines should index this page.",
+                    },
+                    "robots_follow": {
+                        "type": "boolean",
+                        "description": "Whether search engines should follow links on this page.",
+                    },
+                    "social_title": {
+                        "type": "string",
+                        "description": "Open Graph / social media title override.",
+                    },
+                    "social_description": {
+                        "type": "string",
+                        "description": "Open Graph / social media description.",
+                    },
+                    "social_image": {
+                        "type": "string",
+                        "description": "Open Graph / social media image URL.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Human-readable description for the change request.",
+                    },
+                    "idempotency_key": {
+                        "type": "string",
+                        "description": "Optional key to deduplicate proposals.",
+                    },
                 },
                 "required": ["title", "body"],
+                "additionalProperties": False,
             },
             risk_level=RiskLevel.PROPOSE,
             required_permission=_PERM_PROPOSE,
@@ -1098,12 +1131,43 @@ def _handle_propose_homepage(
     summary="",
     seo_title="",
     meta_description="",
+    canonical_url="",
+    robots_index=True,
+    robots_follow=True,
+    social_title="",
+    social_description="",
+    social_image="",
+    description="",
+    idempotency_key="",
     **kwargs,
 ):
     try:
         from cauldron_ai_admin.tools import AdminAIToolResult
     except ImportError:
         return None
+
+    _PERM_VIEW = "cauldron_content_operations.view_published_content"
+    _PERM_DRAFT = "cauldron_content_operations.view_draft_content"
+
+    actor = context.actor
+
+    # Check additional read permissions; tool registry only enforces propose_content_changes.
+    if not getattr(actor, "has_perm", lambda _: False)(_PERM_VIEW):
+        return AdminAIToolResult(
+            tool_name="site.propose_homepage",
+            success=False,
+            message=(
+                f"Actor lacks {_PERM_VIEW!r}; cannot safely determine homepage state."
+            ),
+        )
+    if not getattr(actor, "has_perm", lambda _: False)(_PERM_DRAFT):
+        return AdminAIToolResult(
+            tool_name="site.propose_homepage",
+            success=False,
+            message=(
+                f"Actor lacks {_PERM_DRAFT!r}; cannot safely determine homepage state."
+            ),
+        )
 
     svc = _get_content_operation_service()
     if svc is None:
@@ -1127,18 +1191,23 @@ def _handle_propose_homepage(
             message="cauldron-content package is required but not installed.",
         )
 
-    # Determine create vs. update by looking up the current homepage.
+    # Determine create vs. update by looking up the current homepage (drafts included).
+    # Fail closed: any lookup error is a tool failure — never silently fall through to create.
     kind = "create"
     expected_hash = ""
     try:
         existing = svc.get_item(
-            HOMEPAGE_ITEM_ID, HOMEPAGE_COLLECTION, user=context.actor
+            HOMEPAGE_ITEM_ID, HOMEPAGE_COLLECTION, user=actor, include_drafts=True
         )
-        if existing is not None:
-            kind = "update"
-            expected_hash = getattr(existing, "hash", "") or ""
-    except Exception:
-        pass
+    except Exception as exc:
+        return AdminAIToolResult(
+            tool_name="site.propose_homepage",
+            success=False,
+            message=f"Homepage lookup failed: {_safe_exc(exc)}",
+        )
+    if existing is not None:
+        kind = "update"
+        expected_hash = getattr(existing, "hash", "") or ""
 
     op = build_homepage_operation(
         kind=kind,
@@ -1150,14 +1219,23 @@ def _handle_propose_homepage(
         summary=summary,
         seo_title=seo_title,
         meta_description=meta_description,
+        canonical_url=canonical_url,
+        robots_index=robots_index,
+        robots_follow=robots_follow,
+        social_title=social_title,
+        social_description=social_description,
+        social_image=social_image,
     )
+
+    change_request_description = description or f"Homepage {kind}: {title[:80]}"
 
     try:
         result = svc.create_change_request(
-            user=context.actor,
+            user=actor,
             operations=[op],
-            provider_name="cauldron_site_astro",
-            description=f"Homepage {kind}: {title[:80]}",
+            provider_name="",
+            description=change_request_description,
+            idempotency_key=idempotency_key,
         )
     except Exception as exc:
         return AdminAIToolResult(

@@ -33,7 +33,10 @@ _MAX_BUILD_LOG_TAIL = 500
 
 def register(registry: "AdminAIToolRegistry") -> None:
     """Register all site tools into *registry*."""
-    from cauldron_ai_admin.tools import AdminAIToolDefinition, RiskLevel
+    try:
+        from cauldron_ai_admin.tools import AdminAIToolDefinition, RiskLevel
+    except ImportError:
+        return
 
     _OWNING_MODULE = "cauldron.site.astro"
     _PERM_VIEW = "cauldron_content_operations.view_published_content"
@@ -241,6 +244,9 @@ def _get_content_operation_service():
     """
     try:
         from cauldron_admin_content.service_factory import get_service
+    except ImportError:
+        return None
+    try:
         return get_service()
     except Exception:
         return None
@@ -381,7 +387,10 @@ def _extract_item_ids(content_request_ids: list[str]) -> list[str]:
 def _handle_site_inspect(context, **kwargs):
     from pathlib import Path
 
-    from cauldron_ai_admin.tools import AdminAIToolResult
+    try:
+        from cauldron_ai_admin.tools import AdminAIToolResult
+    except ImportError:
+        return None
 
     try:
         svc = get_build_service()
@@ -420,7 +429,10 @@ def _handle_site_inspect(context, **kwargs):
 
 
 def _handle_stage_theme(context, *, css_content, description="", **kwargs):
-    from cauldron_ai_admin.tools import AdminAIToolResult
+    try:
+        from cauldron_ai_admin.tools import AdminAIToolResult
+    except ImportError:
+        return None
 
     try:
         svc = get_build_service()
@@ -476,7 +488,10 @@ def _handle_prepare_change_set(
 
     from django.utils import timezone
 
-    from cauldron_ai_admin.tools import AdminAIToolResult
+    try:
+        from cauldron_ai_admin.tools import AdminAIToolResult
+    except ImportError:
+        return None
     from cauldron_site_astro.models import SiteChangeSet
 
     # ---- Validate inputs ---------------------------------------------------
@@ -591,7 +606,10 @@ def _handle_prepare_change_set(
 def _handle_inspect_preview(context, *, change_set_id, **kwargs):
     from pathlib import Path
 
-    from cauldron_ai_admin.tools import AdminAIToolResult
+    try:
+        from cauldron_ai_admin.tools import AdminAIToolResult
+    except ImportError:
+        return None
     from cauldron_site_astro.models import SiteChangeSet
 
     try:
@@ -662,7 +680,10 @@ def _handle_publish(context, *, change_set_id, confirm, **kwargs):
     from django.db import transaction
     from django.utils import timezone
 
-    from cauldron_ai_admin.tools import AdminAIToolResult
+    try:
+        from cauldron_ai_admin.tools import AdminAIToolResult
+    except ImportError:
+        return None
     from cauldron_site_astro.models import SiteChangeSet
 
     if not confirm:

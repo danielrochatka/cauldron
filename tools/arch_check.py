@@ -136,14 +136,16 @@ def _pkg_name_from_namespace(ns: str) -> str:
     return ns.replace("_", "-")
 
 
-def _find_owner(import_path: str, ns_to_pkg: dict[str, PackageInfo]) -> PackageInfo | None:
-    """Return the PackageInfo that owns *import_path*, using boundary-aware longest-prefix matching."""
+def _find_owner(import_path: str, ns_to_pkg: dict[str, PackageInfo]) -> tuple[PackageInfo | None, str | None]:
+    """Return the PackageInfo and matched namespace that owns *import_path*, using boundary-aware longest-prefix matching."""
     best_ns: str | None = None
     for ns in ns_to_pkg:
         if import_path == ns or import_path.startswith(ns + "."):
             if best_ns is None or len(ns) > len(best_ns):
                 best_ns = ns
-    return ns_to_pkg[best_ns] if best_ns else None
+    if best_ns:
+        return ns_to_pkg[best_ns], best_ns
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -238,39 +240,39 @@ def _extract_manifest_fields(module_py: Path) -> dict:
     return result
 
 
-def _extract_cauldron_pkg_names(dep_list: list[str]) -> set[str]:
+def _extract_dep_pkg_names(dep_list: list[str]) -> set[str]:
     import re
     result: set[str] = set()
     for dep_str in dep_list:
         pkg_name = re.split(r"[><=!;]", dep_str.strip())[0].strip()
-        if pkg_name.startswith("cauldron-") and pkg_name != "cauldron":
+        if pkg_name:
             result.add(pkg_name)
     return result
 
 
 def _pyproject_cauldron_deps(pyproject: Path) -> set[str]:
-    """Return cauldron-* package names from ALL sections of pyproject.toml."""
+    """Return package names from ALL sections of pyproject.toml."""
     try:
         data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError):
         return set()
 
     project = data.get("project", {})
-    deps = _extract_cauldron_pkg_names(project.get("dependencies", []))
+    deps = _extract_dep_pkg_names(project.get("dependencies", []))
     for extra_deps in project.get("optional-dependencies", {}).values():
-        deps |= _extract_cauldron_pkg_names(extra_deps)
+        deps |= _extract_dep_pkg_names(extra_deps)
     return deps
 
 
 def _pyproject_main_cauldron_deps(pyproject: Path) -> set[str]:
-    """Return cauldron-* package names from [project.dependencies] only (not optional)."""
+    """Return package names from [project.dependencies] only (not optional)."""
     try:
         data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError):
         return set()
 
     project = data.get("project", {})
-    return _extract_cauldron_pkg_names(project.get("dependencies", []))
+    return _extract_dep_pkg_names(project.get("dependencies", []))
 
 
 def _pyproject_optional_only_cauldron_deps(pyproject: Path) -> set[str]:
@@ -287,10 +289,10 @@ def _pyproject_test_cauldron_deps(pyproject: Path) -> set[str]:
     except (OSError, tomllib.TOMLDecodeError):
         return set()
     project = data.get("project", {})
-    test_deps = _extract_cauldron_pkg_names(
+    test_deps = _extract_dep_pkg_names(
         project.get("optional-dependencies", {}).get("test", [])
     )
-    main_deps = _extract_cauldron_pkg_names(project.get("dependencies", []))
+    main_deps = _extract_dep_pkg_names(project.get("dependencies", []))
     return test_deps - main_deps
 
 
@@ -301,13 +303,13 @@ def _pyproject_runtime_optional_cauldron_deps(pyproject: Path) -> set[str]:
     except (OSError, tomllib.TOMLDecodeError):
         return set()
     project = data.get("project", {})
-    main_deps = _extract_cauldron_pkg_names(project.get("dependencies", []))
+    main_deps = _extract_dep_pkg_names(project.get("dependencies", []))
     opt_groups = project.get("optional-dependencies", {})
     runtime_optional: set[str] = set()
     for group_name, group_deps in opt_groups.items():
         if group_name == "test":
             continue
-        runtime_optional |= _extract_cauldron_pkg_names(group_deps)
+        runtime_optional |= _extract_dep_pkg_names(group_deps)
     return runtime_optional - main_deps
 
 
@@ -471,13 +473,12 @@ class _ImportCollector(ast.NodeVisitor):
     def __init__(self) -> None:
         self.imports: list[ImportRef] = []
         self._guarded = False      # inside try/except ImportError or if TYPE_CHECKING
-        self._in_function = False  # inside a function/method body (deferred)
 
     # -- guard helpers -------------------------------------------------------
 
     def _catches_import_error(self, handler: ast.ExceptHandler) -> bool:
         if handler.type is None:
-            return True
+            return False
         if isinstance(handler.type, ast.Name):
             return handler.type.id in self._IMPORT_ERROR_NAMES
         if isinstance(handler.type, ast.Tuple):
@@ -525,21 +526,11 @@ class _ImportCollector(ast.NodeVisitor):
         for stmt in node.orelse:
             self.visit(stmt)
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        old = self._in_function
-        self._in_function = True
-        self.generic_visit(node)
-        self._in_function = old
-
-    visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
-
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        # Class body runs at class-definition time (not deferred)
-        # but _in_function state can pass through for nested classes
         self.generic_visit(node)
 
     def visit_Import(self, node: ast.Import) -> None:
-        guarded = self._guarded or self._in_function
+        guarded = self._guarded
         for alias in node.names:
             self.imports.append(ImportRef(
                 module=alias.name,
@@ -550,7 +541,7 @@ class _ImportCollector(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         if node.module:
-            guarded = self._guarded or self._in_function
+            guarded = self._guarded
             self.imports.append(ImportRef(
                 module=node.module,
                 line=node.lineno,
@@ -604,6 +595,7 @@ def _arch003_violations(
     imp: "ImportRef",
     import_pkg: "Optional[PackageInfo]",
     py_file: Path,
+    matched_ns: str | None = None,
 ) -> "list[Violation]":
     """Return ARCH003 violations for a single import statement.
 
@@ -640,9 +632,9 @@ def _arch003_violations(
             _fire(imp.module)
             break
 
-    # Root-namespace from-import: ``from cauldron_x import impl``
+    # Root-namespace from-import: ``from <ns> import impl``
     # Construct synthetic path and check against capability_implementations.
-    if imp.is_from and "." not in imp.module:
+    if imp.is_from and matched_ns is not None and imp.module == matched_ns:
         for name in imp.names:
             if name.startswith("_"):
                 continue  # private names handled by ARCH002b
@@ -684,10 +676,10 @@ def check_file(
             continue
 
         # 3. Resolve owner (boundary-aware; works for any namespace prefix)
-        import_pkg = _find_owner(imp.module, ns_to_pkg)
+        import_pkg, matched_ns = _find_owner(imp.module, ns_to_pkg)
 
-        # 4. Skip untracked third-party imports
-        if import_pkg is None and not _is_cauldron_namespace(ns_root):
+        # 4. Skip untracked imports
+        if import_pkg is None:
             continue
 
         # ------------------------------------------------------------------
@@ -696,7 +688,7 @@ def check_file(
         # must not hardcode concrete capability implementations (that is the
         # drift path ARCH003 is designed to prevent regardless of context).
         # ------------------------------------------------------------------
-        violations.extend(_arch003_violations(imp, import_pkg, py_file))
+        violations.extend(_arch003_violations(imp, import_pkg, py_file, matched_ns=matched_ns))
 
         # ------------------------------------------------------------------
         # ARCH002a — _-prefixed segment in the module path itself
@@ -731,28 +723,14 @@ def check_file(
         # ------------------------------------------------------------------
         # ARCH002c — Sub-module path absent from sibling's declared public_api
         # ------------------------------------------------------------------
-        if import_pkg and import_pkg.public_api:
-            if "." in imp.module:
-                # Dotted path: validate directly
-                if not _under_prefix(imp.module, import_pkg.public_api):
-                    violations.append(Violation(
-                        code="ARCH002",
-                        file=py_file,
-                        line=imp.line,
-                        message=f"Import '{imp.module}' is not in the declared public_api of '{import_pkg.slug}'.",
-                        fix=(
-                            f"Only import from paths listed in the public_api of '{import_pkg.slug}'.\n"
-                            f"       Public paths: {', '.join(sorted(import_pkg.public_api)) or '(none)'}"
-                        ),
-                    ))
-                    continue  # ARCH001 is not meaningful if the path itself is non-public
-            elif imp.is_from:
-                # Root-namespace from-import: ``from cauldron_x import name``
-                # Each imported name synthesizes a sub-module path for validation.
+        if import_pkg is not None:
+            if imp.is_from and matched_ns is not None and imp.module == matched_ns:
+                # Root-namespace from-import: ``from <ns> import <name>``
+                # Synthesize ``<ns>.<name>`` and validate against public_api.
                 for name in imp.names:
                     if name.startswith("_"):
-                        continue  # already handled by ARCH002b
-                    synthetic = f"{imp.module}.{name}"
+                        continue  # already caught by ARCH002b
+                    synthetic = f"{matched_ns}.{name}"
                     if not _under_prefix(synthetic, import_pkg.public_api):
                         violations.append(Violation(
                             code="ARCH002",
@@ -767,26 +745,34 @@ def check_file(
                                 f"       Public paths: {', '.join(sorted(import_pkg.public_api)) or '(none)'}"
                             ),
                         ))
+            elif matched_ns is not None and imp.module != matched_ns:
+                # Sub-module path import: validate directly.
+                if not _under_prefix(imp.module, import_pkg.public_api):
+                    violations.append(Violation(
+                        code="ARCH002",
+                        file=py_file,
+                        line=imp.line,
+                        message=f"Import '{imp.module}' is not in the declared public_api of '{import_pkg.slug}'.",
+                        fix=(
+                            f"Only import from paths listed in the public_api of '{import_pkg.slug}'.\n"
+                            f"       Public paths: {', '.join(sorted(import_pkg.public_api)) or '(none)'}"
+                        ),
+                    ))
+                    continue  # ARCH001 is not meaningful if the path itself is non-public
 
         # ------------------------------------------------------------------
         # ARCH001 — Direct import not declared in BOTH pyproject AND manifest.
         # Manifest check requires kind='module'; capability deps authorize the
         # runtime contract only, not static Python imports.
         # ------------------------------------------------------------------
-        pkg_name = import_pkg.name if import_pkg else _pkg_name_from_namespace(ns_root)
-        owner_label = import_pkg.slug if import_pkg else ns_root
+        pkg_name = import_pkg.name
+        owner_label = import_pkg.slug
 
         in_main = pkg_name in owning_pkg.pyproject_main_deps
         in_runtime_opt = pkg_name in owning_pkg.pyproject_runtime_optional_deps
         in_test_only = pkg_name in owning_pkg.pyproject_test_deps
-        in_manifest_requires = import_pkg is not None and (
-            import_pkg.slug in owning_pkg.manifest_requires_module_slugs
-            or bool(import_pkg.provides & owning_pkg.manifest_requires_capability_slugs)
-        )
-        in_manifest_optional = import_pkg is not None and (
-            import_pkg.slug in owning_pkg.manifest_optional_module_slugs
-            or bool(import_pkg.provides & owning_pkg.manifest_optional_capability_slugs)
-        )
+        in_manifest_requires = import_pkg.slug in owning_pkg.manifest_requires_module_slugs
+        in_manifest_optional = import_pkg.slug in owning_pkg.manifest_optional_module_slugs
         in_manifest_any = in_manifest_requires or in_manifest_optional
 
         if not owning_pkg.has_package_metadata:
@@ -806,7 +792,24 @@ def check_file(
                     ),
                     note="No pyproject.toml — only manifest declaration is checked.",
                 ))
-            # else: manifest declares it — fall through cleanly
+            elif in_manifest_optional and not in_manifest_requires:
+                # Optional manifest dep in unpackaged module: still requires guard.
+                if not is_test and not imp.is_guarded:
+                    violations.append(Violation(
+                        code="ARCH001",
+                        file=py_file,
+                        line=imp.line,
+                        message=(
+                            f"Unguarded production import '{imp.module}' from "
+                            f"manifest-optional package '{owner_label}' in unpackaged module."
+                        ),
+                        fix=(
+                            "Wrap the import in: try: ... except ImportError: ...\n"
+                            "or place it inside: if TYPE_CHECKING: ..."
+                        ),
+                        note=f"'{owner_label}' is declared as optional= in module.py but no pyproject.toml is present.",
+                    ))
+            # else: manifest declares it as requires= — fall through cleanly
         elif is_test and not owning_pkg.has_module_manifest:
             # Framework integration root (no module.py): its tests/ is an integration test
             # suite for the whole framework. Cauldron namespace imports are allowed without
@@ -829,8 +832,7 @@ def check_file(
                     ),
                     fix=(
                         "Wrap the import in: try: ... except ImportError: ...\n"
-                        "or place it inside: if TYPE_CHECKING: ...\n"
-                        "or move it inside a function body (deferred import)."
+                        "or place it inside: if TYPE_CHECKING: ..."
                     ),
                     note=f"'{pkg_name}' is in a runtime-optional dependency group.",
                 ))
@@ -1082,6 +1084,34 @@ def check_arch004(
                 fix=(
                     f"Add ModuleRequirement(slug='{dep_pkg.slug}') (kind='module') "
                     f"or a matching capability slug to requires/optional in module.py."
+                ),
+                note=f"'{dep_pkg.slug}' provides: {', '.join(sorted(dep_pkg.provides)) or '(none)'}",
+            ))
+
+    # Direction B (runtime-optional): every runtime-optional pyproject dep must have
+    # a corresponding manifest optional= entry (module slug or capability slug).
+    for dep_name in pkg.pyproject_runtime_optional_deps:
+        if dep_name == pkg.name:
+            continue
+        dep_pkg = pkg_by_name.get(dep_name)
+        if dep_pkg is None:
+            continue
+        in_manifest_opt = (
+            dep_pkg.slug in pkg.manifest_optional_module_slugs
+            or bool(dep_pkg.provides & pkg.manifest_optional_capability_slugs)
+        )
+        if not in_manifest_opt:
+            violations.append(Violation(
+                code="ARCH004",
+                file=pkg.root / "pyproject.toml",
+                line=0,
+                message=(
+                    f"pyproject.toml has runtime-optional dependency on '{dep_name}' "
+                    f"but the manifest has no corresponding optional= entry."
+                ),
+                fix=(
+                    f"Add ModuleRequirement(slug='{dep_pkg.slug}', kind='module') to optional= "
+                    f"in module.py, or add a matching capability slug to optional=."
                 ),
                 note=f"'{dep_pkg.slug}' provides: {', '.join(sorted(dep_pkg.provides)) or '(none)'}",
             ))

@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 _OWNING_MODULE = "cauldron.site.astro"
 
 
-def _get_builtin_templates() -> tuple[AIToolPromptTemplate, ...]:
+def _get_builtin_templates() -> tuple:
     """Construct built-in prompt templates lazily.
 
     Deferred so this module can be safely imported without the optional
@@ -21,7 +21,10 @@ def _get_builtin_templates() -> tuple[AIToolPromptTemplate, ...]:
     installed (apps.py guards with ``import cauldron_ai`` before calling
     :func:`register_builtin_site_tool_prompts`).
     """
-    from cauldron_ai.prompt_templates import AIToolPromptTemplate
+    try:
+        from cauldron_ai.prompt_templates import AIToolPromptTemplate
+    except ImportError:
+        return ()
     return (
         AIToolPromptTemplate(
             tool_name="site.inspect",
@@ -314,6 +317,9 @@ def register_builtin_site_tool_prompts() -> None:
     Called from CauldronSiteAstroConfig.ready(). Idempotent: re-registering
     identical instances is a silent no-op.
     """
-    from cauldron_ai.prompt_templates import register_tool_template
+    try:
+        from cauldron_ai.prompt_templates import register_tool_template
+    except ImportError:
+        return
     for tmpl in _get_builtin_templates():
         register_tool_template(tmpl)

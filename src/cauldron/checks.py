@@ -116,6 +116,7 @@ def cauldron_module_graph_check(app_configs, **kwargs):
         "load_failure": ("cauldron.E020", "cauldron.W020"),
         "duplicate_slug": ("cauldron.E021", "cauldron.W021"),
         "manifest_validation": ("cauldron.E022", "cauldron.W022"),
+        "project_path": ("cauldron.E024", "cauldron.W024"),
     }
 
     for err in registry.discovery_errors():
@@ -163,17 +164,28 @@ def cauldron_module_graph_check(app_configs, **kwargs):
     # E023 covers only genuinely absent modules (no entry point found).
     # load_failure and manifest_validation are already reported by E020/E022
     # above; emitting E023 again for those would be noise.
+    from django.conf import settings as _settings
+    _has_project_root = bool(getattr(_settings, "CAULDRON_PROJECT_MODULE_ROOT", None))
     for unavail in registry.unavailable_modules():
         if unavail.reason == "not_discovered":
+            if _has_project_root:
+                hint = (
+                    f"Install the package that provides the 'cauldron.modules'"
+                    f" entry point for {unavail.slug!r}, or add a project module"
+                    f" directory for it under CAULDRON_PROJECT_MODULE_ROOT,"
+                    " or remove it from CAULDRON_MODULES."
+                )
+            else:
+                hint = (
+                    f"Install the package that provides the 'cauldron.modules'"
+                    f" entry point for {unavail.slug!r}, or remove it from"
+                    " CAULDRON_MODULES."
+                )
             messages.append(
                 Error(
                     f"Module {unavail.slug!r} is listed in CAULDRON_MODULES but was"
-                    " not found among installed entry points.",
-                    hint=(
-                        f"Install the package that provides the 'cauldron.modules'"
-                        f" entry point for {unavail.slug!r}, or remove it from"
-                        " CAULDRON_MODULES."
-                    ),
+                    " not found among installed entry points or project modules.",
+                    hint=hint,
                     obj=unavail.slug,
                     id="cauldron.E023",
                 )

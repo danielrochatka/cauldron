@@ -1,6 +1,8 @@
 """Tests for entry-point discovery using independently packaged fixture modules."""
 
 import json
+import sys
+
 import pytest
 
 from cauldron.modules import CauldronModule
@@ -823,3 +825,232 @@ class TestDeterministicOrdering:
 
         # Exactly once per entry point.
         assert call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Project-folder discovery (#34)
+# ---------------------------------------------------------------------------
+
+def _write_project_module(
+    root,
+    *,
+    dir_name: str,
+    slug: str,
+    label: str = "Test Module",
+):
+    """Write a minimal valid project module under root/dir_name/."""
+    pkg = root / dir_name
+    pkg.mkdir(exist_ok=True)
+    (pkg / "__init__.py").write_text(
+        f"from cauldron.modules import BaseModule, ModuleManifest\n"
+        f"module = BaseModule(ModuleManifest(slug={slug!r}, label={label!r}))\n"
+    )
+    return pkg
+
+
+class TestProjectModuleDiscovery:
+    """Tests for project-folder module discovery (CAULDRON_PROJECT_MODULE_ROOT)."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_import_state(self):
+        """Restore sys.path and evict any modules imported during the test."""
+        original_path = list(sys.path)
+        original_modules = set(sys.modules.keys())
+        yield
+        sys.path[:] = original_path
+        for key in list(sys.modules.keys()):
+            if key not in original_modules:
+                del sys.modules[key]
+
+    def test_no_project_root_returns_no_project_records(self):
+        r = discover_modules(project_module_root=None)
+        project_recs = [rec for rec in r.records if rec.source_type == "project"]
+        assert project_recs == []
+
+    def test_nonexistent_root_produces_project_path_error(self, tmp_path):
+        r = discover_modules(project_module_root=tmp_path / "no_such_dir")
+        assert any(e.kind == "project_path" for e in r.errors)
+        assert r.records == [] or all(rec.source_type != "project" for rec in r.records)
+
+    def test_file_not_dir_produces_project_path_error(self, tmp_path):
+        f = tmp_path / "notadir.txt"
+        f.write_text("x")
+        r = discover_modules(project_module_root=f)
+        assert any(e.kind == "project_path" for e in r.errors)
+
+    def test_valid_project_module_discovered(self, tmp_path):
+        _write_project_module(tmp_path, dir_name="mymod", slug="mymod.pkg", label="My Mod")
+        r = discover_modules(project_module_root=tmp_path)
+        pkg_errors = [e for e in r.errors if e.kind != "project_path"]
+        assert pkg_errors == [], [e.message for e in pkg_errors]
+        project_recs = [rec for rec in r.records if rec.source_type == "project"]
+        assert len(project_recs) == 1
+        assert project_recs[0].slug == "mymod.pkg"
+
+    def test_project_module_source_type_is_project(self, tmp_path):
+        _write_project_module(tmp_path, dir_name="mymod", slug="mymod.pkg")
+        r = discover_modules(project_module_root=tmp_path)
+        project_recs = [rec for rec in r.records if rec.source_type == "project"]
+        assert project_recs
+        assert all(rec.source_type == "project" for rec in project_recs)
+
+    def test_project_module_project_path_is_dir_name(self, tmp_path):
+        _write_project_module(tmp_path, dir_name="mymod", slug="mymod.pkg")
+        r = discover_modules(project_module_root=tmp_path)
+        rec = next(rec for rec in r.records if rec.slug == "mymod.pkg")
+        assert rec.project_path == "mymod"
+        assert not rec.project_path.startswith("/")
+
+    def test_project_module_package_fields_empty(self, tmp_path):
+        _write_project_module(tmp_path, dir_name="mymod", slug="mymod.pkg")
+        r = discover_modules(project_module_root=tmp_path)
+        rec = next(rec for rec in r.records if rec.source_type == "project")
+        assert rec.package_name == ""
+        assert rec.package_version == ""
+        assert rec.entry_point_group == ""
+
+    def test_project_module_to_dict_includes_project_path(self, tmp_path):
+        _write_project_module(tmp_path, dir_name="mymod", slug="mymod.pkg")
+        r = discover_modules(project_module_root=tmp_path)
+        rec = next(rec for rec in r.records if rec.slug == "mymod.pkg")
+        d = rec.to_dict()
+        assert "project_path" in d
+        assert d["project_path"] == "mymod"
+
+    def test_package_module_project_path_is_empty(self, tmp_path):
+        """Package-source DiscoveredModules have project_path == ''."""
+        r = discover_modules(project_module_root=tmp_path)
+        for rec in r.records:
+            if rec.source_type == "package":
+                assert rec.project_path == ""
+
+    def test_discovery_skips_non_directories(self, tmp_path):
+        (tmp_path / "notapackage.py").write_text("x = 1")
+        r = discover_modules(project_module_root=tmp_path)
+        project_recs = [rec for rec in r.records if rec.source_type == "project"]
+        assert project_recs == []
+
+    def test_discovery_skips_dirs_without_init(self, tmp_path):
+        (tmp_path / "no_init").mkdir()
+        r = discover_modules(project_module_root=tmp_path)
+        project_recs = [rec for rec in r.records if rec.source_type == "project"]
+        assert project_recs == []
+
+    def test_discovery_skips_private_dirs(self, tmp_path):
+        private = tmp_path / "_private"
+        private.mkdir()
+        (private / "__init__.py").write_text(
+            "from cauldron.modules import BaseModule, ModuleManifest\n"
+            "module = BaseModule(ModuleManifest(slug='priv.mod', label='P'))\n"
+        )
+        r = discover_modules(project_module_root=tmp_path)
+        project_recs = [rec for rec in r.records if rec.source_type == "project"]
+        assert project_recs == []
+
+    def test_import_error_produces_load_failure(self, tmp_path):
+        pkg = tmp_path / "broken"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("raise ImportError('broken on purpose')")
+        r = discover_modules(project_module_root=tmp_path)
+        errors = [e for e in r.errors if e.kind == "load_failure"]
+        assert len(errors) == 1
+        assert "modules/broken" in errors[0].entry_point_name
+
+    def test_missing_module_attr_produces_load_failure(self, tmp_path):
+        pkg = tmp_path / "nopkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("x = 1  # no 'module' attribute")
+        r = discover_modules(project_module_root=tmp_path)
+        errors = [e for e in r.errors if e.kind == "load_failure"]
+        assert len(errors) == 1
+
+    def test_invalid_manifest_produces_validation_error(self, tmp_path):
+        pkg = tmp_path / "badmod"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("module = object()  # not CauldronModule")
+        r = discover_modules(project_module_root=tmp_path)
+        errors = [e for e in r.errors if e.kind == "manifest_validation"]
+        assert len(errors) == 1
+
+    def test_duplicate_slug_between_project_modules_produces_error(self, tmp_path):
+        for dir_name in ("mod_a", "mod_b"):
+            _write_project_module(
+                tmp_path, dir_name=dir_name, slug="shared.slug", label="Shared",
+            )
+        r = discover_modules(project_module_root=tmp_path)
+        dup_errors = [e for e in r.errors if e.kind == "duplicate_slug"]
+        assert len(dup_errors) == 1
+        project_recs = [rec for rec in r.records if rec.source_type == "project"]
+        assert len(project_recs) == 1
+
+    def test_project_module_wins_slug_race_over_package_module(self, tmp_path):
+        """When a project and package module share a slug, the project wins."""
+        from unittest.mock import patch
+        from cauldron.modules import BaseModule, ModuleManifest
+
+        _write_project_module(tmp_path, dir_name="pkgmod", slug="shared.slug", label="Project")
+        pkg_mod = BaseModule(ModuleManifest(slug="shared.slug", label="Package"))
+        fake_ep = type("EP", (), {
+            "name": "shared.slug",
+            "value": "pkgmod:module",
+            "dist": None,
+            "load": lambda s: pkg_mod,
+        })()
+        with patch("cauldron.modules.discovery.entry_points", return_value=[fake_ep]):
+            r = discover_modules(project_module_root=tmp_path)
+
+        assert len([rec for rec in r.records if rec.slug == "shared.slug"]) == 1
+        winner = next(rec for rec in r.records if rec.slug == "shared.slug")
+        assert winner.source_type == "project"
+
+        dup_errors = [e for e in r.errors if e.kind == "duplicate_slug"]
+        assert len(dup_errors) == 1
+
+    def test_root_added_to_sys_path(self, tmp_path):
+        _write_project_module(tmp_path, dir_name="mymod", slug="mymod.pkg")
+        resolved = str(tmp_path.resolve())
+        assert resolved not in sys.path
+        discover_modules(project_module_root=tmp_path)
+        assert resolved in sys.path
+
+    def test_root_not_added_to_sys_path_twice(self, tmp_path):
+        _write_project_module(tmp_path, dir_name="mymod", slug="mymod.pkg")
+        discover_modules(project_module_root=tmp_path)
+        discover_modules(project_module_root=tmp_path)
+        resolved = str(tmp_path.resolve())
+        assert sys.path.count(resolved) == 1
+
+    def test_combined_records_sorted_by_slug(self, tmp_path):
+        _write_project_module(tmp_path, dir_name="zzz_proj", slug="zzz.project")
+        r = discover_modules(project_module_root=tmp_path)
+        slugs = [rec.slug for rec in r.records]
+        assert slugs == sorted(slugs)
+
+    def test_multiple_project_modules_discovered(self, tmp_path):
+        _write_project_module(tmp_path, dir_name="alpha_m", slug="alpha.proj")
+        _write_project_module(tmp_path, dir_name="beta_m", slug="beta.proj")
+        r = discover_modules(project_module_root=tmp_path)
+        project_recs = [rec for rec in r.records if rec.source_type == "project"]
+        slugs = {rec.slug for rec in project_recs}
+        assert slugs == {"alpha.proj", "beta.proj"}
+
+    def test_load_failure_message_hides_exception_text(self, tmp_path):
+        """Import failure message must not expose raw exception text."""
+        sensitive = "super-secret-credential-xyz"
+        pkg = tmp_path / "leaky"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text(
+            f"raise ImportError({sensitive!r})"
+        )
+        r = discover_modules(project_module_root=tmp_path)
+        errors = [e for e in r.errors if e.kind == "load_failure"]
+        assert errors
+        for e in errors:
+            assert sensitive not in e.message
+
+    def test_project_path_error_has_empty_entry_point_name(self, tmp_path):
+        """Path-level errors have empty entry_point_name (no specific module failed)."""
+        r = discover_modules(project_module_root=tmp_path / "missing")
+        path_errors = [e for e in r.errors if e.kind == "project_path"]
+        assert path_errors
+        assert all(e.entry_point_name == "" for e in path_errors)

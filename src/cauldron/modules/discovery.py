@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
+import sys
 from dataclasses import dataclass
 from importlib.metadata import entry_points
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
@@ -36,6 +39,26 @@ class _EntryPointSource:
     display_package_name: str
     canonical_package_name: str
     package_version: str
+
+
+@dataclass(frozen=True)
+class _ProjectSource:
+    """Source metadata for a project-folder candidate.
+
+    Mirrors the fields of :class:`_EntryPointSource` that :func:`_make_error`
+    and :func:`_validate_manifest` use, so those functions accept both types.
+
+    ``name`` is ``"modules/<dirname>"`` and ``value`` is the bare Python import
+    name (the directory name).  Package-level fields are empty for project
+    sources.
+    """
+
+    name: str
+    value: str
+    group: str = ""
+    display_package_name: str = ""
+    canonical_package_name: str = ""
+    package_version: str = ""
 
 
 def _source_for_ep(ep: Any, group: str) -> _EntryPointSource:
@@ -93,7 +116,7 @@ class DiscoveryError:
     """
 
     entry_point_name: str
-    kind: Literal["load_failure", "duplicate_slug", "manifest_validation"]
+    kind: Literal["load_failure", "duplicate_slug", "manifest_validation", "project_path"]
     message: str
     entry_point_group: str = ""
     entry_point_value: str = ""
@@ -125,6 +148,8 @@ class DiscoveredModule:
     entry_point_value: str
     manifest: ModuleManifest
     module: CauldronModule
+    # Root-relative POSIX path for project-source modules; empty for package sources.
+    project_path: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-safe dict (no live objects).
@@ -143,6 +168,7 @@ class DiscoveredModule:
             "entry_point_group": self.entry_point_group,
             "entry_point_name": self.entry_point_name,
             "entry_point_value": self.entry_point_value,
+            "project_path": self.project_path,
             "manifest": self.manifest.to_dict(),
         }
 
@@ -171,7 +197,7 @@ class DiscoveryResult:
 
 
 def _make_error(
-    src: _EntryPointSource,
+    src: _EntryPointSource | _ProjectSource,
     kind: Literal["load_failure", "duplicate_slug", "manifest_validation"],
     message: str,
     *,
@@ -195,7 +221,7 @@ def _make_error(
 
 
 def _validate_manifest(
-    src: _EntryPointSource,
+    src: _EntryPointSource | _ProjectSource,
     obj: Any,
     *,
     provisional_candidate: str | None = None,
@@ -377,7 +403,157 @@ def _validate_manifest(
     return errors
 
 
-def discover_modules(*, entry_point_group: str = ENTRY_POINT_GROUP) -> DiscoveryResult:
+def _discover_project_modules(
+    root: Path,
+    *,
+    seen_slugs: dict[str, tuple[str, str]],
+) -> tuple[list[DiscoveredModule], list[DiscoveryError]]:
+    """Discover modules from a project-folder root directory.
+
+    Scans direct child directories of *root* in lexical order.  Each child
+    directory that contains an ``__init__.py`` and exposes a ``module``
+    attribute satisfying :class:`~cauldron.modules.CauldronModule` is loaded
+    as a project-source module.
+
+    *seen_slugs* is mutated in-place so that the caller's package-module pass
+    inherits duplicate detection across both sources.
+
+    Path-level failures (root absent or not a directory) produce
+    ``kind="project_path"`` errors.  Per-module failures use the standard
+    ``"load_failure"``, ``"manifest_validation"``, and ``"duplicate_slug"``
+    kinds so existing check IDs (E020–E022) apply.
+
+    The resolved root is prepended to :data:`sys.path` at most once, only
+    after the directory is confirmed to exist.
+    """
+    records: list[DiscoveredModule] = []
+    errors: list[DiscoveryError] = []
+
+    if not root.is_dir():
+        errors.append(DiscoveryError(
+            entry_point_name="",
+            kind="project_path",
+            message=(
+                "CAULDRON_PROJECT_MODULE_ROOT does not exist or is not a"
+                " directory."
+            ),
+        ))
+        return records, errors
+
+    resolved = str(root.resolve())
+    if resolved not in sys.path:
+        sys.path.insert(0, resolved)
+
+    try:
+        candidates = sorted(
+            e for e in root.iterdir()
+            if e.is_dir() and (e / "__init__.py").is_file()
+        )
+    except OSError as exc:
+        errors.append(DiscoveryError(
+            entry_point_name="",
+            kind="project_path",
+            message=(
+                f"CAULDRON_PROJECT_MODULE_ROOT could not be scanned:"
+                f" {type(exc).__name__}."
+            ),
+        ))
+        return records, errors
+
+    for entry in candidates:
+        dir_name = entry.name
+        # Skip private packages and names that aren't valid Python identifiers.
+        if not dir_name.isidentifier() or dir_name.startswith("_"):
+            continue
+
+        ep_name = f"modules/{dir_name}"
+        src = _ProjectSource(name=ep_name, value=dir_name)
+
+        # --- Load ----------------------------------------------------------
+        try:
+            mod_obj = importlib.import_module(dir_name)
+        except Exception as exc:
+            errors.append(DiscoveryError(
+                entry_point_name=ep_name,
+                kind="load_failure",
+                message=(
+                    f"Project module {ep_name!r} raised {type(exc).__name__}"
+                    " on import."
+                ),
+            ))
+            logger.debug(
+                "Project module %r failed to import: %s",
+                ep_name, exc,
+                exc_info=True,
+            )
+            continue
+
+        obj = getattr(mod_obj, "module", None)
+        if obj is None:
+            errors.append(DiscoveryError(
+                entry_point_name=ep_name,
+                kind="load_failure",
+                message=(
+                    f"Project module {ep_name!r}: package {dir_name!r} has"
+                    " no 'module' attribute."
+                ),
+            ))
+            continue
+
+        # --- Manifest validation -------------------------------------------
+        validation_errors = _validate_manifest(src, obj)
+        if validation_errors:
+            errors.extend(validation_errors)
+            logger.debug(
+                "Project module %r failed manifest validation.", ep_name,
+            )
+            continue
+
+        # --- Duplicate slug ------------------------------------------------
+        slug = obj.slug
+        if slug in seen_slugs:
+            accepted_ep_name, accepted_pkg_name = seen_slugs[slug]
+            pkg_note = f" (package {accepted_pkg_name!r})" if accepted_pkg_name else ""
+            errors.append(DiscoveryError(
+                entry_point_name=ep_name,
+                kind="duplicate_slug",
+                message=(
+                    f"Module slug {slug!r} registered by project module"
+                    f" {ep_name!r} conflicts with {accepted_ep_name!r}"
+                    f"{pkg_note}; duplicate is ignored."
+                ),
+                candidate_slug=slug,
+                accepted_entry_point_name=accepted_ep_name,
+                accepted_package_name=accepted_pkg_name,
+            ))
+            continue
+
+        seen_slugs[slug] = (ep_name, "")
+        record = DiscoveredModule(
+            slug=slug,
+            label=obj.label,
+            version=obj.manifest.version,
+            source_type="project",
+            package_name="",
+            package_version="",
+            entry_point_group="",
+            entry_point_name=ep_name,
+            entry_point_value=dir_name,
+            manifest=obj.manifest,
+            module=obj,
+            project_path=dir_name,
+        )
+        records.append(record)
+        logger.debug("Discovered project module %r from %r.", slug, ep_name)
+
+    return records, errors
+
+
+def discover_modules(
+    *,
+    entry_point_group: str = ENTRY_POINT_GROUP,
+    project_module_root: Path | None = None,
+) -> DiscoveryResult:
     """Discover installed Cauldron modules via Python entry points.
 
     Returns a :class:`DiscoveryResult` containing successfully discovered
@@ -385,26 +561,37 @@ def discover_modules(*, entry_point_group: str = ENTRY_POINT_GROUP) -> Discovery
     any entry point that could not be loaded, failed manifest validation, or
     registered a duplicate slug.
 
-    Discovery is deterministic: entry points are sorted by the composite key
-    ``(ep.name, canonical_package_name, ep.value)``.  Distribution metadata
-    is resolved exactly once per entry point.
+    When *project_module_root* is provided, project-folder modules are
+    discovered first (lexical order by directory name) and merged with
+    entry-point modules.  Project modules win duplicate-slug races.
+
+    Discovery is deterministic: combined records are sorted by slug.
+    Entry-point metadata is resolved exactly once per entry point.
     """
     from . import CauldronModule, _validate_slug
 
+    records: list[DiscoveredModule] = []
+    errors: list[DiscoveryError] = []
+    # slug → (accepted_ep_name, accepted_pkg_name); shared across both passes.
+    seen_slugs: dict[str, tuple[str, str]] = {}
+
+    # --- Project-folder pass (first, so project modules win slug races) ----
+    if project_module_root is not None:
+        proj_records, proj_errors = _discover_project_modules(
+            project_module_root, seen_slugs=seen_slugs,
+        )
+        records.extend(proj_records)
+        errors.extend(proj_errors)
+
+    # --- Entry-point pass --------------------------------------------------
     raw_eps = entry_points(group=entry_point_group)
 
-    # Resolve metadata exactly once per EP, then sort.
     ep_pairs = [(ep, _source_for_ep(ep, entry_point_group)) for ep in raw_eps]
     ep_pairs.sort(key=lambda pair: (
         pair[1].name,
         pair[1].canonical_package_name,
         pair[1].value,
     ))
-
-    records: list[DiscoveredModule] = []
-    errors: list[DiscoveryError] = []
-    # slug → (accepted_ep_name, accepted_pkg_name)
-    seen_slugs: dict[str, tuple[str, str]] = {}
 
     for ep, src in ep_pairs:
         # Derive provisional candidate slug from the entry-point name when it
@@ -489,6 +676,7 @@ def get_module_apps(
     *,
     capability_overrides: dict[str, str] | None = None,
     entry_point_group: str = ENTRY_POINT_GROUP,
+    project_module_root: Path | None = None,
 ) -> list[str]:
     """Return Django app labels for the given enabled module slugs in dependency order.
 
@@ -519,7 +707,10 @@ def get_module_apps(
     else:
         slugs = set(enabled)
 
-    result = discover_modules(entry_point_group=entry_point_group)
+    result = discover_modules(
+        entry_point_group=entry_point_group,
+        project_module_root=project_module_root,
+    )
     active_modules = [m for m in result.modules if m.slug in slugs]
 
     # Build capability provider map for the active set only.

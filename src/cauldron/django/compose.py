@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Sequence
 
 
@@ -50,6 +51,7 @@ def compose_django_settings(
     context_processors: Sequence[str] = (),
     module_settings: dict[str, Any] | None = None,
     capability_providers: dict[str, str] | None = None,
+    project_module_root: Path | None = None,
 ) -> SettingsPlan:
     """Compose Django settings from installed Cauldron modules.
 
@@ -74,7 +76,7 @@ def compose_django_settings(
     base_cp: list[str] = list(context_processors)
     cap_overrides: dict[str, str] = dict(capability_providers or {})
 
-    result = discover_modules()
+    result = discover_modules(project_module_root=project_module_root)
     all_modules = result.modules
 
     if module_settings is None:

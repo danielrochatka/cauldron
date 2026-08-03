@@ -185,19 +185,22 @@ def resolve(
         ))
 
     for slug in sorted(blocked_nodes):
-        # Find the immediate blocker(s) among the blocked/cycle set.
-        blockers = sorted(
-            d for d in dep_graph.get(slug, [])
-            if d in cycle_nodes or d in blocked_nodes
-        )
-        blocker_str = ", ".join(repr(b) for b in blockers) if blockers else "a cyclic module"
+        direct_deps = dep_graph.get(slug, [])
+        cycle_blockers = sorted(d for d in direct_deps if d in cycle_nodes)
+        blocked_blockers = sorted(d for d in direct_deps if d in blocked_nodes)
+
+        parts: list[str] = []
+        if cycle_blockers:
+            cbs = ", ".join(repr(b) for b in cycle_blockers)
+            parts.append(f"{cbs} (part of a circular dependency)")
+        if blocked_blockers:
+            bbs = ", ".join(repr(b) for b in blocked_blockers)
+            parts.append(f"{bbs} (blocked by a circular dependency)")
+        blocker_desc = " and ".join(parts) if parts else "a cyclic module"
         errors.append(ResolutionError(
             kind=ErrorKind.BLOCKED_DEPENDENCY,
             module_slug=slug,
-            message=(
-                f"Module {slug!r} cannot be loaded because it depends on"
-                f" {blocker_str}, which is part of a circular dependency."
-            ),
+            message=f"Module {slug!r} cannot be loaded because it depends on {blocker_desc}.",
         ))
 
     return ResolutionResult(

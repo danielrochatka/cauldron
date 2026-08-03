@@ -283,7 +283,8 @@ class TestBlockedDependencyDetection:
         assert "safe" not in blocked_slugs
         assert "safe" in result.load_order
 
-    def test_blocked_message_names_blocker(self):
+    def test_blocked_message_names_blocker_as_cycle_participant(self):
+        # c's direct blocker is 'a', which IS in the cycle.
         a = _mod("a", requires=(ModuleRequirement(slug="b"),))
         b = _mod("b", requires=(ModuleRequirement(slug="a"),))
         c = _mod("c", requires=(ModuleRequirement(slug="a"),))
@@ -291,6 +292,7 @@ class TestBlockedDependencyDetection:
         blocked_err = next(e for e in result.errors if e.kind == ErrorKind.BLOCKED_DEPENDENCY)
         assert blocked_err.module_slug == "c"
         assert "'a'" in blocked_err.message
+        assert "part of a circular dependency" in blocked_err.message
 
     def test_two_level_block_chain(self):
         # a <-> b is the cycle; c depends on a; d depends on c.
@@ -303,6 +305,14 @@ class TestBlockedDependencyDetection:
         blocked_slugs = {e.module_slug for e in result.errors if e.kind == ErrorKind.BLOCKED_DEPENDENCY}
         assert cycle_slugs == {"a", "b"}
         assert blocked_slugs == {"c", "d"}
+        # d's direct blocker is 'c', which is blocked (not in the cycle itself).
+        d_err = next(e for e in result.errors if e.kind == ErrorKind.BLOCKED_DEPENDENCY and e.module_slug == "d")
+        assert "'c'" in d_err.message
+        assert "blocked by a circular dependency" in d_err.message
+        # c's direct blocker is 'a', which IS in the cycle.
+        c_err = next(e for e in result.errors if e.kind == ErrorKind.BLOCKED_DEPENDENCY and e.module_slug == "c")
+        assert "'a'" in c_err.message
+        assert "part of a circular dependency" in c_err.message
 
     def test_self_loop_is_circular_not_blocked(self):
         a = _mod("a", requires=(ModuleRequirement(slug="a"),))

@@ -644,12 +644,10 @@ def test_frozen_incompatible_registered_adapter_rejects_apply(tmp_path):
         ContentOperationService, _compute_canonical_changeset_hash,
     )
     from cauldron_content_operations.config import ContentOperationsConfig
-    from cauldron_content_operations.reversible import (
-        _registry,
-    )
     from cauldron_content_operations.models import ContentChangeRequest
+    from unittest.mock import patch
 
-    # Bypass register_adapter's contract check by inserting directly.
+    # Bypass register_adapter's contract check by patching the backing dict.
     class _Bad:
         supports_rollback = True
         reversible_adapter_version = 2
@@ -662,8 +660,7 @@ def test_frozen_incompatible_registered_adapter_rejects_apply(tmp_path):
         def verify_rolled_back_state(self, *a, **k): ...
         def inspect(self, *a, **k): ...
         # Deliberately no load_rollback_completion.
-    _registry["flatfile"] = _Bad()
-    try:
+    with patch.dict("cauldron_content.reversible._registry", {"flatfile": _Bad()}):
         user = _make_user(is_superuser=True, username="fz-inc")
         locks_dir = tmp_path / "locks"
         locks_dir.mkdir()
@@ -693,8 +690,6 @@ def test_frozen_incompatible_registered_adapter_rejects_apply(tmp_path):
         assert not result.ok
         assert result.error.code == "application.rollback_adapter_incompatible"
         router.apply.assert_not_called()
-    finally:
-        _registry.pop("flatfile", None)
 
 
 def test_frozen_required_reversible_missing_adapter(tmp_path):

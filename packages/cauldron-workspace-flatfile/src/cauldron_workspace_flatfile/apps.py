@@ -1,6 +1,11 @@
 """Django AppConfig for cauldron_workspace_flatfile."""
 from django.apps import AppConfig
 
+from cauldron_content.reversible import get_adapter, register_adapter
+
+from .config import WorkspaceConfig
+from .reversible import FlatFileReversibleMutationAdapter
+
 
 class CauldronWorkspaceFlatfileConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
@@ -12,27 +17,23 @@ class CauldronWorkspaceFlatfileConfig(AppConfig):
         self._maybe_register_reversible_adapter()
 
     def _maybe_register_reversible_adapter(self) -> None:
-        """Register a FlatFileReversibleMutationAdapter if the CMS is configured.
+        """Register a FlatFileReversibleMutationAdapter when workspace/content roots are configured.
 
-        The registration is best-effort: it is skipped silently when the CMS
-        flatfile provider or the content operations package are not installed.
+        Uses the canonical reversible adapter contract from ``cauldron_content.reversible``.
+
+        Registration is skipped when either ``workspace_root`` (from
+        ``CAULDRON_MODULES["cauldron.workspace.flatfile"]``) or ``content_root``
+        (from ``CAULDRON_MODULES["cauldron.cms.flatfile"]``) is unconfigured.
+
+        If a ``"flatfile"`` adapter is already registered the existing
+        registration is preserved (idempotent re-entrant startup).
+
+        Any other failure — invalid ``WorkspaceConfig``, adapter construction
+        error, or ``AdapterVersionMismatch`` from ``register_adapter`` — is
+        allowed to propagate so it surfaces as a visible startup failure rather
+        than a silent no-op.
         """
-        try:
-            from django.conf import settings
-        except Exception:  # pragma: no cover - django must be present
-            return
-        try:
-            from cauldron_content_operations.reversible import (
-                get_adapter,
-                register_adapter,
-            )
-        except Exception:
-            return
-        try:
-            from .config import WorkspaceConfig
-            from .reversible import FlatFileReversibleMutationAdapter
-        except Exception:
-            return
+        from django.conf import settings
 
         modules = getattr(settings, "CAULDRON_MODULES", {}) or {}
         ws_cfg = modules.get("cauldron.workspace.flatfile") or {}
@@ -42,14 +43,11 @@ class CauldronWorkspaceFlatfileConfig(AppConfig):
         if not workspace_root or not content_root:
             return
 
-        provider_name = "flatfile"
-        if get_adapter(provider_name) is not None:
+        if get_adapter("flatfile") is not None:
             return
-        try:
-            adapter = FlatFileReversibleMutationAdapter(
-                WorkspaceConfig(workspace_root=workspace_root),
-                content_root,
-            )
-            register_adapter(provider_name, adapter)
-        except Exception:
-            return
+
+        adapter = FlatFileReversibleMutationAdapter(
+            WorkspaceConfig(workspace_root=workspace_root),
+            content_root,
+        )
+        register_adapter("flatfile", adapter)

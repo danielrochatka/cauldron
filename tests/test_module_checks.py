@@ -45,14 +45,19 @@ def reset_global_registry():
         setattr(registry, attr, value)
 
 
-def _inject_modules(modules, *, enabled=None):
-    """Populate the global registry for check testing.
+def _inject_modules(modules, *, enabled=None, activate=True):
+    """Populate (and optionally activate) the global registry for check testing.
 
     *enabled=None* activates all provided modules (test convenience default).
+    *activate=True* runs registry.activate() so is_ready is set, which is
+    required for cauldron.I002 to fire.  Pass activate=False for tests that
+    deliberately check pre-activation state.
     """
     from cauldron.modules.registry import registry
 
     registry.populate(modules, enabled=enabled)
+    if activate:
+        registry.activate()
 
 
 class TestFoundationCheck:

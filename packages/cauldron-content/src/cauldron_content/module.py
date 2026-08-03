@@ -23,6 +23,7 @@ _manifest = ModuleManifest(
         "cauldron_content.router",
         "cauldron_content.site",
         "cauldron_content.hashing",
+        "cauldron_content.reversible",
     ),
     settings_declarations=(
         ModuleSettingsDeclaration(

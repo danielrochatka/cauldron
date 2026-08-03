@@ -3,7 +3,7 @@
 import pytest
 
 from cauldron.modules import BaseModule, ModuleManifest, ModuleRequirement
-from cauldron.modules.resolver import ErrorKind, resolve
+from cauldron.modules.resolver import ErrorKind, resolve, _find_sccs
 
 
 def _mod(slug, *, version="1.0.0", cauldron_version="", requires=(), optional=(), provides=()):
@@ -249,3 +249,119 @@ class TestCapabilityResolution:
         caps = {"cap": ["p1", "p2"]}
         result = resolve([p1, p2, consumer], caps, capability_overrides={"cap": "p2"})
         assert result.dep_graph.get("consumer") == ["p2"]
+
+
+class TestBlockedDependencyDetection:
+    """E016 BLOCKED_DEPENDENCY: nodes downstream of a cycle, but not in it."""
+
+    def test_downstream_node_gets_blocked_not_circular(self):
+        # a <-> b is the cycle; c depends on a.
+        a = _mod("a", requires=(ModuleRequirement(slug="b"),))
+        b = _mod("b", requires=(ModuleRequirement(slug="a"),))
+        c = _mod("c", requires=(ModuleRequirement(slug="a"),))
+        result = resolve([a, b, c], {})
+        cycle_slugs = {e.module_slug for e in result.errors if e.kind == ErrorKind.CIRCULAR_DEPENDENCY}
+        blocked_slugs = {e.module_slug for e in result.errors if e.kind == ErrorKind.BLOCKED_DEPENDENCY}
+        assert cycle_slugs == {"a", "b"}
+        assert blocked_slugs == {"c"}
+
+    def test_cycle_nodes_not_in_blocked(self):
+        a = _mod("a", requires=(ModuleRequirement(slug="b"),))
+        b = _mod("b", requires=(ModuleRequirement(slug="a"),))
+        result = resolve([a, b], {})
+        blocked_slugs = {e.module_slug for e in result.errors if e.kind == ErrorKind.BLOCKED_DEPENDENCY}
+        assert blocked_slugs == set()
+
+    def test_safe_module_not_in_cycle_or_blocked(self):
+        safe = _mod("safe")
+        a = _mod("a", requires=(ModuleRequirement(slug="b"),))
+        b = _mod("b", requires=(ModuleRequirement(slug="a"),))
+        result = resolve([safe, a, b], {})
+        cycle_slugs = {e.module_slug for e in result.errors if e.kind == ErrorKind.CIRCULAR_DEPENDENCY}
+        blocked_slugs = {e.module_slug for e in result.errors if e.kind == ErrorKind.BLOCKED_DEPENDENCY}
+        assert "safe" not in cycle_slugs
+        assert "safe" not in blocked_slugs
+        assert "safe" in result.load_order
+
+    def test_blocked_message_names_blocker_as_cycle_participant(self):
+        # c's direct blocker is 'a', which IS in the cycle.
+        a = _mod("a", requires=(ModuleRequirement(slug="b"),))
+        b = _mod("b", requires=(ModuleRequirement(slug="a"),))
+        c = _mod("c", requires=(ModuleRequirement(slug="a"),))
+        result = resolve([a, b, c], {})
+        blocked_err = next(e for e in result.errors if e.kind == ErrorKind.BLOCKED_DEPENDENCY)
+        assert blocked_err.module_slug == "c"
+        assert "'a'" in blocked_err.message
+        assert "part of a circular dependency" in blocked_err.message
+
+    def test_two_level_block_chain(self):
+        # a <-> b is the cycle; c depends on a; d depends on c.
+        a = _mod("a", requires=(ModuleRequirement(slug="b"),))
+        b = _mod("b", requires=(ModuleRequirement(slug="a"),))
+        c = _mod("c", requires=(ModuleRequirement(slug="a"),))
+        d = _mod("d", requires=(ModuleRequirement(slug="c"),))
+        result = resolve([a, b, c, d], {})
+        cycle_slugs = {e.module_slug for e in result.errors if e.kind == ErrorKind.CIRCULAR_DEPENDENCY}
+        blocked_slugs = {e.module_slug for e in result.errors if e.kind == ErrorKind.BLOCKED_DEPENDENCY}
+        assert cycle_slugs == {"a", "b"}
+        assert blocked_slugs == {"c", "d"}
+        # d's direct blocker is 'c', which is blocked (not in the cycle itself).
+        d_err = next(e for e in result.errors if e.kind == ErrorKind.BLOCKED_DEPENDENCY and e.module_slug == "d")
+        assert "'c'" in d_err.message
+        assert "blocked by a circular dependency" in d_err.message
+        # c's direct blocker is 'a', which IS in the cycle.
+        c_err = next(e for e in result.errors if e.kind == ErrorKind.BLOCKED_DEPENDENCY and e.module_slug == "c")
+        assert "'a'" in c_err.message
+        assert "part of a circular dependency" in c_err.message
+
+    def test_self_loop_is_circular_not_blocked(self):
+        a = _mod("a", requires=(ModuleRequirement(slug="a"),))
+        result = resolve([a], {})
+        cycle_slugs = {e.module_slug for e in result.errors if e.kind == ErrorKind.CIRCULAR_DEPENDENCY}
+        blocked_slugs = {e.module_slug for e in result.errors if e.kind == ErrorKind.BLOCKED_DEPENDENCY}
+        assert "a" in cycle_slugs
+        assert "a" not in blocked_slugs
+
+    def test_no_blocked_errors_when_no_cycle(self):
+        a = _mod("a")
+        b = _mod("b", requires=(ModuleRequirement(slug="a"),))
+        c = _mod("c", requires=(ModuleRequirement(slug="b"),))
+        result = resolve([a, b, c], {})
+        assert not result.has_errors
+        blocked = [e for e in result.errors if e.kind == ErrorKind.BLOCKED_DEPENDENCY]
+        assert blocked == []
+
+
+class TestSCCAlgorithm:
+    """Unit tests for Tarjan's SCC implementation."""
+
+    def test_no_edges_all_singletons(self):
+        deps = {"a": [], "b": [], "c": []}
+        sccs = _find_sccs(deps)
+        sizes = sorted(len(s) for s in sccs)
+        assert sizes == [1, 1, 1]
+
+    def test_two_node_cycle(self):
+        deps = {"a": ["b"], "b": ["a"]}
+        sccs = _find_sccs(deps)
+        multi = [s for s in sccs if len(s) > 1]
+        assert len(multi) == 1
+        assert multi[0] == {"a", "b"}
+
+    def test_three_node_cycle(self):
+        deps = {"a": ["b"], "b": ["c"], "c": ["a"]}
+        sccs = _find_sccs(deps)
+        multi = [s for s in sccs if len(s) > 1]
+        assert len(multi) == 1
+        assert multi[0] == {"a", "b", "c"}
+
+    def test_linear_chain_no_cycle(self):
+        deps = {"a": ["b"], "b": ["c"], "c": []}
+        sccs = _find_sccs(deps)
+        assert all(len(s) == 1 for s in sccs)
+
+    def test_self_loop_is_nontrivial(self):
+        deps = {"a": ["a"]}
+        sccs = _find_sccs(deps)
+        assert len(sccs) == 1
+        assert sccs[0] == {"a"}

@@ -9,7 +9,6 @@ _manifest = ModuleManifest(
     django_apps=("cauldron_workspace_flatfile",),
     requires=(
         ModuleRequirement(slug="cauldron.content"),
-        ModuleRequirement(slug="cauldron.content.operations", kind="module"),
     ),
     provides=(
         "workspace.flatfile",

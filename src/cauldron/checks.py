@@ -181,7 +181,7 @@ def cauldron_module_graph_check(app_configs, **kwargs):
 
     # Active-module summary --------------------------------------------------
     active = registry.all_active()
-    if active:
+    if registry.is_ready and active:
         slugs = ", ".join(m.slug for m in active)
         messages.append(
             Info(
@@ -202,6 +202,7 @@ def cauldron_module_graph_check(app_configs, **kwargs):
         ErrorKind.CAULDRON_VERSION: "cauldron.E013",
         ErrorKind.CIRCULAR_DEPENDENCY: "cauldron.E014",
         ErrorKind.CAPABILITY_CONFLICT: "cauldron.E015",
+        ErrorKind.BLOCKED_DEPENDENCY: "cauldron.E016",
     }
     for err in registry.errors():
         messages.append(

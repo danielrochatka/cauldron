@@ -18,7 +18,8 @@ def clean_registry():
 
 
 def _make_app() -> CauldronWorkspaceFlatfileConfig:
-    return CauldronWorkspaceFlatfileConfig("cauldron_workspace_flatfile", None)
+    import cauldron_workspace_flatfile as _mod
+    return CauldronWorkspaceFlatfileConfig("cauldron_workspace_flatfile", _mod)
 
 
 def _modules_setting(*, workspace_root=None, content_root=None) -> dict:

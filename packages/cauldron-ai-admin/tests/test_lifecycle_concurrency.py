@@ -70,17 +70,85 @@ def _run_threads(*targets):
         assert not t.is_alive(), "Thread did not finish within timeout."
 
 
+def _handle_apply_race(
+    successes: list,
+    errors: list[Exception],
+    proposal_pk: int,
+    user_pk: int,
+    override_root: Path,
+    scope: str,
+    target_path: str,
+    retryable_status: str,
+    service,
+    *,
+    base_exists: bool = False,
+):
+    """Assert at-most-one-wins and handle the both-OperationalError SQLite path.
+
+    When both racing threads get OperationalError (SQLite lock exhaustion):
+    - verifies the proposal stays in ``retryable_status`` (no partial commit);
+    - verifies the target file is absent when ``base_exists=False``;
+    - performs one serial apply to prove the lock was transient.
+
+    Returns the freshly loaded final proposal.
+    """
+    from cauldron_ai_admin.models import UIStyleChangeRequest
+
+    assert len(successes) + len(errors) == 2, (
+        f"Expected exactly 2 outcomes, got {len(successes)} success(es) "
+        f"and {len(errors)} error(s)"
+    )
+    assert len(successes) <= 1, (
+        f"At most one racing success expected, got {len(successes)}. "
+        "Two apply transitions must never both commit."
+    )
+
+    all_operational = all(isinstance(e, OperationalError) for e in errors)
+    if len(successes) == 0 and all_operational:
+        close_old_connections()
+        fresh = UIStyleChangeRequest.objects.get(pk=proposal_pk)
+        fresh_user = get_user_model().objects.get(pk=user_pk)
+        assert fresh.status == retryable_status, (
+            f"Proposal must remain {retryable_status!r} after both-OperationalError, "
+            f"got {fresh.status!r}"
+        )
+        if not base_exists:
+            target = override_root / scope / target_path
+            assert not target.exists(), (
+                "Target file must not exist after both-OperationalError "
+                "(no partial filesystem write)"
+            )
+        with override_settings(CAULDRON_UI_OVERRIDES_DIR=str(override_root)):
+            service.apply(fresh, applied_by=fresh_user)
+    else:
+        assert len(successes) == 1, (
+            f"Expected exactly one racing success, got {len(successes)}. "
+            f"Errors: {[type(e).__name__ for e in errors]}"
+        )
+
+    close_old_connections()
+    return UIStyleChangeRequest.objects.get(pk=proposal_pk)
+
+
 @pytest.mark.django_db(transaction=True)
 def test_concurrent_approves_only_one_wins():
     """Two threads call ``approve`` on the same proposal simultaneously.
-    Exactly one must succeed; the other must raise ``ValueError`` (row was
-    already approved) or ``OperationalError`` (SQLite serialised us out).
-    Either way the DB ends up with status=approved and no double-transition.
+
+    Invariants:
+    - Exactly two outcomes are recorded (success or handled exception).
+    - The proposal ends up in status=approved.
+    - Exactly one approved audit event exists (two approvals never both commit).
+    - When both threads get OperationalError (SQLite lock exhaustion), a single
+      serial approval still succeeds, proving the lock was transient.
+    - On databases with row-level locking, exactly one racing call succeeds.
     """
+    from cauldron_ai_admin.models import UIStyleAuditEvent, UIStyleChangeRequest
     from cauldron_ai_admin.style_service import UIStyleChangeService
 
     user = _make_user("approve-race-user")
     proposal = _make_proposal(status="proposed")
+    proposal_pk = proposal.pk
+    user_pk = user.pk
     service = UIStyleChangeService()
 
     approved: list = []
@@ -89,9 +157,12 @@ def test_concurrent_approves_only_one_wins():
     barrier = threading.Barrier(2, timeout=10)
 
     def do_approve():
-        barrier.wait()
+        close_old_connections()
         try:
-            result = service.approve(proposal, reviewed_by=user)
+            fresh_proposal = UIStyleChangeRequest.objects.get(pk=proposal_pk)
+            fresh_user = get_user_model().objects.get(pk=user_pk)
+            barrier.wait()
+            result = service.approve(fresh_proposal, reviewed_by=fresh_user)
             with lock:
                 approved.append(result)
         except (ValueError, OperationalError) as exc:
@@ -102,19 +173,58 @@ def test_concurrent_approves_only_one_wins():
 
     _run_threads(do_approve, do_approve)
 
-    assert len(approved) >= 1, "Expected at least one approve to succeed."
-    assert len(approved) + len(errors) == 2
+    assert len(approved) + len(errors) == 2, (
+        f"Expected exactly 2 outcomes, got {len(approved)} success(es) "
+        f"and {len(errors)} error(s)"
+    )
+
+    all_operational = all(isinstance(e, OperationalError) for e in errors)
+    if len(approved) == 0 and all_operational:
+        # SQLite lock exhaustion: both racing writes failed.  Prove a serial
+        # approval still works — the proposal is still "proposed".
+        close_old_connections()
+        fresh = UIStyleChangeRequest.objects.get(pk=proposal_pk)
+        fresh_user = get_user_model().objects.get(pk=user_pk)
+        service.approve(fresh, reviewed_by=fresh_user)
+    else:
+        # Row-locking database (or SQLite serialised exactly one through):
+        # exactly one racing call must have succeeded.
+        assert len(approved) == 1, (
+            f"Expected exactly one racing success, got {len(approved)}. "
+            f"Errors: {[type(e).__name__ for e in errors]}"
+        )
+
+    close_old_connections()
     proposal.refresh_from_db()
     assert proposal.status == "approved"
+
+    # Exactly one approved audit event — two approvals must never both commit.
+    audit_events = UIStyleAuditEvent.objects.filter(
+        change_request=proposal, event_type="approved"
+    )
+    assert audit_events.count() == 1, (
+        f"Expected exactly one approved audit event, got {audit_events.count()}. "
+        f"Two approvals must never both commit."
+    )
 
 
 @pytest.mark.django_db(transaction=True)
 def test_concurrent_applies_produce_exactly_one_applied_event():
     """Two threads apply the same approved proposal simultaneously. Exactly
     one apply commits — one ``applied`` audit event, one filesystem write.
+
+    Invariants:
+    - Exactly two outcomes are recorded (success or handled exception).
+    - Two apply transitions never both commit.
+    - The proposal ends up in status=applied.
+    - Exactly one applied audit event exists.
+    - The target file contains the proposed content.
+    - When both threads get OperationalError (SQLite lock exhaustion), the
+      proposal remains in ``approved`` (no partial commit), the target file
+      does not exist, and a single serial apply still succeeds.
     """
     from cauldron_ai_admin.style_service import UIStyleChangeService
-    from cauldron_ai_admin.models import UIStyleAuditEvent
+    from cauldron_ai_admin.models import UIStyleAuditEvent, UIStyleChangeRequest
     from cauldron_django_admin.override_store import UIOverrideStore
 
     user = _make_user("apply-race-user")
@@ -131,6 +241,8 @@ def test_concurrent_applies_produce_exactly_one_applied_event():
             base_exists=False,
             base_hash="",
         )
+        proposal_pk = proposal.pk
+        user_pk = user.pk
         service = UIStyleChangeService()
 
         successes: list = []
@@ -139,13 +251,16 @@ def test_concurrent_applies_produce_exactly_one_applied_event():
         barrier = threading.Barrier(2, timeout=10)
 
         def do_apply():
-            barrier.wait()
+            close_old_connections()
             try:
+                fresh_proposal = UIStyleChangeRequest.objects.get(pk=proposal_pk)
+                fresh_user = get_user_model().objects.get(pk=user_pk)
+                barrier.wait()
                 with override_settings(CAULDRON_UI_OVERRIDES_DIR=str(override_root)):
-                    result = service.apply(proposal, applied_by=user)
+                    result = service.apply(fresh_proposal, applied_by=fresh_user)
                     with lock:
                         successes.append(result)
-            except Exception as exc:  # noqa: BLE001
+            except (ValueError, OperationalError) as exc:
                 with lock:
                     errors.append(exc)
             finally:
@@ -153,8 +268,41 @@ def test_concurrent_applies_produce_exactly_one_applied_event():
 
         _run_threads(do_apply, do_apply)
 
-        # Exactly one applied event must exist — the winning apply is the
-        # only one whose Phase 3 committed.
+        assert len(successes) + len(errors) == 2, (
+            f"Expected exactly 2 outcomes, got {len(successes)} success(es) "
+            f"and {len(errors)} error(s)"
+        )
+
+        all_operational = all(isinstance(e, OperationalError) for e in errors)
+        if len(successes) == 0 and all_operational:
+            # SQLite lock exhaustion: both racing writes failed.  Verify the
+            # proposal is still in the retryable approved state and no partial
+            # filesystem write occurred, then perform one serial apply.
+            close_old_connections()
+            fresh = UIStyleChangeRequest.objects.get(pk=proposal_pk)
+            assert fresh.status == "approved", (
+                f"Proposal must remain 'approved' after both-OperationalError, "
+                f"got {fresh.status!r}"
+            )
+            target = override_root / "admin" / "race.css"
+            assert not target.exists(), (
+                "Target file must not exist after both-OperationalError "
+                "(no partial filesystem write)"
+            )
+            fresh_user = get_user_model().objects.get(pk=user_pk)
+            with override_settings(CAULDRON_UI_OVERRIDES_DIR=str(override_root)):
+                service.apply(fresh, applied_by=fresh_user)
+        else:
+            # Row-locking database: exactly one racing call must have succeeded.
+            assert len(successes) == 1, (
+                f"Expected exactly one racing success, got {len(successes)}. "
+                f"Errors: {[type(e).__name__ for e in errors]}"
+            )
+
+        close_old_connections()
+
+        # Exactly one applied event must exist — two apply transitions must
+        # never both commit.
         applied_events = UIStyleAuditEvent.objects.filter(
             change_request=proposal, event_type="applied",
         )
@@ -167,10 +315,9 @@ def test_concurrent_applies_produce_exactly_one_applied_event():
         proposal.refresh_from_db()
         assert proposal.status == "applied"
 
-        # And the file on disk must contain the proposed content.
+        # The target file must contain the proposed content.
         store = UIOverrideStore(override_root)
-        assert store.read_file("admin", "race.css") == \
-            "body { color: red; }"
+        assert store.read_file("admin", "race.css") == "body { color: red; }"
 
 
 @pytest.mark.django_db(transaction=True)
@@ -494,13 +641,12 @@ def test_phase3_rollback_failure_marks_conflicted():
 @pytest.mark.django_db(transaction=True)
 def test_simultaneous_apply_one_replace_one_applied_event():
     """A dedicated race test with a hard barrier: two threads must hit
-    Phase 2 at the same instant, and the assertions specifically check
-    exactly-one ``applied`` audit event and that the final file bytes
-    equal the proposed content. This is stronger than the pre-existing
-    concurrent-apply test because it asserts both invariants explicitly.
+    Phase 2 at the same instant. Exactly one ``applied`` audit event must
+    exist and the final file bytes must equal the proposed content.
+    Two racing apply transitions must never both commit.
     """
     from cauldron_ai_admin.style_service import UIStyleChangeService
-    from cauldron_ai_admin.models import UIStyleAuditEvent
+    from cauldron_ai_admin.models import UIStyleAuditEvent, UIStyleChangeRequest
     from cauldron_django_admin.override_store import UIOverrideStore
 
     user = _make_user("apply-race-hard-user")
@@ -518,6 +664,8 @@ def test_simultaneous_apply_one_replace_one_applied_event():
             base_exists=False,
             base_hash="",
         )
+        proposal_pk = proposal.pk
+        user_pk = user.pk
         service = UIStyleChangeService()
 
         successes: list = []
@@ -526,13 +674,16 @@ def test_simultaneous_apply_one_replace_one_applied_event():
         barrier = threading.Barrier(2, timeout=10)
 
         def do_apply():
-            barrier.wait()
+            close_old_connections()
             try:
+                fresh_proposal = UIStyleChangeRequest.objects.get(pk=proposal_pk)
+                fresh_user = get_user_model().objects.get(pk=user_pk)
+                barrier.wait()
                 with override_settings(CAULDRON_UI_OVERRIDES_DIR=str(override_root)):
-                    result = service.apply(proposal, applied_by=user)
+                    result = service.apply(fresh_proposal, applied_by=fresh_user)
                     with lock:
                         successes.append(result)
-            except Exception as exc:  # noqa: BLE001
+            except (ValueError, OperationalError) as exc:
                 with lock:
                     errors.append(exc)
             finally:
@@ -540,16 +691,19 @@ def test_simultaneous_apply_one_replace_one_applied_event():
 
         _run_threads(do_apply, do_apply)
 
+        final = _handle_apply_race(
+            successes, errors, proposal_pk, user_pk,
+            override_root, "admin", "hard-race.css", "approved", service,
+        )
+
         applied_events = UIStyleAuditEvent.objects.filter(
-            change_request=proposal, event_type="applied",
+            change_request=final, event_type="applied",
         )
         assert applied_events.count() == 1, (
             "Expected exactly one applied audit event, got "
             f"{applied_events.count()}. errors={[type(e).__name__ for e in errors]}"
         )
-
-        proposal.refresh_from_db()
-        assert proposal.status == "applied"
+        assert final.status == "applied"
 
         store = UIOverrideStore(override_root)
         assert store.read_file("admin", "hard-race.css") == proposed
@@ -560,11 +714,11 @@ def test_concurrent_applies_only_one_claims_applying():
     """Two callers race to apply the same approved proposal.
     Exactly one must succeed in transitioning to 'applying' and then
     'applied'. The loser must see status != 'approved' and raise ValueError
-    or OperationalError (SQLite serialisation). If both get OperationalError
-    (SQLite lock exhaustion), we retry sequentially to confirm one can apply.
+    or OperationalError (SQLite serialisation). Two apply transitions must
+    never both commit.
     """
     from cauldron_ai_admin.style_service import UIStyleChangeService
-    from cauldron_ai_admin.models import UIStyleAuditEvent
+    from cauldron_ai_admin.models import UIStyleAuditEvent, UIStyleChangeRequest
 
     user = _make_user("apply-claim-race-user")
 
@@ -580,6 +734,8 @@ def test_concurrent_applies_only_one_claims_applying():
             base_exists=False,
             base_hash="",
         )
+        proposal_pk = proposal.pk
+        user_pk = user.pk
         service = UIStyleChangeService()
 
         successes: list = []
@@ -588,16 +744,16 @@ def test_concurrent_applies_only_one_claims_applying():
         barrier = threading.Barrier(2, timeout=10)
 
         def do_apply():
-            barrier.wait()
+            close_old_connections()
             try:
+                fresh_proposal = UIStyleChangeRequest.objects.get(pk=proposal_pk)
+                fresh_user = get_user_model().objects.get(pk=user_pk)
+                barrier.wait()
                 with override_settings(CAULDRON_UI_OVERRIDES_DIR=str(override_root)):
-                    result = service.apply(proposal, applied_by=user)
+                    result = service.apply(fresh_proposal, applied_by=fresh_user)
                     with lock:
                         successes.append(result)
             except (ValueError, OperationalError) as exc:
-                with lock:
-                    errors.append(exc)
-            except Exception as exc:  # noqa: BLE001
                 with lock:
                     errors.append(exc)
             finally:
@@ -605,37 +761,30 @@ def test_concurrent_applies_only_one_claims_applying():
 
         _run_threads(do_apply, do_apply)
 
-        # If both threads hit OperationalError (SQLite lock exhaustion), the
-        # proposal may still be in approved state. Try to apply sequentially
-        # to confirm at least one application is possible.
-        proposal.refresh_from_db()
-        if proposal.status == "approved" and len(successes) == 0:
-            # Both lost to SQLite — retry sequentially.
-            with override_settings(CAULDRON_UI_OVERRIDES_DIR=str(override_root)):
-                service.apply(proposal, applied_by=user)
-            proposal.refresh_from_db()
+        final = _handle_apply_race(
+            successes, errors, proposal_pk, user_pk,
+            override_root, "admin", "claim-race.css", "approved", service,
+        )
 
-        # At most one applied audit event must exist.
         applied_events = UIStyleAuditEvent.objects.filter(
-            change_request=proposal, event_type="applied",
+            change_request=final, event_type="applied",
         )
         assert applied_events.count() == 1, (
             "Expected exactly one applied audit event, got "
             f"{applied_events.count()}. errors={[type(e).__name__ for e in errors]}"
         )
-
-        proposal.refresh_from_db()
-        assert proposal.status == "applied"
-        # The apply_lease must be cleared after successful application.
-        assert proposal.apply_lease == ""
+        assert final.status == "applied"
+        assert final.apply_lease == ""
 
 
 @pytest.mark.django_db(transaction=True)
 def test_identical_content_apply_serialized():
     """For a proposal where proposed_content == base_content, two concurrent
-    callers must still see exactly one FS write and one applied audit event."""
+    callers must still see exactly one FS write and one applied audit event.
+    Two racing apply transitions must never both commit.
+    """
     from cauldron_ai_admin.style_service import UIStyleChangeService
-    from cauldron_ai_admin.models import UIStyleAuditEvent
+    from cauldron_ai_admin.models import UIStyleAuditEvent, UIStyleChangeRequest
     from cauldron_django_admin.override_store import UIOverrideStore
 
     user = _make_user("identical-content-user")
@@ -645,7 +794,6 @@ def test_identical_content_apply_serialized():
         admin_dir = override_root / "admin"
         admin_dir.mkdir()
 
-        # The file already exists with the same content as the proposal.
         content = "body { color: green; }"
         (admin_dir / "same.css").write_text(content, encoding="utf-8")
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -658,6 +806,8 @@ def test_identical_content_apply_serialized():
             base_exists=True,
             base_hash=content_hash,
         )
+        proposal_pk = proposal.pk
+        user_pk = user.pk
         service = UIStyleChangeService()
 
         successes: list = []
@@ -666,13 +816,16 @@ def test_identical_content_apply_serialized():
         barrier = threading.Barrier(2, timeout=10)
 
         def do_apply():
-            barrier.wait()
+            close_old_connections()
             try:
+                fresh_proposal = UIStyleChangeRequest.objects.get(pk=proposal_pk)
+                fresh_user = get_user_model().objects.get(pk=user_pk)
+                barrier.wait()
                 with override_settings(CAULDRON_UI_OVERRIDES_DIR=str(override_root)):
-                    result = service.apply(proposal, applied_by=user)
+                    result = service.apply(fresh_proposal, applied_by=fresh_user)
                     with lock:
                         successes.append(result)
-            except Exception as exc:  # noqa: BLE001
+            except (ValueError, OperationalError) as exc:
                 with lock:
                     errors.append(exc)
             finally:
@@ -680,17 +833,20 @@ def test_identical_content_apply_serialized():
 
         _run_threads(do_apply, do_apply)
 
-        # There should be exactly one applied audit event.
+        final = _handle_apply_race(
+            successes, errors, proposal_pk, user_pk,
+            override_root, "admin", "same.css", "approved", service,
+            base_exists=True,
+        )
+
         applied_events = UIStyleAuditEvent.objects.filter(
-            change_request=proposal, event_type="applied",
+            change_request=final, event_type="applied",
         )
         assert applied_events.count() == 1, (
             "Expected exactly one applied audit event, got "
             f"{applied_events.count()}. errors={[type(e).__name__ for e in errors]}"
         )
-
-        proposal.refresh_from_db()
-        assert proposal.status == "applied"
+        assert final.status == "applied"
 
         store = UIOverrideStore(override_root)
         assert store.read_file("admin", "same.css") == content

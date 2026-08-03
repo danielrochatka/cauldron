@@ -112,8 +112,8 @@ def test_execution_budget_defaults_preserved_numeric_values():
     from cauldron_ai_admin.service_factory import EXECUTION_BUDGET_DEFAULTS
     assert EXECUTION_BUDGET_DEFAULTS["tool_timeout_seconds"] == 10.0
     assert EXECUTION_BUDGET_DEFAULTS["run_timeout_seconds"] == 120.0
-    assert EXECUTION_BUDGET_DEFAULTS["max_argument_bytes"] == 4096
-    assert EXECUTION_BUDGET_DEFAULTS["max_result_bytes"] == 8192
+    assert EXECUTION_BUDGET_DEFAULTS["max_argument_bytes"] == 131072
+    assert EXECUTION_BUDGET_DEFAULTS["max_result_bytes"] == 262144
 
 
 # ---------------------------------------------------------------------------

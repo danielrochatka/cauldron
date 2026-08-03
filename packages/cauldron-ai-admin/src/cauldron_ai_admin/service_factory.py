@@ -12,6 +12,7 @@ from cauldron_ai.providers import (
     provider_names,
 )
 
+from .budget_defaults import DEFAULT_MAX_ARGUMENT_BYTES, DEFAULT_MAX_RESULT_BYTES
 from .checks import _FactoryProviderMarker, _resolve_provider
 from .service import AdminAIService
 from .tools import get_tool_registry
@@ -74,8 +75,8 @@ EXECUTION_BUDGET_DEFAULTS: dict[str, Any] = {
     "max_tool_calls": 12,
     "tool_timeout_seconds": 10.0,
     "run_timeout_seconds": 120.0,
-    "max_argument_bytes": 131072,
-    "max_result_bytes": 262144,
+    "max_argument_bytes": DEFAULT_MAX_ARGUMENT_BYTES,
+    "max_result_bytes": DEFAULT_MAX_RESULT_BYTES,
     "include_content_tools": True,
 }
 

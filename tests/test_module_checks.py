@@ -257,6 +257,114 @@ class TestProjectPathChecks:
         assert e024 == []
 
 
+class TestSystemCheckWithRealDiscovery:
+    """System checks using real project discovery results (not manually injected errors)."""
+
+    @pytest.fixture(autouse=True)
+    def _temp_modules_root(self, tmp_path):
+        self._modules_root = tmp_path
+
+    def _run_with_discovery(self, *, project_module_root, enabled=None):
+        """Run discovery and populate registry, then run all checks."""
+        from cauldron.modules.discovery import discover_modules
+        from cauldron.modules.registry import registry
+
+        result = discover_modules(project_module_root=project_module_root)
+        enabled_set = enabled or set()
+        registry.populate(
+            result.modules,
+            enabled=enabled_set,
+            discovery_errors=result.errors,
+        )
+        registry.activate()
+        return django_checks.run_checks()
+
+    def test_unsafe_nested_path_emits_e024(self, tmp_path):
+        import sys
+        original_path = list(sys.path)
+        original_modules = set(sys.modules.keys())
+        try:
+            modules_root = tmp_path / "modules"
+            modules_root.mkdir()
+            external = tmp_path / "evil.py"
+            external.write_text("x = 1")
+            pkg = modules_root / "badmod"
+            pkg.mkdir()
+            (pkg / "__init__.py").write_text("x=1")
+            (pkg / "evil_link.py").symlink_to(external)
+            messages = self._run_with_discovery(project_module_root=modules_root)
+            e024 = [m for m in messages if m.id == "cauldron.E024"]
+            assert len(e024) >= 1
+        finally:
+            sys.path[:] = original_path
+            for key in list(sys.modules.keys()):
+                if key not in original_modules:
+                    del sys.modules[key]
+
+    def test_unsafe_path_message_has_no_absolute_path(self, tmp_path):
+        import sys
+        original_path = list(sys.path)
+        original_modules = set(sys.modules.keys())
+        try:
+            modules_root = tmp_path / "modules"
+            modules_root.mkdir()
+            external = tmp_path / "evil.py"
+            external.write_text("x = 1")
+            pkg = modules_root / "badmod"
+            pkg.mkdir()
+            (pkg / "__init__.py").write_text("x=1")
+            (pkg / "evil_link.py").symlink_to(external)
+            messages = self._run_with_discovery(project_module_root=modules_root)
+            for m in messages:
+                if m.id.startswith("cauldron.E024") or m.id.startswith("cauldron.W024"):
+                    assert str(tmp_path) not in m.msg, (
+                        f"Absolute path in check message: {m.msg!r}"
+                    )
+        finally:
+            sys.path[:] = original_path
+            for key in list(sys.modules.keys()):
+                if key not in original_modules:
+                    del sys.modules[key]
+
+    def test_malformed_manifest_emits_e022(self, tmp_path):
+        import sys
+        original_path = list(sys.path)
+        original_modules = set(sys.modules.keys())
+        try:
+            modules_root = tmp_path / "modules"
+            modules_root.mkdir()
+            pkg = modules_root / "badmod"
+            pkg.mkdir()
+            (pkg / "__init__.py").write_text("module = object()  # not CauldronModule")
+            messages = self._run_with_discovery(project_module_root=modules_root)
+            e022 = [m for m in messages if m.id == "cauldron.E022"]
+            assert len(e022) >= 1
+        finally:
+            sys.path[:] = original_path
+            for key in list(sys.modules.keys()):
+                if key not in original_modules:
+                    del sys.modules[key]
+
+    def test_missing_enabled_slug_emits_e023(self, tmp_path):
+        import sys
+        original_path = list(sys.path)
+        original_modules = set(sys.modules.keys())
+        try:
+            modules_root = tmp_path / "modules"
+            modules_root.mkdir()
+            messages = self._run_with_discovery(
+                project_module_root=modules_root,
+                enabled={"missing.local.module"},
+            )
+            e023 = [m for m in messages if m.id == "cauldron.E023"]
+            assert len(e023) >= 1
+        finally:
+            sys.path[:] = original_path
+            for key in list(sys.modules.keys()):
+                if key not in original_modules:
+                    del sys.modules[key]
+
+
 class TestLifecycleErrorCheck:
     def test_lifecycle_error_emits_e030(self):
         from cauldron.modules.registry import LifecycleError, registry

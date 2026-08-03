@@ -421,6 +421,116 @@ def _is_under(path: Path, root: Path) -> bool:
         return False
 
 
+def _validate_candidate_tree(
+    ep_name: str,
+    candidate_dir: Path,
+    canonical_root: Path,
+) -> list[DiscoveryError]:
+    """Validate the tree rooted at candidate_dir for symlink safety.
+
+    Uses os.walk with followlinks=False. For each directory and file
+    encountered, if it is a symlink, resolves it and verifies the resolved
+    target is under canonical_root. Broken symlinks and resolve failures
+    (OSError) are also rejected.
+
+    Returns a list of DiscoveryError with kind="project_path".
+    All messages use root-relative POSIX paths; no absolute paths are included.
+    """
+    tree_errors: list[DiscoveryError] = []
+    canonical_root_str = str(canonical_root)
+
+    for dirpath, dirnames, filenames in os.walk(str(candidate_dir), followlinks=False):
+        # Check and prune symlinked directories
+        dirs_to_remove = []
+        for dname in list(dirnames):
+            dpath = Path(dirpath) / dname
+            if os.path.islink(str(dpath)):
+                rel = (Path(dirpath) / dname).relative_to(candidate_dir).as_posix()
+                try:
+                    resolved = dpath.resolve()
+                    if not resolved.exists():
+                        tree_errors.append(DiscoveryError(
+                            entry_point_name=ep_name,
+                            kind="project_path",
+                            message=(
+                                f"Project module tree contains broken symlink"
+                                f" {rel!r}."
+                            ),
+                        ))
+                        dirs_to_remove.append(dname)
+                        continue
+                    if not _is_under(resolved, canonical_root):
+                        tree_errors.append(DiscoveryError(
+                            entry_point_name=ep_name,
+                            kind="project_path",
+                            message=(
+                                f"Project module tree contains directory symlink"
+                                f" {rel!r} that resolves outside the project root."
+                            ),
+                        ))
+                        dirs_to_remove.append(dname)
+                        continue
+                except OSError:
+                    tree_errors.append(DiscoveryError(
+                        entry_point_name=ep_name,
+                        kind="project_path",
+                        message=(
+                            f"Project module tree contains unresolvable directory"
+                            f" symlink {rel!r}."
+                        ),
+                    ))
+                    dirs_to_remove.append(dname)
+                    continue
+                # Safe internal dir symlink: remove from traversal to avoid loops
+                dirs_to_remove.append(dname)
+            # Non-symlink dirs are traversed normally (os.walk handles them)
+
+        # Remove symlinked dirs from traversal list (in-place modification)
+        for dname in dirs_to_remove:
+            if dname in dirnames:
+                dirnames.remove(dname)
+
+        # Check file symlinks
+        for fname in filenames:
+            fpath = Path(dirpath) / fname
+            if os.path.islink(str(fpath)):
+                rel = (Path(dirpath) / fname).relative_to(candidate_dir).as_posix()
+                try:
+                    resolved = fpath.resolve()
+                    if not resolved.exists():
+                        tree_errors.append(DiscoveryError(
+                            entry_point_name=ep_name,
+                            kind="project_path",
+                            message=(
+                                f"Project module tree contains broken symlink"
+                                f" {rel!r}."
+                            ),
+                        ))
+                        continue
+                    if not _is_under(resolved, canonical_root):
+                        tree_errors.append(DiscoveryError(
+                            entry_point_name=ep_name,
+                            kind="project_path",
+                            message=(
+                                f"Project module tree contains file symlink"
+                                f" {rel!r} that resolves outside the project root."
+                            ),
+                        ))
+                        continue
+                except OSError:
+                    tree_errors.append(DiscoveryError(
+                        entry_point_name=ep_name,
+                        kind="project_path",
+                        message=(
+                            f"Project module tree contains unresolvable file"
+                            f" symlink {rel!r}."
+                        ),
+                    ))
+                    continue
+
+    return tree_errors
+
+
 def _normalize_project_root(
     value: Any,
 ) -> tuple[Path | None, list[DiscoveryError]]:
@@ -467,7 +577,57 @@ def _normalize_project_root(
         return Path(stripped), []
 
     if isinstance(value, os.PathLike):
-        return Path(value), []
+        try:
+            raw_str = os.fspath(value)
+        except Exception:
+            return None, [DiscoveryError(
+                entry_point_name="",
+                kind="project_path",
+                message=(
+                    "CAULDRON_PROJECT_MODULE_ROOT: PathLike.__fspath__() raised;"
+                    " a valid path string is required."
+                ),
+            )]
+        if isinstance(raw_str, bytes):
+            return None, [DiscoveryError(
+                entry_point_name="",
+                kind="project_path",
+                message=(
+                    "CAULDRON_PROJECT_MODULE_ROOT: PathLike returned bytes from"
+                    " __fspath__(); a str path is required."
+                ),
+            )]
+        if not isinstance(raw_str, str):
+            return None, [DiscoveryError(
+                entry_point_name="",
+                kind="project_path",
+                message=(
+                    "CAULDRON_PROJECT_MODULE_ROOT: PathLike returned"
+                    f" {type(raw_str).__name__!r} from __fspath__();"
+                    " a str path is required."
+                ),
+            )]
+        stripped = raw_str.strip()
+        if not stripped:
+            return None, [DiscoveryError(
+                entry_point_name="",
+                kind="project_path",
+                message=(
+                    "CAULDRON_PROJECT_MODULE_ROOT must not be empty or"
+                    " whitespace-only."
+                ),
+            )]
+        try:
+            return Path(stripped), []
+        except Exception:
+            return None, [DiscoveryError(
+                entry_point_name="",
+                kind="project_path",
+                message=(
+                    "CAULDRON_PROJECT_MODULE_ROOT: Path() construction failed;"
+                    " ensure the value is a valid filesystem path."
+                ),
+            )]
 
     return None, [DiscoveryError(
         entry_point_name="",
@@ -477,6 +637,24 @@ def _normalize_project_root(
             f" got {type(value).__name__!r}."
         ),
     )]
+
+
+def _place_at_sys_path_front(canonical_str: str) -> None:
+    """Ensure canonical_str occupies sys.path[0], removing equivalents."""
+    kept = []
+    for entry in sys.path:
+        if not isinstance(entry, str):
+            kept.append(entry)
+            continue
+        try:
+            resolved = str(Path(entry).resolve())
+        except (OSError, ValueError):
+            kept.append(entry)
+            continue
+        if resolved != canonical_str:
+            kept.append(entry)
+        # else: drop equivalent duplicate
+    sys.path[:] = [canonical_str] + kept
 
 
 def _discover_project_modules(
@@ -530,11 +708,9 @@ def _discover_project_modules(
         ))
         return records, errors
 
-    # Idempotent sys.path insertion (compare resolved string representations).
+    # Place canonical root at sys.path[0], removing any equivalent duplicates.
     canonical_root_str = str(canonical_root)
-    resolved_paths = {str(Path(p).resolve()) for p in sys.path if p}
-    if canonical_root_str not in resolved_paths:
-        sys.path.insert(0, canonical_root_str)
+    _place_at_sys_path_front(canonical_root_str)
 
     try:
         all_entries = sorted(root.iterdir(), key=lambda e: e.name)
@@ -661,6 +837,23 @@ def _discover_project_modules(
             ))
             continue
 
+        # 4b. __init__.py must be a regular file (not a directory)
+        if resolved_init.is_dir() or not resolved_init.is_file():
+            errors.append(DiscoveryError(
+                entry_point_name=ep_name,
+                kind="project_path",
+                message=(
+                    f"Project module {dir_name!r}: __init__.py is not a regular file."
+                ),
+            ))
+            continue
+
+        # 5. Tree validation: check all nested symlinks for path escapes
+        tree_errors = _validate_candidate_tree(ep_name, entry, canonical_root)
+        if tree_errors:
+            errors.extend(tree_errors)
+            continue
+
         # --- sys.modules collision check -----------------------------------
         existing = sys.modules.get(dir_name)
         if existing is not None:
@@ -679,10 +872,21 @@ def _discover_project_modules(
             mod_obj = existing
         else:
             # --- Load ------------------------------------------------------
+            # Snapshot keys for this package before importing so we can clean
+            # up on failure.
+            modules_before = set(
+                k for k in sys.modules
+                if k == dir_name or k.startswith(dir_name + ".")
+            )
             importlib.invalidate_caches()
             try:
                 mod_obj = importlib.import_module(dir_name)
             except Exception as exc:
+                # Remove any partially-loaded entries for this package
+                for key in list(sys.modules.keys()):
+                    if (key == dir_name or key.startswith(dir_name + ".")) and key not in modules_before:
+                        del sys.modules[key]
+                importlib.invalidate_caches()
                 errors.append(_make_error(
                     src, "load_failure",
                     f"Project module {ep_name!r} raised {type(exc).__name__}"
@@ -697,6 +901,11 @@ def _discover_project_modules(
 
             # Verify the newly imported module came from the expected place.
             if not _module_origin_ok(mod_obj, resolved_entry):
+                # Remove newly added entries for this package
+                for key in list(sys.modules.keys()):
+                    if (key == dir_name or key.startswith(dir_name + ".")) and key not in modules_before:
+                        del sys.modules[key]
+                importlib.invalidate_caches()
                 errors.append(DiscoveryError(
                     entry_point_name=ep_name,
                     kind="project_path",

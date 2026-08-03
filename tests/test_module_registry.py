@@ -512,3 +512,253 @@ class TestFixtureModuleIntegration:
         from django.apps import apps as django_apps
 
         assert django_apps.is_installed("cauldron_fixture_alpha")
+
+
+class TestInventory:
+    """Tests for ModuleRegistry.inventory()."""
+
+    def test_inventory_empty_when_no_modules(self, registry):
+        registry.populate([])
+        assert registry.inventory() == []
+
+    def test_inventory_returns_one_entry_per_discovered_module(self, registry):
+        a = _mod("a")
+        b = _mod("b")
+        registry.populate([a, b])
+        assert len(registry.inventory()) == 2
+
+    def test_inventory_sorted_by_slug(self, registry):
+        z = _mod("z")
+        a = _mod("a")
+        registry.populate([z, a])
+        slugs = [e["slug"] for e in registry.inventory()]
+        assert slugs == sorted(slugs)
+
+    def test_inventory_identity_fields(self, registry):
+        a = _mod("a", version="2.0.0")
+        registry.populate([a])
+        entry = registry.inventory()[0]
+        assert entry["slug"] == "a"
+        assert entry["label"] == "a"
+        assert entry["version"] == "2.0.0"
+
+    def test_inventory_active_flag_true_for_active_module(self, registry):
+        a = _mod("a")
+        registry.populate([a])
+        entry = registry.inventory()[0]
+        assert entry["active"] is True
+
+    def test_inventory_active_flag_false_for_inactive_module(self, registry):
+        a = _mod("a")
+        registry.populate([a], enabled=set())
+        entry = registry.inventory()[0]
+        assert entry["active"] is False
+
+    def test_inventory_enabled_flag_true_when_enabled(self, registry):
+        a = _mod("a")
+        registry.populate([a], enabled={"a"})
+        entry = registry.inventory()[0]
+        assert entry["enabled"] is True
+
+    def test_inventory_enabled_flag_false_when_not_enabled(self, registry):
+        a = _mod("a")
+        b = _mod("b")
+        registry.populate([a, b], enabled={"a"})
+        by_slug = {e["slug"]: e for e in registry.inventory()}
+        assert by_slug["a"]["enabled"] is True
+        assert by_slug["b"]["enabled"] is False
+
+    def test_inventory_enabled_true_for_all_when_enabled_none(self, registry):
+        a = _mod("a")
+        b = _mod("b")
+        registry.populate([a, b])  # enabled=None → all
+        for entry in registry.inventory():
+            assert entry["enabled"] is True
+
+    def test_inventory_load_index_set_for_active_modules(self, registry):
+        a = _mod("a")
+        b = _mod("b", requires=(ModuleRequirement(slug="a"),))
+        registry.populate([a, b])
+        by_slug = {e["slug"]: e for e in registry.inventory()}
+        assert by_slug["a"]["load_index"] == 0
+        assert by_slug["b"]["load_index"] == 1
+
+    def test_inventory_load_index_none_for_inactive(self, registry):
+        a = _mod("a")
+        registry.populate([a], enabled=set())
+        entry = registry.inventory()[0]
+        assert entry["load_index"] is None
+
+    def test_inventory_provides_field(self, registry):
+        a = _mod("a", provides=("my.cap",))
+        registry.populate([a])
+        entry = registry.inventory()[0]
+        assert entry["provides"] == ["my.cap"]
+
+    def test_inventory_deps_field(self, registry):
+        a = _mod("a")
+        b = _mod("b", requires=(ModuleRequirement(slug="a"),))
+        registry.populate([a, b])
+        by_slug = {e["slug"]: e for e in registry.inventory()}
+        assert by_slug["b"]["deps"] == ["a"]
+        assert by_slug["a"]["deps"] == []
+
+    def test_inventory_django_apps_field(self, registry):
+        manifest = ModuleManifest(slug="a", label="a", django_apps=("myapp",))
+        a = BaseModule(manifest)
+        registry.populate([a])
+        entry = registry.inventory()[0]
+        assert entry["django_apps"] == ["myapp"]
+
+    def test_inventory_config_field_returns_module_config(self, registry):
+        a = _mod("a")
+        registry.populate([a], module_configs={"a": {"key": "val"}})
+        entry = registry.inventory()[0]
+        assert entry["config"] == {"key": "val"}
+
+    def test_inventory_config_empty_when_no_config(self, registry):
+        a = _mod("a")
+        registry.populate([a])
+        entry = registry.inventory()[0]
+        assert entry["config"] == {}
+
+    def test_inventory_source_fields_populated_from_discovery_records(self, registry):
+        from cauldron.modules.discovery import DiscoveredModule
+        from cauldron.modules import ModuleManifest, BaseModule
+
+        manifest = ModuleManifest(slug="a", label="a")
+        mod = BaseModule(manifest)
+
+        record = DiscoveredModule(
+            slug="a",
+            label="a",
+            version="1.0.0",
+            source_type="package",
+            package_name="my-package",
+            package_version="1.2.3",
+            entry_point_group="cauldron.modules",
+            entry_point_name="my-ep",
+            entry_point_value="my_module:obj",
+            manifest=manifest,
+            module=mod,
+        )
+        registry.populate([mod], discovery_records=[record])
+        entry = registry.inventory()[0]
+        assert entry["source_type"] == "package"
+        assert entry["package_name"] == "my-package"
+        assert entry["package_version"] == "1.2.3"
+        assert entry["entry_point_name"] == "my-ep"
+        assert entry["entry_point_value"] == "my_module:obj"
+
+    def test_inventory_source_fields_none_without_discovery_records(self, registry):
+        a = _mod("a")
+        registry.populate([a])  # no discovery_records
+        entry = registry.inventory()[0]
+        assert entry["source_type"] is None
+        assert entry["package_name"] is None
+
+    def test_graph_info_derives_from_inventory(self, registry):
+        """graph_info() must be a strict subset of the inventory keys."""
+        a = _mod("a")
+        b = _mod("b", requires=(ModuleRequirement(slug="a"),))
+        registry.populate([a, b])
+
+        graph = {e["slug"]: e for e in registry.graph_info()}
+        inv = {e["slug"]: e for e in registry.inventory()}
+
+        for slug, g_entry in graph.items():
+            i_entry = inv[slug]
+            for key, val in g_entry.items():
+                assert i_entry[key] == val, (
+                    f"graph_info[{slug!r}][{key!r}] != inventory[{slug!r}][{key!r}]"
+                )
+
+
+class TestEnabledSetStorage:
+    """Tests that _enabled is stored and drives enabled flag in inventory."""
+
+    def test_enabled_none_stores_all_discovered_slugs(self, registry):
+        a = _mod("a")
+        b = _mod("b")
+        registry.populate([a, b])  # enabled=None
+        # All discovered modules should show enabled=True
+        for entry in registry.inventory():
+            assert entry["enabled"] is True
+
+    def test_enabled_empty_set_stores_empty(self, registry):
+        a = _mod("a")
+        registry.populate([a], enabled=set())
+        assert registry.inventory()[0]["enabled"] is False
+
+    def test_enabled_set_persists_across_activate(self, registry):
+        a = _mod("a")
+        registry.populate([a], enabled={"a"})
+        registry.activate()
+        entry = registry.inventory()[0]
+        assert entry["enabled"] is True
+
+
+class TestUnavailableModules:
+    """Tests for slugs listed in CAULDRON_MODULES but absent from discovery."""
+
+    def test_no_unavailable_when_all_discovered(self, registry):
+        a = _mod("a")
+        registry.populate([a], enabled={"a"})
+        assert registry.unavailable_modules() == []
+
+    def test_unavailable_when_enabled_slug_not_discovered(self, registry):
+        from cauldron.modules.registry import UnavailableModule
+
+        registry.populate([], enabled={"ghost.module"})
+        unavail = registry.unavailable_modules()
+        assert len(unavail) == 1
+        assert unavail[0].slug == "ghost.module"
+
+    def test_multiple_unavailable_slugs(self, registry):
+        registry.populate([], enabled={"ghost.a", "ghost.b"})
+        unavail = registry.unavailable_modules()
+        slugs = {u.slug for u in unavail}
+        assert slugs == {"ghost.a", "ghost.b"}
+
+    def test_no_unavailable_when_enabled_is_none(self, registry):
+        a = _mod("a")
+        registry.populate([a])  # enabled=None
+        assert registry.unavailable_modules() == []
+
+    def test_unavailable_does_not_count_toward_has_errors(self, registry):
+        """has_errors only covers resolution + discovery errors, not unavailable slugs.
+
+        Unavailable slugs are surfaced by Django system checks (cauldron.E023),
+        not by has_errors, to preserve existing semantics.
+        """
+        registry.populate([], enabled={"ghost.module"})
+        assert not registry.has_errors
+
+    def test_unavailable_slugs_sorted(self, registry):
+        registry.populate([], enabled={"zzz.slug", "aaa.slug", "mmm.slug"})
+        slugs = [u.slug for u in registry.unavailable_modules()]
+        assert slugs == sorted(slugs)
+
+
+class TestVersionSatisfiesHelper:
+    """Tests for the shared version_satisfies helper promoted from resolver."""
+
+    def test_version_satisfies_exact(self):
+        from cauldron.modules.resolver import version_satisfies
+        assert version_satisfies("1.0.0", "==1.0.0")
+
+    def test_version_satisfies_range(self):
+        from cauldron.modules.resolver import version_satisfies
+        assert version_satisfies("1.5.0", ">=1.0.0,<2.0.0")
+
+    def test_version_not_satisfies(self):
+        from cauldron.modules.resolver import version_satisfies
+        assert not version_satisfies("2.0.0", "<1.0.0")
+
+    def test_empty_constraint_always_satisfies(self):
+        from cauldron.modules.resolver import version_satisfies
+        assert version_satisfies("0.0.1", "")
+
+    def test_invalid_version_returns_false(self):
+        from cauldron.modules.resolver import version_satisfies
+        assert not version_satisfies("not-a-version", ">=1.0.0")

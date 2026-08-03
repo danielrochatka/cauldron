@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from . import CauldronModule
-    from .discovery import DiscoveryError
+    from .discovery import DiscoveredModule, DiscoveryError
     from .resolver import ResolutionError, ResolutionResult, ResolutionWarning
 
 logger = logging.getLogger(__name__)
@@ -24,6 +24,18 @@ class LifecycleError:
     message: str
 
 
+@dataclass(frozen=True)
+class UnavailableModule:
+    """A slug listed in CAULDRON_MODULES that has no corresponding discovery record.
+
+    This occurs when a site enables a module slug but the corresponding
+    package is not installed (missing entry point).  It is surfaced as a
+    Django system check error (cauldron.E023).
+    """
+
+    slug: str
+
+
 class ModuleRegistry:
     """Manages discovered, resolved, and active Cauldron modules."""
 
@@ -37,6 +49,9 @@ class ModuleRegistry:
         self._warnings: list[ResolutionWarning] = []
         self._discovery_errors: list[DiscoveryError] = []
         self._lifecycle_errors: list[LifecycleError] = []
+        self._enabled: set[str] = set()
+        self._discovery_records: list[DiscoveredModule] = []
+        self._unavailable: list[UnavailableModule] = []
         self._populated = False
         self._ready = False
 
@@ -48,6 +63,7 @@ class ModuleRegistry:
         module_configs: dict[str, dict[str, Any]] | None = None,
         discovery_errors: list[DiscoveryError] | None = None,
         capability_overrides: dict[str, str] | None = None,
+        discovery_records: list[DiscoveredModule] | None = None,
     ) -> None:
         """Register modules, resolve dependencies, determine load order.
 
@@ -58,6 +74,10 @@ class ModuleRegistry:
         - An explicit ``set`` — activates only the listed slugs.  Pass an
           empty set to activate nothing.  This is the production model;
           ``apps.py`` derives the set from ``CAULDRON_MODULES``.
+
+        *discovery_records* carries the full :class:`~discovery.DiscoveredModule`
+        metadata for each successfully discovered module, used by
+        :meth:`inventory`.
 
         Safe to call multiple times; replaces all previous state.
         """
@@ -73,6 +93,8 @@ class ModuleRegistry:
         self._warnings = []
         self._discovery_errors = list(discovery_errors or [])
         self._lifecycle_errors = []
+        self._discovery_records = list(discovery_records or [])
+        self._unavailable = []
         self._populated = False
         self._ready = False
 
@@ -80,11 +102,18 @@ class ModuleRegistry:
             self._discovered[module.slug] = module
 
         if enabled is None:
+            self._enabled = set(self._discovered.keys())
             active_modules = dict(self._discovered)
         else:
+            self._enabled = set(enabled)
             active_modules = {
                 slug: m for slug, m in self._discovered.items() if slug in enabled
             }
+            # Detect slugs that were enabled but not discovered at all.
+            discovered_slugs = set(self._discovered)
+            for slug in sorted(self._enabled):
+                if slug not in discovered_slugs:
+                    self._unavailable.append(UnavailableModule(slug=slug))
 
         for slug, module in sorted(active_modules.items()):
             for cap in sorted(module.manifest.provides):
@@ -194,6 +223,10 @@ class ModuleRegistry:
     def lifecycle_errors(self) -> list[LifecycleError]:
         return list(self._lifecycle_errors)
 
+    def unavailable_modules(self) -> list[UnavailableModule]:
+        """Slugs listed in CAULDRON_MODULES with no matching discovery record."""
+        return list(self._unavailable)
+
     def dependency_graph(self) -> dict[str, list[str]]:
         """Machine-readable map of module slug to its resolved dependency slugs.
 
@@ -211,31 +244,90 @@ class ModuleRegistry:
             graph[slug] = sorted(set(deps))
         return graph
 
+    def inventory(self) -> list[dict[str, Any]]:
+        """Rich inventory combining discovery metadata and resolution state.
+
+        Returns one entry per discovered module, sorted by slug.  Each entry
+        contains:
+
+        - **identity & source**: slug, label, version, source_type,
+          package_name, package_version, entry_point_name, entry_point_value
+        - **config & activation**: enabled, active, load_index, config
+        - **compatibility** (from manifest): cauldron_version
+        - **capabilities**: provides, requires, optional, deps, django_apps
+
+        Callers that only want the subset of keys from :meth:`graph_info`
+        should use that method instead.
+        """
+        from .resolver import version_satisfies
+        try:
+            from cauldron import __version__ as cauldron_version
+        except Exception:
+            cauldron_version = ""
+
+        record_by_slug: dict[str, DiscoveredModule] = {
+            r.slug: r for r in self._discovery_records
+        }
+        load_index_map = {slug: i for i, slug in enumerate(self._load_order)}
+        dep_graph = self.dependency_graph()
+        result = []
+        for slug in sorted(self._discovered):
+            m = self._discovered[slug]
+            rec = record_by_slug.get(slug)
+            constraint = m.manifest.cauldron_version
+            compat = (
+                version_satisfies(cauldron_version, constraint)
+                if cauldron_version and constraint
+                else None
+            )
+            entry: dict[str, Any] = {
+                "slug": slug,
+                "label": m.label,
+                "version": m.manifest.version,
+                "source_type": rec.source_type if rec else None,
+                "package_name": rec.package_name if rec else None,
+                "package_version": rec.package_version if rec else None,
+                "entry_point_name": rec.entry_point_name if rec else None,
+                "entry_point_value": rec.entry_point_value if rec else None,
+                "enabled": slug in self._enabled,
+                "active": slug in self._active,
+                "load_index": load_index_map.get(slug),
+                "config": self.get_module_config(slug),
+                "cauldron_version_constraint": constraint,
+                "cauldron_version_ok": compat,
+                "provides": sorted(m.manifest.provides),
+                "requires": [r.to_dict() for r in m.manifest.requires],
+                "optional": [r.to_dict() for r in m.manifest.optional],
+                "deps": dep_graph.get(slug, []),
+                "django_apps": list(m.django_apps()),
+            }
+            result.append(entry)
+        return result
+
     def graph_info(self) -> list[dict[str, Any]]:
         """Rich module graph for tooling and visualizers.
 
         Returns one entry per discovered module, sorted by slug.  Each entry
         contains identity, status, load position, capabilities, requirements,
         resolved dependencies, and Django apps.
+
+        This is a stable subset of :meth:`inventory` keys.
         """
-        load_index_map = {slug: i for i, slug in enumerate(self._load_order)}
-        dep_graph = self.dependency_graph()
-        result = []
-        for slug in sorted(self._discovered):
-            m = self._discovered[slug]
-            result.append({
-                "slug": slug,
-                "label": m.label,
-                "version": m.manifest.version,
-                "active": slug in self._active,
-                "load_index": load_index_map.get(slug),
-                "provides": sorted(m.manifest.provides),
-                "requires": [r.to_dict() for r in m.manifest.requires],
-                "optional": [r.to_dict() for r in m.manifest.optional],
-                "deps": dep_graph.get(slug, []),
-                "django_apps": list(m.django_apps()),
-            })
-        return result
+        return [
+            {
+                "slug": e["slug"],
+                "label": e["label"],
+                "version": e["version"],
+                "active": e["active"],
+                "load_index": e["load_index"],
+                "provides": e["provides"],
+                "requires": e["requires"],
+                "optional": e["optional"],
+                "deps": e["deps"],
+                "django_apps": e["django_apps"],
+            }
+            for e in self.inventory()
+        ]
 
     # ----------------------------------------------------------------- flags
 

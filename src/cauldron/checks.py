@@ -116,6 +116,21 @@ def cauldron_module_graph_check(app_configs, **kwargs):
             )
         )
 
+    # Unavailable configured slugs -------------------------------------------
+    for unavail in registry.unavailable_modules():
+        messages.append(
+            Error(
+                f"Module {unavail.slug!r} is listed in CAULDRON_MODULES but was not"
+                " found among installed entry points.",
+                hint=(
+                    f"Install the package that provides the 'cauldron.modules' entry"
+                    f" point for {unavail.slug!r}, or remove it from CAULDRON_MODULES."
+                ),
+                obj=unavail.slug,
+                id="cauldron.E023",
+            )
+        )
+
     # Active-module summary --------------------------------------------------
     active = registry.all_active()
     if active:

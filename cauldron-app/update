@@ -7,6 +7,34 @@ VENV="$CAULDRON_DIR/.venv"
 
 source "$CAULDRON_DIR/lib.sh"
 
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+SKIP_PREFLIGHT=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --skip-preflight)
+      SKIP_PREFLIGHT=1
+      shift
+      ;;
+    --help|-h)
+      echo "Usage: ./update [--skip-preflight]"
+      echo ""
+      echo "  --skip-preflight  Skip the pre-update verification step."
+      echo "                    WARNING: skipping preflight means the server may stop"
+      echo "                    before a broken update is detected."
+      exit 0
+      ;;
+    *)
+      echo "ERROR: Unknown option: $1" >&2
+      echo "       Run: $0 --help" >&2
+      exit 2
+      ;;
+  esac
+done
+
 echo "==> Cauldron Update"
 echo ""
 
@@ -57,13 +85,32 @@ if [ "$HAS_UPSTREAM" -eq 1 ]; then
   fi
 fi
 
-# 2. Stop server and wait for all workers to exit.
+# 2. Preflight verification — runs BEFORE stopping the server so that a broken
+#    candidate is rejected while the live server continues serving requests.
+if [ "$SKIP_PREFLIGHT" -eq 1 ]; then
+  echo ""
+  echo "    WARNING: Preflight verification skipped (--skip-preflight)."
+  echo "             The server will be stopped before the update is verified."
+  echo "             Use this flag only for emergency maintenance."
+  echo ""
+elif [ -x "$CAULDRON_DIR/verify-update" ]; then
+  echo "--> Running preflight verification..."
+  if ! "$CAULDRON_DIR/verify-update" "${UPSTREAM_REF:-HEAD}" 2>&1; then
+    echo ""
+    echo "ERROR: Preflight verification failed. The live server is still running."
+    echo "       Fix the issue above and re-run ./update."
+    exit 1
+  fi
+  echo ""
+fi
+
+# 4. Stop server and wait for all workers to exit.
 if [ -f "$CAULDRON_DIR/data/cauldron.pid" ]; then
   echo "--> Stopping server..."
   "$CAULDRON_DIR/stop"
 fi
 
-# 3. Back up the database.
+# 5. Back up the database.
 DB="$CAULDRON_DIR/data/cauldron.db"
 BACKUP=""
 if [ -f "$DB" ]; then
@@ -72,7 +119,7 @@ if [ -f "$DB" ]; then
   echo "--> Database backed up to $(basename "$BACKUP")"
 fi
 
-# 4. Record the current commit so rollback can return to it exactly.
+# 6. Record the current commit so rollback can return to it exactly.
 PREV_COMMIT="$(git rev-parse HEAD)"
 echo "--> Current commit: ${PREV_COMMIT:0:8}"
 
@@ -107,7 +154,7 @@ _rollback() {
 }
 trap '_rollback' ERR
 
-# 5. Pull latest code (only when an upstream is configured).
+# 7. Pull latest code (only when an upstream is configured).
 if [ "$HAS_UPSTREAM" -eq 1 ]; then
   echo "--> Pulling latest Cauldron..."
   cd "$REPO_DIR"
@@ -116,27 +163,27 @@ else
   echo "--> Skipping git pull (no upstream configured)."
 fi
 
-# 6. Install/upgrade all Python packages and their dependencies.
+# 8. Install/upgrade all Python packages and their dependencies.
 echo "--> Upgrading dependencies..."
 source "$VENV/bin/activate"
 install_python_projects "$REPO_DIR" "$CAULDRON_DIR/requirements.txt"
 
-# 7. Run migrations.
+# 9. Run migrations.
 echo "--> Applying database migrations..."
 "$CAULDRON_DIR/manage" migrate --no-input
 
-# 8. Collect static assets.
+# 10. Collect static assets.
 echo "--> Collecting static assets..."
 "$CAULDRON_DIR/manage" collectstatic --no-input --clear -v 0
 
-# 9. Initialize override directory.
+# 11. Initialize override directory.
 "$CAULDRON_DIR/manage" cauldron_ui_init 2>/dev/null || true
 
-# 10. Install/upgrade frontend dependencies (always re-runs after a git pull
+# 12. Install/upgrade frontend dependencies (always re-runs after a git pull
 #     in case package-lock.json was updated).
 install_frontend "$CAULDRON_DIR"
 
-# 11. Rebuild public site.
+# 13. Rebuild public site.
 #     A build failure does NOT roll back the Python/database updates — those
 #     are safe to keep.  We record the outcome and report it at the end after
 #     the server is confirmed healthy.
@@ -150,12 +197,12 @@ if [ "$SITE_BUILD_OK" -eq 0 ]; then
   echo "             See: $CAULDRON_DIR/logs/site_build.log"
 fi
 
-# 12. Run system check.
+# 14. Run system check.
 echo "--> Running system check..."
 "$CAULDRON_DIR/manage" check
 
-# 13. Start server.
-# Re-source lib.sh so any changes pulled in step 5 (e.g. new --timeout flag)
+# 15. Start server.
+# Re-source lib.sh so any changes pulled in step 7 (e.g. new --timeout flag)
 # take effect before the server is launched.  lib.sh was sourced at startup
 # from the pre-pull version; re-sourcing here picks up the updated functions.
 echo "--> Starting server..."
@@ -163,7 +210,7 @@ source "$CAULDRON_DIR/lib.sh"
 PORT="${CAULDRON_PORT:-8000}"
 launch_server "$CAULDRON_DIR" "$PORT"
 
-# 14. Health check — verify the app and static files are reachable.
+# 16. Health check — verify the app and static files are reachable.
 #     Triggers the ERR trap (and therefore rollback) on failure.
 # Use the configured host; substitute 0.0.0.0 with 127.0.0.1 since 0.0.0.0
 # is a bind-all address and not a routable destination.

@@ -1,0 +1,81 @@
+name: distribution-smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── clean-install ────────────────────────────────────────────────────────────
+  # Verifies that the candidate installs cleanly, migrates, and serves.
+  clean-install:
+    name: distribution-smoke / clean-install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies
+        run: sudo apt-get install -y curl
+
+      - name: Run clean-install verification
+        run: |
+          chmod +x cauldron-app/verify-update
+          cauldron-app/verify-update HEAD
+
+      - name: Upload verify logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-clean-install-logs
+          path: /tmp/cauldron-verify-*/cauldron-app/logs/
+          if-no-files-found: ignore
+
+  # ── upgrade ──────────────────────────────────────────────────────────────────
+  # Verifies that upgrading from the previous release to HEAD works.
+  # This is the BLOCKING job required for branch protection.
+  upgrade:
+    name: distribution-smoke / upgrade
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies
+        run: sudo apt-get install -y curl
+
+      - name: Determine previous release ref
+        id: refs
+        run: |
+          # Use the most recent tag as FROM_REF.  Fall back to origin/main~1 when
+          # no tags exist yet (bootstrapping a new project).
+          FROM=$(git describe --tags --abbrev=0 2>/dev/null || git rev-parse origin/main~1 2>/dev/null || git rev-parse HEAD~1)
+          echo "from_ref=$FROM" >> "$GITHUB_OUTPUT"
+          echo "to_ref=HEAD" >> "$GITHUB_OUTPUT"
+          echo "Upgrade path: $FROM -> HEAD"
+
+      - name: Run upgrade-path verification
+        run: |
+          chmod +x cauldron-app/verify-update
+          cauldron-app/verify-update \
+            --from-ref "${{ steps.refs.outputs.from_ref }}" \
+            --to-ref   "${{ steps.refs.outputs.to_ref }}"
+
+      - name: Upload verify logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-upgrade-logs
+          path: /tmp/cauldron-verify-*/cauldron-app/logs/
+          if-no-files-found: ignore

@@ -78,7 +78,63 @@ To update Cauldron to the latest version:
 ./update
 ```
 
-`./update` stops the server, backs up the database, pulls the latest code, upgrades all Python and frontend dependencies, applies migrations, rebuilds the public site, runs system checks, and restarts.
+`./update` runs a **preflight verification** against the incoming code before stopping the live server.  If verification fails the server keeps running and nothing is changed.  If verification passes, the script stops the server, backs up the database, pulls the latest code, upgrades all Python and frontend dependencies, applies migrations, rebuilds the public site, runs system checks, and restarts.
+
+### Emergency bypass
+
+If the preflight check itself is preventing an update (e.g. a critical security fix where the environment is already broken), you can skip it:
+
+```bash
+./update --skip-preflight
+```
+
+This is a last-resort flag.  The server will stop before the update is verified, so a broken candidate can leave the server down.
+
+## Verification
+
+`verify-update` checks that a given Git ref installs, migrates, and serves correctly, without touching the live checkout, database, virtualenv, or running server.  All work happens in a temporary Git worktree and throwaway virtualenv that are removed on exit.
+
+### Clean-install verification
+
+```bash
+./verify-update          # verify HEAD
+./verify-update main     # verify a branch
+./verify-update v1.2.3   # verify a tag
+```
+
+### Upgrade-path verification
+
+```bash
+./verify-update --from-ref v1.1.0 --to-ref main
+```
+
+This simulates a real upgrade: installs and migrates the old version, creates representative persisted state, upgrades packages in-place to the new version, re-migrates, and verifies the state is still readable before running a server health check.
+
+### What is verified
+
+Each run exercises these phases (failures are collected; a summary is always printed):
+
+| Phase | What it checks |
+|-------|---------------|
+| `worktree` | Git ref resolves and worktree can be created |
+| `venv` | Python virtualenv creates successfully |
+| `packages` | All packages install without error |
+| `config` | `config.env` initialises without error |
+| `check` | `manage.py check` passes |
+| `makemigrations --check` | No unapplied schema changes |
+| `migrate` | Migrations apply cleanly |
+| `collectstatic` | Static assets collect without error |
+| `cauldron_site_build` | Frontend build succeeds (skipped if Node.js absent) |
+| `server startup` | Dev server starts and responds within 30 s |
+| `health` | `/accounts/login/` and CSS tokens asset return 200 |
+
+### Package tests vs distribution verification
+
+Package tests (run with `pytest` inside each `packages/*/tests/`) verify individual module logic in isolation.  `verify-update` verifies the full distribution: install sequence, migration chain, and HTTP surface.  Both are required before shipping.
+
+### CI
+
+`verify-update` runs in the `distribution-smoke` GitHub Actions workflow on every push and pull request to `main`.  The `distribution-smoke / upgrade` job is a **required branch-protection check** — PRs cannot be merged until upgrade-path verification passes.
 
 ## Stopping the server
 

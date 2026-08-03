@@ -1,0 +1,437 @@
+#!/usr/bin/env bash
+# verify-update — Verify a Cauldron ref installs, migrates, and serves cleanly.
+#
+# Does NOT touch the live checkout, live virtualenv, live database, PID files,
+# generated public output, or any running server.  All work happens inside a
+# temporary Git worktree and a temporary Python virtualenv that are removed on
+# exit, regardless of success or failure.
+#
+# Usage
+# -----
+#   ./verify-update [REF]                          # clean-install verification
+#   ./verify-update --from-ref OLD --to-ref NEW    # upgrade-path verification
+#
+# REF defaults to HEAD when omitted.
+# --from-ref and --to-ref must both be supplied together.
+#
+# Exit codes
+# ----------
+#   0  all phases passed
+#   1  at least one phase failed
+#   2  usage error
+
+set -euo pipefail
+
+CAULDRON_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(dirname "$CAULDRON_DIR")"
+source "$CAULDRON_DIR/lib.sh"
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+FROM_REF=""
+TO_REF=""
+CLEAN_REF="HEAD"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --from-ref) FROM_REF="$2"; shift 2 ;;
+    --to-ref)   TO_REF="$2";   shift 2 ;;
+    --help|-h)
+      sed -n '2,/^$/p' "$0" | grep '^#' | sed 's/^# \?//'
+      exit 0
+      ;;
+    -*)
+      echo "ERROR: Unknown option: $1" >&2
+      echo "       Run: $0 --help" >&2
+      exit 2
+      ;;
+    *) CLEAN_REF="$1"; shift ;;
+  esac
+done
+
+UPGRADE_MODE=0
+if [[ -n "$FROM_REF" || -n "$TO_REF" ]]; then
+  if [[ -z "$FROM_REF" || -z "$TO_REF" ]]; then
+    echo "ERROR: --from-ref and --to-ref must both be specified together." >&2
+    exit 2
+  fi
+  UPGRADE_MODE=1
+fi
+
+# ---------------------------------------------------------------------------
+# Phase tracking
+# ---------------------------------------------------------------------------
+
+declare -a _PHASE_LOG=()
+_OVERALL_OK=1
+
+_phase() {
+  echo ""
+  echo "--> [$1]"
+}
+
+_pass() { _PHASE_LOG+=("  PASS  $1"); }
+_fail() { _PHASE_LOG+=("  FAIL  $1"); _OVERALL_OK=0; }
+
+_print_report() {
+  echo ""
+  echo "==> Verification report"
+  for line in "${_PHASE_LOG[@]}"; do
+    echo "    $line"
+  done
+  echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+
+_VERIFY_WORKTREE=""
+_VERIFY_SERVER_PID=""
+
+_cleanup() {
+  local exit_status=$?
+
+  # If the script exited with a non-zero status but no _fail() was recorded
+  # (e.g. an unexpected exit from inside a helper), treat it as a failure.
+  if [[ "$exit_status" -ne 0 && "${_OVERALL_OK}" -eq 1 ]]; then
+    _OVERALL_OK=0
+  fi
+
+  # Stop the temporary server if it is still running.
+  if [[ -n "${_VERIFY_SERVER_PID:-}" ]] && kill -0 "$_VERIFY_SERVER_PID" 2>/dev/null; then
+    kill "$_VERIFY_SERVER_PID" 2>/dev/null || true
+    wait "$_VERIFY_SERVER_PID" 2>/dev/null || true
+  fi
+
+  # Remove the temporary worktree (also removes its .venv and data/).
+  if [[ -n "${_VERIFY_WORKTREE:-}" && -d "${_VERIFY_WORKTREE:-}" ]]; then
+    git -C "$REPO_DIR" worktree remove --force "$_VERIFY_WORKTREE" 2>/dev/null \
+      || rm -rf "$_VERIFY_WORKTREE"
+    git -C "$REPO_DIR" worktree prune 2>/dev/null || true
+  fi
+
+  _print_report
+
+  if [[ "${_OVERALL_OK}" -eq 1 ]]; then
+    echo "==> Verification PASSED."
+    exit 0
+  else
+    echo "==> Verification FAILED (see report above)."
+    exit 1
+  fi
+}
+
+trap '_cleanup' EXIT
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_find_free_port() {
+  python3 -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(('127.0.0.1', 0))
+port = s.getsockname()[1]
+s.close()
+print(port)
+"
+}
+
+_resolve_ref() {
+  local ref="$1"
+  local sha
+  if ! sha=$(git -C "$REPO_DIR" rev-parse --verify "${ref}^{commit}" 2>/dev/null); then
+    echo "ERROR: Cannot resolve Git ref: ${ref}" >&2
+    exit 1
+  fi
+  echo "$sha"
+}
+
+# Install every Python project into the venv at WORKTREE/.venv using the same
+# pip-install sources as cauldron-app/update (requirements.txt + root + all
+# packages/*/pyproject.toml directories).
+_install_packages() {
+  local worktree="$1"
+  local venv_pip="$worktree/.venv/bin/pip"
+
+  local args=(-q -r "$worktree/cauldron-app/requirements.txt" -e "$worktree")
+  for pkg in "$worktree/packages"/*/; do
+    [[ -f "${pkg}pyproject.toml" ]] || continue
+    args+=(-e "$pkg")
+  done
+
+  "$venv_pip" install "${args[@]}"
+}
+
+# ---------------------------------------------------------------------------
+# Phase runner: prepare a worktree at a given ref
+# ---------------------------------------------------------------------------
+
+_setup_worktree() {
+  local ref="$1"
+  local worktree="$2"
+
+  _phase "worktree"
+  local sha
+  sha=$(_resolve_ref "$ref")
+  git -C "$REPO_DIR" worktree add --detach "$worktree" "$sha"
+  _pass "worktree created at ${sha:0:8}"
+
+  local app_dir="$worktree/cauldron-app"
+
+  _phase "venv"
+  python3 -m venv "$worktree/.venv"
+  "$worktree/.venv/bin/pip" install --upgrade pip -q
+  _pass "virtualenv created"
+
+  _phase "packages"
+  _install_packages "$worktree"
+  _pass "packages installed (${sha:0:8})"
+
+  _phase "config"
+  mkdir -p \
+    "$app_dir/data/workspace" \
+    "$app_dir/data/ai" \
+    "$app_dir/data/public" \
+    "$app_dir/data/previews" \
+    "$app_dir/logs" \
+    "$app_dir/staticfiles"
+  initialize_config "$app_dir/config.env" "$app_dir/config.env.example"
+  _pass "config initialized"
+}
+
+# ---------------------------------------------------------------------------
+# Phase runner: Django management commands
+# ---------------------------------------------------------------------------
+
+_run_django_phases() {
+  local worktree="$1"
+  local label="${2:-}"     # e.g. "[from] " or "[to] " for upgrade mode
+  local app_dir="$worktree/cauldron-app"
+  local python="$worktree/.venv/bin/python"
+
+  # Export the config env vars so settings.py can read them.
+  set -a
+  # shellcheck source=/dev/null
+  source "$app_dir/config.env"
+  set +a
+
+  # ---- system check -------------------------------------------------------
+  _phase "${label}check"
+  if "$python" "$app_dir/manage.py" check 2>&1; then
+    _pass "${label}manage.py check"
+  else
+    _fail "${label}manage.py check"
+    return 1
+  fi
+
+  # ---- migration check (no unapplied schema changes) ----------------------
+  _phase "${label}makemigrations --check"
+  if "$python" "$app_dir/manage.py" makemigrations --check --dry-run 2>&1; then
+    _pass "${label}no pending migrations"
+  else
+    _fail "${label}pending migrations detected"
+    return 1
+  fi
+
+  # ---- apply migrations ---------------------------------------------------
+  _phase "${label}migrate"
+  if "$python" "$app_dir/manage.py" migrate --no-input 2>&1; then
+    _pass "${label}migrations applied"
+  else
+    _fail "${label}migration failed"
+    return 1
+  fi
+
+  # ---- static assets ------------------------------------------------------
+  _phase "${label}collectstatic"
+  if "$python" "$app_dir/manage.py" collectstatic --no-input --clear -v 0 2>&1; then
+    _pass "${label}static files collected"
+  else
+    _fail "${label}collectstatic failed"
+    return 1
+  fi
+
+  # ---- frontend + site build (skipped gracefully when Node.js absent) -----
+  _phase "${label}cauldron_site_build"
+  if ! command -v node &>/dev/null; then
+    _pass "${label}site build skipped (Node.js not in PATH)"
+  else
+    install_frontend "$app_dir" 2>&1 || true
+    if is_frontend_installed "$app_dir"; then
+      if "$python" "$app_dir/manage.py" cauldron_site_build 2>&1; then
+        _pass "${label}site build succeeded"
+      else
+        _fail "${label}site build failed"
+        return 1
+      fi
+    else
+      _pass "${label}site build skipped (frontend not installed)"
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Phase runner: server startup and HTTP health
+# ---------------------------------------------------------------------------
+
+_run_server_phases() {
+  local worktree="$1"
+  local label="${2:-}"
+  local app_dir="$worktree/cauldron-app"
+  local python="$worktree/.venv/bin/python"
+
+  set -a
+  # shellcheck source=/dev/null
+  source "$app_dir/config.env"
+  set +a
+
+  local port
+  port=$(_find_free_port)
+
+  _phase "${label}server startup"
+  "$python" "$app_dir/manage.py" \
+    runserver "127.0.0.1:$port" --nothreading --noreload \
+    >"$app_dir/logs/verify-server.log" 2>&1 &
+  _VERIFY_SERVER_PID=$!
+
+  # Poll until the server responds or times out.
+  local healthy=0
+  for _ in $(seq 1 30); do
+    if curl -sf "http://127.0.0.1:${port}/accounts/login/" -o /dev/null 2>/dev/null; then
+      healthy=1
+      break
+    fi
+    sleep 1
+  done
+
+  if [[ "$healthy" -eq 0 ]]; then
+    _fail "${label}server did not respond on port ${port} within 30 s"
+    kill "$_VERIFY_SERVER_PID" 2>/dev/null || true
+    wait "$_VERIFY_SERVER_PID" 2>/dev/null || true
+    _VERIFY_SERVER_PID=""
+    return 1
+  fi
+  _pass "${label}server started on port ${port}"
+
+  # ---- HTTP health checks -------------------------------------------------
+  _phase "${label}health"
+  local health_ok=1
+
+  if curl -sf "http://127.0.0.1:${port}/accounts/login/" -o /dev/null 2>/dev/null; then
+    _pass "${label}/accounts/login/ → 200"
+  else
+    _fail "${label}/accounts/login/ did not respond"
+    health_ok=0
+  fi
+
+  if curl -sf \
+    "http://127.0.0.1:${port}/static/cauldron_admin/css/tokens.css" \
+    -o /dev/null 2>/dev/null; then
+    _pass "${label}/static/cauldron_admin/css/tokens.css → 200"
+  else
+    _fail "${label}/static/cauldron_admin/css/tokens.css not found"
+    health_ok=0
+  fi
+
+  # Stop the temporary server before returning.
+  kill "$_VERIFY_SERVER_PID" 2>/dev/null || true
+  wait "$_VERIFY_SERVER_PID" 2>/dev/null || true
+  _VERIFY_SERVER_PID=""
+
+  [[ "$health_ok" -eq 1 ]]
+}
+
+# ---------------------------------------------------------------------------
+# Clean-install verification
+# ---------------------------------------------------------------------------
+
+_run_clean_install() {
+  local ref="${1:-HEAD}"
+  echo "==> Cauldron verify-update  (clean install: $ref)"
+  echo "    Repository: $REPO_DIR"
+  echo ""
+
+  _VERIFY_WORKTREE="$(mktemp -d /tmp/cauldron-verify-XXXXXX)"
+  _setup_worktree "$ref" "$_VERIFY_WORKTREE"
+  _run_django_phases "$_VERIFY_WORKTREE" ""
+  _run_server_phases "$_VERIFY_WORKTREE" ""
+}
+
+# ---------------------------------------------------------------------------
+# Upgrade-path verification
+# ---------------------------------------------------------------------------
+
+_run_upgrade_path() {
+  local from_ref="$1"
+  local to_ref="$2"
+  echo "==> Cauldron verify-update  (upgrade: $from_ref → $to_ref)"
+  echo "    Repository: $REPO_DIR"
+  echo ""
+
+  _VERIFY_WORKTREE="$(mktemp -d /tmp/cauldron-verify-XXXXXX)"
+  local app_dir="$_VERIFY_WORKTREE/cauldron-app"
+  local python="$_VERIFY_WORKTREE/.venv/bin/python"
+
+  # 1. Install and initialise the from-ref.
+  _setup_worktree "$from_ref" "$_VERIFY_WORKTREE"
+  _run_django_phases "$_VERIFY_WORKTREE" "[from] "
+
+  # 2. Create representative persisted state in the from-ref database.
+  _phase "[from] state:create"
+  set -a; source "$app_dir/config.env"; set +a
+  "$python" "$app_dir/manage.py" shell --no-input -c "
+from django.contrib.auth import get_user_model
+User = get_user_model()
+if not User.objects.filter(username='verify-upgrade-user').exists():
+    User.objects.create_superuser('verify-upgrade-user', 'verify@localhost', 'verify-pw-1!')
+    print('created superuser verify-upgrade-user')
+else:
+    print('superuser already exists')
+" 2>&1
+  _pass "[from] representative state created (superuser)"
+
+  # 3. Upgrade packages in-place to the to-ref.
+  _phase "[to] upgrade:packages"
+  local to_sha
+  to_sha=$(_resolve_ref "$to_ref")
+  git -C "$_VERIFY_WORKTREE" checkout --detach "$to_sha" 2>/dev/null
+  _install_packages "$_VERIFY_WORKTREE"
+  _pass "[to] packages upgraded to ${to_sha:0:8}"
+
+  # 4. Run Django phases on the upgraded installation (same data/ directory).
+  _run_django_phases "$_VERIFY_WORKTREE" "[to] "
+
+  # 5. Verify representative state is readable after upgrade.
+  _phase "[to] state:verify"
+  set -a; source "$app_dir/config.env"; set +a
+  local count
+  count=$("$python" "$app_dir/manage.py" shell --no-input -c "
+from django.contrib.auth import get_user_model
+print(get_user_model().objects.filter(username='verify-upgrade-user').count())
+" 2>&1 | tail -1)
+
+  if [[ "${count}" == "1" ]]; then
+    _pass "[to] representative state readable after upgrade"
+  else
+    _fail "[to] representative state lost after upgrade (count=${count})"
+    return 1
+  fi
+
+  # 6. Server health on the upgraded installation.
+  _run_server_phases "$_VERIFY_WORKTREE" "[to] "
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+if [[ "$UPGRADE_MODE" -eq 1 ]]; then
+  _run_upgrade_path "$FROM_REF" "$TO_REF"
+else
+  _run_clean_install "$CLEAN_REF"
+fi

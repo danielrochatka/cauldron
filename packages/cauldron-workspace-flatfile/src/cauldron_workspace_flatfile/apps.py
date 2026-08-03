@@ -22,11 +22,11 @@ class CauldronWorkspaceFlatfileConfig(AppConfig):
         except Exception:  # pragma: no cover - django must be present
             return
         try:
-            from cauldron_content_operations.reversible import (
+            from cauldron_content.reversible import (
                 get_adapter,
                 register_adapter,
             )
-        except Exception:
+        except ImportError:
             return
         try:
             from .config import WorkspaceConfig

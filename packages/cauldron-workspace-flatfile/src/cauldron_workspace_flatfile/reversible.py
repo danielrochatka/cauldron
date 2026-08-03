@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from cauldron_content_operations.reversible import PreparationResult
+from cauldron_content.reversible import PreparationResult
 
 from .config import WorkspaceConfig
 from .paths import PathEscapeError, safe_resolve

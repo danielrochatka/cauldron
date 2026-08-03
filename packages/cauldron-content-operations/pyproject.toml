@@ -27,6 +27,6 @@ test = [
 where = ["src"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src", "../../src", "../.."]
+pythonpath = ["src", "../../src", "../..", "../cauldron-content/src"]
 addopts = "-ra"
 testpaths = ["tests"]

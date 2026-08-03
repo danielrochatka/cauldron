@@ -70,6 +70,18 @@ class _ProjectSource:
     package_version: str = ""
 
 
+def _resolve_safely(path: Path) -> Path | None:
+    """Resolve path strictly; return None on OSError, RuntimeError, or ValueError.
+
+    Uses strict=False resolve but catches all resolution failures.
+    Never exposes raw exception messages in return values.
+    """
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
 def _source_for_ep(ep: Any, group: str) -> _EntryPointSource:
     """Resolve one :class:`_EntryPointSource` for *ep* without side effects.
 
@@ -207,7 +219,7 @@ class DiscoveryResult:
 
 def _make_error(
     src: _EntryPointSource | _ProjectSource,
-    kind: Literal["load_failure", "duplicate_slug", "manifest_validation"],
+    kind: Literal["load_failure", "duplicate_slug", "manifest_validation", "project_path"],
     message: str,
     *,
     candidate_slug: str | None = None,
@@ -437,46 +449,48 @@ def _validate_candidate_tree(
     All messages use root-relative POSIX paths; no absolute paths are included.
     """
     tree_errors: list[DiscoveryError] = []
-    canonical_root_str = str(canonical_root)
+    walk_errors: list[str] = []
 
-    for dirpath, dirnames, filenames in os.walk(str(candidate_dir), followlinks=False):
+    def _onerror(exc: OSError) -> None:
+        walk_errors.append(type(exc).__name__)
+
+    for dirpath, dirnames, filenames in os.walk(str(candidate_dir), followlinks=False, onerror=_onerror):
         # Check and prune symlinked directories
         dirs_to_remove = []
         for dname in list(dirnames):
             dpath = Path(dirpath) / dname
             if os.path.islink(str(dpath)):
                 rel = (Path(dirpath) / dname).relative_to(candidate_dir).as_posix()
-                try:
-                    resolved = dpath.resolve()
-                    if not resolved.exists():
-                        tree_errors.append(DiscoveryError(
-                            entry_point_name=ep_name,
-                            kind="project_path",
-                            message=(
-                                f"Project module tree contains broken symlink"
-                                f" {rel!r}."
-                            ),
-                        ))
-                        dirs_to_remove.append(dname)
-                        continue
-                    if not _is_under(resolved, canonical_root):
-                        tree_errors.append(DiscoveryError(
-                            entry_point_name=ep_name,
-                            kind="project_path",
-                            message=(
-                                f"Project module tree contains directory symlink"
-                                f" {rel!r} that resolves outside the project root."
-                            ),
-                        ))
-                        dirs_to_remove.append(dname)
-                        continue
-                except OSError:
+                resolved = _resolve_safely(dpath)
+                if resolved is None:
                     tree_errors.append(DiscoveryError(
                         entry_point_name=ep_name,
                         kind="project_path",
                         message=(
                             f"Project module tree contains unresolvable directory"
                             f" symlink {rel!r}."
+                        ),
+                    ))
+                    dirs_to_remove.append(dname)
+                    continue
+                if not resolved.exists():
+                    tree_errors.append(DiscoveryError(
+                        entry_point_name=ep_name,
+                        kind="project_path",
+                        message=(
+                            f"Project module tree contains broken symlink"
+                            f" {rel!r}."
+                        ),
+                    ))
+                    dirs_to_remove.append(dname)
+                    continue
+                if not _is_under(resolved, canonical_root):
+                    tree_errors.append(DiscoveryError(
+                        entry_point_name=ep_name,
+                        kind="project_path",
+                        message=(
+                            f"Project module tree contains directory symlink"
+                            f" {rel!r} that resolves outside the project root."
                         ),
                     ))
                     dirs_to_remove.append(dname)
@@ -495,29 +509,8 @@ def _validate_candidate_tree(
             fpath = Path(dirpath) / fname
             if os.path.islink(str(fpath)):
                 rel = (Path(dirpath) / fname).relative_to(candidate_dir).as_posix()
-                try:
-                    resolved = fpath.resolve()
-                    if not resolved.exists():
-                        tree_errors.append(DiscoveryError(
-                            entry_point_name=ep_name,
-                            kind="project_path",
-                            message=(
-                                f"Project module tree contains broken symlink"
-                                f" {rel!r}."
-                            ),
-                        ))
-                        continue
-                    if not _is_under(resolved, canonical_root):
-                        tree_errors.append(DiscoveryError(
-                            entry_point_name=ep_name,
-                            kind="project_path",
-                            message=(
-                                f"Project module tree contains file symlink"
-                                f" {rel!r} that resolves outside the project root."
-                            ),
-                        ))
-                        continue
-                except OSError:
+                resolved = _resolve_safely(fpath)
+                if resolved is None:
                     tree_errors.append(DiscoveryError(
                         entry_point_name=ep_name,
                         kind="project_path",
@@ -527,6 +520,33 @@ def _validate_candidate_tree(
                         ),
                     ))
                     continue
+                if not resolved.exists():
+                    tree_errors.append(DiscoveryError(
+                        entry_point_name=ep_name,
+                        kind="project_path",
+                        message=(
+                            f"Project module tree contains broken symlink"
+                            f" {rel!r}."
+                        ),
+                    ))
+                    continue
+                if not _is_under(resolved, canonical_root):
+                    tree_errors.append(DiscoveryError(
+                        entry_point_name=ep_name,
+                        kind="project_path",
+                        message=(
+                            f"Project module tree contains file symlink"
+                            f" {rel!r} that resolves outside the project root."
+                        ),
+                    ))
+                    continue
+
+    for _ in walk_errors:
+        tree_errors.append(DiscoveryError(
+            entry_point_name=ep_name,
+            kind="project_path",
+            message="Project module tree contains an unreadable or unscannable directory.",
+        ))
 
     return tree_errors
 
@@ -646,12 +666,11 @@ def _place_at_sys_path_front(canonical_str: str) -> None:
         if not isinstance(entry, str):
             kept.append(entry)
             continue
-        try:
-            resolved = str(Path(entry).resolve())
-        except (OSError, ValueError):
+        resolved_path = _resolve_safely(Path(entry))
+        if resolved_path is None:
             kept.append(entry)
             continue
-        if resolved != canonical_str:
+        if str(resolved_path) != canonical_str:
             kept.append(entry)
         # else: drop equivalent duplicate
     sys.path[:] = [canonical_str] + kept
@@ -661,197 +680,196 @@ def _discover_project_modules(
     root: Path,
     *,
     seen_slugs: dict[str, tuple[str, str]],
+    candidate_names: list[str] | None = None,
+    canonical_root: Path | None = None,
 ) -> tuple[list[DiscoveredModule], list[DiscoveryError]]:
-    """Discover modules from a project-folder root directory.
+    """Import and register pre-enumerated project-module candidates.
 
-    Scans direct child directories of *root* in lexical order.  Each child
-    directory that contains an ``__init__.py`` and exposes a ``module``
-    attribute satisfying :class:`~cauldron.modules.CauldronModule` is loaded
-    as a project-source module.
+    When *candidate_names* is provided (the output of :func:`_enumerate_candidates`),
+    only those names are imported — all static path checks were already done.
+    When *candidate_names* is ``None`` (legacy/direct call), falls back to
+    full scanning behaviour for backward compatibility.
 
     *seen_slugs* is mutated in-place so that the caller's package-module pass
     inherits duplicate detection across both sources.
 
-    Path-level failures (root absent or not a directory) produce
-    ``kind="project_path"`` errors.  Per-module failures use the standard
-    ``"load_failure"``, ``"manifest_validation"``, and ``"duplicate_slug"``
-    kinds so existing check IDs (E020–E022) apply.
-
-    The resolved root is prepended to :data:`sys.path` at most once, only
-    after the directory is confirmed to exist.
+    The resolved root must already be on ``sys.path`` when this is called.
     """
     records: list[DiscoveredModule] = []
     errors: list[DiscoveryError] = []
 
-    if not root.is_dir():
-        errors.append(DiscoveryError(
-            entry_point_name="",
-            kind="project_path",
-            message=(
-                "CAULDRON_PROJECT_MODULE_ROOT does not exist or is not a"
-                " directory."
-            ),
-        ))
-        return records, errors
+    # --- Legacy fallback: full scan when called without pre-enumerated names --
+    if candidate_names is None:
+        if not root.is_dir():
+            errors.append(DiscoveryError(
+                entry_point_name="",
+                kind="project_path",
+                message=(
+                    "CAULDRON_PROJECT_MODULE_ROOT does not exist or is not a"
+                    " directory."
+                ),
+            ))
+            return records, errors
 
-    # Resolve the canonical root once; used for path-escape checks below.
-    try:
-        canonical_root = root.resolve()
-    except OSError as exc:
-        errors.append(DiscoveryError(
-            entry_point_name="",
-            kind="project_path",
-            message=(
-                f"CAULDRON_PROJECT_MODULE_ROOT could not be resolved:"
-                f" {type(exc).__name__}."
-            ),
-        ))
-        return records, errors
+        canonical_root = _resolve_safely(root)
+        if canonical_root is None:
+            errors.append(DiscoveryError(
+                entry_point_name="",
+                kind="project_path",
+                message=(
+                    "CAULDRON_PROJECT_MODULE_ROOT could not be resolved: OSError."
+                ),
+            ))
+            return records, errors
 
-    # Place canonical root at sys.path[0], removing any equivalent duplicates.
-    canonical_root_str = str(canonical_root)
-    _place_at_sys_path_front(canonical_root_str)
+        canonical_root_str = str(canonical_root)
+        _place_at_sys_path_front(canonical_root_str)
 
-    try:
-        all_entries = sorted(root.iterdir(), key=lambda e: e.name)
-    except OSError as exc:
-        errors.append(DiscoveryError(
-            entry_point_name="",
-            kind="project_path",
-            message=(
-                f"CAULDRON_PROJECT_MODULE_ROOT could not be scanned:"
-                f" {type(exc).__name__}."
-            ),
-        ))
-        return records, errors
+        try:
+            all_entries = sorted(root.iterdir(), key=lambda e: e.name)
+        except OSError as exc:
+            errors.append(DiscoveryError(
+                entry_point_name="",
+                kind="project_path",
+                message=(
+                    f"CAULDRON_PROJECT_MODULE_ROOT could not be scanned:"
+                    f" {type(exc).__name__}."
+                ),
+            ))
+            return records, errors
+
+        legacy_names: list[str] = []
+        for entry in all_entries:
+            dir_name = entry.name
+            if not entry.is_dir():
+                continue
+            if dir_name.startswith("."):
+                continue
+            if dir_name.startswith("__") and dir_name.endswith("__"):
+                continue
+            if dir_name in _IGNORED_DIR_NAMES:
+                continue
+            if dir_name.endswith(".egg-info"):
+                continue
+
+            ep_name = f"modules/{dir_name}"
+            if not dir_name.isidentifier():
+                errors.append(DiscoveryError(
+                    entry_point_name=ep_name,
+                    kind="project_path",
+                    message=(
+                        f"Project module directory {dir_name!r} is not a valid"
+                        " Python identifier."
+                    ),
+                ))
+                continue
+            if not (entry / "__init__.py").exists():
+                errors.append(DiscoveryError(
+                    entry_point_name=ep_name,
+                    kind="project_path",
+                    message=(
+                        f"Project module directory {dir_name!r} has no __init__.py."
+                    ),
+                ))
+                continue
+            resolved_entry = _resolve_safely(entry)
+            if resolved_entry is None:
+                errors.append(DiscoveryError(
+                    entry_point_name=ep_name,
+                    kind="project_path",
+                    message=(
+                        f"Project module directory {dir_name!r} could not be"
+                        f" resolved: OSError."
+                    ),
+                ))
+                continue
+            if not _is_under(resolved_entry, canonical_root):
+                errors.append(DiscoveryError(
+                    entry_point_name=ep_name,
+                    kind="project_path",
+                    message=(
+                        f"Project module directory {dir_name!r} resolves outside"
+                        " the project root."
+                    ),
+                ))
+                continue
+            resolved_init = _resolve_safely(entry / "__init__.py")
+            if resolved_init is None:
+                errors.append(DiscoveryError(
+                    entry_point_name=ep_name,
+                    kind="project_path",
+                    message=(
+                        f"Project module {dir_name!r}: __init__.py could not be"
+                        f" resolved: OSError."
+                    ),
+                ))
+                continue
+            if not _is_under(resolved_init, canonical_root):
+                errors.append(DiscoveryError(
+                    entry_point_name=ep_name,
+                    kind="project_path",
+                    message=(
+                        f"Project module {dir_name!r}: __init__.py resolves"
+                        " outside the project root."
+                    ),
+                ))
+                continue
+            if resolved_init.is_dir() or not resolved_init.is_file():
+                errors.append(DiscoveryError(
+                    entry_point_name=ep_name,
+                    kind="project_path",
+                    message=(
+                        f"Project module {dir_name!r}: __init__.py is not a regular file."
+                    ),
+                ))
+                continue
+            tree_errors = _validate_candidate_tree(ep_name, entry, canonical_root)
+            if tree_errors:
+                errors.extend(tree_errors)
+                continue
+            legacy_names.append(dir_name)
+        candidate_names = legacy_names
+
+    # canonical_root must be set at this point
+    if canonical_root is None:
+        canonical_root = _resolve_safely(root)
+        if canonical_root is None:
+            return records, errors
 
     def _module_origin_ok(mod_obj: Any, expected_dir: Path) -> bool:
         """Check that an imported module's actual location is inside expected_dir."""
         file_ = getattr(mod_obj, "__file__", None)
         if file_ is not None:
-            try:
-                return _is_under(Path(file_).resolve(), expected_dir)
-            except OSError:
+            resolved = _resolve_safely(Path(file_))
+            if resolved is None:
                 return False
+            return _is_under(resolved, expected_dir)
         # Package with __path__ but no __file__ (namespace package)
         path_ = getattr(mod_obj, "__path__", None)
         if path_ is not None:
             for p in path_:
-                try:
-                    if _is_under(Path(p).resolve(), expected_dir):
-                        return True
-                except OSError:
-                    pass
+                resolved = _resolve_safely(Path(p))
+                if resolved is not None and _is_under(resolved, expected_dir):
+                    return True
             return False
         return False
 
-    for entry in all_entries:
-        dir_name = entry.name
-
-        # --- Silently ignore hidden, dunder, build/dist, and egg-info dirs ---
-        if not entry.is_dir():
-            continue
-        if dir_name.startswith("."):
-            continue
-        if dir_name.startswith("__") and dir_name.endswith("__"):
-            continue
-        if dir_name in _IGNORED_DIR_NAMES:
-            continue
-        if dir_name.endswith(".egg-info"):
-            continue
-
-        # ---- All remaining directory entries are "visible candidates" -------
+    # --- Import each validated candidate ------------------------------------
+    for dir_name in candidate_names:
         ep_name = f"modules/{dir_name}"
         src = _ProjectSource(name=ep_name, value=dir_name)
-
-        # 1. Invalid identifier
-        if not dir_name.isidentifier():
-            errors.append(DiscoveryError(
-                entry_point_name=ep_name,
-                kind="project_path",
-                message=(
-                    f"Project module directory {dir_name!r} is not a valid"
-                    " Python identifier."
-                ),
-            ))
-            continue
-
-        # 2. Missing __init__.py
-        if not (entry / "__init__.py").exists():
-            errors.append(DiscoveryError(
-                entry_point_name=ep_name,
-                kind="project_path",
-                message=(
-                    f"Project module directory {dir_name!r} has no __init__.py."
-                ),
-            ))
-            continue
-
-        # 3. Candidate path escapes root
-        try:
-            resolved_entry = entry.resolve()
-        except OSError as exc:
+        entry = root / dir_name
+        resolved_entry = _resolve_safely(entry)
+        if resolved_entry is None:
+            # Should not happen since _enumerate_candidates checked this
             errors.append(DiscoveryError(
                 entry_point_name=ep_name,
                 kind="project_path",
                 message=(
                     f"Project module directory {dir_name!r} could not be"
-                    f" resolved: {type(exc).__name__}."
+                    f" resolved: OSError."
                 ),
             ))
-            continue
-
-        if not _is_under(resolved_entry, canonical_root):
-            errors.append(DiscoveryError(
-                entry_point_name=ep_name,
-                kind="project_path",
-                message=(
-                    f"Project module directory {dir_name!r} resolves outside"
-                    " the project root."
-                ),
-            ))
-            continue
-
-        # 4. __init__.py escapes root
-        try:
-            resolved_init = (entry / "__init__.py").resolve()
-        except OSError as exc:
-            errors.append(DiscoveryError(
-                entry_point_name=ep_name,
-                kind="project_path",
-                message=(
-                    f"Project module {dir_name!r}: __init__.py could not be"
-                    f" resolved: {type(exc).__name__}."
-                ),
-            ))
-            continue
-
-        if not _is_under(resolved_init, canonical_root):
-            errors.append(DiscoveryError(
-                entry_point_name=ep_name,
-                kind="project_path",
-                message=(
-                    f"Project module {dir_name!r}: __init__.py resolves"
-                    " outside the project root."
-                ),
-            ))
-            continue
-
-        # 4b. __init__.py must be a regular file (not a directory)
-        if resolved_init.is_dir() or not resolved_init.is_file():
-            errors.append(DiscoveryError(
-                entry_point_name=ep_name,
-                kind="project_path",
-                message=(
-                    f"Project module {dir_name!r}: __init__.py is not a regular file."
-                ),
-            ))
-            continue
-
-        # 5. Tree validation: check all nested symlinks for path escapes
-        tree_errors = _validate_candidate_tree(ep_name, entry, canonical_root)
-        if tree_errors:
-            errors.extend(tree_errors)
             continue
 
         # --- sys.modules collision check -----------------------------------
@@ -996,6 +1014,148 @@ def _discover_project_modules(
     return records, errors
 
 
+def _enumerate_candidates(
+    root: Path,
+    canonical_root: Path,
+) -> tuple[list[str], list[DiscoveryError]]:
+    """Enumerate valid candidate directory names under *root* WITHOUT importing anything.
+
+    Performs all static checks: identifier validity, ``__init__.py`` existence,
+    path containment, ``__init__.py`` is a regular file, and tree validation.
+
+    Returns ``(valid_names, errors)`` where *valid_names* is a list of directory
+    name strings that passed all checks, and *errors* collects structured errors
+    for each candidate that failed.
+
+    Does NOT add root to ``sys.path`` or import any module.
+    """
+    valid_names: list[str] = []
+    errors: list[DiscoveryError] = []
+
+    try:
+        all_entries = sorted(root.iterdir(), key=lambda e: e.name)
+    except OSError as exc:
+        errors.append(DiscoveryError(
+            entry_point_name="",
+            kind="project_path",
+            message=(
+                f"CAULDRON_PROJECT_MODULE_ROOT could not be scanned:"
+                f" {type(exc).__name__}."
+            ),
+        ))
+        return valid_names, errors
+
+    for entry in all_entries:
+        dir_name = entry.name
+
+        # --- Silently ignore hidden, dunder, build/dist, and egg-info dirs ---
+        if not entry.is_dir():
+            continue
+        if dir_name.startswith("."):
+            continue
+        if dir_name.startswith("__") and dir_name.endswith("__"):
+            continue
+        if dir_name in _IGNORED_DIR_NAMES:
+            continue
+        if dir_name.endswith(".egg-info"):
+            continue
+
+        # ---- All remaining directory entries are "visible candidates" -------
+        ep_name = f"modules/{dir_name}"
+
+        # 1. Invalid identifier
+        if not dir_name.isidentifier():
+            errors.append(DiscoveryError(
+                entry_point_name=ep_name,
+                kind="project_path",
+                message=(
+                    f"Project module directory {dir_name!r} is not a valid"
+                    " Python identifier."
+                ),
+            ))
+            continue
+
+        # 2. Missing __init__.py
+        if not (entry / "__init__.py").exists():
+            errors.append(DiscoveryError(
+                entry_point_name=ep_name,
+                kind="project_path",
+                message=(
+                    f"Project module directory {dir_name!r} has no __init__.py."
+                ),
+            ))
+            continue
+
+        # 3. Candidate path escapes root
+        resolved_entry = _resolve_safely(entry)
+        if resolved_entry is None:
+            errors.append(DiscoveryError(
+                entry_point_name=ep_name,
+                kind="project_path",
+                message=(
+                    f"Project module directory {dir_name!r} could not be"
+                    f" resolved: OSError."
+                ),
+            ))
+            continue
+
+        if not _is_under(resolved_entry, canonical_root):
+            errors.append(DiscoveryError(
+                entry_point_name=ep_name,
+                kind="project_path",
+                message=(
+                    f"Project module directory {dir_name!r} resolves outside"
+                    " the project root."
+                ),
+            ))
+            continue
+
+        # 4. __init__.py escapes root
+        resolved_init = _resolve_safely(entry / "__init__.py")
+        if resolved_init is None:
+            errors.append(DiscoveryError(
+                entry_point_name=ep_name,
+                kind="project_path",
+                message=(
+                    f"Project module {dir_name!r}: __init__.py could not be"
+                    f" resolved: OSError."
+                ),
+            ))
+            continue
+
+        if not _is_under(resolved_init, canonical_root):
+            errors.append(DiscoveryError(
+                entry_point_name=ep_name,
+                kind="project_path",
+                message=(
+                    f"Project module {dir_name!r}: __init__.py resolves"
+                    " outside the project root."
+                ),
+            ))
+            continue
+
+        # 4b. __init__.py must be a regular file (not a directory)
+        if resolved_init.is_dir() or not resolved_init.is_file():
+            errors.append(DiscoveryError(
+                entry_point_name=ep_name,
+                kind="project_path",
+                message=(
+                    f"Project module {dir_name!r}: __init__.py is not a regular file."
+                ),
+            ))
+            continue
+
+        # 5. Tree validation: check all nested symlinks for path escapes
+        tree_errors = _validate_candidate_tree(ep_name, entry, canonical_root)
+        if tree_errors:
+            errors.extend(tree_errors)
+            continue
+
+        valid_names.append(dir_name)
+
+    return valid_names, errors
+
+
 def discover_modules(
     *,
     entry_point_group: str = ENTRY_POINT_GROUP,
@@ -1012,6 +1172,11 @@ def discover_modules(
     discovered first (lexical order by directory name) and merged with
     entry-point modules.  Project modules win duplicate-slug races.
 
+    Phase separation guarantees that EP loading cannot accidentally import a
+    project directory with the same top-level import name: the project root is
+    temporarily removed from ``sys.path`` during EP loading and added back
+    only for the project import phase.
+
     Discovery is deterministic: combined records are sorted by slug.
     Entry-point metadata is resolved exactly once per entry point.
     """
@@ -1022,18 +1187,48 @@ def discover_modules(
     # slug → (accepted_ep_name, accepted_pkg_name); shared across both passes.
     seen_slugs: dict[str, tuple[str, str]] = {}
 
-    # --- Project-folder pass (first, so project modules win slug races) ----
+    # --- Phase 1: Normalize project root and enumerate candidates ------------
+    norm_root: Path | None = None
+    canonical_root: Path | None = None
+    canonical_root_str: str | None = None
+    candidate_names: list[str] = []
+    # Candidate names that collide with EP import names (rejected before import)
+    collision_candidate_names: set[str] = set()
+
     if project_module_root is not None:
         norm_root, norm_errors = _normalize_project_root(project_module_root)
         errors.extend(norm_errors)
         if norm_root is not None:
-            proj_records, proj_errors = _discover_project_modules(
-                norm_root, seen_slugs=seen_slugs,
-            )
-            records.extend(proj_records)
-            errors.extend(proj_errors)
+            if not norm_root.is_dir():
+                errors.append(DiscoveryError(
+                    entry_point_name="",
+                    kind="project_path",
+                    message=(
+                        "CAULDRON_PROJECT_MODULE_ROOT does not exist or is not a"
+                        " directory."
+                    ),
+                ))
+                norm_root = None
+            else:
+                canonical_root = _resolve_safely(norm_root)
+                if canonical_root is None:
+                    errors.append(DiscoveryError(
+                        entry_point_name="",
+                        kind="project_path",
+                        message=(
+                            "CAULDRON_PROJECT_MODULE_ROOT could not be resolved: OSError."
+                        ),
+                    ))
+                    norm_root = None
+                else:
+                    canonical_root_str = str(canonical_root)
+                    # Enumerate candidates WITHOUT importing or modifying sys.path
+                    candidate_names, enum_errors = _enumerate_candidates(
+                        norm_root, canonical_root,
+                    )
+                    errors.extend(enum_errors)
 
-    # --- Entry-point pass --------------------------------------------------
+    # --- Phase 2: Build EP import-name set -----------------------------------
     raw_eps = entry_points(group=entry_point_group)
 
     ep_pairs = [(ep, _source_for_ep(ep, entry_point_group)) for ep in raw_eps]
@@ -1042,6 +1237,67 @@ def discover_modules(
         pair[1].canonical_package_name,
         pair[1].value,
     ))
+
+    # Extract top-level import name from each EP's value field.
+    # e.g. "shared_name:module" → "shared_name", "mypkg.sub:attr" → "mypkg"
+    ep_import_names: set[str] = set()
+    for _ep, src in ep_pairs:
+        val = src.value
+        # value is "module.path:attribute" or "module.path"
+        module_part = val.split(":")[0] if ":" in val else val
+        top_level = module_part.split(".")[0] if "." in module_part else module_part
+        if top_level:
+            ep_import_names.add(top_level)
+
+    # Detect import-name collisions between candidate dirs and EP import names.
+    if candidate_names and ep_import_names and canonical_root is not None:
+        surviving_candidates: list[str] = []
+        for dir_name in candidate_names:
+            ep_name = f"modules/{dir_name}"
+            if dir_name in ep_import_names:
+                # Find the EP name for the message (first EP whose top-level
+                # import name matches this dir_name)
+                colliding_ep_name = next(
+                    (src.name for _ep, src in ep_pairs
+                     if (src.value.split(":")[0] if ":" in src.value else src.value
+                         ).split(".")[0] == dir_name),
+                    "unknown",
+                )
+                errors.append(DiscoveryError(
+                    entry_point_name=ep_name,
+                    kind="project_path",
+                    message=(
+                        f"Project module directory {dir_name!r} has the same"
+                        f" top-level import name as installed entry point"
+                        f" {colliding_ep_name!r}; the installed package is"
+                        f" authoritative."
+                    ),
+                ))
+                collision_candidate_names.add(dir_name)
+            else:
+                surviving_candidates.append(dir_name)
+        candidate_names = surviving_candidates
+
+    # --- Phase 3: Load EPs with project root temporarily removed ------------
+    # Snapshot sys.path entries that resolve to the project root, then remove them.
+    if canonical_root_str is not None:
+        kept_path: list[Any] = []
+        for entry in sys.path:
+            if not isinstance(entry, str):
+                kept_path.append(entry)
+                continue
+            resolved = _resolve_safely(Path(entry))
+            if resolved is not None and str(resolved) == canonical_root_str:
+                pass  # drop it temporarily
+            else:
+                kept_path.append(entry)
+        sys.path[:] = kept_path
+
+    # Collect EP candidate records with their own internal duplicate tracking.
+    # We defer slug-race resolution with project modules until Phase 4.
+    ep_seen_slugs: dict[str, tuple[str, str]] = {}
+    ep_pending_records: list[DiscoveredModule] = []
+    ep_pending_errors: list[DiscoveryError] = []
 
     for ep, src in ep_pairs:
         # Derive provisional candidate slug from the entry-point name when it
@@ -1059,7 +1315,7 @@ def discover_modules(
             if callable(obj) and not isinstance(obj, CauldronModule):
                 obj = obj()
         except Exception as exc:
-            errors.append(_make_error(
+            ep_pending_errors.append(_make_error(
                 src, "load_failure",
                 f"Entry point {src.name!r} raised {type(exc).__name__} on"
                 " load.",
@@ -1077,18 +1333,18 @@ def discover_modules(
             src, obj, provisional_candidate=provisional_candidate,
         )
         if validation_errors:
-            errors.extend(validation_errors)
+            ep_pending_errors.extend(validation_errors)
             logger.debug("Entry point %r failed manifest validation.", src.name)
             continue
 
-        # --- Duplicate slug -----------------------------------------------
+        # --- EP-internal duplicate slug check --------------------------------
         slug = obj.slug
-        if slug in seen_slugs:
-            accepted_ep_name, accepted_pkg_name = seen_slugs[slug]
+        if slug in ep_seen_slugs:
+            accepted_ep_name, accepted_pkg_name = ep_seen_slugs[slug]
             accepted_pkg_note = (
                 f" (package {accepted_pkg_name!r})" if accepted_pkg_name else ""
             )
-            errors.append(_make_error(
+            ep_pending_errors.append(_make_error(
                 src, "duplicate_slug",
                 f"Module slug {slug!r} registered by {src.name!r}"
                 f" (package {src.display_package_name!r}) conflicts with"
@@ -1100,7 +1356,7 @@ def discover_modules(
             ))
             continue
 
-        seen_slugs[slug] = (src.name, src.display_package_name)
+        ep_seen_slugs[slug] = (src.name, src.display_package_name)
         record = DiscoveredModule(
             slug=slug,
             label=obj.label,
@@ -1114,11 +1370,57 @@ def discover_modules(
             manifest=obj.manifest,
             module=obj,
         )
-        records.append(record)
+        ep_pending_records.append(record)
         logger.debug(
             "Discovered module %r from entry point %r (package %r %s).",
             slug, src.name, src.display_package_name, src.package_version,
         )
+
+    # --- Phase 4: Restore/place project root and import project modules ------
+    # Project modules are loaded FIRST into seen_slugs so they win slug races.
+    if norm_root is not None and canonical_root is not None and canonical_root_str is not None:
+        # Place the project root at sys.path[0] for imports
+        _place_at_sys_path_front(canonical_root_str)
+
+        proj_records, proj_errors = _discover_project_modules(
+            norm_root,
+            seen_slugs=seen_slugs,
+            candidate_names=candidate_names,
+            canonical_root=canonical_root,
+        )
+        records.extend(proj_records)
+        errors.extend(proj_errors)
+
+    # --- Phase 5: Merge EP records, checking against project-registered slugs -
+    errors.extend(ep_pending_errors)
+    for ep_rec in ep_pending_records:
+        slug = ep_rec.slug
+        if slug in seen_slugs:
+            # Project module (or another EP) already registered this slug.
+            accepted_ep_name, accepted_pkg_name = seen_slugs[slug]
+            accepted_pkg_note = (
+                f" (package {accepted_pkg_name!r})" if accepted_pkg_name else ""
+            )
+            errors.append(DiscoveryError(
+                entry_point_name=ep_rec.entry_point_name,
+                kind="duplicate_slug",
+                message=(
+                    f"Module slug {slug!r} registered by {ep_rec.entry_point_name!r}"
+                    f" (package {ep_rec.package_name!r}) conflicts with"
+                    f" {accepted_ep_name!r}"
+                    f"{accepted_pkg_note}; duplicate is ignored."
+                ),
+                entry_point_group=ep_rec.entry_point_group,
+                entry_point_value=ep_rec.entry_point_value,
+                package_name=ep_rec.package_name,
+                package_version=ep_rec.package_version,
+                candidate_slug=slug,
+                accepted_entry_point_name=accepted_ep_name,
+                accepted_package_name=accepted_pkg_name,
+            ))
+        else:
+            seen_slugs[slug] = (ep_rec.entry_point_name, ep_rec.package_name)
+            records.append(ep_rec)
 
     records.sort(key=lambda r: r.slug)
     return DiscoveryResult(records=records, errors=errors)

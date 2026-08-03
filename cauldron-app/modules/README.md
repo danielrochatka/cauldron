@@ -45,7 +45,14 @@ CAULDRON_MODULES = {
 - Hidden (`.`-prefixed), dunder (`__...__`), `build/`, `dist/`, and `.egg-info`
   directories are silently ignored.
 - Symlinks whose resolved target lies outside the project root are rejected.
-- Project modules take **slug priority** over installed-package entry points.
+- Project modules take **slug priority** over installed-package entry points when
+  the slugs collide but the top-level import names differ (project wins the
+  slug race and the package entry point gets a `duplicate_slug` error).
+- **Packaged-source protection**: if a project directory name matches the
+  top-level Python import name of an installed entry point (e.g., directory
+  `"mymod"` and an EP with value `"mymod:module"`), the installed package is
+  authoritative. The project candidate is rejected with a `project_path` error
+  and the entry point is loaded from the installed package instead.
 
 ## Tree validation
 

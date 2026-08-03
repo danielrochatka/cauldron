@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from importlib.metadata import entry_points
-from typing import TYPE_CHECKING, Any, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from . import CauldronModule, ModuleManifest
@@ -195,20 +195,28 @@ def _make_error(
 
 
 def _validate_manifest(
-    src: _EntryPointSource, obj: Any,
+    src: _EntryPointSource,
+    obj: Any,
+    *,
+    provisional_candidate: str | None = None,
 ) -> list[DiscoveryError]:
     """Validate *obj* against the CauldronModule protocol and manifest contract.
 
     Returns a list of :class:`DiscoveryError` (kind ``"manifest_validation"``)
     for every violation.  An empty return means the module is valid.
 
+    *provisional_candidate* is used as ``candidate_slug`` for errors emitted
+    before the module's manifest slug is confirmed.  It is typically derived
+    from the entry-point name when that name is a valid module slug.  Once a
+    valid :class:`ModuleManifest` is obtained, its slug becomes authoritative.
+
     All protocol attribute accesses are guarded; a property that raises does
     not escape as an unhandled exception.
 
     ``django_apps()`` return value is normalised to a tuple exactly once and
     compared against ``manifest.django_apps`` including when that tuple is
-    empty.  ``str`` and ``bytes`` returns are rejected even though they are
-    technically sequences.
+    empty.  ``str`` and ``bytes`` returns are rejected; generators and other
+    iterables are accepted.
     """
     from . import CauldronModule, ModuleManifest
 
@@ -220,6 +228,7 @@ def _validate_manifest(
             src, "manifest_validation",
             f"Entry point {src.name!r} yielded {type(obj).__name__!r} which does"
             " not satisfy the CauldronModule protocol.",
+            candidate_slug=provisional_candidate,
         ))
         return errors
 
@@ -231,6 +240,7 @@ def _validate_manifest(
             src, "manifest_validation",
             f"Entry point {src.name!r}: accessing .manifest raised"
             f" {type(exc).__name__}.",
+            candidate_slug=provisional_candidate,
         ))
         return errors
 
@@ -239,6 +249,7 @@ def _validate_manifest(
             src, "manifest_validation",
             f"Entry point {src.name!r}: manifest must be a ModuleManifest"
             f" instance, got {type(manifest).__name__!r}.",
+            candidate_slug=provisional_candidate,
         ))
         return errors
 
@@ -313,12 +324,12 @@ def _validate_manifest(
         ))
         return errors
 
-    # Reject str/bytes (both are Sequence[str] but are not app-label lists).
+    # Reject str/bytes — both are iterable but are not app-label lists.
     if isinstance(live_result, (str, bytes)):
         errors.append(_make_error(
             src, "manifest_validation",
             f"Entry point {src.name!r}: django_apps() returned"
-            f" {type(live_result).__name__!r}; expected a list or tuple of"
+            f" {type(live_result).__name__!r}; expected an iterable of"
             " app-label strings.",
             candidate_slug=candidate_slug,
         ))
@@ -378,7 +389,7 @@ def discover_modules(*, entry_point_group: str = ENTRY_POINT_GROUP) -> Discovery
     ``(ep.name, canonical_package_name, ep.value)``.  Distribution metadata
     is resolved exactly once per entry point.
     """
-    from . import CauldronModule
+    from . import CauldronModule, _validate_slug
 
     raw_eps = entry_points(group=entry_point_group)
 
@@ -396,6 +407,15 @@ def discover_modules(*, entry_point_group: str = ENTRY_POINT_GROUP) -> Discovery
     seen_slugs: dict[str, tuple[str, str]] = {}
 
     for ep, src in ep_pairs:
+        # Derive provisional candidate slug from the entry-point name when it
+        # is a valid module slug.  Used as candidate_slug for load failures and
+        # early manifest failures where the module identity is otherwise unknown.
+        try:
+            _validate_slug(src.name, "entry-point name")
+            provisional_candidate: str | None = src.name
+        except (ValueError, Exception):
+            provisional_candidate = None
+
         # --- Load ----------------------------------------------------------
         try:
             obj = ep.load()
@@ -406,6 +426,7 @@ def discover_modules(*, entry_point_group: str = ENTRY_POINT_GROUP) -> Discovery
                 src, "load_failure",
                 f"Entry point {src.name!r} raised {type(exc).__name__} on"
                 " load.",
+                candidate_slug=provisional_candidate,
             ))
             logger.debug(
                 "Entry point %r failed to load: %s",
@@ -415,7 +436,9 @@ def discover_modules(*, entry_point_group: str = ENTRY_POINT_GROUP) -> Discovery
             continue
 
         # --- Manifest validation -------------------------------------------
-        validation_errors = _validate_manifest(src, obj)
+        validation_errors = _validate_manifest(
+            src, obj, provisional_candidate=provisional_candidate,
+        )
         if validation_errors:
             errors.extend(validation_errors)
             logger.debug("Entry point %r failed manifest validation.", src.name)

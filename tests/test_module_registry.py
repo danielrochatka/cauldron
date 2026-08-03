@@ -626,7 +626,7 @@ class TestInventory:
         from cauldron.modules.discovery import DiscoveredModule
         from cauldron.modules import ModuleManifest, BaseModule
 
-        manifest = ModuleManifest(slug="a", label="a")
+        manifest = ModuleManifest(slug="a", label="a", version="1.0.0")
         mod = BaseModule(manifest)
 
         record = DiscoveredModule(
@@ -813,7 +813,7 @@ class TestInventoryCompleteness:
     def test_entry_point_group_from_discovery_record(self, registry):
         from cauldron.modules.discovery import DiscoveredModule
 
-        manifest = ModuleManifest(slug="a", label="a")
+        manifest = ModuleManifest(slug="a", label="a", version="1.0.0")
         mod = BaseModule(manifest)
         record = DiscoveredModule(
             slug="a",
@@ -1070,3 +1070,256 @@ class TestEnabledSlugs:
         result = registry.enabled_slugs()
         with pytest.raises((AttributeError, TypeError)):
             result.add("new")  # type: ignore[attr-defined]
+
+
+class TestDiscoveryRecordValidation:
+    """populate() must reject inconsistent discovery_records before mutating state."""
+
+    def _make_record(self, manifest, mod, **kwargs):
+        from cauldron.modules.discovery import DiscoveredModule
+        defaults = dict(
+            slug=mod.slug,
+            label=mod.label,
+            version=mod.manifest.version,
+            source_type="package",
+            package_name="pkg",
+            package_version="1.0",
+            entry_point_group="cauldron.modules",
+            entry_point_name=mod.slug,
+            entry_point_value="mod:obj",
+            manifest=manifest,
+            module=mod,
+        )
+        defaults.update(kwargs)
+        return DiscoveredModule(**defaults)
+
+    def test_valid_matching_records_accepted(self, registry):
+        manifest = ModuleManifest(slug="a", label="a", version="1.0.0")
+        mod = BaseModule(manifest)
+        rec = self._make_record(manifest, mod)
+        registry.populate([mod], discovery_records=[rec])  # must not raise
+        assert registry.is_populated
+
+    def test_missing_record_raises(self, registry):
+        a = _mod("a")
+        b = _mod("b")
+        manifest_a = a.manifest
+        rec = self._make_record(manifest_a, a)
+        with pytest.raises(ValueError, match="missing from records"):
+            registry.populate([a, b], discovery_records=[rec])
+
+    def test_extra_record_raises(self, registry):
+        manifest = ModuleManifest(slug="a", label="a")
+        mod = BaseModule(manifest)
+        rec_a = self._make_record(manifest, mod)
+        manifest_b = ModuleManifest(slug="b", label="b")
+        mod_b = BaseModule(manifest_b)
+        rec_b = self._make_record(manifest_b, mod_b)
+        with pytest.raises(ValueError, match="extra in records"):
+            registry.populate([mod], discovery_records=[rec_a, rec_b])
+
+    def test_duplicate_record_slug_raises(self, registry):
+        manifest = ModuleManifest(slug="a", label="a")
+        mod = BaseModule(manifest)
+        rec1 = self._make_record(manifest, mod)
+        rec2 = self._make_record(manifest, mod)
+        with pytest.raises(ValueError, match="duplicate slug"):
+            registry.populate([mod], discovery_records=[rec1, rec2])
+
+    def test_different_module_object_raises(self, registry):
+        manifest = ModuleManifest(slug="a", label="a")
+        mod1 = BaseModule(manifest)
+        mod2 = BaseModule(manifest)  # different instance, same manifest
+        rec = self._make_record(manifest, mod1)
+        with pytest.raises(ValueError, match="not the same object"):
+            registry.populate([mod2], discovery_records=[rec])
+
+    def test_mismatched_manifest_raises(self, registry):
+        manifest1 = ModuleManifest(slug="a", label="a")
+        manifest2 = ModuleManifest(slug="a", label="a")
+        mod = BaseModule(manifest1)
+        # Build record using manifest2 but module uses manifest1
+        from cauldron.modules.discovery import DiscoveredModule
+        rec = DiscoveredModule(
+            slug="a", label="a", version="",
+            source_type="package", package_name="pkg", package_version="1.0",
+            entry_point_group="cauldron.modules", entry_point_name="a",
+            entry_point_value="mod:obj", manifest=manifest2, module=mod,
+        )
+        with pytest.raises(ValueError, match="manifest"):
+            registry.populate([mod], discovery_records=[rec])
+
+    def test_mismatched_version_raises(self, registry):
+        manifest = ModuleManifest(slug="a", label="a", version="1.0.0")
+        mod = BaseModule(manifest)
+        rec = self._make_record(manifest, mod, version="2.0.0")
+        with pytest.raises(ValueError, match="version"):
+            registry.populate([mod], discovery_records=[rec])
+
+    def test_empty_records_with_empty_modules_accepted(self, registry):
+        registry.populate([], discovery_records=[])  # must not raise
+        assert registry.is_populated
+
+    def test_state_not_mutated_on_validation_failure(self, registry):
+        """A failing validation must leave registry state unchanged."""
+        manifest = ModuleManifest(slug="a", label="a")
+        mod = BaseModule(manifest)
+        registry.populate([mod])  # healthy state
+        original_active = registry.all_active()
+
+        manifest2 = ModuleManifest(slug="b", label="b")
+        mod2 = BaseModule(manifest2)
+        bad_rec = self._make_record(manifest2, mod2)
+        with pytest.raises(ValueError):
+            registry.populate([mod], discovery_records=[bad_rec])
+
+        # Registry should still report the previously populated state
+        assert registry.all_active() == original_active
+
+
+class TestUnavailableReasonsFromRealDiscovery:
+    """Section 3: unavailable reasons derived from actual discover_modules() results."""
+
+    def test_load_failure_reason_via_real_discovery(self):
+        """discover_modules() errors with valid EP slug must map to load_failure."""
+        from unittest.mock import patch
+        from cauldron.modules.discovery import discover_modules
+
+        class _FakeEP:
+            name = "cauldron.example"
+            value = "cauldron_example:module"
+            dist = None
+
+            def load(self):
+                raise ImportError("cannot import cauldron_example")
+
+        with patch("cauldron.modules.discovery.entry_points", return_value=[_FakeEP()]):
+            result = discover_modules()
+
+        assert len(result.errors) == 1
+        assert result.errors[0].kind == "load_failure"
+        assert result.errors[0].candidate_slug == "cauldron.example"
+
+        r = ModuleRegistry()
+        r.populate(
+            result.modules,
+            discovery_errors=result.errors,
+            enabled={"cauldron.example"},
+        )
+        unavail = r.unavailable_modules()
+        assert len(unavail) == 1
+        assert unavail[0].slug == "cauldron.example"
+        assert unavail[0].reason == "load_failure"
+
+    def test_manifest_validation_reason_via_real_discovery(self):
+        """Non-protocol object with valid EP slug maps to manifest_validation."""
+        from unittest.mock import patch
+        from cauldron.modules.discovery import discover_modules
+
+        class NotAModule:
+            pass
+
+        class _FakeEP:
+            name = "cauldron.badmod"
+            value = "cauldron_badmod:obj"
+            dist = None
+
+            def load(self):
+                return NotAModule()
+
+        with patch("cauldron.modules.discovery.entry_points", return_value=[_FakeEP()]):
+            result = discover_modules()
+
+        assert len(result.errors) == 1
+        assert result.errors[0].kind == "manifest_validation"
+        assert result.errors[0].candidate_slug == "cauldron.badmod"
+
+        r = ModuleRegistry()
+        r.populate(
+            result.modules,
+            discovery_errors=result.errors,
+            enabled={"cauldron.badmod"},
+        )
+        unavail = r.unavailable_modules()
+        assert len(unavail) == 1
+        assert unavail[0].slug == "cauldron.badmod"
+        assert unavail[0].reason == "manifest_validation"
+
+
+class TestCapabilityBlockingSemantics:
+    """_blocked_slugs() must use provider-selection semantics, not all-providers."""
+
+    def test_unselected_provider_blocked_does_not_block_consumer(self, registry):
+        """Provider B is blocked; A is selected via override; consumer stays active."""
+        p_a = _mod("p.a", provides=("shared.cap",))
+        p_b = _mod("p.b", requires=(ModuleRequirement(slug="missing"),),
+                   provides=("shared.cap",))
+        consumer = _mod("consumer", requires=(
+            ModuleRequirement(slug="shared.cap", kind="capability"),
+        ))
+        registry.populate(
+            [p_a, p_b, consumer],
+            capability_overrides={"shared.cap": "p.a"},
+        )
+        by_slug = {e["slug"]: e for e in registry.inventory()}
+        assert by_slug["p.a"]["active"] is True
+        assert by_slug["p.b"]["active"] is False
+        assert by_slug["consumer"]["active"] is True
+
+    def test_selected_provider_blocked_blocks_consumer(self, registry):
+        """Override selects A; A is blocked → consumer is transitively blocked."""
+        p_a = _mod("p.a", requires=(ModuleRequirement(slug="missing"),),
+                   provides=("shared.cap",))
+        p_b = _mod("p.b", provides=("shared.cap",))
+        consumer = _mod("consumer", requires=(
+            ModuleRequirement(slug="shared.cap", kind="capability"),
+        ))
+        registry.populate(
+            [p_a, p_b, consumer],
+            capability_overrides={"shared.cap": "p.a"},
+        )
+        by_slug = {e["slug"]: e for e in registry.inventory()}
+        assert by_slug["p.a"]["active"] is False
+        assert by_slug["consumer"]["active"] is False
+
+    def test_single_provider_blocked_blocks_consumer(self, registry):
+        """With one provider (no conflict), blocking it blocks the consumer."""
+        provider = _mod("provider", requires=(ModuleRequirement(slug="missing"),),
+                        provides=("the.cap",))
+        consumer = _mod("consumer", requires=(
+            ModuleRequirement(slug="the.cap", kind="capability"),
+        ))
+        registry.populate([provider, consumer])
+        by_slug = {e["slug"]: e for e in registry.inventory()}
+        assert by_slug["provider"]["active"] is False
+        assert by_slug["consumer"]["active"] is False
+
+    def test_optional_blocked_dep_does_not_block_consumer(self, registry):
+        """Optional blocked dependency must not transitively block the consumer."""
+        a = _mod("a", requires=(ModuleRequirement(slug="missing"),))
+        b = BaseModule(ModuleManifest(
+            slug="b", label="b",
+            optional=(ModuleRequirement(slug="a"),),
+        ))
+        registry.populate([a, b])
+        by_slug = {e["slug"]: e for e in registry.inventory()}
+        assert by_slug["a"]["active"] is False
+        assert by_slug["b"]["active"] is True
+
+    def test_blocking_deterministic_regardless_of_input_order(self, registry):
+        """Active/blocked flags must not depend on the order modules are passed."""
+        a = _mod("a", requires=(ModuleRequirement(slug="missing"),))
+        b = _mod("b", requires=(ModuleRequirement(slug="a"),))
+        c = _mod("c")
+
+        r1 = ModuleRegistry()
+        r1.populate([a, b, c])
+        r2 = ModuleRegistry()
+        r2.populate([c, b, a])
+
+        inv1 = {e["slug"]: e["active"] for e in r1.inventory()}
+        inv2 = {e["slug"]: e["active"] for e in r2.inventory()}
+        assert inv1 == inv2
+        assert inv1["a"] is False
+        assert inv1["b"] is False
+        assert inv1["c"] is True

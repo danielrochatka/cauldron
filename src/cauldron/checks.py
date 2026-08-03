@@ -124,10 +124,11 @@ def cauldron_module_graph_check(app_configs, **kwargs):
         )
 
         candidate = err.candidate_slug
-        # Relevant when: slug unknown, no enabled set, or slug is enabled.
+        # Relevant when: slug unknown, or slug is explicitly enabled.
+        # An empty enabled set means no modules are enabled, so a known
+        # candidate is not enabled and must be a warning, not an error.
         is_relevant = (
             candidate is None
-            or not enabled
             or candidate in enabled
         )
 
@@ -159,6 +160,9 @@ def cauldron_module_graph_check(app_configs, **kwargs):
             )
 
     # Unavailable configured slugs ---------------------------------------
+    # E023 covers only genuinely absent modules (no entry point found).
+    # load_failure and manifest_validation are already reported by E020/E022
+    # above; emitting E023 again for those would be noise.
     for unavail in registry.unavailable_modules():
         if unavail.reason == "not_discovered":
             messages.append(
@@ -169,19 +173,6 @@ def cauldron_module_graph_check(app_configs, **kwargs):
                         f"Install the package that provides the 'cauldron.modules'"
                         f" entry point for {unavail.slug!r}, or remove it from"
                         " CAULDRON_MODULES."
-                    ),
-                    obj=unavail.slug,
-                    id="cauldron.E023",
-                )
-            )
-        else:
-            messages.append(
-                Error(
-                    f"Module {unavail.slug!r} is listed in CAULDRON_MODULES but could"
-                    f" not be activated ({unavail.reason.replace('_', ' ')}).",
-                    hint=(
-                        "See the accompanying cauldron.E020 or cauldron.E022 message"
-                        " for details."
                     ),
                     obj=unavail.slug,
                     id="cauldron.E023",

@@ -326,6 +326,66 @@ class TestDiscoveryError:
         assert sensitive not in msg
         assert "ImportError" in msg
 
+    def test_load_failure_carries_ep_name_as_candidate_slug(self):
+        """When EP name is a valid module slug, load failures use it as candidate_slug."""
+        from unittest.mock import patch
+
+        def bad_load():
+            raise ImportError("not found")
+
+        eps = [type("EP", (), {
+            "name": "cauldron.example",
+            "value": "cauldron_example:module",
+            "dist": None,
+            "load": lambda s: bad_load(),
+        })()]
+        with patch("cauldron.modules.discovery.entry_points", return_value=eps):
+            r = discover_modules()
+
+        assert len(r.errors) == 1
+        assert r.errors[0].kind == "load_failure"
+        assert r.errors[0].candidate_slug == "cauldron.example"
+
+    def test_non_protocol_object_uses_ep_name_candidate(self):
+        """Non-CauldronModule object uses valid EP name as provisional candidate_slug."""
+        from unittest.mock import patch
+
+        class NotAModule:
+            pass
+
+        eps = [type("EP", (), {
+            "name": "cauldron.bad",
+            "value": "cauldron_bad:obj",
+            "dist": None,
+            "load": lambda s: NotAModule(),
+        })()]
+        with patch("cauldron.modules.discovery.entry_points", return_value=eps):
+            r = discover_modules()
+
+        assert len(r.errors) == 1
+        assert r.errors[0].kind == "manifest_validation"
+        assert r.errors[0].candidate_slug == "cauldron.bad"
+
+    def test_invalid_ep_name_leaves_candidate_unknown(self):
+        """EP name that is not a valid module slug leaves candidate_slug as None."""
+        from unittest.mock import patch
+
+        def bad_load():
+            raise RuntimeError("broken")
+
+        eps = [type("EP", (), {
+            "name": "NOT-A-VALID-SLUG",
+            "value": "pkg:obj",
+            "dist": None,
+            "load": lambda s: bad_load(),
+        })()]
+        with patch("cauldron.modules.discovery.entry_points", return_value=eps):
+            r = discover_modules()
+
+        assert len(r.errors) == 1
+        assert r.errors[0].kind == "load_failure"
+        assert r.errors[0].candidate_slug is None
+
 
 # ---------------------------------------------------------------------------
 # Duplicate slug handling

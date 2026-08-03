@@ -28,6 +28,7 @@ def reset_global_registry():
         "_active": dict(registry._active),
         "_load_order": list(registry._load_order),
         "_capability_providers": dict(registry._capability_providers),
+        "_capability_overrides": dict(registry._capability_overrides),
         "_module_configs": dict(registry._module_configs),
         "_errors": list(registry._errors),
         "_warnings": list(registry._warnings),
@@ -264,8 +265,8 @@ class TestUnavailableModuleChecks:
         e023 = [m for m in messages if m.id == "cauldron.E023"]
         assert e023 == []
 
-    def test_e023_when_discovery_error_caused_unavailability(self):
-        """Slug listed in enabled that failed discovery still emits E023."""
+    def test_no_e023_for_load_failure(self):
+        """Load-failure already covered by E020; E023 must not fire."""
         from cauldron.modules.discovery import DiscoveryError
         from cauldron.modules.registry import registry
 
@@ -278,8 +279,27 @@ class TestUnavailableModuleChecks:
         registry.populate([], enabled={"broken.mod"}, discovery_errors=[err])
         messages = django_checks.run_checks()
         e023 = [m for m in messages if m.id == "cauldron.E023"]
-        assert len(e023) == 1
-        assert "broken.mod" in e023[0].obj
+        e020 = [m for m in messages if m.id == "cauldron.E020"]
+        assert e023 == []
+        assert len(e020) == 1
+
+    def test_no_e023_for_manifest_validation_failure(self):
+        """Manifest-validation already covered by E022; E023 must not fire."""
+        from cauldron.modules.discovery import DiscoveryError
+        from cauldron.modules.registry import registry
+
+        err = DiscoveryError(
+            entry_point_name="bad.ep",
+            kind="manifest_validation",
+            message="bad manifest",
+            candidate_slug="bad.mod",
+        )
+        registry.populate([], enabled={"bad.mod"}, discovery_errors=[err])
+        messages = django_checks.run_checks()
+        e023 = [m for m in messages if m.id == "cauldron.E023"]
+        e022 = [m for m in messages if m.id == "cauldron.E022"]
+        assert e023 == []
+        assert len(e022) == 1
 
 
 class TestScopedDiscoveryChecks:
@@ -352,6 +372,24 @@ class TestScopedDiscoveryChecks:
         e020 = [m for m in messages if m.id == "cauldron.E020"]
         assert len(e020) == 1
 
+    def test_empty_enabled_set_known_load_failure_is_warning(self):
+        """Empty enabled set + known candidate → W020, not E020."""
+        from cauldron.modules.discovery import DiscoveryError
+        from cauldron.modules.registry import registry
+
+        err = DiscoveryError(
+            entry_point_name="ep",
+            kind="load_failure",
+            message="failed",
+            candidate_slug="known.mod",
+        )
+        registry.populate([], enabled=set(), discovery_errors=[err])
+        messages = django_checks.run_checks()
+        w020 = [m for m in messages if m.id == "cauldron.W020"]
+        e020 = [m for m in messages if m.id == "cauldron.E020"]
+        assert len(w020) == 1
+        assert e020 == []
+
     def test_duplicate_slug_for_disabled_module_is_w021(self):
         from cauldron.modules.discovery import DiscoveryError
         from cauldron.modules.registry import registry
@@ -368,3 +406,19 @@ class TestScopedDiscoveryChecks:
         e021 = [m for m in messages if m.id == "cauldron.E021"]
         assert len(w021) == 1
         assert e021 == []
+
+    def test_disabled_load_failure_no_e023(self):
+        """Disabled load failure should be W020, not E023."""
+        from cauldron.modules.discovery import DiscoveryError
+        from cauldron.modules.registry import registry
+
+        err = DiscoveryError(
+            entry_point_name="ep",
+            kind="load_failure",
+            message="failed",
+            candidate_slug="disabled.mod",
+        )
+        registry.populate([], enabled=set(), discovery_errors=[err])
+        messages = django_checks.run_checks()
+        e023 = [m for m in messages if m.id == "cauldron.E023"]
+        assert e023 == []

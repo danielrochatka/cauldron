@@ -44,6 +44,67 @@ class UnavailableModule:
     discovery_error_message: str = ""
 
 
+def _validate_discovery_records(
+    modules: list[CauldronModule],
+    records: list[DiscoveredModule],
+) -> None:
+    """Raise ValueError if *records* and *modules* are inconsistent.
+
+    Checks performed before populate() mutates any state:
+    - No duplicate slugs in *records*.
+    - Slug sets of *modules* and *records* must be equal.
+    - Each record's ``.module`` must be the identical object as the matching module.
+    - Each record's ``.manifest`` must be the identical object as ``module.manifest``.
+    - ``record.label`` must equal ``module.label``.
+    - ``record.version`` must equal ``module.manifest.version``.
+    """
+    # Duplicate slug check
+    seen: set[str] = set()
+    for rec in records:
+        if rec.slug in seen:
+            raise ValueError(
+                f"discovery_records contains duplicate slug {rec.slug!r}."
+            )
+        seen.add(rec.slug)
+
+    module_slugs = {m.slug for m in modules}
+    record_slugs = {r.slug for r in records}
+    if module_slugs != record_slugs:
+        extra = sorted(record_slugs - module_slugs)
+        missing = sorted(module_slugs - record_slugs)
+        parts: list[str] = []
+        if extra:
+            parts.append(f"extra in records: {extra!r}")
+        if missing:
+            parts.append(f"missing from records: {missing!r}")
+        raise ValueError(
+            f"discovery_records slug set does not match module slug set: {'; '.join(parts)}."
+        )
+
+    module_by_slug = {m.slug: m for m in modules}
+    for rec in records:
+        m = module_by_slug[rec.slug]
+        if rec.module is not m:
+            raise ValueError(
+                f"discovery_records[{rec.slug!r}].module is not the same object"
+                " as the provided module."
+            )
+        if rec.manifest is not m.manifest:
+            raise ValueError(
+                f"discovery_records[{rec.slug!r}].manifest is not the module's manifest."
+            )
+        if rec.label != m.label:
+            raise ValueError(
+                f"discovery_records[{rec.slug!r}].label {rec.label!r} does not"
+                f" match module label {m.label!r}."
+            )
+        if rec.version != m.manifest.version:
+            raise ValueError(
+                f"discovery_records[{rec.slug!r}].version {rec.version!r} does not"
+                f" match manifest version {m.manifest.version!r}."
+            )
+
+
 class ModuleRegistry:
     """Manages discovered, resolved, and active Cauldron modules."""
 
@@ -52,6 +113,7 @@ class ModuleRegistry:
         self._active: dict[str, CauldronModule] = {}
         self._load_order: list[str] = []
         self._capability_providers: dict[str, list[str]] = {}
+        self._capability_overrides: dict[str, str] = {}
         self._module_configs: dict[str, dict[str, Any]] = {}
         self._errors: list[ResolutionError] = []
         self._warnings: list[ResolutionWarning] = []
@@ -92,10 +154,15 @@ class ModuleRegistry:
         from .resolver import resolve
         from cauldron import __version__ as cauldron_version
 
+        # Validate consistency before mutating any state.
+        if discovery_records is not None:
+            _validate_discovery_records(modules, discovery_records)
+
         self._discovered = {}
         self._active = {}
         self._load_order = []
         self._capability_providers = {}
+        self._capability_overrides = dict(capability_overrides or {})
         self._module_configs = dict(module_configs or {})
         self._errors = []
         self._warnings = []
@@ -277,19 +344,47 @@ class ModuleRegistry:
             graph[slug] = sorted(set(deps))
         return graph
 
+    def _resolved_required_graph(self) -> dict[str, list[str]]:
+        """Required-dependency graph using provider-selection semantics.
+
+        Unlike :meth:`dependency_graph` (which lists all capability providers),
+        this graph uses the same single-provider / override selection as the
+        resolver, so only the actually-selected provider becomes a blocking
+        edge.  Optional dependencies are excluded.  Used only by
+        :meth:`_blocked_slugs`.
+        """
+        graph: dict[str, list[str]] = {}
+        for slug in sorted(self._discovered):
+            module = self._discovered[slug]
+            deps: list[str] = []
+            for req in module.manifest.requires:
+                if req.kind == "module":
+                    deps.append(req.slug)
+                elif req.kind == "capability":
+                    providers = sorted(self._capability_providers.get(req.slug, []))
+                    if len(providers) == 1:
+                        deps.extend(providers)
+                    elif len(providers) > 1:
+                        override = self._capability_overrides.get(req.slug)
+                        if override and override in providers:
+                            deps.append(override)
+                        # else: CAPABILITY_CONFLICT — consumer is directly blocked
+            graph[slug] = sorted(set(deps))
+        return graph
+
     def _blocked_slugs(self) -> frozenset[str]:
         """Compute the set of slugs blocked by resolution errors (with propagation).
 
         A module is blocked if:
         - it has a direct resolution error (missing dep, version mismatch, etc.), or
-        - it has a required dependency that is blocked (transitive propagation).
+        - one of its selected required dependencies is blocked (transitive).
 
-        Circular-dependency modules are already absent from ``_active``; this
-        method additionally captures modules in the load order that cannot be
-        safely activated because of unmet constraints.
+        Uses :meth:`_resolved_required_graph` so that an unselected capability
+        provider being blocked does not transitively block the consumer.
+        Circular-dependency modules are already absent from ``_active``.
         """
         directly_blocked = frozenset(e.module_slug for e in self._errors)
-        dep_graph = self.dependency_graph()
+        dep_graph = self._resolved_required_graph()
 
         blocked: set[str] = set(directly_blocked)
         changed = True

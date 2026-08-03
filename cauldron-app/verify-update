@@ -261,10 +261,15 @@ _verify_wheel_contents() {
   [[ -n "$require_sha" ]] && extra_args+=(--require-sha "$require_sha")
   [[ -n "$repo_root" ]]   && extra_args+=(--repo-root   "$repo_root")
 
+  # Use `if output=$(…)` so that a non-zero exit from verify_wheels.py
+  # is caught by the branch, not by `set -e` from a caller that sourced us.
   local output exit_code
-  output=$(python3 "$_VERIFY_WHEELS_PY" verify \
-    --wheelhouse "$wheelhouse_dir" "${extra_args[@]}" 2>&1)
-  exit_code=$?
+  if output=$(python3 "$_VERIFY_WHEELS_PY" verify \
+      --wheelhouse "$wheelhouse_dir" "${extra_args[@]}" 2>&1); then
+    exit_code=0
+  else
+    exit_code=$?
+  fi
 
   # Parse per-wheel result lines emitted by verify_wheels.py.
   # Format: "OK    <label>: <detail>" or "FAIL  <label>: <detail>" (6-char prefix)
@@ -375,7 +380,9 @@ _setup_worktree() {
 
   if [[ -n "$wheelhouse" ]]; then
     # Verify wheel contents and confirm the manifest was built from this SHA.
-    _verify_wheel_contents "$wheelhouse" "" "$sha" "$worktree"
+    if ! _verify_wheel_contents "$wheelhouse" "" "$sha" "$worktree"; then
+      return 1
+    fi
   else
     # Build wheels from source, then verify their contents.
     _phase "wheel:build"
@@ -385,7 +392,9 @@ _setup_worktree() {
       _fail "wheel build failed at ${sha:0:8}"
       return 1
     fi
-    _verify_wheel_contents "$worktree/.wheelhouse" "" "" "$worktree"
+    if ! _verify_wheel_contents "$worktree/.wheelhouse" "" "" "$worktree"; then
+      return 1
+    fi
     wheelhouse="$worktree/.wheelhouse"
   fi
 
@@ -643,7 +652,9 @@ else:
   local to_wheelhouse
   if [[ -n "$WHEELHOUSE" ]]; then
     to_wheelhouse="$WHEELHOUSE"
-    _verify_wheel_contents "$to_wheelhouse" "[to] " "$to_sha" "$_VERIFY_WORKTREE"
+    if ! _verify_wheel_contents "$to_wheelhouse" "[to] " "$to_sha" "$_VERIFY_WORKTREE"; then
+      return 1
+    fi
   else
     _phase "[to] wheel:build"
     to_wheelhouse="$_VERIFY_WORKTREE/.wheelhouse-to"
@@ -653,7 +664,9 @@ else:
       _fail "[to] wheel build failed at ${to_sha:0:8}"
       return 1
     fi
-    _verify_wheel_contents "$to_wheelhouse" "[to] " "" "$_VERIFY_WORKTREE"
+    if ! _verify_wheel_contents "$to_wheelhouse" "[to] " "" "$_VERIFY_WORKTREE"; then
+      return 1
+    fi
   fi
 
   # 5. Install to-ref packages (force-reinstall to replace from-ref versions).

@@ -4,20 +4,22 @@
 Modes
 -----
   generate-manifest  Write wheelhouse/manifest.json with source SHA and per-wheel
-                     sha256 digests.  Called by _build_wheels() after building.
+                     sha256 digests.  Fails when the wheelhouse is absent or empty.
 
   verify             Validate wheel contents and optionally check the manifest
                      source SHA + per-wheel digests.  When --repo-root is given,
-                     also cross-validates wheel contents against the source tree
-                     (entry points, migrations, templates, static assets).
+                     performs source-aware validation: requires exactly one wheel
+                     per source project and cross-validates wheel contents against
+                     the source tree (all Python files, entry points, migrations,
+                     templates, static assets).  --repo-root always fails closed
+                     on bad input.
 
 Output format (verify mode)
 ---------------------------
   Each wheel produces one line on stdout:
       OK    <pkg-label>: <stats>
       FAIL  <pkg-label>: <error details>
-  Manifest errors and cross-package errors are printed to stderr before
-  per-wheel results.
+  Discovery, manifest, and cross-package failures are printed to stderr.
 
 Exit codes
 ----------
@@ -37,13 +39,20 @@ from pathlib import Path
 
 try:
     import tomllib
-except ImportError:  # Python < 3.11 fallback (shouldn't be needed with 3.12 requirement)
+except ImportError:  # Python < 3.11 (shouldn't be needed; project requires 3.12)
     import tomli as tomllib  # type: ignore[no-redef]
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+class DiscoveryError(Exception):
+    """Raised when source package discovery fails fatally."""
+
+
+_SKIP_DIRS = frozenset({"__pycache__", "build", "dist"})
+
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -131,16 +140,38 @@ def _find_src_root(pkg_data: dict, pkg_root: Path) -> Path:
     return pkg_root
 
 
+def _collect_all_py_files(src_root: Path) -> list[str]:
+    """Collect all distributable .py files under src_root, relative to src_root.
+
+    Skips __pycache__, build, dist, and *.egg-info directories.
+    """
+    files: list[str] = []
+    for f in src_root.rglob("*.py"):
+        if not f.is_file():
+            continue
+        try:
+            rel = f.relative_to(src_root)
+        except ValueError:
+            continue
+        parts = rel.parts[:-1]  # directory components
+        if any(p in _SKIP_DIRS or p.endswith(".egg-info") for p in parts):
+            continue
+        files.append(str(rel).replace("\\", "/"))
+    return sorted(files)
+
+
 def _collect_package_files(src_root: Path, subdir: str, *,
                            extensions: tuple[str, ...] | None = None) -> list[str]:
     """Return files in src_root/<pkg>/<subdir>/**/* relative to src_root.
 
-    Skips __pycache__ directories and .pyc files.  When *extensions* is given
-    only files with one of those suffixes are included.
+    Skips __pycache__ directories and .pyc files.
     """
     files: list[str] = []
     try:
-        top_dirs = [d for d in src_root.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        top_dirs = [
+            d for d in src_root.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        ]
     except OSError:
         return files
 
@@ -164,54 +195,93 @@ def _collect_package_files(src_root: Path, subdir: str, *,
 
 
 def _discover_source_packages(repo_root: Path) -> dict[str, dict]:
-    """Return {normalized_name: pkg_info} for all first-party source packages."""
-    result: dict[str, dict] = {}
-    pyprojects: list[tuple[Path, Path]] = []
+    """Return {normalized_name: pkg_info} for all first-party source packages.
+
+    Raises DiscoveryError on any fatal problem.  Per-package errors are
+    collected and re-raised together so all problems surface in one pass.
+    """
+    if not repo_root.exists():
+        raise DiscoveryError(f"repo root does not exist: {repo_root}")
+    if not repo_root.is_dir():
+        raise DiscoveryError(f"repo root is not a directory: {repo_root}")
 
     root_pp = repo_root / "pyproject.toml"
-    if root_pp.exists():
-        pyprojects.append((root_pp, repo_root))
+    if not root_pp.exists():
+        raise DiscoveryError(f"missing root pyproject.toml in {repo_root}")
 
+    pyprojects: list[tuple[Path, Path]] = [(root_pp, repo_root)]
     pkg_dir = repo_root / "packages"
     if pkg_dir.is_dir():
         for pp in sorted(pkg_dir.glob("*/pyproject.toml")):
             pyprojects.append((pp, pp.parent))
 
+    result: dict[str, dict] = {}
+    errors: list[str] = []
+
     for pp_path, pkg_root in pyprojects:
+        rel_pp = pp_path.relative_to(repo_root)
         try:
             with open(pp_path, "rb") as fh:
                 data = tomllib.load(fh)
-        except Exception:
+        except Exception as exc:
+            errors.append(f"cannot parse {rel_pp}: {exc}")
             continue
 
         project = data.get("project", {})
+        if not isinstance(project, dict):
+            errors.append(f"[project] table is not a mapping in {rel_pp}")
+            continue
+
         name = project.get("name", "")
         if not name:
+            errors.append(f"missing [project].name in {rel_pp}")
+            continue
+        if not isinstance(name, str):
+            errors.append(f"[project].name is not a string in {rel_pp}")
             continue
 
         norm = _normalize_name(name)
+        if norm in result:
+            existing = result[norm]["pyproject_path"].relative_to(repo_root)
+            raise DiscoveryError(
+                f"duplicate normalized distribution name {norm!r}: "
+                f"{existing} and {rel_pp}"
+            )
+
         src_root = _find_src_root(data, pkg_root)
+        if not src_root.is_dir():
+            errors.append(f"source root {src_root} does not exist for {name!r}")
+            continue
 
         ep_entries: dict[str, str] = (
             project.get("entry-points", {}).get("cauldron.modules", {})
         )
 
+        py_files = _collect_all_py_files(src_root)
         migrations = _collect_package_files(src_root, "migrations", extensions=(".py",))
-        # Exclude __init__.py — not a migration
         migrations = [f for f in migrations if not f.endswith("__init__.py")]
-
         templates = _collect_package_files(src_root, "templates")
         static = _collect_package_files(src_root, "static")
 
         result[norm] = {
             "name": name,
             "normalized_name": norm,
+            "pyproject_path": pp_path,
             "ep_entries": ep_entries,
             "src_root": src_root,
+            "py_files": py_files,
             "migrations": migrations,
             "templates": templates,
             "static": static,
         }
+
+    if errors:
+        for err in errors:
+            print(f"FAIL  discovery: {err}", file=sys.stderr)
+        raise DiscoveryError(f"{len(errors)} package(s) failed discovery")
+
+    if not result:
+        raise DiscoveryError(f"no first-party packages discovered in {repo_root}")
 
     return result
 
@@ -240,27 +310,48 @@ def _validate_wheel_source(whl_path: Path, pkg_info: dict) -> tuple[bool, list[s
         with zipfile.ZipFile(whl_path) as z:
             names = set(z.namelist())
 
-            # --- Entry points ---
+            # --- All distributable Python source files ---
+            for py_path in pkg_info["py_files"]:
+                if py_path not in names:
+                    errors.append(f"missing source file {py_path}")
+
+            # --- Entry points (exact bidirectional check) ---
             ep_entries = pkg_info["ep_entries"]
+            ep_files = [n for n in names if n.endswith("entry_points.txt")]
+            wheel_ep_txt = z.read(ep_files[0]).decode() if ep_files else ""
+            wheel_eps = _parse_ep_section(wheel_ep_txt, "cauldron.modules")
+
             if ep_entries:
-                ep_files = [n for n in names if n.endswith("entry_points.txt")]
                 if not ep_files:
                     errors.append(
                         "missing entry_points.txt (expected cauldron.modules entries)"
                     )
+                elif "[cauldron.modules]" not in wheel_ep_txt:
+                    errors.append(
+                        "missing [cauldron.modules] section in entry_points.txt"
+                    )
                 else:
-                    ep_content = z.read(ep_files[0]).decode()
-                    found_eps = _parse_ep_section(ep_content, "cauldron.modules")
+                    # Source → wheel: every declared entry must be present and correct
                     for ep_key, ep_val in ep_entries.items():
-                        if ep_key not in found_eps:
+                        if ep_key not in wheel_eps:
                             errors.append(f"missing entry point {ep_key!r}")
-                        elif found_eps[ep_key] != ep_val:
+                        elif wheel_eps[ep_key] != ep_val:
                             errors.append(
                                 f"entry point {ep_key!r}: "
-                                f"expected {ep_val!r}, got {found_eps[ep_key]!r}"
+                                f"expected {ep_val!r}, got {wheel_eps[ep_key]!r}"
                             )
+                    # Wheel → source: no extra entries in wheel
+                    for ep_key in wheel_eps:
+                        if ep_key not in ep_entries:
+                            errors.append(f"extra entry point {ep_key!r} in wheel")
+            else:
+                # Source declares no cauldron.modules eps — wheel must have none either
+                for ep_key in wheel_eps:
+                    errors.append(
+                        f"extra entry point {ep_key!r} in wheel (not declared in source)"
+                    )
 
-            # --- Migrations ---
+            # --- Migrations (non-__init__ .py files under migrations/) ---
             for migration_path in pkg_info["migrations"]:
                 if migration_path not in names:
                     errors.append(f"missing migration {migration_path}")
@@ -289,9 +380,29 @@ def cmd_generate_manifest(args: argparse.Namespace) -> int:
     wheelhouse = Path(args.wheelhouse)
     source_sha: str = args.source_sha
 
+    if not wheelhouse.exists():
+        print(
+            f"FAIL  manifest: wheelhouse does not exist: {wheelhouse}",
+            file=sys.stderr,
+        )
+        return 1
+    if not wheelhouse.is_dir():
+        print(
+            f"FAIL  manifest: wheelhouse is not a directory: {wheelhouse}",
+            file=sys.stderr,
+        )
+        return 1
+
     wheels: dict[str, dict] = {}
     for whl in sorted(wheelhouse.glob("*.whl")):
         wheels[whl.name] = {"sha256": _sha256(whl)}
+
+    if not wheels:
+        print(
+            f"FAIL  manifest: no *.whl files found in {wheelhouse}",
+            file=sys.stderr,
+        )
+        return 1
 
     manifest = {"source_sha": source_sha, "wheels": wheels}
     (wheelhouse / "manifest.json").write_text(
@@ -304,13 +415,19 @@ def cmd_generate_manifest(args: argparse.Namespace) -> int:
 def cmd_verify(args: argparse.Namespace) -> int:
     wheelhouse = Path(args.wheelhouse)
     any_fail = False
+    cross_fail = 0   # distribution-level failures (not per-wheel content)
+    per_wheel_fail = 0
 
     # --- Source package discovery (when --repo-root given) -------------------
     source_pkgs: dict[str, dict] = {}
     if args.repo_root:
-        source_pkgs = _discover_source_packages(Path(args.repo_root))
+        try:
+            source_pkgs = _discover_source_packages(Path(args.repo_root))
+        except DiscoveryError as exc:
+            print(f"FAIL  discovery: {exc}", file=sys.stderr)
+            return 1
 
-    # --- Manifest / SHA validation (before per-wheel checks) -----------------
+    # --- Manifest / SHA validation -------------------------------------------
     recorded_wheels: dict[str, dict] = {}
     if args.require_sha:
         manifest_path = wheelhouse / "manifest.json"
@@ -329,7 +446,20 @@ def cmd_verify(args: argparse.Namespace) -> int:
             )
             return 1
 
-        recorded_sha: str = manifest.get("source_sha", "")
+        # Validate top-level types before consuming fields
+        if not isinstance(manifest, dict):
+            print("FAIL  manifest: manifest.json is not a JSON object", file=sys.stderr)
+            return 1
+
+        recorded_sha = manifest.get("source_sha", "")
+        if not isinstance(recorded_sha, str):
+            print(
+                f"FAIL  manifest: source_sha is not a string "
+                f"(got {type(recorded_sha).__name__})",
+                file=sys.stderr,
+            )
+            return 1
+
         if recorded_sha != args.require_sha:
             print(
                 f"FAIL  manifest: source_sha mismatch "
@@ -338,14 +468,41 @@ def cmd_verify(args: argparse.Namespace) -> int:
             )
             return 1
 
-        recorded_wheels = manifest.get("wheels", {})
+        recorded_wheels_raw = manifest.get("wheels", {})
+        if not isinstance(recorded_wheels_raw, dict):
+            print(
+                f"FAIL  manifest: 'wheels' is not a JSON object "
+                f"(got {type(recorded_wheels_raw).__name__})",
+                file=sys.stderr,
+            )
+            return 1
 
-        # Verify per-wheel sha256 digests and set equality
+        type_errors: list[str] = []
+        for whl_name, whl_meta in recorded_wheels_raw.items():
+            if not isinstance(whl_meta, dict):
+                type_errors.append(
+                    f"wheel entry for {whl_name!r} is not an object "
+                    f"(got {type(whl_meta).__name__})"
+                )
+                continue
+            sha256 = whl_meta.get("sha256", "")
+            if not isinstance(sha256, str):
+                type_errors.append(
+                    f"sha256 for {whl_name!r} is not a string "
+                    f"(got {type(sha256).__name__})"
+                )
+        if type_errors:
+            for err in type_errors:
+                print(f"FAIL  manifest: {err}", file=sys.stderr)
+            return 1
+
+        recorded_wheels = recorded_wheels_raw
+
+        # Per-wheel sha256 digest + set equality
         digest_failures: list[str] = []
         disk_wheel_names = {w.name for w in wheelhouse.glob("*.whl")}
         manifest_wheel_names = set(recorded_wheels.keys())
 
-        # Wheels in manifest but missing on disk
         for whl_name, whl_meta in recorded_wheels.items():
             whl_path = wheelhouse / whl_name
             if not whl_path.exists():
@@ -361,7 +518,6 @@ def cmd_verify(args: argparse.Namespace) -> int:
                     f"sha256 mismatch (manifest={expected[:8]}, actual={actual[:8]})"
                 )
 
-        # Wheels on disk but absent from manifest
         for whl_name in sorted(disk_wheel_names - manifest_wheel_names):
             digest_failures.append(
                 f"FAIL  {_pkg_label(whl_name)}: wheel on disk but absent from manifest"
@@ -372,7 +528,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
                 print(line, file=sys.stderr)
             return 1
 
-    # --- Per-wheel content validation ----------------------------------------
+    # --- Per-wheel list -------------------------------------------------------
     wheels = sorted(wheelhouse.glob("*.whl"))
     if not wheels:
         print(
@@ -383,21 +539,22 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
     # --- Cross-package checks (when --repo-root given) -----------------------
     if source_pkgs:
-        # Detect duplicate distributions
         wheel_by_label: dict[str, list[Path]] = {}
         for whl_path in wheels:
             label = _pkg_label(whl_path.name)
             wheel_by_label.setdefault(label, []).append(whl_path)
 
+        # Duplicate distributions
         for label, wpaths in wheel_by_label.items():
             if len(wpaths) > 1:
                 print(
                     f"FAIL  {label}: {len(wpaths)} duplicate wheels in wheelhouse",
                     file=sys.stderr,
                 )
+                cross_fail += 1
                 any_fail = True
 
-        # Wheels with no corresponding source package
+        # Wheels with no corresponding source project
         for whl_path in wheels:
             label = _pkg_label(whl_path.name)
             if label not in source_pkgs:
@@ -405,18 +562,18 @@ def cmd_verify(args: argparse.Namespace) -> int:
                     f"FAIL  {label}: wheel has no corresponding source package in repo",
                     file=sys.stderr,
                 )
+                cross_fail += 1
                 any_fail = True
 
-        # Source packages with cauldron.modules entry point but no wheel
+        # Every source project requires exactly one wheel
         wheel_labels = {_pkg_label(w.name) for w in wheels}
-        for norm_name, pkg_info in source_pkgs.items():
-            if pkg_info["ep_entries"] and norm_name not in wheel_labels:
-                print(
-                    f"FAIL  {norm_name}: has cauldron.modules entry point but no wheel found",
-                    file=sys.stderr,
-                )
+        for norm_name in source_pkgs:
+            if norm_name not in wheel_labels:
+                print(f"FAIL  {norm_name}: no wheel found", file=sys.stderr)
+                cross_fail += 1
                 any_fail = True
 
+    # --- Per-wheel content validation ----------------------------------------
     for whl_path in wheels:
         label = _pkg_label(whl_path.name)
         ok, detail = _validate_wheel(whl_path)
@@ -432,20 +589,17 @@ def cmd_verify(args: argparse.Namespace) -> int:
         else:
             all_errors = ([detail] if not ok else []) + src_errors
             print(f"FAIL  {label}: {'; '.join(all_errors)}")
+            per_wheel_fail += 1
             any_fail = True
 
     if any_fail:
         total = len(wheels)
-        failed = sum(
-            1 for whl in wheels
-            if not _validate_wheel(whl)[0]
-            or (source_pkgs and _pkg_label(whl.name) in source_pkgs
-                and not _validate_wheel_source(whl, source_pkgs[_pkg_label(whl.name)])[0])
-        )
-        print(
-            f"\nFAIL: {failed} of {total} wheel(s) failed content check.",
-            file=sys.stderr,
-        )
+        parts: list[str] = []
+        if per_wheel_fail:
+            parts.append(f"{per_wheel_fail} of {total} wheel(s) failed content check")
+        if cross_fail:
+            parts.append(f"{cross_fail} distribution-level issue(s)")
+        print(f"\nFAIL: {'; '.join(parts)}.", file=sys.stderr)
         return 1
 
     total = len(wheels)
@@ -481,7 +635,8 @@ def main(argv: list[str] | None = None) -> int:
     # verify
     ver = sub.add_parser(
         "verify",
-        help="Validate wheel contents; optionally check manifest SHA and digests",
+        help="Validate wheel contents; optionally check manifest SHA, digests, "
+             "and source-aware correctness",
     )
     ver.add_argument(
         "--wheelhouse", required=True, metavar="DIR",
@@ -493,8 +648,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     ver.add_argument(
         "--repo-root", default=None, metavar="DIR",
-        help="Repo root for source-aware validation: cross-validates wheel contents "
-             "against source entry points, migrations, templates, and static assets",
+        help="Repo root for source-aware validation.  Requires a root pyproject.toml. "
+             "Cross-validates every wheel against its source entry points, Python "
+             "files, migrations, templates, and static assets.  Fails closed on any "
+             "discovery error.",
     )
 
     args = parser.parse_args(argv)

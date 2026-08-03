@@ -888,6 +888,7 @@ class TestVerifyUpdatePhaseRunners:
 VERIFY_WHEELS_PY = REPO_DIR / "tools" / "verify_wheels.py"
 
 _PKG = "cauldron_fakepkg"
+_ROOT_PKG = "cauldron_testrootpkg"  # synthetic root package present in every fake repo
 _EP_KEY = "cauldron.fake"
 _EP_VAL = "cauldron_fakepkg.module:module"
 
@@ -897,8 +898,23 @@ def _make_fake_repo(tmp_path: Path, *,
                     migrations: list[str] | None = None,
                     templates: list[str] | None = None,
                     static_files: list[str] | None = None) -> Path:
-    """Minimal fake repo with one sub-package for source-aware validation tests."""
+    """Fake mono-repo with a root package and one sub-package.
+
+    The root ``pyproject.toml`` is required by ``--repo-root`` validation.
+    ``_make_source_wheel`` creates matching wheels for both packages.
+    """
     repo = tmp_path / "repo"
+
+    # --- Root package (always present — required by _discover_source_packages) ---
+    root_src = repo / "src" / _ROOT_PKG
+    root_src.mkdir(parents=True)
+    (root_src / "__init__.py").write_text("")
+    (repo / "pyproject.toml").write_text(
+        f'[project]\nname = "{_ROOT_PKG.replace("_", "-")}"\nversion = "0.0.1"\n'
+        f'[tool.setuptools.packages.find]\nwhere = ["src"]\n'
+    )
+
+    # --- Sub-package (with optional ep, migrations, templates, static) ---
     pkg_dir = repo / "packages" / _PKG.replace("_", "-")
     src = pkg_dir / "src" / _PKG
     src.mkdir(parents=True)
@@ -941,7 +957,21 @@ def _make_source_wheel(wh: Path, *,
                        migrations: list[str] | None = None,
                        templates: list[str] | None = None,
                        static_files: list[str] | None = None) -> Path:
-    """Wheel for _PKG matching the source layout produced by _make_fake_repo."""
+    """Create wheels for BOTH the root package and the sub-package.
+
+    The root wheel contains only METADATA + ``__init__.py``.
+    Returns the sub-package wheel path.
+    """
+    # Root wheel
+    root_whl = wh / f"{_ROOT_PKG}-0.0.1-py3-none-any.whl"
+    with zipfile.ZipFile(root_whl, "w") as z:
+        z.writestr(
+            f"{_ROOT_PKG}-0.0.1.dist-info/METADATA",
+            f"Metadata-Version: 2.1\nName: {_ROOT_PKG}\nVersion: 0.0.1\n",
+        )
+        z.writestr(f"{_ROOT_PKG}/__init__.py", "")
+
+    # Sub-package wheel
     whl = wh / f"{_PKG}-0.1.0-py3-none-any.whl"
     with zipfile.ZipFile(whl, "w") as z:
         z.writestr(f"{_PKG}-0.1.0.dist-info/METADATA",
@@ -1128,12 +1158,246 @@ class TestVerifyWheelsSourceAware:
         import json, hashlib
         wh = tmp_path / "wh"
         wh.mkdir()
-        whl = _make_source_wheel(wh)
+        _make_source_wheel(wh)  # creates root + fakepkg wheels
         sha = "abcd1234" * 5
-        digest = hashlib.sha256(whl.read_bytes()).hexdigest()
-        manifest = {"source_sha": sha, "wheels": {whl.name: {"sha256": digest}}}
+        wheels_dict = {}
+        for whl_file in sorted(wh.glob("*.whl")):
+            digest = hashlib.sha256(whl_file.read_bytes()).hexdigest()
+            wheels_dict[whl_file.name] = {"sha256": digest}
+        manifest = {"source_sha": sha, "wheels": wheels_dict}
         (wh / "manifest.json").write_text(json.dumps(manifest))
         r = _run_verify(wh, require_sha=sha)
         assert r.returncode == 0, (
             f"Expected pass.\nstdout: {r.stdout}\nstderr: {r.stderr}"
         )
+
+    # ── Regression tests: --repo-root validation ──────────────────────────────
+
+    def test_nonexistent_repo_root_fails(self, tmp_path):
+        """--repo-root pointing to a path that doesn't exist → discovery error."""
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        _make_source_wheel(wh)
+        nonexistent = tmp_path / "no-such-dir"
+        r = _run_verify(wh, repo=nonexistent)
+        assert r.returncode != 0, "Should fail: nonexistent repo root"
+        assert "does not exist" in (r.stdout + r.stderr)
+
+    def test_missing_root_pyproject_fails(self, tmp_path):
+        """--repo-root directory without root pyproject.toml → discovery error."""
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        _make_source_wheel(wh)
+        repo = tmp_path / "bare-repo"
+        repo.mkdir()
+        (repo / "packages").mkdir()
+        r = _run_verify(wh, repo=repo)
+        assert r.returncode != 0, "Should fail: missing root pyproject.toml"
+        assert "pyproject.toml" in (r.stdout + r.stderr)
+
+    def test_malformed_toml_fails(self, tmp_path):
+        """Root pyproject.toml with invalid TOML syntax → discovery error."""
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        _make_source_wheel(wh)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "pyproject.toml").write_text("x = @invalid_toml\n")
+        r = _run_verify(wh, repo=repo)
+        assert r.returncode != 0, "Should fail: malformed TOML"
+        assert "cannot parse" in (r.stdout + r.stderr) or "parse" in (r.stdout + r.stderr)
+
+    def test_missing_project_name_fails(self, tmp_path):
+        """pyproject.toml with missing [project].name field → discovery error."""
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        _make_source_wheel(wh)
+        repo = tmp_path / "repo"
+        src = repo / "src" / "mypackage"
+        src.mkdir(parents=True)
+        (src / "__init__.py").write_text("")
+        (repo / "pyproject.toml").write_text(
+            '[project]\nversion = "0.1.0"\n'
+            '[tool.setuptools.packages.find]\nwhere = ["src"]\n'
+        )
+        r = _run_verify(wh, repo=repo)
+        assert r.returncode != 0, "Should fail: missing project name"
+        assert "name" in (r.stdout + r.stderr)
+
+    def test_duplicate_normalized_source_distributions_fails(self, tmp_path):
+        """Two source packages with the same normalized name → discovery error."""
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        _make_source_wheel(wh)
+        repo = tmp_path / "repo"
+        root_src = repo / "src" / "cauldron_testrootpkg"
+        root_src.mkdir(parents=True)
+        (root_src / "__init__.py").write_text("")
+        (repo / "pyproject.toml").write_text(
+            '[project]\nname = "cauldron-testrootpkg"\nversion = "0.0.1"\n'
+            '[tool.setuptools.packages.find]\nwhere = ["src"]\n'
+        )
+        for variant in ("cauldron-dup", "cauldron_dup"):
+            pkg_dir = repo / "packages" / variant
+            pkg_src = pkg_dir / "src" / "cauldron_dup"
+            pkg_src.mkdir(parents=True)
+            (pkg_src / "__init__.py").write_text("")
+            (pkg_dir / "pyproject.toml").write_text(
+                f'[project]\nname = "{variant}"\nversion = "0.1.0"\n'
+                '[tool.setuptools.packages.find]\nwhere = ["src"]\n'
+            )
+        r = _run_verify(wh, repo=repo)
+        assert r.returncode != 0, "Should fail: duplicate normalized names"
+        assert "duplicate" in (r.stdout + r.stderr)
+
+    def test_missing_wheel_for_project_without_entry_points(self, tmp_path):
+        """Source package with no entry points still requires exactly one wheel."""
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        repo = _make_fake_repo(tmp_path)  # _PKG has no ep_entries
+        # Only put the root wheel — no wheel for _PKG (the sub-package)
+        root_whl = wh / f"{_ROOT_PKG}-0.0.1-py3-none-any.whl"
+        with zipfile.ZipFile(root_whl, "w") as z:
+            z.writestr(
+                f"{_ROOT_PKG}-0.0.1.dist-info/METADATA",
+                f"Metadata-Version: 2.1\nName: {_ROOT_PKG}\nVersion: 0.0.1\n",
+            )
+            z.writestr(f"{_ROOT_PKG}/__init__.py", "")
+        r = _run_verify(wh, repo)
+        assert r.returncode != 0, "Should fail: no wheel for non-ep package"
+        assert "no wheel found" in (r.stdout + r.stderr)
+
+    def test_missing_ordinary_python_module_fails(self, tmp_path):
+        """Source .py file absent from the wheel → fail."""
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        repo = _make_fake_repo(tmp_path)
+        # Add an extra .py file to the source package tree
+        extra = (
+            repo / "packages" / _PKG.replace("_", "-")
+            / "src" / _PKG / "budget_defaults.py"
+        )
+        extra.write_text("# default budget settings\n")
+        # Wheel does NOT include budget_defaults.py
+        _make_source_wheel(wh)
+        r = _run_verify(wh, repo)
+        assert r.returncode != 0, "Should fail: source .py not in wheel"
+        combined = r.stdout + r.stderr
+        assert "budget_defaults.py" in combined or "missing source file" in combined
+
+    def test_extra_wheel_module_entry_point_fails(self, tmp_path):
+        """Wheel entry_points.txt has an ep not declared in source pyproject → fail."""
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        repo = _make_fake_repo(tmp_path)  # source has no ep_entries for _PKG
+        # Root wheel — correct
+        root_whl = wh / f"{_ROOT_PKG}-0.0.1-py3-none-any.whl"
+        with zipfile.ZipFile(root_whl, "w") as z:
+            z.writestr(
+                f"{_ROOT_PKG}-0.0.1.dist-info/METADATA",
+                f"Metadata-Version: 2.1\nName: {_ROOT_PKG}\nVersion: 0.0.1\n",
+            )
+            z.writestr(f"{_ROOT_PKG}/__init__.py", "")
+        # Sub-package wheel includes an undeclared entry point
+        whl = wh / f"{_PKG}-0.1.0-py3-none-any.whl"
+        with zipfile.ZipFile(whl, "w") as z:
+            z.writestr(f"{_PKG}-0.1.0.dist-info/METADATA",
+                       f"Metadata-Version: 2.1\nName: {_PKG}\nVersion: 0.1.0\n")
+            z.writestr(f"{_PKG}/__init__.py", "")
+            z.writestr(
+                f"{_PKG}-0.1.0.dist-info/entry_points.txt",
+                f"[cauldron.modules]\n{_EP_KEY} = {_EP_VAL}\n",
+            )
+        r = _run_verify(wh, repo)
+        assert r.returncode != 0, "Should fail: extra entry point in wheel"
+        assert "extra entry point" in (r.stdout + r.stderr)
+
+    # ── Regression tests: manifest generation and type validation ─────────────
+
+    def test_empty_manifest_generation_fails(self, tmp_path):
+        """generate-manifest on an empty wheelhouse → exit 1."""
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        r = subprocess.run(
+            [
+                "python3", str(VERIFY_WHEELS_PY),
+                "generate-manifest",
+                "--wheelhouse", str(wh),
+                "--source-sha", "a" * 40,
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert r.returncode != 0, "generate-manifest on empty wheelhouse should fail"
+        assert "no *.whl" in (r.stdout + r.stderr) or "empty" in (r.stdout + r.stderr)
+
+    def test_malformed_manifest_field_types_fails(self, tmp_path):
+        """manifest.json with source_sha as int → type error → fail."""
+        import json, hashlib
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        whl = _make_source_wheel(wh)
+        sha = "abcd1234" * 5
+        digest = hashlib.sha256(whl.read_bytes()).hexdigest()
+        manifest = {"source_sha": 12345, "wheels": {whl.name: {"sha256": digest}}}
+        (wh / "manifest.json").write_text(json.dumps(manifest))
+        r = _run_verify(wh, require_sha=sha)
+        assert r.returncode != 0, "Should fail: source_sha is not a string"
+        combined = r.stdout + r.stderr
+        assert "not a string" in combined or "source_sha" in combined
+
+    # ── Regression tests: bash set -e safety ─────────────────────────────────
+
+    def test_bash_verifier_failure_captured_under_set_e(self, tmp_path):
+        """Under set -e, _verify_wheel_contents captures failure without aborting shell."""
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        _make_wheel(wh, has_metadata=False)  # content check will fail
+        script = textwrap.dedent(f"""\
+            source '{LIB_SH}'
+            source '{VERIFY_UPDATE}'
+            # Must propagate failure without set -e aborting the outer script
+            if _verify_wheel_contents '{wh}' ''; then
+                echo "UNEXPECTEDLY_PASSED"
+            else
+                echo "CORRECTLY_FAILED"
+            fi
+        """)
+        r = _bash(script, timeout=15)
+        assert r.returncode == 0, (
+            f"Outer script must not be aborted by set -e.\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+        assert "CORRECTLY_FAILED" in r.stdout, (
+            f"_verify_wheel_contents must propagate failure.\nstdout: {r.stdout}"
+        )
+        assert "UNEXPECTEDLY_PASSED" not in r.stdout
+
+    def test_explicit_caller_termination_after_verifier_failure(self, tmp_path):
+        """Caller function returns 1 when _verify_wheel_contents fails."""
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        _make_wheel(wh, has_metadata=False)  # content check will fail
+        script = textwrap.dedent(f"""\
+            source '{LIB_SH}'
+            source '{VERIFY_UPDATE}'
+            _caller() {{
+                if ! _verify_wheel_contents '{wh}' ''; then
+                    return 1
+                fi
+                echo "CALLER_CONTINUED"
+            }}
+            if _caller; then
+                echo "OUTER_PASSED"
+            else
+                echo "OUTER_FAILED"
+            fi
+        """)
+        r = _bash(script, timeout=15)
+        assert r.returncode == 0, (
+            f"Outer script must not be aborted.\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+        assert "OUTER_FAILED" in r.stdout, (
+            f"Caller must propagate failure.\nstdout: {r.stdout}"
+        )
+        assert "CALLER_CONTINUED" not in r.stdout

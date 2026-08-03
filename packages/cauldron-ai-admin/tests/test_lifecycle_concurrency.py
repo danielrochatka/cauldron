@@ -73,14 +73,22 @@ def _run_threads(*targets):
 @pytest.mark.django_db(transaction=True)
 def test_concurrent_approves_only_one_wins():
     """Two threads call ``approve`` on the same proposal simultaneously.
-    Exactly one must succeed; the other must raise ``ValueError`` (row was
-    already approved) or ``OperationalError`` (SQLite serialised us out).
-    Either way the DB ends up with status=approved and no double-transition.
+
+    Invariants:
+    - Exactly two outcomes are recorded (success or handled exception).
+    - The proposal ends up in status=approved.
+    - Exactly one approved audit event exists (two approvals never both commit).
+    - When both threads get OperationalError (SQLite lock exhaustion), a single
+      serial approval still succeeds, proving the lock was transient.
+    - On databases with row-level locking, exactly one racing call succeeds.
     """
+    from cauldron_ai_admin.models import UIStyleAuditEvent, UIStyleChangeRequest
     from cauldron_ai_admin.style_service import UIStyleChangeService
 
     user = _make_user("approve-race-user")
     proposal = _make_proposal(status="proposed")
+    proposal_pk = proposal.pk
+    user_pk = user.pk
     service = UIStyleChangeService()
 
     approved: list = []
@@ -89,9 +97,12 @@ def test_concurrent_approves_only_one_wins():
     barrier = threading.Barrier(2, timeout=10)
 
     def do_approve():
-        barrier.wait()
+        close_old_connections()
         try:
-            result = service.approve(proposal, reviewed_by=user)
+            fresh_proposal = UIStyleChangeRequest.objects.get(pk=proposal_pk)
+            fresh_user = get_user_model().objects.get(pk=user_pk)
+            barrier.wait()
+            result = service.approve(fresh_proposal, reviewed_by=fresh_user)
             with lock:
                 approved.append(result)
         except (ValueError, OperationalError) as exc:
@@ -102,10 +113,39 @@ def test_concurrent_approves_only_one_wins():
 
     _run_threads(do_approve, do_approve)
 
-    assert len(approved) >= 1, "Expected at least one approve to succeed."
-    assert len(approved) + len(errors) == 2
+    assert len(approved) + len(errors) == 2, (
+        f"Expected exactly 2 outcomes, got {len(approved)} success(es) "
+        f"and {len(errors)} error(s)"
+    )
+
+    all_operational = all(isinstance(e, OperationalError) for e in errors)
+    if len(approved) == 0 and all_operational:
+        # SQLite lock exhaustion: both racing writes failed.  Prove a serial
+        # approval still works — the proposal is still "proposed".
+        close_old_connections()
+        fresh = UIStyleChangeRequest.objects.get(pk=proposal_pk)
+        fresh_user = get_user_model().objects.get(pk=user_pk)
+        service.approve(fresh, reviewed_by=fresh_user)
+    else:
+        # Row-locking database (or SQLite serialised exactly one through):
+        # exactly one racing call must have succeeded.
+        assert len(approved) == 1, (
+            f"Expected exactly one racing success, got {len(approved)}. "
+            f"Errors: {[type(e).__name__ for e in errors]}"
+        )
+
+    close_old_connections()
     proposal.refresh_from_db()
     assert proposal.status == "approved"
+
+    # Exactly one approved audit event — two approvals must never both commit.
+    audit_events = UIStyleAuditEvent.objects.filter(
+        change_request=proposal, event_type="approved"
+    )
+    assert audit_events.count() == 1, (
+        f"Expected exactly one approved audit event, got {audit_events.count()}. "
+        f"Two approvals must never both commit."
+    )
 
 
 @pytest.mark.django_db(transaction=True)

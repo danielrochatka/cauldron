@@ -75,7 +75,7 @@ def resolve(
         for slug in sorted(module_index):
             module = module_index[slug]
             constraint = module.manifest.cauldron_version
-            if constraint and not _version_satisfies(cauldron_version, constraint):
+            if constraint and not version_satisfies(cauldron_version, constraint):
                 errors.append(ResolutionError(
                     kind=ErrorKind.CAULDRON_VERSION,
                     module_slug=slug,
@@ -99,7 +99,7 @@ def resolve(
                     ))
                     continue
                 dep = module_index[req.slug]
-                if req.version and not _version_satisfies(dep.manifest.version, req.version):
+                if req.version and not version_satisfies(dep.manifest.version, req.version):
                     errors.append(ResolutionError(
                         kind=ErrorKind.VERSION_CONSTRAINT,
                         module_slug=slug,
@@ -143,7 +143,7 @@ def resolve(
         for req in module.manifest.optional:
             if req.kind == "module" and req.slug in module_index:
                 dep = module_index[req.slug]
-                if req.version and not _version_satisfies(dep.manifest.version, req.version):
+                if req.version and not version_satisfies(dep.manifest.version, req.version):
                     warnings.append(ResolutionWarning(
                         module_slug=slug,
                         message=(
@@ -191,7 +191,7 @@ def resolve(
     )
 
 
-def _version_satisfies(version: str, constraint: str) -> bool:
+def version_satisfies(version: str, constraint: str) -> bool:
     if not constraint:
         return True
     try:

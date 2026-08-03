@@ -41,5 +41,6 @@ class CauldronConfig(AppConfig):
             module_configs=module_configs,
             discovery_errors=result.errors,
             capability_overrides=capability_overrides,
+            discovery_records=result.records,
         )
         registry.activate()

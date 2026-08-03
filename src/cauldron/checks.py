@@ -95,26 +95,89 @@ def cauldron_settings_check(app_configs, **kwargs):
 
 @register()
 def cauldron_module_graph_check(app_configs, **kwargs):
-    """Validate the module dependency graph and report active modules."""
+    """Validate the module dependency graph and report active modules.
+
+    Discovery-error severity is scoped to the enabled module set:
+
+    * Errors whose ``candidate_slug`` is in the enabled set retain their
+      blocking ``cauldron.E0xx`` ID.
+    * Errors whose ``candidate_slug`` is set but NOT in the enabled set are
+      downgraded to ``cauldron.W0xx`` warnings, because a broken third-party
+      package that is not enabled must not block a healthy installation.
+    * Errors without a ``candidate_slug`` (where the module identity is
+      unknown) are always treated as blocking Errors.
+    """
     from .modules.registry import registry
 
     messages = []
+    enabled = registry.enabled_slugs()
 
-    # Discovery errors -------------------------------------------------------
     _discovery_id_map = {
-        "load_failure": "cauldron.E020",
-        "duplicate_slug": "cauldron.E021",
-        "manifest_validation": "cauldron.E022",
+        "load_failure": ("cauldron.E020", "cauldron.W020"),
+        "duplicate_slug": ("cauldron.E021", "cauldron.W021"),
+        "manifest_validation": ("cauldron.E022", "cauldron.W022"),
     }
+
     for err in registry.discovery_errors():
-        messages.append(
-            Error(
-                err.message,
-                hint="Fix the entry-point registration or module package before starting.",
-                obj=err.entry_point_name,
-                id=_discovery_id_map.get(err.kind, "cauldron.E029"),
-            )
+        error_id, warning_id = _discovery_id_map.get(
+            err.kind, ("cauldron.E029", "cauldron.W029")
         )
+
+        candidate = err.candidate_slug
+        # Relevant when: slug unknown, or slug is explicitly enabled.
+        # An empty enabled set means no modules are enabled, so a known
+        # candidate is not enabled and must be a warning, not an error.
+        is_relevant = (
+            candidate is None
+            or candidate in enabled
+        )
+
+        if is_relevant:
+            messages.append(
+                Error(
+                    err.message,
+                    hint=(
+                        "Fix the entry-point registration or module package before"
+                        " starting."
+                    ),
+                    obj=err.entry_point_name,
+                    id=error_id,
+                )
+            )
+        else:
+            messages.append(
+                Warning(
+                    err.message,
+                    hint=(
+                        f"Module {candidate!r} is not enabled in CAULDRON_MODULES;"
+                        " this discovery problem does not affect the running"
+                        " application.  Fix or remove the broken package to suppress"
+                        " this warning."
+                    ),
+                    obj=err.entry_point_name,
+                    id=warning_id,
+                )
+            )
+
+    # Unavailable configured slugs ---------------------------------------
+    # E023 covers only genuinely absent modules (no entry point found).
+    # load_failure and manifest_validation are already reported by E020/E022
+    # above; emitting E023 again for those would be noise.
+    for unavail in registry.unavailable_modules():
+        if unavail.reason == "not_discovered":
+            messages.append(
+                Error(
+                    f"Module {unavail.slug!r} is listed in CAULDRON_MODULES but was"
+                    " not found among installed entry points.",
+                    hint=(
+                        f"Install the package that provides the 'cauldron.modules'"
+                        f" entry point for {unavail.slug!r}, or remove it from"
+                        " CAULDRON_MODULES."
+                    ),
+                    obj=unavail.slug,
+                    id="cauldron.E023",
+                )
+            )
 
     # Active-module summary --------------------------------------------------
     active = registry.all_active()

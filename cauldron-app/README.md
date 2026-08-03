@@ -78,7 +78,16 @@ To update Cauldron to the latest version:
 ./update
 ```
 
-`./update` runs a **preflight verification** against the incoming code before stopping the live server.  If verification fails the server keeps running and nothing is changed.  If verification passes, the script stops the server, backs up the database, pulls the latest code, upgrades all Python and frontend dependencies, applies migrations, rebuilds the public site, runs system checks, and restarts.
+`./update` runs a **preflight verification** against the exact incoming commit before stopping the live server.  If verification fails the server keeps running and nothing is changed.
+
+The update sequence:
+1. Fetch the remote (updates the upstream tracking ref).
+2. Resolve the upstream to an immutable commit SHA.
+3. Confirm the candidate is a valid fast-forward from HEAD.
+4. Run `verify-update <CANDIDATE_SHA>` — builds wheels, verifies their contents, migrates, and checks HTTP health in a throwaway environment.
+5. If preflight passes: stop server → back up database → advance checkout to the exact verified SHA with `git merge --ff-only` → install → migrate → rebuild → restart.
+
+A newer remote commit that arrives after step 2 is never installed — the checkout is pinned to the SHA that was verified.
 
 ### Emergency bypass
 
@@ -88,18 +97,25 @@ If the preflight check itself is preventing an update (e.g. a critical security 
 ./update --skip-preflight
 ```
 
-This is a last-resort flag.  The server will stop before the update is verified, so a broken candidate can leave the server down.
+This is a last-resort flag.  The server will stop before the update is verified, so a broken candidate can leave the server down.  Missing `verify-update` fails closed unless `--skip-preflight` is specified.
 
 ## Verification
 
-`verify-update` checks that a given Git ref installs, migrates, and serves correctly, without touching the live checkout, database, virtualenv, or running server.  All work happens in a temporary Git worktree and throwaway virtualenv that are removed on exit.
+`verify-update` checks that a given Git ref installs (from distribution wheels), migrates, and serves correctly, without touching the live checkout, database, virtualenv, or running server.  All work happens in a temporary Git worktree and throwaway virtualenv that are removed on exit.
+
+```bash
+./verify-update [--wheelhouse DIR] [REF]
+./verify-update [--wheelhouse DIR] --from-ref OLD --to-ref NEW
+```
+
+`--wheelhouse DIR` installs from pre-built wheels instead of editable source, matching the production distribution.  Without `--wheelhouse`, wheels are built from source in the worktree before installation.
 
 ### Clean-install verification
 
 ```bash
 ./verify-update          # verify HEAD
-./verify-update main     # verify a branch
-./verify-update v1.2.3   # verify a tag
+./verify-update v1.2.3   # verify a tag or commit SHA
+./verify-update --wheelhouse /tmp/wh v1.2.3  # verify pre-built wheels
 ```
 
 ### Upgrade-path verification
@@ -108,7 +124,7 @@ This is a last-resort flag.  The server will stop before the update is verified,
 ./verify-update --from-ref v1.1.0 --to-ref main
 ```
 
-This simulates a real upgrade: installs and migrates the old version, creates representative persisted state, upgrades packages in-place to the new version, re-migrates, and verifies the state is still readable before running a server health check.
+This simulates a real upgrade: installs and migrates the old version from source, creates representative persisted state, builds or uses a wheelhouse for the new version, upgrades packages in-place, re-migrates, verifies state is still readable, then runs a server health check.
 
 ### What is verified
 
@@ -118,23 +134,35 @@ Each run exercises these phases (failures are collected; a summary is always pri
 |-------|---------------|
 | `worktree` | Git ref resolves and worktree can be created |
 | `venv` | Python virtualenv creates successfully |
-| `packages` | All packages install without error |
+| `wheel:build` | Wheels built from source (when no `--wheelhouse`) |
+| `wheel:<pkg>` | Each wheel contains METADATA, Python source, valid entry points |
+| `packages` | All packages install from wheels |
 | `config` | `config.env` initialises without error |
 | `check` | `manage.py check` passes |
 | `makemigrations --check` | No unapplied schema changes |
 | `migrate` | Migrations apply cleanly |
 | `collectstatic` | Static assets collect without error |
-| `cauldron_site_build` | Frontend build succeeds (skipped if Node.js absent) |
-| `server startup` | Dev server starts and responds within 30 s |
-| `health` | `/accounts/login/` and CSS tokens asset return 200 |
+| `cauldron_site_build` | Frontend build succeeds; SKIP when no `frontend/package.json` |
+| `server startup` | Dev server starts on 127.0.0.1, process exit detected immediately |
+| `health` | `/accounts/login/` and CSS tokens asset return 200 on 127.0.0.1 |
+
+Frontend is fail-closed: when `frontend/package.json` exists, Node ≥18, npm, and Astro are required.
+
+### Persistent failure diagnostics
+
+Set `VERIFY_ARTIFACT_DIR` to copy logs and the phase report before the worktree is removed:
+
+```bash
+VERIFY_ARTIFACT_DIR=/tmp/verify-artifacts ./verify-update HEAD
+```
 
 ### Package tests vs distribution verification
 
-Package tests (run with `pytest` inside each `packages/*/tests/`) verify individual module logic in isolation.  `verify-update` verifies the full distribution: install sequence, migration chain, and HTTP surface.  Both are required before shipping.
+Package tests (run with `pytest` inside each `packages/*/tests/`) verify individual module logic in isolation.  `verify-update` verifies the full distribution: wheel artifacts, install sequence, migration chain, and HTTP surface.  Both are required before shipping.
 
 ### CI
 
-`verify-update` runs in the `distribution-smoke` GitHub Actions workflow on every push and pull request to `main`.  The `distribution-smoke / upgrade` job is a **required branch-protection check** — PRs cannot be merged until upgrade-path verification passes.
+`verify-update` runs in the `distribution-smoke` GitHub Actions workflow on every push and pull request to `main`.  The workflow also runs `arch-check`, unit tests, and package tests.  The `distribution-smoke / upgrade` job is the **branch-protection gate**.
 
 ## Stopping the server
 

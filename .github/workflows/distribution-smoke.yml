@@ -7,10 +7,65 @@ on:
     branches: [main]
 
 jobs:
-  # ── clean-install ────────────────────────────────────────────────────────────
-  # Verifies that the candidate installs cleanly, migrates, and serves.
-  clean-install:
-    name: distribution-smoke / clean-install
+  # ── architecture check ────────────────────────────────────────────────────
+  arch-check:
+    name: distribution-smoke / arch-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install core (for arch_check imports)
+        run: pip install -e '.[dev]'
+
+      - name: Run architecture boundary checker
+        run: python tools/arch_check.py
+
+  # ── unit and package tests ────────────────────────────────────────────────
+  tests:
+    name: distribution-smoke / tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install all packages (editable)
+        run: |
+          pip install -e '.[dev]'
+          for pkg in packages/*/; do
+            [ -f "${pkg}pyproject.toml" ] || continue
+            pip install -e "$pkg"
+          done
+
+      - name: Install test fixture modules
+        run: |
+          for fixture in tests/fixtures/*/; do
+            [ -f "${fixture}pyproject.toml" ] || continue
+            pip install -e "$fixture"
+          done
+
+      - name: Core tests
+        run: pytest tests/ -v
+
+      - name: Package tests
+        run: |
+          for pkg in packages/*/; do
+            [ -d "${pkg}tests" ] || continue
+            [ -f "${pkg}pyproject.toml" ] || continue
+            echo "--- pytest $pkg ---"
+            pytest "${pkg}tests/" -v
+          done
+
+  # ── wheel build ───────────────────────────────────────────────────────────
+  # Builds all first-party wheels into a wheelhouse that subsequent jobs use.
+  build-wheels:
+    name: distribution-smoke / build-wheels
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,27 +76,112 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install system dependencies
-        run: sudo apt-get install -y curl
+      - name: Install build tooling
+        run: pip install build wheel
 
-      - name: Run clean-install verification
+      - name: Build root cauldron wheel
+        run: python -m build --wheel --outdir wheelhouse .
+
+      - name: Build package wheels
         run: |
-          chmod +x cauldron-app/verify-update
-          cauldron-app/verify-update HEAD
+          for pkg in packages/*/; do
+            [ -f "${pkg}pyproject.toml" ] || continue
+            echo "Building $pkg..."
+            python -m build --wheel --outdir wheelhouse "$pkg"
+          done
 
-      - name: Upload verify logs on failure
-        if: failure()
+      - name: List built wheels
+        run: ls -lh wheelhouse/
+
+      - name: Upload wheelhouse artifact
         uses: actions/upload-artifact@v4
         with:
-          name: verify-clean-install-logs
-          path: /tmp/cauldron-verify-*/cauldron-app/logs/
-          if-no-files-found: ignore
+          name: wheelhouse
+          path: wheelhouse/
+          retention-days: 1
 
-  # ── upgrade ──────────────────────────────────────────────────────────────────
-  # Verifies that upgrading from the previous release to HEAD works.
-  # This is the BLOCKING job required for branch protection.
-  upgrade:
-    name: distribution-smoke / upgrade
+  # ── wheel content validation ──────────────────────────────────────────────
+  verify-wheels:
+    name: distribution-smoke / verify-wheels
+    needs: build-wheels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download wheelhouse
+        uses: actions/download-artifact@v4
+        with:
+          name: wheelhouse
+          path: wheelhouse/
+
+      - name: Verify wheel contents
+        run: |
+          python3 - wheelhouse/ <<'PY'
+          import sys, zipfile, re
+          from pathlib import Path
+
+          wheelhouse = Path(sys.argv[1])
+          failures = []
+
+          for whl in sorted(wheelhouse.glob("*.whl")):
+              errors = []
+              with zipfile.ZipFile(whl) as z:
+                  names = z.namelist()
+
+                  # Must have package metadata.
+                  if not any(re.search(r"\.dist-info/METADATA$", n) for n in names):
+                      errors.append("missing METADATA")
+
+                  # Must have Python source.
+                  if not any(n.endswith(".py") for n in names):
+                      errors.append("no .py files")
+
+                  # Verify cauldron.modules entry points are non-empty.
+                  ep_files = [n for n in names if n.endswith("entry_points.txt")]
+                  for ep_file in ep_files:
+                      ep = z.read(ep_file).decode()
+                      if "[cauldron.modules]" in ep:
+                          in_sec, found = False, False
+                          for line in ep.splitlines():
+                              stripped = line.strip()
+                              if stripped == "[cauldron.modules]":
+                                  in_sec = True
+                              elif stripped.startswith("[") and in_sec:
+                                  in_sec = False
+                              elif in_sec and "=" in stripped:
+                                  found = True
+                          if not found:
+                              errors.append("[cauldron.modules] entry point section empty")
+
+                  migrations = [n for n in names if "/migrations/" in n and n.endswith(".py")]
+                  templates  = [n for n in names if "/templates/" in n]
+                  statics    = [n for n in names if "/static/" in n]
+
+              status = "FAIL" if errors else "OK  "
+              details = ", ".join(errors) if errors else (
+                  f"{sum(1 for n in names if n.endswith('.py'))} py "
+                  f"| {len(migrations)} migrations "
+                  f"| {len(templates)} templates "
+                  f"| {len(statics)} static"
+              )
+              print(f"  {status}  {whl.name}: {details}")
+              if errors:
+                  failures.append(whl.name)
+
+          if failures:
+              print(f"\nFAIL: {len(failures)} wheel(s) failed content check", file=sys.stderr)
+              sys.exit(1)
+          print(f"\nAll {sum(1 for _ in wheelhouse.glob('*.whl'))} wheels passed content check.")
+          PY
+
+  # ── clean-install verification ────────────────────────────────────────────
+  clean-install:
+    name: distribution-smoke / clean-install
+    needs: [build-wheels, verify-wheels]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -52,30 +192,110 @@ jobs:
         with:
           python-version: "3.12"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Install system dependencies
         run: sudo apt-get install -y curl
 
-      - name: Determine previous release ref
+      - name: Download wheelhouse
+        uses: actions/download-artifact@v4
+        with:
+          name: wheelhouse
+          path: wheelhouse/
+
+      - name: Resolve candidate SHA
         id: refs
         run: |
-          # Use the most recent tag as FROM_REF.  Fall back to origin/main~1 when
-          # no tags exist yet (bootstrapping a new project).
-          FROM=$(git describe --tags --abbrev=0 2>/dev/null || git rev-parse origin/main~1 2>/dev/null || git rev-parse HEAD~1)
-          echo "from_ref=$FROM" >> "$GITHUB_OUTPUT"
-          echo "to_ref=HEAD" >> "$GITHUB_OUTPUT"
-          echo "Upgrade path: $FROM -> HEAD"
+          SHA=$(git rev-parse HEAD)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Clean-install candidate: $SHA"
 
-      - name: Run upgrade-path verification
+      - name: Run clean-install verification
+        env:
+          VERIFY_ARTIFACT_DIR: ${{ github.workspace }}/verify-artifacts/clean-install
         run: |
           chmod +x cauldron-app/verify-update
           cauldron-app/verify-update \
-            --from-ref "${{ steps.refs.outputs.from_ref }}" \
-            --to-ref   "${{ steps.refs.outputs.to_ref }}"
+            --wheelhouse "${{ github.workspace }}/wheelhouse" \
+            "${{ steps.refs.outputs.sha }}"
 
-      - name: Upload verify logs on failure
+      - name: Upload verification artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: verify-upgrade-logs
-          path: /tmp/cauldron-verify-*/cauldron-app/logs/
+          name: verify-clean-install-artifacts
+          path: ${{ github.workspace }}/verify-artifacts/clean-install/
+          if-no-files-found: ignore
+
+  # ── upgrade-path verification ─────────────────────────────────────────────
+  # This is the REQUIRED branch-protection job.
+  # For PRs: upgrades from base branch SHA to the PR merge commit.
+  # For pushes: upgrades from the previous release tag (or HEAD~1).
+  upgrade:
+    name: distribution-smoke / upgrade
+    needs: [build-wheels, verify-wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install system dependencies
+        run: sudo apt-get install -y curl
+
+      - name: Download wheelhouse (for TO_REF)
+        uses: actions/download-artifact@v4
+        with:
+          name: wheelhouse
+          path: wheelhouse/
+
+      - name: Determine upgrade refs
+        id: refs
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            # Start from the current working main — the commit the PR targets.
+            # This guarantees FROM_REF includes every merged PR (including #72)
+            # rather than an arbitrary ancestor.
+            FROM="${{ github.event.pull_request.base.sha }}"
+            TO="${{ github.event.pull_request.head.sha }}"
+          else
+            # Push to main: use the most recent release tag as FROM_REF.
+            # Fall back to HEAD~1 when no tags exist yet.
+            FROM=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null \
+                   || git rev-parse HEAD~1)
+            TO=$(git rev-parse HEAD)
+          fi
+          echo "from_ref=$FROM" >> "$GITHUB_OUTPUT"
+          echo "to_ref=$TO"     >> "$GITHUB_OUTPUT"
+          echo "Upgrade path: $FROM -> $TO"
+          # Confirm FROM_REF is a real commit we can check out.
+          git rev-parse --verify "${FROM}^{commit}" \
+            || { echo "ERROR: FROM_REF $FROM does not resolve to a commit"; exit 1; }
+
+      - name: Run upgrade-path verification
+        env:
+          VERIFY_ARTIFACT_DIR: ${{ github.workspace }}/verify-artifacts/upgrade
+        run: |
+          chmod +x cauldron-app/verify-update
+          cauldron-app/verify-update \
+            --wheelhouse "${{ github.workspace }}/wheelhouse" \
+            --from-ref "${{ steps.refs.outputs.from_ref }}" \
+            --to-ref   "${{ steps.refs.outputs.to_ref }}"
+
+      - name: Upload verification artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-upgrade-artifacts
+          path: ${{ github.workspace }}/verify-artifacts/upgrade/
           if-no-files-found: ignore

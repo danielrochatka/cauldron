@@ -8,11 +8,25 @@
 #
 # Usage
 # -----
-#   ./verify-update [REF]                          # clean-install verification
-#   ./verify-update --from-ref OLD --to-ref NEW    # upgrade-path verification
+#   ./verify-update [--wheelhouse DIR] [REF]
+#   ./verify-update [--wheelhouse DIR] --from-ref OLD --to-ref NEW
 #
 # REF defaults to HEAD when omitted.
 # --from-ref and --to-ref must both be supplied together.
+#
+# Options
+# -------
+#   --wheelhouse DIR   Use pre-built wheels from DIR instead of building from
+#                      source.  When provided, wheels are installed rather than
+#                      editable source installs.  For upgrade mode this
+#                      wheelhouse applies to TO_REF; FROM_REF is always built
+#                      from source to simulate a real upgrade.
+#
+# Environment
+# -----------
+#   VERIFY_ARTIFACT_DIR   When set, logs and the phase report are copied here
+#                         before the temporary worktree is removed.  Useful for
+#                         uploading CI artifacts on failure.
 #
 # Exit codes
 # ----------
@@ -33,13 +47,15 @@ source "$CAULDRON_DIR/lib.sh"
 FROM_REF=""
 TO_REF=""
 CLEAN_REF="HEAD"
+WHEELHOUSE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --from-ref) FROM_REF="$2"; shift 2 ;;
-    --to-ref)   TO_REF="$2";   shift 2 ;;
+    --from-ref)   FROM_REF="$2";    shift 2 ;;
+    --to-ref)     TO_REF="$2";      shift 2 ;;
+    --wheelhouse) WHEELHOUSE="$2";  shift 2 ;;
     --help|-h)
-      sed -n '2,/^$/p' "$0" | grep '^#' | sed 's/^# \?//'
+      sed -n '2,/^[^#]/p' "$0" | grep '^#' | sed 's/^# \?//'
       exit 0
       ;;
     -*)
@@ -74,6 +90,7 @@ _phase() {
 
 _pass() { _PHASE_LOG+=("  PASS  $1"); }
 _fail() { _PHASE_LOG+=("  FAIL  $1"); _OVERALL_OK=0; }
+_skip() { _PHASE_LOG+=("  SKIP  $1"); }
 
 _print_report() {
   echo ""
@@ -95,7 +112,7 @@ _cleanup() {
   local exit_status=$?
 
   # If the script exited with a non-zero status but no _fail() was recorded
-  # (e.g. an unexpected exit from inside a helper), treat it as a failure.
+  # (e.g. an unexpected exit inside a helper), treat it as a failure.
   if [[ "$exit_status" -ne 0 && "${_OVERALL_OK}" -eq 1 ]]; then
     _OVERALL_OK=0
   fi
@@ -106,7 +123,33 @@ _cleanup() {
     wait "$_VERIFY_SERVER_PID" 2>/dev/null || true
   fi
 
-  # Remove the temporary worktree (also removes its .venv and data/).
+  # Preserve diagnostics before removing the worktree.
+  # refs.txt and report.txt are always written when VERIFY_ARTIFACT_DIR is set,
+  # even when the worktree was never created (e.g. failed ref resolution).
+  if [[ -n "${VERIFY_ARTIFACT_DIR:-}" ]]; then
+    mkdir -p "$VERIFY_ARTIFACT_DIR"
+    {
+      echo "CLEAN_REF=${CLEAN_REF:-}"
+      echo "FROM_REF=${FROM_REF:-}"
+      echo "TO_REF=${TO_REF:-}"
+      echo "WHEELHOUSE=${WHEELHOUSE:-}"
+    } > "$VERIFY_ARTIFACT_DIR/refs.txt"
+    {
+      echo "==> Verification report"
+      for line in "${_PHASE_LOG[@]}"; do
+        echo "    $line"
+      done
+    } > "$VERIFY_ARTIFACT_DIR/report.txt"
+    # Copy server/build logs if the worktree was created.
+    if [[ -n "${_VERIFY_WORKTREE:-}" && -d "${_VERIFY_WORKTREE:-}" ]]; then
+      local app_logs="$_VERIFY_WORKTREE/cauldron-app/logs"
+      if [[ -d "$app_logs" ]]; then
+        cp -a "$app_logs/." "$VERIFY_ARTIFACT_DIR/" 2>/dev/null || true
+      fi
+    fi
+  fi
+
+  # Remove the temporary worktree (also removes its .venv, data/, and built wheels).
   if [[ -n "${_VERIFY_WORKTREE:-}" && -d "${_VERIFY_WORKTREE:-}" ]]; then
     git -C "$REPO_DIR" worktree remove --force "$_VERIFY_WORKTREE" 2>/dev/null \
       || rm -rf "$_VERIFY_WORKTREE"
@@ -124,7 +167,11 @@ _cleanup() {
   fi
 }
 
-trap '_cleanup' EXIT
+# Register the EXIT trap only when executing as a script (not when sourced by
+# tests that need to call individual functions).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  trap '_cleanup' EXIT
+fi
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -151,20 +198,149 @@ _resolve_ref() {
   echo "$sha"
 }
 
-# Install every Python project into the venv at WORKTREE/.venv using the same
-# pip-install sources as cauldron-app/update (requirements.txt + root + all
-# packages/*/pyproject.toml directories).
-_install_packages() {
+# ---------------------------------------------------------------------------
+# Wheel helpers
+# ---------------------------------------------------------------------------
+
+# Build distribution wheels for every first-party Python package in WORKTREE
+# into WHEELHOUSE_DIR.  Requires build and wheel to be installed in the venv.
+_build_wheels() {
   local worktree="$1"
+  local wheelhouse_dir="$2"
+  local venv_python="$worktree/.venv/bin/python"
   local venv_pip="$worktree/.venv/bin/pip"
 
-  local args=(-q -r "$worktree/cauldron-app/requirements.txt" -e "$worktree")
+  mkdir -p "$wheelhouse_dir"
+
+  # Ensure build tooling is available.
+  "$venv_pip" install -q build wheel
+
+  # Build root cauldron package.
+  "$venv_python" -m build --wheel --no-isolation \
+    --outdir "$wheelhouse_dir" \
+    "$worktree" \
+    >> "$worktree/cauldron-app/logs/pip-build.log" 2>&1
+
+  # Build each sub-package.
   for pkg in "$worktree/packages"/*/; do
     [[ -f "${pkg}pyproject.toml" ]] || continue
-    args+=(-e "$pkg")
+    "$venv_python" -m build --wheel --no-isolation \
+      --outdir "$wheelhouse_dir" \
+      "$pkg" \
+      >> "$worktree/cauldron-app/logs/pip-build.log" 2>&1
+  done
+}
+
+# Verify that each wheel in WHEELHOUSE_DIR contains the required artifacts.
+_verify_wheel_contents() {
+  local wheelhouse_dir="$1"
+  local label="${2:-}"
+  local all_ok=1
+
+  for whl in "$wheelhouse_dir"/*.whl; do
+    [[ -f "$whl" ]] || continue
+    local whl_name
+    whl_name=$(basename "$whl")
+    # Strip version and platform tags to get a human-readable package name.
+    local pkg_label
+    pkg_label=$(echo "$whl_name" | sed 's/-[0-9].*//')
+
+    _phase "${label}wheel:${pkg_label}"
+
+    local result
+    if result=$(python3 - "$whl" 2>&1 <<'PY'
+import sys, zipfile, re
+
+whl_path = sys.argv[1]
+errors = []
+stats = []
+
+with zipfile.ZipFile(whl_path) as z:
+    names = z.namelist()
+
+    # METADATA must exist (basic wheel structure).
+    metadata = [n for n in names if re.search(r"\.dist-info/METADATA$", n)]
+    if not metadata:
+        errors.append("missing METADATA")
+
+    # Must contain Python source.
+    py_files = [n for n in names if n.endswith(".py")]
+    if not py_files:
+        errors.append("no .py files")
+
+    # If there is an entry_points.txt with a cauldron.modules section, verify
+    # it has at least one non-empty entry.
+    ep_files = [n for n in names if n.endswith("entry_points.txt")]
+    if ep_files:
+        ep_content = z.read(ep_files[0]).decode()
+        if "[cauldron.modules]" in ep_content:
+            in_section = False
+            found_entry = False
+            for line in ep_content.splitlines():
+                stripped = line.strip()
+                if stripped == "[cauldron.modules]":
+                    in_section = True
+                elif stripped.startswith("[") and in_section:
+                    in_section = False
+                elif in_section and "=" in stripped:
+                    found_entry = True
+            if not found_entry:
+                errors.append("[cauldron.modules] entry_point section is empty")
+
+    # Collect stats for informational output.
+    migrations = [n for n in names if "/migrations/" in n and n.endswith(".py")]
+    templates  = [n for n in names if "/templates/" in n]
+    statics    = [n for n in names if "/static/" in n]
+    stats.append(f"{len(py_files)} py, {len(migrations)} migrations, "
+                 f"{len(templates)} templates, {len(statics)} static")
+
+if errors:
+    print("FAIL: " + "; ".join(errors), file=sys.stderr)
+    sys.exit(1)
+print("OK: " + "; ".join(stats))
+PY
+    ); then
+      _pass "${label}wheel:${pkg_label} — ${result#OK: }"
+    else
+      _fail "${label}wheel:${pkg_label} — ${result#FAIL: }"
+      all_ok=0
+    fi
   done
 
-  "$venv_pip" install "${args[@]}"
+  [[ "$all_ok" -eq 1 ]]
+}
+
+# Install all Python packages into WORKTREE/.venv from either:
+#   (a) a pre-built wheelhouse (when WHEELHOUSE arg is non-empty), or
+#   (b) editable source installs from the worktree.
+# PyPI dependencies from requirements.txt are always fetched normally.
+_install_packages() {
+  local worktree="$1"
+  local wheelhouse="${2:-}"
+  local venv_pip="$worktree/.venv/bin/pip"
+  local req="$worktree/cauldron-app/requirements.txt"
+  local pip_log="$worktree/cauldron-app/logs/pip-install.log"
+
+  if [[ -n "$wheelhouse" ]]; then
+    # Install from pre-built wheels.  PyPI deps come from requirements.txt;
+    # first-party packages come from the wheelhouse (no editable paths).
+    "$venv_pip" install -q -r "$req" \
+      >> "$pip_log" 2>&1
+    # shellcheck disable=SC2086
+    local whl_files=("$wheelhouse"/*.whl)
+    if [[ ${#whl_files[@]} -gt 0 && -f "${whl_files[0]}" ]]; then
+      "$venv_pip" install -q "${whl_files[@]}" \
+        >> "$pip_log" 2>&1
+    fi
+  else
+    # Editable installs from source (default: development / no pre-built wheels).
+    local args=(-q -r "$req" -e "$worktree")
+    for pkg in "$worktree/packages"/*/; do
+      [[ -f "${pkg}pyproject.toml" ]] || continue
+      args+=(-e "$pkg")
+    done
+    "$venv_pip" install "${args[@]}" >> "$pip_log" 2>&1
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -174,6 +350,7 @@ _install_packages() {
 _setup_worktree() {
   local ref="$1"
   local worktree="$2"
+  local wheelhouse="${3:-}"
 
   _phase "worktree"
   local sha
@@ -188,8 +365,27 @@ _setup_worktree() {
   "$worktree/.venv/bin/pip" install --upgrade pip -q
   _pass "virtualenv created"
 
+  # Ensure logs dir exists before any installs write to it.
+  mkdir -p "$app_dir/logs"
+
+  if [[ -n "$wheelhouse" ]]; then
+    # Wheel-content verification happens before install.
+    _verify_wheel_contents "$wheelhouse" ""
+  else
+    # Build wheels from source, then verify their contents.
+    _phase "wheel:build"
+    if _build_wheels "$worktree" "$worktree/.wheelhouse" 2>&1; then
+      _pass "wheels built from ${sha:0:8}"
+    else
+      _fail "wheel build failed at ${sha:0:8}"
+      return 1
+    fi
+    _verify_wheel_contents "$worktree/.wheelhouse" ""
+    wheelhouse="$worktree/.wheelhouse"
+  fi
+
   _phase "packages"
-  _install_packages "$worktree"
+  _install_packages "$worktree" "$wheelhouse"
   _pass "packages installed (${sha:0:8})"
 
   _phase "config"
@@ -198,7 +394,6 @@ _setup_worktree() {
     "$app_dir/data/ai" \
     "$app_dir/data/public" \
     "$app_dir/data/previews" \
-    "$app_dir/logs" \
     "$app_dir/staticfiles"
   initialize_config "$app_dir/config.env" "$app_dir/config.env.example"
   _pass "config initialized"
@@ -210,14 +405,17 @@ _setup_worktree() {
 
 _run_django_phases() {
   local worktree="$1"
-  local label="${2:-}"     # e.g. "[from] " or "[to] " for upgrade mode
+  local label="${2:-}"
   local app_dir="$worktree/cauldron-app"
   local python="$worktree/.venv/bin/python"
 
-  # Export the config env vars so settings.py can read them.
+  # Export config env vars so settings.py can read them.
+  # Always override CAULDRON_HOST to 127.0.0.1 so the verify server and
+  # health-check URLs are on the same address.
   set -a
   # shellcheck source=/dev/null
   source "$app_dir/config.env"
+  CAULDRON_HOST=127.0.0.1
   set +a
 
   # ---- system check -------------------------------------------------------
@@ -256,22 +454,28 @@ _run_django_phases() {
     return 1
   fi
 
-  # ---- frontend + site build (skipped gracefully when Node.js absent) -----
+  # ---- frontend + site build ----------------------------------------------
+  # When frontend/package.json exists, Node/npm/Astro are required and a
+  # build failure is a hard error.  When no frontend is configured the phase
+  # is skipped with SKIP (not PASS) so the distinction is visible in the report.
   _phase "${label}cauldron_site_build"
-  if ! command -v node &>/dev/null; then
-    _pass "${label}site build skipped (Node.js not in PATH)"
+  local app_frontend="$app_dir/frontend"
+  if [[ ! -f "$app_frontend/package.json" ]]; then
+    _skip "${label}site build (no frontend/package.json)"
   else
-    install_frontend "$app_dir" 2>&1 || true
-    if is_frontend_installed "$app_dir"; then
-      if "$python" "$app_dir/manage.py" cauldron_site_build 2>&1; then
-        _pass "${label}site build succeeded"
-      else
-        _fail "${label}site build failed"
-        return 1
-      fi
-    else
-      _pass "${label}site build skipped (frontend not installed)"
+    if ! check_node_version 18 2>&1; then
+      _fail "${label}Node.js ≥18 required for frontend but not found"
+      return 1
     fi
+    if ! install_frontend "$app_dir" 2>&1; then
+      _fail "${label}frontend installation failed"
+      return 1
+    fi
+    if ! "$python" "$app_dir/manage.py" cauldron_site_build 2>&1; then
+      _fail "${label}site build failed"
+      return 1
+    fi
+    _pass "${label}site build succeeded"
   fi
 }
 
@@ -288,20 +492,33 @@ _run_server_phases() {
   set -a
   # shellcheck source=/dev/null
   source "$app_dir/config.env"
+  # Pin the verify server to 127.0.0.1 regardless of production config.
+  CAULDRON_HOST=127.0.0.1
   set +a
 
   local port
   port=$(_find_free_port)
+  local srv_log="$app_dir/logs/verify-server.log"
 
   _phase "${label}server startup"
+  CAULDRON_HOST=127.0.0.1 \
   "$python" "$app_dir/manage.py" \
     runserver "127.0.0.1:$port" --nothreading --noreload \
-    >"$app_dir/logs/verify-server.log" 2>&1 &
+    >"$srv_log" 2>&1 &
   _VERIFY_SERVER_PID=$!
 
-  # Poll until the server responds or times out.
+  # Poll until the server responds, the process exits, or the timeout expires.
   local healthy=0
   for _ in $(seq 1 30); do
+    # Detect immediate crash — fail without waiting the full 30 s.
+    if ! kill -0 "$_VERIFY_SERVER_PID" 2>/dev/null; then
+      echo "" >&2
+      echo "    Server process exited unexpectedly.  Log:" >&2
+      sed 's/^/    /' "$srv_log" >&2 2>/dev/null || true
+      _fail "${label}server process exited before accepting connections"
+      _VERIFY_SERVER_PID=""
+      return 1
+    fi
     if curl -sf "http://127.0.0.1:${port}/accounts/login/" -o /dev/null 2>/dev/null; then
       healthy=1
       break
@@ -310,6 +527,9 @@ _run_server_phases() {
   done
 
   if [[ "$healthy" -eq 0 ]]; then
+    echo "" >&2
+    echo "    Server did not respond within 30 s.  Log:" >&2
+    sed 's/^/    /' "$srv_log" >&2 2>/dev/null || true
     _fail "${label}server did not respond on port ${port} within 30 s"
     kill "$_VERIFY_SERVER_PID" 2>/dev/null || true
     wait "$_VERIFY_SERVER_PID" 2>/dev/null || true
@@ -352,12 +572,15 @@ _run_server_phases() {
 
 _run_clean_install() {
   local ref="${1:-HEAD}"
-  echo "==> Cauldron verify-update  (clean install: $ref)"
+  local sha
+  sha=$(_resolve_ref "$ref")
+  echo "==> Cauldron verify-update  (clean install: ${sha:0:8})"
   echo "    Repository: $REPO_DIR"
+  [[ -n "$WHEELHOUSE" ]] && echo "    Wheelhouse: $WHEELHOUSE"
   echo ""
 
   _VERIFY_WORKTREE="$(mktemp -d /tmp/cauldron-verify-XXXXXX)"
-  _setup_worktree "$ref" "$_VERIFY_WORKTREE"
+  _setup_worktree "$ref" "$_VERIFY_WORKTREE" "$WHEELHOUSE"
   _run_django_phases "$_VERIFY_WORKTREE" ""
   _run_server_phases "$_VERIFY_WORKTREE" ""
 }
@@ -369,21 +592,27 @@ _run_clean_install() {
 _run_upgrade_path() {
   local from_ref="$1"
   local to_ref="$2"
-  echo "==> Cauldron verify-update  (upgrade: $from_ref → $to_ref)"
-  echo "    Repository: $REPO_DIR"
+  local from_sha to_sha
+  from_sha=$(_resolve_ref "$from_ref")
+  to_sha=$(_resolve_ref "$to_ref")
+  echo "==> Cauldron verify-update  (upgrade: ${from_sha:0:8} → ${to_sha:0:8})"
+  echo "    Repository:  $REPO_DIR"
+  echo "    From commit: ${from_sha}"
+  echo "    To commit:   ${to_sha}"
+  [[ -n "$WHEELHOUSE" ]] && echo "    To wheelhouse: $WHEELHOUSE"
   echo ""
 
   _VERIFY_WORKTREE="$(mktemp -d /tmp/cauldron-verify-XXXXXX)"
   local app_dir="$_VERIFY_WORKTREE/cauldron-app"
   local python="$_VERIFY_WORKTREE/.venv/bin/python"
 
-  # 1. Install and initialise the from-ref.
-  _setup_worktree "$from_ref" "$_VERIFY_WORKTREE"
+  # 1. Install and initialise the from-ref (always from source for upgrade base).
+  _setup_worktree "$from_ref" "$_VERIFY_WORKTREE" ""
   _run_django_phases "$_VERIFY_WORKTREE" "[from] "
 
-  # 2. Create representative persisted state in the from-ref database.
+  # 2. Create representative persisted state.
   _phase "[from] state:create"
-  set -a; source "$app_dir/config.env"; set +a
+  set -a; source "$app_dir/config.env"; CAULDRON_HOST=127.0.0.1; set +a
   "$python" "$app_dir/manage.py" shell --no-input -c "
 from django.contrib.auth import get_user_model
 User = get_user_model()
@@ -395,20 +624,53 @@ else:
 " 2>&1
   _pass "[from] representative state created (superuser)"
 
-  # 3. Upgrade packages in-place to the to-ref.
-  _phase "[to] upgrade:packages"
-  local to_sha
-  to_sha=$(_resolve_ref "$to_ref")
+  # 3. Check out to-ref in the same worktree.
+  _phase "[to] upgrade:worktree"
   git -C "$_VERIFY_WORKTREE" checkout --detach "$to_sha" 2>/dev/null
-  _install_packages "$_VERIFY_WORKTREE"
+  _pass "[to] checked out ${to_sha:0:8}"
+
+  # 4. Build (or use provided) wheelhouse for to-ref and verify contents.
+  local to_wheelhouse
+  if [[ -n "$WHEELHOUSE" ]]; then
+    to_wheelhouse="$WHEELHOUSE"
+    _verify_wheel_contents "$to_wheelhouse" "[to] "
+  else
+    _phase "[to] wheel:build"
+    to_wheelhouse="$_VERIFY_WORKTREE/.wheelhouse-to"
+    if _build_wheels "$_VERIFY_WORKTREE" "$to_wheelhouse" 2>&1; then
+      _pass "[to] wheels built from ${to_sha:0:8}"
+    else
+      _fail "[to] wheel build failed at ${to_sha:0:8}"
+      return 1
+    fi
+    _verify_wheel_contents "$to_wheelhouse" "[to] "
+  fi
+
+  # 5. Install to-ref packages (force-reinstall to replace from-ref versions).
+  _phase "[to] upgrade:packages"
+  local venv_pip="$_VERIFY_WORKTREE/.venv/bin/pip"
+  local pip_log="$app_dir/logs/pip-install-upgrade.log"
+  local whl_files=("$to_wheelhouse"/*.whl)
+  if [[ ${#whl_files[@]} -gt 0 && -f "${whl_files[0]}" ]]; then
+    "$venv_pip" install -q --force-reinstall "${whl_files[@]}" \
+      >> "$pip_log" 2>&1
+  else
+    # Fall back to editable installs if no wheels were built.
+    local args=(-q -e "$_VERIFY_WORKTREE")
+    for pkg in "$_VERIFY_WORKTREE/packages"/*/; do
+      [[ -f "${pkg}pyproject.toml" ]] || continue
+      args+=(-e "$pkg")
+    done
+    "$venv_pip" install "${args[@]}" >> "$pip_log" 2>&1
+  fi
   _pass "[to] packages upgraded to ${to_sha:0:8}"
 
-  # 4. Run Django phases on the upgraded installation (same data/ directory).
+  # 6. Run Django phases on the upgraded installation (same data/ directory).
   _run_django_phases "$_VERIFY_WORKTREE" "[to] "
 
-  # 5. Verify representative state is readable after upgrade.
+  # 7. Verify representative state is readable after upgrade.
   _phase "[to] state:verify"
-  set -a; source "$app_dir/config.env"; set +a
+  set -a; source "$app_dir/config.env"; CAULDRON_HOST=127.0.0.1; set +a
   local count
   count=$("$python" "$app_dir/manage.py" shell --no-input -c "
 from django.contrib.auth import get_user_model
@@ -422,16 +684,18 @@ print(get_user_model().objects.filter(username='verify-upgrade-user').count())
     return 1
   fi
 
-  # 6. Server health on the upgraded installation.
+  # 8. Server health on the upgraded installation.
   _run_server_phases "$_VERIFY_WORKTREE" "[to] "
 }
 
 # ---------------------------------------------------------------------------
-# Dispatch
+# Dispatch (only when executed as a script, not when sourced)
 # ---------------------------------------------------------------------------
 
-if [[ "$UPGRADE_MODE" -eq 1 ]]; then
-  _run_upgrade_path "$FROM_REF" "$TO_REF"
-else
-  _run_clean_install "$CLEAN_REF"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  if [[ "$UPGRADE_MODE" -eq 1 ]]; then
+    _run_upgrade_path "$FROM_REF" "$TO_REF"
+  else
+    _run_clean_install "$CLEAN_REF"
+  fi
 fi

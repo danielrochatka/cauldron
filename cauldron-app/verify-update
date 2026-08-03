@@ -254,14 +254,16 @@ _verify_wheel_contents() {
   local wheelhouse_dir="$1"
   local label="${2:-}"
   local require_sha="${3:-}"
+  local repo_root="${4:-}"
   local all_ok=1
 
-  local sha_args=()
-  [[ -n "$require_sha" ]] && sha_args=(--require-sha "$require_sha")
+  local extra_args=()
+  [[ -n "$require_sha" ]] && extra_args+=(--require-sha "$require_sha")
+  [[ -n "$repo_root" ]]   && extra_args+=(--repo-root   "$repo_root")
 
   local output exit_code
   output=$(python3 "$_VERIFY_WHEELS_PY" verify \
-    --wheelhouse "$wheelhouse_dir" "${sha_args[@]}" 2>&1)
+    --wheelhouse "$wheelhouse_dir" "${extra_args[@]}" 2>&1)
   exit_code=$?
 
   # Parse per-wheel result lines emitted by verify_wheels.py.
@@ -373,7 +375,7 @@ _setup_worktree() {
 
   if [[ -n "$wheelhouse" ]]; then
     # Verify wheel contents and confirm the manifest was built from this SHA.
-    _verify_wheel_contents "$wheelhouse" "" "$sha"
+    _verify_wheel_contents "$wheelhouse" "" "$sha" "$worktree"
   else
     # Build wheels from source, then verify their contents.
     _phase "wheel:build"
@@ -383,7 +385,7 @@ _setup_worktree() {
       _fail "wheel build failed at ${sha:0:8}"
       return 1
     fi
-    _verify_wheel_contents "$worktree/.wheelhouse" ""
+    _verify_wheel_contents "$worktree/.wheelhouse" "" "" "$worktree"
     wheelhouse="$worktree/.wheelhouse"
   fi
 
@@ -618,7 +620,7 @@ _run_upgrade_path() {
   # 2. Create representative persisted state.
   _phase "[from] state:create"
   set -a; source "$app_dir/config.env"; CAULDRON_HOST=127.0.0.1; set +a
-  "$python" "$app_dir/manage.py" shell --no-input -c "
+  if ! "$python" "$app_dir/manage.py" shell -c "
 from django.contrib.auth import get_user_model
 User = get_user_model()
 if not User.objects.filter(username='verify-upgrade-user').exists():
@@ -626,7 +628,10 @@ if not User.objects.filter(username='verify-upgrade-user').exists():
     print('created superuser verify-upgrade-user')
 else:
     print('superuser already exists')
-" 2>&1
+" 2>&1; then
+    _fail "[from] representative state creation failed"
+    return 1
+  fi
   _pass "[from] representative state created (superuser)"
 
   # 3. Check out to-ref in the same worktree.
@@ -638,7 +643,7 @@ else:
   local to_wheelhouse
   if [[ -n "$WHEELHOUSE" ]]; then
     to_wheelhouse="$WHEELHOUSE"
-    _verify_wheel_contents "$to_wheelhouse" "[to] " "$to_sha"
+    _verify_wheel_contents "$to_wheelhouse" "[to] " "$to_sha" "$_VERIFY_WORKTREE"
   else
     _phase "[to] wheel:build"
     to_wheelhouse="$_VERIFY_WORKTREE/.wheelhouse-to"
@@ -648,7 +653,7 @@ else:
       _fail "[to] wheel build failed at ${to_sha:0:8}"
       return 1
     fi
-    _verify_wheel_contents "$to_wheelhouse" "[to] "
+    _verify_wheel_contents "$to_wheelhouse" "[to] " "" "$_VERIFY_WORKTREE"
   fi
 
   # 5. Install to-ref packages (force-reinstall to replace from-ref versions).
@@ -682,10 +687,13 @@ else:
   _phase "[to] state:verify"
   set -a; source "$app_dir/config.env"; CAULDRON_HOST=127.0.0.1; set +a
   local count
-  count=$("$python" "$app_dir/manage.py" shell --no-input -c "
+  if ! count=$("$python" "$app_dir/manage.py" shell -c "
 from django.contrib.auth import get_user_model
 print(get_user_model().objects.filter(username='verify-upgrade-user').count())
-" 2>&1 | tail -1)
+" 2>&1 | tail -1); then
+    _fail "[to] state verification command failed"
+    return 1
+  fi
 
   if [[ "${count}" == "1" ]]; then
     _pass "[to] representative state readable after upgrade"

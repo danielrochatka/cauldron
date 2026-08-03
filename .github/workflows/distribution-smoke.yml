@@ -126,7 +126,11 @@ jobs:
           path: wheelhouse/
 
       - name: Verify wheel contents
-        run: python3 tools/verify_wheels.py verify --wheelhouse wheelhouse/
+        run: |
+          python3 tools/verify_wheels.py verify \
+            --wheelhouse wheelhouse/ \
+            --require-sha "$(git rev-parse HEAD)" \
+            --repo-root .
 
   # ── clean-install verification ────────────────────────────────────────────
   clean-install:

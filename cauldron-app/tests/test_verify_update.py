@@ -879,3 +879,261 @@ class TestVerifyUpdatePhaseRunners:
         )
         assert r.returncode != 0, "verify with wrong SHA should fail"
         assert "mismatch" in (r.stdout + r.stderr).lower()
+
+
+# ---------------------------------------------------------------------------
+# Source-aware wheel validation (--repo-root)
+# ---------------------------------------------------------------------------
+
+VERIFY_WHEELS_PY = REPO_DIR / "tools" / "verify_wheels.py"
+
+_PKG = "cauldron_fakepkg"
+_EP_KEY = "cauldron.fake"
+_EP_VAL = "cauldron_fakepkg.module:module"
+
+
+def _make_fake_repo(tmp_path: Path, *,
+                    ep_entries: dict | None = None,
+                    migrations: list[str] | None = None,
+                    templates: list[str] | None = None,
+                    static_files: list[str] | None = None) -> Path:
+    """Minimal fake repo with one sub-package for source-aware validation tests."""
+    repo = tmp_path / "repo"
+    pkg_dir = repo / "packages" / _PKG.replace("_", "-")
+    src = pkg_dir / "src" / _PKG
+    src.mkdir(parents=True)
+    (src / "__init__.py").write_text("")
+
+    ep_section = ""
+    if ep_entries:
+        ep_section = '\n[project.entry-points."cauldron.modules"]\n'
+        for k, v in ep_entries.items():
+            ep_section += f'"{k}" = "{v}"\n'
+
+    (pkg_dir / "pyproject.toml").write_text(
+        f'[build-system]\nrequires = ["setuptools>=68"]\n'
+        f'build-backend = "setuptools.build_meta"\n\n'
+        f"[project]\nname = \"{_PKG.replace('_', '-')}\"\nversion = \"0.1.0\"\n"
+        f"{ep_section}\n"
+        f'[tool.setuptools.packages.find]\nwhere = ["src"]\n'
+    )
+
+    for migration in (migrations or []):
+        mig = src / "migrations" / migration
+        mig.parent.mkdir(parents=True, exist_ok=True)
+        mig.write_text("")
+
+    for template in (templates or []):
+        tmpl = src / "templates" / template
+        tmpl.parent.mkdir(parents=True, exist_ok=True)
+        tmpl.write_text("<html/>")
+
+    for static_file in (static_files or []):
+        sf = src / "static" / static_file
+        sf.parent.mkdir(parents=True, exist_ok=True)
+        sf.write_text("")
+
+    return repo
+
+
+def _make_source_wheel(wh: Path, *,
+                       ep_entries: dict | None = None,
+                       migrations: list[str] | None = None,
+                       templates: list[str] | None = None,
+                       static_files: list[str] | None = None) -> Path:
+    """Wheel for _PKG matching the source layout produced by _make_fake_repo."""
+    whl = wh / f"{_PKG}-0.1.0-py3-none-any.whl"
+    with zipfile.ZipFile(whl, "w") as z:
+        z.writestr(f"{_PKG}-0.1.0.dist-info/METADATA",
+                   f"Metadata-Version: 2.1\nName: {_PKG}\nVersion: 0.1.0\n")
+        z.writestr(f"{_PKG}/__init__.py", "")
+
+        if ep_entries:
+            ep_txt = "[cauldron.modules]\n"
+            for k, v in ep_entries.items():
+                ep_txt += f"{k} = {v}\n"
+            z.writestr(f"{_PKG}-0.1.0.dist-info/entry_points.txt", ep_txt)
+
+        for migration in (migrations or []):
+            z.writestr(f"{_PKG}/migrations/{migration}", "")
+
+        for template in (templates or []):
+            z.writestr(f"{_PKG}/templates/{template}", "<html/>")
+
+        for static_file in (static_files or []):
+            z.writestr(f"{_PKG}/static/{static_file}", "")
+
+    return whl
+
+
+def _run_verify(wh: Path, repo: Path | None = None,
+                require_sha: str | None = None) -> subprocess.CompletedProcess:
+    cmd = ["python3", str(VERIFY_WHEELS_PY), "verify", "--wheelhouse", str(wh)]
+    if require_sha:
+        cmd += ["--require-sha", require_sha]
+    if repo:
+        cmd += ["--repo-root", str(repo)]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+
+
+class TestVerifyWheelsSourceAware:
+
+    def test_all_correct_passes(self, tmp_path):
+        """Wheel with matching ep, migration, template, static → pass."""
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        repo = _make_fake_repo(
+            tmp_path,
+            ep_entries={_EP_KEY: _EP_VAL},
+            migrations=["0001_initial.py"],
+            templates=["fakepkg/base.html"],
+            static_files=["fakepkg/main.css"],
+        )
+        _make_source_wheel(
+            wh,
+            ep_entries={_EP_KEY: _EP_VAL},
+            migrations=["0001_initial.py"],
+            templates=["fakepkg/base.html"],
+            static_files=["fakepkg/main.css"],
+        )
+        r = _run_verify(wh, repo)
+        assert r.returncode == 0, f"Expected pass.\nstdout: {r.stdout}\nstderr: {r.stderr}"
+
+    def test_missing_entry_points_txt_fails(self, tmp_path):
+        """Source declares cauldron.modules ep but wheel has no entry_points.txt → fail."""
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        repo = _make_fake_repo(tmp_path, ep_entries={_EP_KEY: _EP_VAL})
+        _make_source_wheel(wh)  # no ep_entries in wheel
+        r = _run_verify(wh, repo)
+        assert r.returncode != 0, "Should fail: missing entry_points.txt"
+        assert "entry_points" in (r.stdout + r.stderr)
+
+    def test_missing_declared_entry_point_fails(self, tmp_path):
+        """Wheel entry_points.txt lacks a key declared in pyproject.toml → fail."""
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        repo = _make_fake_repo(tmp_path, ep_entries={_EP_KEY: _EP_VAL})
+        # Wheel has entry_points.txt but with a DIFFERENT key
+        whl = wh / f"{_PKG}-0.1.0-py3-none-any.whl"
+        with zipfile.ZipFile(whl, "w") as z:
+            z.writestr(f"{_PKG}-0.1.0.dist-info/METADATA",
+                       f"Metadata-Version: 2.1\nName: {_PKG}\nVersion: 0.1.0\n")
+            z.writestr(f"{_PKG}/__init__.py", "")
+            z.writestr(f"{_PKG}-0.1.0.dist-info/entry_points.txt",
+                       "[cauldron.modules]\ncauldron.other = cauldron_fakepkg.other:module\n")
+        r = _run_verify(wh, repo)
+        assert r.returncode != 0, "Should fail: declared entry point not in wheel"
+        assert "entry point" in (r.stdout + r.stderr)
+
+    def test_missing_migration_fails(self, tmp_path):
+        """Source migration not present in wheel → fail."""
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        repo = _make_fake_repo(tmp_path, migrations=["0001_initial.py"])
+        _make_source_wheel(wh)  # wheel has no migrations
+        r = _run_verify(wh, repo)
+        assert r.returncode != 0, "Should fail: missing migration"
+        assert "migration" in (r.stdout + r.stderr)
+
+    def test_missing_template_fails(self, tmp_path):
+        """Source template not present in wheel → fail."""
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        repo = _make_fake_repo(tmp_path, templates=["fakepkg/base.html"])
+        _make_source_wheel(wh)  # wheel has no templates
+        r = _run_verify(wh, repo)
+        assert r.returncode != 0, "Should fail: missing template"
+        assert "template" in (r.stdout + r.stderr)
+
+    def test_missing_static_fails(self, tmp_path):
+        """Source static file not present in wheel → fail."""
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        repo = _make_fake_repo(tmp_path, static_files=["fakepkg/main.css"])
+        _make_source_wheel(wh)  # wheel has no static
+        r = _run_verify(wh, repo)
+        assert r.returncode != 0, "Should fail: missing static"
+        assert "static" in (r.stdout + r.stderr)
+
+    def test_missing_expected_wheel_fails(self, tmp_path):
+        """Package has cauldron.modules ep but no matching wheel → fail."""
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        repo = _make_fake_repo(tmp_path, ep_entries={_EP_KEY: _EP_VAL})
+        # Add a wheel for a *different* package so the empty-wheelhouse check
+        # doesn't fire first; _PKG still has no wheel despite declaring an ep.
+        other = "cauldron_base"
+        other_pkg_dir = repo / "packages" / "cauldron-base"
+        (other_pkg_dir / "src" / other).mkdir(parents=True)
+        (other_pkg_dir / "src" / other / "__init__.py").write_text("")
+        (other_pkg_dir / "pyproject.toml").write_text(
+            f'[project]\nname = "cauldron-base"\nversion = "0.1.0"\n'
+            f'[tool.setuptools.packages.find]\nwhere = ["src"]\n'
+        )
+        other_whl = wh / f"{other}-0.1.0-py3-none-any.whl"
+        with zipfile.ZipFile(other_whl, "w") as z:
+            z.writestr(f"{other}-0.1.0.dist-info/METADATA",
+                       f"Metadata-Version: 2.1\nName: {other}\nVersion: 0.1.0\n")
+            z.writestr(f"{other}/__init__.py", "")
+        r = _run_verify(wh, repo)
+        assert r.returncode != 0, "Should fail: no wheel for ep-declaring package"
+        assert "no wheel found" in (r.stdout + r.stderr)
+
+    def test_extra_unrecorded_wheel_fails(self, tmp_path):
+        """Wheel in wheelhouse with no matching source package → fail."""
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        repo = _make_fake_repo(tmp_path)  # no ep entries
+        # Put a wheel whose name doesn't match any source package
+        _make_wheel(wh, name="cauldron_unknown_pkg")
+        # also put the expected wheel so the missing-wheel check doesn't trigger
+        _make_source_wheel(wh)
+        r = _run_verify(wh, repo)
+        assert r.returncode != 0, "Should fail: wheel not from any source package"
+        assert "no corresponding source package" in (r.stdout + r.stderr)
+
+    def test_duplicate_distribution_fails(self, tmp_path):
+        """Two wheels with the same distribution name → fail."""
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        repo = _make_fake_repo(tmp_path)
+        # Write two wheels with same label but different versions
+        for ver in ("0.1.0", "0.2.0"):
+            whl = wh / f"{_PKG}-{ver}-py3-none-any.whl"
+            with zipfile.ZipFile(whl, "w") as z:
+                z.writestr(f"{_PKG}-{ver}.dist-info/METADATA",
+                           f"Metadata-Version: 2.1\nName: {_PKG}\nVersion: {ver}\n")
+                z.writestr(f"{_PKG}/__init__.py", "")
+        r = _run_verify(wh, repo)
+        assert r.returncode != 0, "Should fail: duplicate distribution"
+        assert "duplicate" in (r.stdout + r.stderr)
+
+    def test_manifest_extra_disk_wheel_fails(self, tmp_path):
+        """Wheel on disk absent from manifest → fail with --require-sha."""
+        import json, hashlib
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        whl = _make_source_wheel(wh)
+        sha = "abcd1234" * 5
+        # Manifest lists no wheels — wheel on disk is unrecorded
+        manifest = {"source_sha": sha, "wheels": {}}
+        (wh / "manifest.json").write_text(json.dumps(manifest))
+        r = _run_verify(wh, require_sha=sha)
+        assert r.returncode != 0, "Should fail: wheel on disk not in manifest"
+        assert "absent from manifest" in (r.stdout + r.stderr)
+
+    def test_manifest_all_present_passes(self, tmp_path):
+        """All wheels on disk match manifest → pass with --require-sha."""
+        import json, hashlib
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        whl = _make_source_wheel(wh)
+        sha = "abcd1234" * 5
+        digest = hashlib.sha256(whl.read_bytes()).hexdigest()
+        manifest = {"source_sha": sha, "wheels": {whl.name: {"sha256": digest}}}
+        (wh / "manifest.json").write_text(json.dumps(manifest))
+        r = _run_verify(wh, require_sha=sha)
+        assert r.returncode == 0, (
+            f"Expected pass.\nstdout: {r.stdout}\nstderr: {r.stderr}"
+        )

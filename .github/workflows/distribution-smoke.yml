@@ -37,18 +37,18 @@ jobs:
 
       - name: Install all packages (editable)
         run: |
-          pip install -e '.[dev]'
+          # Build one args array: root+dev, all packages, all test fixtures —
+          # single pip invocation so first-party cross-deps resolve in one pass.
+          args=("-e" ".[dev]")
           for pkg in packages/*/; do
             [ -f "${pkg}pyproject.toml" ] || continue
-            pip install -e "$pkg"
+            args+=("-e" "$pkg")
           done
-
-      - name: Install test fixture modules
-        run: |
           for fixture in tests/fixtures/*/; do
             [ -f "${fixture}pyproject.toml" ] || continue
-            pip install -e "$fixture"
+            args+=("-e" "$fixture")
           done
+          pip install "${args[@]}"
 
       - name: Core tests
         run: pytest tests/ -v
@@ -59,7 +59,7 @@ jobs:
             [ -d "${pkg}tests" ] || continue
             [ -f "${pkg}pyproject.toml" ] || continue
             echo "--- pytest $pkg ---"
-            pytest "${pkg}tests/" -v
+            (cd "$pkg" && pytest tests/ -v)
           done
 
   # ── wheel build ───────────────────────────────────────────────────────────
@@ -77,7 +77,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install build tooling
-        run: pip install build wheel
+        run: pip install build
 
       - name: Build root cauldron wheel
         run: python -m build --wheel --outdir wheelhouse .
@@ -89,6 +89,13 @@ jobs:
             echo "Building $pkg..."
             python -m build --wheel --outdir wheelhouse "$pkg"
           done
+
+      - name: Generate wheelhouse manifest
+        run: |
+          SHA=$(git rev-parse HEAD)
+          python3 tools/verify_wheels.py generate-manifest \
+            --wheelhouse wheelhouse \
+            --source-sha "$SHA"
 
       - name: List built wheels
         run: ls -lh wheelhouse/
@@ -119,64 +126,7 @@ jobs:
           path: wheelhouse/
 
       - name: Verify wheel contents
-        run: |
-          python3 - wheelhouse/ <<'PY'
-          import sys, zipfile, re
-          from pathlib import Path
-
-          wheelhouse = Path(sys.argv[1])
-          failures = []
-
-          for whl in sorted(wheelhouse.glob("*.whl")):
-              errors = []
-              with zipfile.ZipFile(whl) as z:
-                  names = z.namelist()
-
-                  # Must have package metadata.
-                  if not any(re.search(r"\.dist-info/METADATA$", n) for n in names):
-                      errors.append("missing METADATA")
-
-                  # Must have Python source.
-                  if not any(n.endswith(".py") for n in names):
-                      errors.append("no .py files")
-
-                  # Verify cauldron.modules entry points are non-empty.
-                  ep_files = [n for n in names if n.endswith("entry_points.txt")]
-                  for ep_file in ep_files:
-                      ep = z.read(ep_file).decode()
-                      if "[cauldron.modules]" in ep:
-                          in_sec, found = False, False
-                          for line in ep.splitlines():
-                              stripped = line.strip()
-                              if stripped == "[cauldron.modules]":
-                                  in_sec = True
-                              elif stripped.startswith("[") and in_sec:
-                                  in_sec = False
-                              elif in_sec and "=" in stripped:
-                                  found = True
-                          if not found:
-                              errors.append("[cauldron.modules] entry point section empty")
-
-                  migrations = [n for n in names if "/migrations/" in n and n.endswith(".py")]
-                  templates  = [n for n in names if "/templates/" in n]
-                  statics    = [n for n in names if "/static/" in n]
-
-              status = "FAIL" if errors else "OK  "
-              details = ", ".join(errors) if errors else (
-                  f"{sum(1 for n in names if n.endswith('.py'))} py "
-                  f"| {len(migrations)} migrations "
-                  f"| {len(templates)} templates "
-                  f"| {len(statics)} static"
-              )
-              print(f"  {status}  {whl.name}: {details}")
-              if errors:
-                  failures.append(whl.name)
-
-          if failures:
-              print(f"\nFAIL: {len(failures)} wheel(s) failed content check", file=sys.stderr)
-              sys.exit(1)
-          print(f"\nAll {sum(1 for _ in wheelhouse.glob('*.whl'))} wheels passed content check.")
-          PY
+        run: python3 tools/verify_wheels.py verify --wheelhouse wheelhouse/
 
   # ── clean-install verification ────────────────────────────────────────────
   clean-install:
@@ -266,8 +216,10 @@ jobs:
             # Start from the current working main — the commit the PR targets.
             # This guarantees FROM_REF includes every merged PR (including #72)
             # rather than an arbitrary ancestor.
+            # Use git rev-parse HEAD (not github.event.pull_request.head.sha) so
+            # TO_REF matches the actual merge commit the wheelhouse was built from.
             FROM="${{ github.event.pull_request.base.sha }}"
-            TO="${{ github.event.pull_request.head.sha }}"
+            TO=$(git rev-parse HEAD)
           else
             # Push to main: use the most recent release tag as FROM_REF.
             # Fall back to HEAD~1 when no tags exist yet.

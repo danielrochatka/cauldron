@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import subprocess
 import textwrap
+import time
 import zipfile
 from pathlib import Path
 
@@ -574,3 +575,307 @@ class TestPhaseReport:
         )
         combined = r.stdout + r.stderr
         assert "Verification report" in combined or "ERROR" in combined
+
+
+# ---------------------------------------------------------------------------
+# Verify-update phase runners: genuine subprocess tests
+# ---------------------------------------------------------------------------
+# These tests exercise _run_django_phases and _run_server_phases by sourcing
+# verify-update (the BASH_SOURCE guard prevents dispatch) and calling each
+# phase runner with a fake worktree whose "python" binary simulates specific
+# failure scenarios.
+# ---------------------------------------------------------------------------
+
+def _make_fake_worktree(
+    tmp_path: Path,
+    *,
+    check_fails: bool = False,
+    migration_check_fails: bool = False,
+    migrate_fails: bool = False,
+    collectstatic_fails: bool = False,
+    site_build_fails: bool = False,
+    server_exits: bool = False,
+    has_frontend: bool = False,
+) -> tuple[Path, Path]:
+    """Create a minimal fake worktree for phase runner tests.
+
+    Returns (worktree_path, calls_log_path).  The fake "python" at
+    .venv/bin/python examines its argument list and exits with the code
+    specified by the scenario flags.
+    """
+    worktree = tmp_path / "worktree"
+    venv_bin = worktree / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    app_dir = worktree / "cauldron-app"
+    (app_dir / "logs").mkdir(parents=True)
+    (app_dir / "data").mkdir()
+    (app_dir / "config.env").write_text("SECRET_KEY=test-key-for-phase-runner-tests\n")
+
+    calls_log = tmp_path / "calls.log"
+    calls_log.touch()
+
+    if has_frontend:
+        frontend = app_dir / "frontend"
+        frontend.mkdir()
+        (frontend / "package.json").write_text('{"name": "test", "scripts": {}}')
+
+    server_exit = "exit 1" if server_exits else "exit 0"
+    python_script = textwrap.dedent(f"""\
+        #!/bin/sh
+        echo "python $*" >> "{calls_log}"
+        case "$*" in
+          *" check"*|*"manage.py check"*)
+            {"exit 1" if check_fails else "exit 0"} ;;
+          *"makemigrations --check"*)
+            {"exit 1" if migration_check_fails else "exit 0"} ;;
+          *" migrate"*)
+            {"exit 1" if migrate_fails else "exit 0"} ;;
+          *"collectstatic"*)
+            {"exit 1" if collectstatic_fails else "exit 0"} ;;
+          *"cauldron_site_build"*)
+            {"exit 1" if site_build_fails else "exit 0"} ;;
+          *"runserver"*)
+            echo "Fake server exiting." >&2
+            {server_exit} ;;
+          *) exit 0 ;;
+        esac
+    """)
+    python_bin = venv_bin / "python"
+    python_bin.write_text(python_script)
+    python_bin.chmod(0o755)
+
+    return worktree, calls_log
+
+
+def _source_and_run_django(
+    worktree: Path,
+    tmp_path: Path,
+    *,
+    extra_env: dict | None = None,
+) -> subprocess.CompletedProcess:
+    """Source verify-update and call _run_django_phases with a fake worktree."""
+    script = textwrap.dedent(f"""\
+        source '{LIB_SH}'
+        source '{VERIFY_UPDATE}'
+        _run_django_phases "{worktree}" ""
+        for line in "${{_PHASE_LOG[@]}}"; do echo "$line"; done
+        [[ "$_OVERALL_OK" -eq 1 ]] && echo "OVERALL_PASS" || echo "OVERALL_FAIL"
+    """)
+    merged = {**os.environ, **(extra_env or {})}
+    return subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True, text=True, timeout=20,
+        env=merged,
+        cwd=str(CAULDRON_APP),
+    )
+
+
+def _source_and_run_server(
+    worktree: Path,
+) -> tuple[subprocess.CompletedProcess, float]:
+    """Source verify-update and call _run_server_phases; return (result, elapsed)."""
+    script = textwrap.dedent(f"""\
+        source '{LIB_SH}'
+        source '{VERIFY_UPDATE}'
+        _run_server_phases "{worktree}" ""
+        for line in "${{_PHASE_LOG[@]}}"; do echo "$line"; done
+        [[ "$_OVERALL_OK" -eq 1 ]] && echo "OVERALL_PASS" || echo "OVERALL_FAIL"
+    """)
+    start = time.monotonic()
+    r = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True, text=True, timeout=40,
+        env=os.environ,
+        cwd=str(CAULDRON_APP),
+    )
+    return r, time.monotonic() - start
+
+
+def _fake_node_npm_env(tmp_path: Path, *, npm_fails: bool = False) -> dict:
+    """Return env dict with fake node and npm stubs in PATH."""
+    fake_bin = tmp_path / "fake_nm_bin"
+    fake_bin.mkdir(exist_ok=True)
+    node = fake_bin / "node"
+    node.write_text("#!/bin/sh\necho 'v22.0.0'\n")
+    node.chmod(0o755)
+    npm = fake_bin / "npm"
+    npm.write_text(f"#!/bin/sh\nexit {'1' if npm_fails else '0'}\n")
+    npm.chmod(0o755)
+    return {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+
+class TestVerifyUpdatePhaseRunners:
+    """Genuine subprocess tests for individual phase runner functions.
+
+    Exercises criteria 2, 3, 6, 7, 9 with real bash invocations but fake
+    worktrees — no real git worktrees, venvs, or Django installs needed.
+    """
+
+    # -- Criterion 2: Django check failure ------------------------------------
+
+    def test_django_check_failure_reports_fail(self, tmp_path):
+        # set -e (from sourcing verify-update) causes bash to exit when
+        # _run_django_phases returns 1, so we check returncode, not text.
+        worktree, _ = _make_fake_worktree(tmp_path, check_fails=True)
+        r = _source_and_run_django(worktree, tmp_path)
+        assert r.returncode != 0, (
+            f"Expected non-zero exit for Django check failure.\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+        assert "OVERALL_PASS" not in (r.stdout + r.stderr)
+
+    # -- Criterion 3: Missing migration ---------------------------------------
+
+    def test_missing_migration_reports_fail(self, tmp_path):
+        worktree, _ = _make_fake_worktree(tmp_path, migration_check_fails=True)
+        r = _source_and_run_django(worktree, tmp_path)
+        assert r.returncode != 0, (
+            f"Expected non-zero exit for missing migration.\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+        assert "OVERALL_PASS" not in (r.stdout + r.stderr)
+
+    # -- Criterion 6: Frontend install failure (npm fails) --------------------
+
+    def test_frontend_npm_failure_reports_fail(self, tmp_path):
+        worktree, _ = _make_fake_worktree(tmp_path, has_frontend=True)
+        env = _fake_node_npm_env(tmp_path, npm_fails=True)
+        r = _source_and_run_django(worktree, tmp_path, extra_env=env)
+        assert r.returncode != 0, (
+            f"Expected non-zero exit when npm fails.\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+        assert "OVERALL_PASS" not in (r.stdout + r.stderr)
+
+    # -- Criterion 7: Site build failure --------------------------------------
+
+    def test_site_build_failure_reports_fail(self, tmp_path):
+        worktree, _ = _make_fake_worktree(tmp_path, has_frontend=True,
+                                          site_build_fails=True)
+        env = _fake_node_npm_env(tmp_path)
+        r = _source_and_run_django(worktree, tmp_path, extra_env=env)
+        assert r.returncode != 0, (
+            f"Expected non-zero exit when site build fails.\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+        assert "OVERALL_PASS" not in (r.stdout + r.stderr)
+
+    # -- Criterion 9: Server exit detected quickly ----------------------------
+
+    def test_server_exit_detected_before_timeout(self, tmp_path):
+        """Server that exits immediately is detected in under 10 s (not 30 s)."""
+        worktree, _ = _make_fake_worktree(tmp_path, server_exits=True)
+        r, elapsed = _source_and_run_server(worktree)
+        assert r.returncode != 0, (
+            f"Expected non-zero exit when server exits immediately.\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+        assert elapsed < 10, (
+            f"Server exit should be detected quickly, but took {elapsed:.1f}s"
+        )
+        assert "OVERALL_PASS" not in (r.stdout + r.stderr)
+
+    # -- Successful all-pass path (no frontend) -------------------------------
+
+    def test_all_phases_pass_without_frontend(self, tmp_path):
+        """All django phases pass when the fake python reports no errors."""
+        worktree, _ = _make_fake_worktree(tmp_path)
+        r = _source_and_run_django(worktree, tmp_path)
+        combined = r.stdout + r.stderr
+        assert "OVERALL_FAIL" not in combined, (
+            f"Expected all phases to pass.\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+        assert "OVERALL_PASS" in combined
+
+    # -- Criterion 17: SKIP for no frontend (reinforced) ---------------------
+
+    def test_no_frontend_emits_skip_not_pass(self, tmp_path):
+        """Without frontend/package.json the site-build phase is SKIP, not PASS."""
+        worktree, _ = _make_fake_worktree(tmp_path, has_frontend=False)
+        r = _source_and_run_django(worktree, tmp_path)
+        assert "SKIP" in r.stdout, (
+            f"Expected SKIP for absent frontend.\nstdout: {r.stdout}"
+        )
+        assert "PASS  site build" not in r.stdout
+
+    # -- tools/verify_wheels.py: generate-manifest and verify -----------------
+
+    def test_generate_manifest_creates_manifest_json(self, tmp_path):
+        """generate-manifest writes manifest.json with source_sha and digests."""
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        _make_wheel(wh, name="cauldron_test")
+        r = subprocess.run(
+            [
+                "python3",
+                str(REPO_DIR / "tools" / "verify_wheels.py"),
+                "generate-manifest",
+                "--wheelhouse", str(wh),
+                "--source-sha", "abc" * 14,  # 42-char test SHA (truncated to 40)
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert r.returncode == 0, f"generate-manifest failed: {r.stderr}"
+        manifest_path = wh / "manifest.json"
+        assert manifest_path.exists(), "manifest.json was not created"
+        import json
+        manifest = json.loads(manifest_path.read_text())
+        assert "source_sha" in manifest
+        assert "wheels" in manifest
+        whl_names = list(manifest["wheels"].keys())
+        assert any("cauldron_test" in n for n in whl_names)
+
+    def test_verify_with_correct_sha_passes(self, tmp_path):
+        """verify --require-sha passes when manifest SHA matches."""
+        import json, hashlib
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        _make_wheel(wh, name="cauldron_test")
+        sha = "abcd1234" * 5  # 40 chars
+        whl_file = next(wh.glob("*.whl"))
+        digest = hashlib.sha256(whl_file.read_bytes()).hexdigest()
+        manifest = {
+            "source_sha": sha,
+            "wheels": {whl_file.name: {"sha256": digest}},
+        }
+        (wh / "manifest.json").write_text(json.dumps(manifest))
+        r = subprocess.run(
+            [
+                "python3",
+                str(REPO_DIR / "tools" / "verify_wheels.py"),
+                "verify",
+                "--wheelhouse", str(wh),
+                "--require-sha", sha,
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert r.returncode == 0, (
+            f"verify with correct SHA should pass.\nstdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+
+    def test_verify_with_wrong_sha_fails(self, tmp_path):
+        """verify --require-sha fails when manifest SHA does not match."""
+        import json, hashlib
+        wh = tmp_path / "wh"
+        wh.mkdir()
+        _make_wheel(wh, name="cauldron_test")
+        whl_file = next(wh.glob("*.whl"))
+        digest = hashlib.sha256(whl_file.read_bytes()).hexdigest()
+        manifest = {
+            "source_sha": "aaaa" * 10,
+            "wheels": {whl_file.name: {"sha256": digest}},
+        }
+        (wh / "manifest.json").write_text(json.dumps(manifest))
+        r = subprocess.run(
+            [
+                "python3",
+                str(REPO_DIR / "tools" / "verify_wheels.py"),
+                "verify",
+                "--wheelhouse", str(wh),
+                "--require-sha", "bbbb" * 10,
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert r.returncode != 0, "verify with wrong SHA should fail"
+        assert "mismatch" in (r.stdout + r.stderr).lower()

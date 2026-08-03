@@ -40,6 +40,11 @@ CAULDRON_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$CAULDRON_DIR")"
 source "$CAULDRON_DIR/lib.sh"
 
+# Use BASH_SOURCE[0] so the path resolves correctly when this script is sourced
+# (e.g. by tests). $0 changes when sourced but BASH_SOURCE[0] does not.
+_VERIFY_UPDATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_VERIFY_WHEELS_PY="$_VERIFY_UPDATE_DIR/../tools/verify_wheels.py"
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -203,109 +208,97 @@ _resolve_ref() {
 # ---------------------------------------------------------------------------
 
 # Build distribution wheels for every first-party Python package in WORKTREE
-# into WHEELHOUSE_DIR.  Requires build and wheel to be installed in the venv.
+# into WHEELHOUSE_DIR, then generate manifest.json with per-wheel sha256
+# digests bound to SOURCE_SHA.
 _build_wheels() {
   local worktree="$1"
   local wheelhouse_dir="$2"
+  local source_sha="$3"
   local venv_python="$worktree/.venv/bin/python"
   local venv_pip="$worktree/.venv/bin/pip"
+  local build_log="$worktree/cauldron-app/logs/pip-build.log"
 
   mkdir -p "$wheelhouse_dir"
 
-  # Ensure build tooling is available.
-  "$venv_pip" install -q build wheel
+  # Install build frontend only; each project's build backend is installed in
+  # an isolated environment by python -m build (PEP 517, no --no-isolation).
+  "$venv_pip" install -q build
 
   # Build root cauldron package.
-  "$venv_python" -m build --wheel --no-isolation \
+  "$venv_python" -m build --wheel \
     --outdir "$wheelhouse_dir" \
     "$worktree" \
-    >> "$worktree/cauldron-app/logs/pip-build.log" 2>&1
+    >> "$build_log" 2>&1 || return 1
 
   # Build each sub-package.
   for pkg in "$worktree/packages"/*/; do
     [[ -f "${pkg}pyproject.toml" ]] || continue
-    "$venv_python" -m build --wheel --no-isolation \
+    "$venv_python" -m build --wheel \
       --outdir "$wheelhouse_dir" \
       "$pkg" \
-      >> "$worktree/cauldron-app/logs/pip-build.log" 2>&1
+      >> "$build_log" 2>&1 || return 1
   done
+
+  # Record source SHA and per-wheel digests so verify-update can confirm the
+  # wheelhouse was built from the exact ref being verified.
+  python3 "$_VERIFY_WHEELS_PY" generate-manifest \
+    --wheelhouse "$wheelhouse_dir" \
+    --source-sha "$source_sha" \
+    >> "$build_log" 2>&1
 }
 
 # Verify that each wheel in WHEELHOUSE_DIR contains the required artifacts.
+# When REQUIRE_SHA is non-empty, also validates manifest.json source_sha and
+# per-wheel sha256 digests (requires _build_wheels to have generated the manifest).
 _verify_wheel_contents() {
   local wheelhouse_dir="$1"
   local label="${2:-}"
+  local require_sha="${3:-}"
   local all_ok=1
 
-  for whl in "$wheelhouse_dir"/*.whl; do
-    [[ -f "$whl" ]] || continue
-    local whl_name
-    whl_name=$(basename "$whl")
-    # Strip version and platform tags to get a human-readable package name.
-    local pkg_label
-    pkg_label=$(echo "$whl_name" | sed 's/-[0-9].*//')
+  local sha_args=()
+  [[ -n "$require_sha" ]] && sha_args=(--require-sha "$require_sha")
 
-    _phase "${label}wheel:${pkg_label}"
+  local output exit_code
+  output=$(python3 "$_VERIFY_WHEELS_PY" verify \
+    --wheelhouse "$wheelhouse_dir" "${sha_args[@]}" 2>&1)
+  exit_code=$?
 
-    local result
-    if result=$(python3 - "$whl" 2>&1 <<'PY'
-import sys, zipfile, re
-
-whl_path = sys.argv[1]
-errors = []
-stats = []
-
-with zipfile.ZipFile(whl_path) as z:
-    names = z.namelist()
-
-    # METADATA must exist (basic wheel structure).
-    metadata = [n for n in names if re.search(r"\.dist-info/METADATA$", n)]
-    if not metadata:
-        errors.append("missing METADATA")
-
-    # Must contain Python source.
-    py_files = [n for n in names if n.endswith(".py")]
-    if not py_files:
-        errors.append("no .py files")
-
-    # If there is an entry_points.txt with a cauldron.modules section, verify
-    # it has at least one non-empty entry.
-    ep_files = [n for n in names if n.endswith("entry_points.txt")]
-    if ep_files:
-        ep_content = z.read(ep_files[0]).decode()
-        if "[cauldron.modules]" in ep_content:
-            in_section = False
-            found_entry = False
-            for line in ep_content.splitlines():
-                stripped = line.strip()
-                if stripped == "[cauldron.modules]":
-                    in_section = True
-                elif stripped.startswith("[") and in_section:
-                    in_section = False
-                elif in_section and "=" in stripped:
-                    found_entry = True
-            if not found_entry:
-                errors.append("[cauldron.modules] entry_point section is empty")
-
-    # Collect stats for informational output.
-    migrations = [n for n in names if "/migrations/" in n and n.endswith(".py")]
-    templates  = [n for n in names if "/templates/" in n]
-    statics    = [n for n in names if "/static/" in n]
-    stats.append(f"{len(py_files)} py, {len(migrations)} migrations, "
-                 f"{len(templates)} templates, {len(statics)} static")
-
-if errors:
-    print("FAIL: " + "; ".join(errors), file=sys.stderr)
-    sys.exit(1)
-print("OK: " + "; ".join(stats))
-PY
-    ); then
-      _pass "${label}wheel:${pkg_label} — ${result#OK: }"
+  # Parse per-wheel result lines emitted by verify_wheels.py.
+  # Format: "OK    <label>: <detail>" or "FAIL  <label>: <detail>" (6-char prefix)
+  local parsed=0
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local status="" pkg_label="" detail="" rest=""
+    if [[ "$line" == "OK    "* ]]; then
+      status="OK"
+      rest="${line:6}"
+      pkg_label="${rest%%:*}"
+      detail="${rest#*: }"
+    elif [[ "$line" == "FAIL  "* ]]; then
+      status="FAIL"
+      rest="${line:6}"
+      pkg_label="${rest%%:*}"
+      detail="${rest#*: }"
     else
-      _fail "${label}wheel:${pkg_label} — ${result#FAIL: }"
+      continue
+    fi
+    _phase "${label}wheel:${pkg_label}"
+    if [[ "$status" == "OK" ]]; then
+      _pass "${label}wheel:${pkg_label} — ${detail}"
+    else
+      _fail "${label}wheel:${pkg_label} — ${detail}"
       all_ok=0
     fi
-  done
+    parsed=1
+  done <<< "$output"
+
+  # If verify_wheels.py exited non-zero but produced no parseable per-wheel
+  # lines (e.g. manifest SHA mismatch or empty wheelhouse), surface the error.
+  if [[ "$exit_code" -ne 0 && "$parsed" -eq 0 ]]; then
+    _fail "${label}wheel validation: ${output}"
+    all_ok=0
+  fi
 
   [[ "$all_ok" -eq 1 ]]
 }
@@ -313,7 +306,11 @@ PY
 # Install all Python packages into WORKTREE/.venv from either:
 #   (a) a pre-built wheelhouse (when WHEELHOUSE arg is non-empty), or
 #   (b) editable source installs from the worktree.
-# PyPI dependencies from requirements.txt are always fetched normally.
+#
+# In both cases a single pip invocation is used so that pip can resolve
+# first-party packages (including cauldron-site-astro, which is listed in
+# requirements.txt) from the provided wheels or editable paths rather than
+# attempting a PyPI download.
 _install_packages() {
   local worktree="$1"
   local wheelhouse="${2:-}"
@@ -322,24 +319,30 @@ _install_packages() {
   local pip_log="$worktree/cauldron-app/logs/pip-install.log"
 
   if [[ -n "$wheelhouse" ]]; then
-    # Install from pre-built wheels.  PyPI deps come from requirements.txt;
-    # first-party packages come from the wheelhouse (no editable paths).
-    "$venv_pip" install -q -r "$req" \
-      >> "$pip_log" 2>&1
-    # shellcheck disable=SC2086
     local whl_files=("$wheelhouse"/*.whl)
-    if [[ ${#whl_files[@]} -gt 0 && -f "${whl_files[0]}" ]]; then
-      "$venv_pip" install -q "${whl_files[@]}" \
-        >> "$pip_log" 2>&1
+    if [[ ${#whl_files[@]} -eq 0 || ! -f "${whl_files[0]}" ]]; then
+      _fail "packages: no wheels found in wheelhouse ${wheelhouse}"
+      return 1
+    fi
+    # Single invocation: pip satisfies requirements.txt AND first-party wheels
+    # together, so packages like cauldron-site-astro resolve from the wheelhouse
+    # instead of PyPI.
+    if ! "$venv_pip" install -q -r "$req" "${whl_files[@]}" >> "$pip_log" 2>&1; then
+      _fail "package installation failed"
+      return 1
     fi
   else
-    # Editable installs from source (default: development / no pre-built wheels).
+    # Editable installs from source — single invocation covers the root package
+    # and every sub-package so cross-dependency resolution works in one pass.
     local args=(-q -r "$req" -e "$worktree")
     for pkg in "$worktree/packages"/*/; do
       [[ -f "${pkg}pyproject.toml" ]] || continue
       args+=(-e "$pkg")
     done
-    "$venv_pip" install "${args[@]}" >> "$pip_log" 2>&1
+    if ! "$venv_pip" install "${args[@]}" >> "$pip_log" 2>&1; then
+      _fail "package installation failed"
+      return 1
+    fi
   fi
 }
 
@@ -369,12 +372,12 @@ _setup_worktree() {
   mkdir -p "$app_dir/logs"
 
   if [[ -n "$wheelhouse" ]]; then
-    # Wheel-content verification happens before install.
-    _verify_wheel_contents "$wheelhouse" ""
+    # Verify wheel contents and confirm the manifest was built from this SHA.
+    _verify_wheel_contents "$wheelhouse" "" "$sha"
   else
     # Build wheels from source, then verify their contents.
     _phase "wheel:build"
-    if _build_wheels "$worktree" "$worktree/.wheelhouse" 2>&1; then
+    if _build_wheels "$worktree" "$worktree/.wheelhouse" "$sha"; then
       _pass "wheels built from ${sha:0:8}"
     else
       _fail "wheel build failed at ${sha:0:8}"
@@ -385,7 +388,9 @@ _setup_worktree() {
   fi
 
   _phase "packages"
-  _install_packages "$worktree" "$wheelhouse"
+  if ! _install_packages "$worktree" "$wheelhouse"; then
+    return 1
+  fi
   _pass "packages installed (${sha:0:8})"
 
   _phase "config"
@@ -633,11 +638,11 @@ else:
   local to_wheelhouse
   if [[ -n "$WHEELHOUSE" ]]; then
     to_wheelhouse="$WHEELHOUSE"
-    _verify_wheel_contents "$to_wheelhouse" "[to] "
+    _verify_wheel_contents "$to_wheelhouse" "[to] " "$to_sha"
   else
     _phase "[to] wheel:build"
     to_wheelhouse="$_VERIFY_WORKTREE/.wheelhouse-to"
-    if _build_wheels "$_VERIFY_WORKTREE" "$to_wheelhouse" 2>&1; then
+    if _build_wheels "$_VERIFY_WORKTREE" "$to_wheelhouse" "$to_sha"; then
       _pass "[to] wheels built from ${to_sha:0:8}"
     else
       _fail "[to] wheel build failed at ${to_sha:0:8}"
@@ -652,16 +657,21 @@ else:
   local pip_log="$app_dir/logs/pip-install-upgrade.log"
   local whl_files=("$to_wheelhouse"/*.whl)
   if [[ ${#whl_files[@]} -gt 0 && -f "${whl_files[0]}" ]]; then
-    "$venv_pip" install -q --force-reinstall "${whl_files[@]}" \
-      >> "$pip_log" 2>&1
+    if ! "$venv_pip" install -q --force-reinstall "${whl_files[@]}" \
+        >> "$pip_log" 2>&1; then
+      _fail "[to] package upgrade failed"
+      return 1
+    fi
   else
-    # Fall back to editable installs if no wheels were built.
     local args=(-q -e "$_VERIFY_WORKTREE")
     for pkg in "$_VERIFY_WORKTREE/packages"/*/; do
       [[ -f "${pkg}pyproject.toml" ]] || continue
       args+=(-e "$pkg")
     done
-    "$venv_pip" install "${args[@]}" >> "$pip_log" 2>&1
+    if ! "$venv_pip" install "${args[@]}" >> "$pip_log" 2>&1; then
+      _fail "[to] package upgrade failed"
+      return 1
+    fi
   fi
   _pass "[to] packages upgraded to ${to_sha:0:8}"
 

@@ -12,8 +12,6 @@ class CauldronConfig(AppConfig):
 
     def ready(self) -> None:
         """Register system checks and activate the module runtime."""
-        from pathlib import Path
-
         from django.conf import settings
 
         from . import checks  # noqa: F401
@@ -36,9 +34,7 @@ class CauldronConfig(AppConfig):
 
         capability_overrides: dict = getattr(settings, "CAULDRON_CAPABILITY_PROVIDERS", {})
 
-        _pmr = getattr(settings, "CAULDRON_PROJECT_MODULE_ROOT", None)
-        project_module_root = Path(_pmr) if _pmr is not None else None
-
+        project_module_root = getattr(settings, "CAULDRON_PROJECT_MODULE_ROOT", None)
         result = discover_modules(project_module_root=project_module_root)
         registry.populate(
             result.modules,

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -51,7 +52,7 @@ def compose_django_settings(
     context_processors: Sequence[str] = (),
     module_settings: dict[str, Any] | None = None,
     capability_providers: dict[str, str] | None = None,
-    project_module_root: Path | None = None,
+    project_module_root: str | os.PathLike[str] | None = None,
 ) -> SettingsPlan:
     """Compose Django settings from installed Cauldron modules.
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
 import sys
 from dataclasses import dataclass
 from importlib.metadata import entry_points
@@ -16,6 +17,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 ENTRY_POINT_GROUP = "cauldron.modules"
+
+# Sentinel for missing attributes (distinguishes "not set" from None).
+_MISSING = object()
+
+# Directory names that are silently skipped during project-module scanning.
+_IGNORED_DIR_NAMES: frozenset[str] = frozenset({
+    "build", "dist",
+})
 
 # Source types: "package" for entry-point discoveries (#33); "project" is
 # reserved for project-folder discovery (#34) and must not be produced here.
@@ -403,6 +412,73 @@ def _validate_manifest(
     return errors
 
 
+def _is_under(path: Path, root: Path) -> bool:
+    """Return True if path is root or is under root."""
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _normalize_project_root(
+    value: Any,
+) -> tuple[Path | None, list[DiscoveryError]]:
+    """Normalize a raw CAULDRON_PROJECT_MODULE_ROOT value to a Path.
+
+    Returns ``(path, [])`` on success, ``(None, [error])`` on failure.
+    Does NOT check whether the path exists — that is ``_discover_project_modules``'s job.
+    """
+    if value is None:
+        return None, []
+
+    # bool is a subclass of int; check it first.
+    if isinstance(value, bool):
+        return None, [DiscoveryError(
+            entry_point_name="",
+            kind="project_path",
+            message=(
+                "CAULDRON_PROJECT_MODULE_ROOT must be a path string or Path object,"
+                f" got {type(value).__name__!r}."
+            ),
+        )]
+
+    if isinstance(value, int):
+        return None, [DiscoveryError(
+            entry_point_name="",
+            kind="project_path",
+            message=(
+                "CAULDRON_PROJECT_MODULE_ROOT must be a path string or Path object,"
+                f" got {type(value).__name__!r}."
+            ),
+        )]
+
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None, [DiscoveryError(
+                entry_point_name="",
+                kind="project_path",
+                message=(
+                    "CAULDRON_PROJECT_MODULE_ROOT must not be an empty or"
+                    " whitespace-only string."
+                ),
+            )]
+        return Path(stripped), []
+
+    if isinstance(value, os.PathLike):
+        return Path(value), []
+
+    return None, [DiscoveryError(
+        entry_point_name="",
+        kind="project_path",
+        message=(
+            "CAULDRON_PROJECT_MODULE_ROOT must be a path string or Path object,"
+            f" got {type(value).__name__!r}."
+        ),
+    )]
+
+
 def _discover_project_modules(
     root: Path,
     *,
@@ -440,15 +516,28 @@ def _discover_project_modules(
         ))
         return records, errors
 
-    resolved = str(root.resolve())
-    if resolved not in sys.path:
-        sys.path.insert(0, resolved)
+    # Resolve the canonical root once; used for path-escape checks below.
+    try:
+        canonical_root = root.resolve()
+    except OSError as exc:
+        errors.append(DiscoveryError(
+            entry_point_name="",
+            kind="project_path",
+            message=(
+                f"CAULDRON_PROJECT_MODULE_ROOT could not be resolved:"
+                f" {type(exc).__name__}."
+            ),
+        ))
+        return records, errors
+
+    # Idempotent sys.path insertion (compare resolved string representations).
+    canonical_root_str = str(canonical_root)
+    resolved_paths = {str(Path(p).resolve()) for p in sys.path if p}
+    if canonical_root_str not in resolved_paths:
+        sys.path.insert(0, canonical_root_str)
 
     try:
-        candidates = sorted(
-            e for e in root.iterdir()
-            if e.is_dir() and (e / "__init__.py").is_file()
-        )
+        all_entries = sorted(root.iterdir(), key=lambda e: e.name)
     except OSError as exc:
         errors.append(DiscoveryError(
             entry_point_name="",
@@ -460,45 +549,197 @@ def _discover_project_modules(
         ))
         return records, errors
 
-    for entry in candidates:
+    def _module_origin_ok(mod_obj: Any, expected_dir: Path) -> bool:
+        """Check that an imported module's actual location is inside expected_dir."""
+        file_ = getattr(mod_obj, "__file__", None)
+        if file_ is not None:
+            try:
+                return _is_under(Path(file_).resolve(), expected_dir)
+            except OSError:
+                return False
+        # Package with __path__ but no __file__ (namespace package)
+        path_ = getattr(mod_obj, "__path__", None)
+        if path_ is not None:
+            for p in path_:
+                try:
+                    if _is_under(Path(p).resolve(), expected_dir):
+                        return True
+                except OSError:
+                    pass
+            return False
+        return False
+
+    for entry in all_entries:
         dir_name = entry.name
-        # Skip private packages and names that aren't valid Python identifiers.
-        if not dir_name.isidentifier() or dir_name.startswith("_"):
+
+        # --- Silently ignore hidden, dunder, build/dist, and egg-info dirs ---
+        if not entry.is_dir():
+            continue
+        if dir_name.startswith("."):
+            continue
+        if dir_name.startswith("__") and dir_name.endswith("__"):
+            continue
+        if dir_name in _IGNORED_DIR_NAMES:
+            continue
+        if dir_name.endswith(".egg-info"):
             continue
 
+        # ---- All remaining directory entries are "visible candidates" -------
         ep_name = f"modules/{dir_name}"
         src = _ProjectSource(name=ep_name, value=dir_name)
 
-        # --- Load ----------------------------------------------------------
-        try:
-            mod_obj = importlib.import_module(dir_name)
-        except Exception as exc:
+        # 1. Invalid identifier
+        if not dir_name.isidentifier():
             errors.append(DiscoveryError(
                 entry_point_name=ep_name,
-                kind="load_failure",
+                kind="project_path",
                 message=(
-                    f"Project module {ep_name!r} raised {type(exc).__name__}"
-                    " on import."
+                    f"Project module directory {dir_name!r} is not a valid"
+                    " Python identifier."
                 ),
             ))
-            logger.debug(
-                "Project module %r failed to import: %s",
-                ep_name, exc,
-                exc_info=True,
-            )
             continue
 
-        obj = getattr(mod_obj, "module", None)
-        if obj is None:
+        # 2. Missing __init__.py
+        if not (entry / "__init__.py").exists():
             errors.append(DiscoveryError(
                 entry_point_name=ep_name,
-                kind="load_failure",
+                kind="project_path",
                 message=(
-                    f"Project module {ep_name!r}: package {dir_name!r} has"
-                    " no 'module' attribute."
+                    f"Project module directory {dir_name!r} has no __init__.py."
                 ),
             ))
             continue
+
+        # 3. Candidate path escapes root
+        try:
+            resolved_entry = entry.resolve()
+        except OSError as exc:
+            errors.append(DiscoveryError(
+                entry_point_name=ep_name,
+                kind="project_path",
+                message=(
+                    f"Project module directory {dir_name!r} could not be"
+                    f" resolved: {type(exc).__name__}."
+                ),
+            ))
+            continue
+
+        if not _is_under(resolved_entry, canonical_root):
+            errors.append(DiscoveryError(
+                entry_point_name=ep_name,
+                kind="project_path",
+                message=(
+                    f"Project module directory {dir_name!r} resolves outside"
+                    " the project root."
+                ),
+            ))
+            continue
+
+        # 4. __init__.py escapes root
+        try:
+            resolved_init = (entry / "__init__.py").resolve()
+        except OSError as exc:
+            errors.append(DiscoveryError(
+                entry_point_name=ep_name,
+                kind="project_path",
+                message=(
+                    f"Project module {dir_name!r}: __init__.py could not be"
+                    f" resolved: {type(exc).__name__}."
+                ),
+            ))
+            continue
+
+        if not _is_under(resolved_init, canonical_root):
+            errors.append(DiscoveryError(
+                entry_point_name=ep_name,
+                kind="project_path",
+                message=(
+                    f"Project module {dir_name!r}: __init__.py resolves"
+                    " outside the project root."
+                ),
+            ))
+            continue
+
+        # --- sys.modules collision check -----------------------------------
+        existing = sys.modules.get(dir_name)
+        if existing is not None:
+            if not _module_origin_ok(existing, resolved_entry):
+                errors.append(DiscoveryError(
+                    entry_point_name=ep_name,
+                    kind="project_path",
+                    message=(
+                        f"Project module {dir_name!r} is already imported"
+                        " from a different location; skipping to avoid"
+                        " collision."
+                    ),
+                ))
+                continue
+            # Already imported from the correct place — reuse it.
+            mod_obj = existing
+        else:
+            # --- Load ------------------------------------------------------
+            importlib.invalidate_caches()
+            try:
+                mod_obj = importlib.import_module(dir_name)
+            except Exception as exc:
+                errors.append(_make_error(
+                    src, "load_failure",
+                    f"Project module {ep_name!r} raised {type(exc).__name__}"
+                    " on import.",
+                ))
+                logger.debug(
+                    "Project module %r failed to import: %s",
+                    ep_name, exc,
+                    exc_info=True,
+                )
+                continue
+
+            # Verify the newly imported module came from the expected place.
+            if not _module_origin_ok(mod_obj, resolved_entry):
+                errors.append(DiscoveryError(
+                    entry_point_name=ep_name,
+                    kind="project_path",
+                    message=(
+                        f"Project module {dir_name!r} was imported but its"
+                        " actual location differs from the expected directory;"
+                        " skipping to avoid collision."
+                    ),
+                ))
+                continue
+
+        # --- Access 'module' attribute with guard --------------------------
+        try:
+            raw_obj = getattr(mod_obj, "module", _MISSING)
+        except Exception as exc:
+            errors.append(_make_error(
+                src, "load_failure",
+                f"Project module {ep_name!r}: accessing 'module' attribute"
+                f" raised {type(exc).__name__}.",
+            ))
+            continue
+
+        if raw_obj is _MISSING:
+            errors.append(_make_error(
+                src, "load_failure",
+                f"Project module {ep_name!r}: package {dir_name!r} has"
+                " no 'module' attribute.",
+            ))
+            continue
+
+        # --- Callable factory handling (same as entry points) --------------
+        from . import CauldronModule as _CauldronModule
+        obj = raw_obj
+        if callable(obj) and not isinstance(obj, _CauldronModule):
+            try:
+                obj = obj()
+            except Exception as exc:
+                errors.append(_make_error(
+                    src, "load_failure",
+                    f"Project module {ep_name!r}: calling module factory"
+                    f" raised {type(exc).__name__}.",
+                ))
+                continue
 
         # --- Manifest validation -------------------------------------------
         validation_errors = _validate_manifest(src, obj)
@@ -514,14 +755,11 @@ def _discover_project_modules(
         if slug in seen_slugs:
             accepted_ep_name, accepted_pkg_name = seen_slugs[slug]
             pkg_note = f" (package {accepted_pkg_name!r})" if accepted_pkg_name else ""
-            errors.append(DiscoveryError(
-                entry_point_name=ep_name,
-                kind="duplicate_slug",
-                message=(
-                    f"Module slug {slug!r} registered by project module"
-                    f" {ep_name!r} conflicts with {accepted_ep_name!r}"
-                    f"{pkg_note}; duplicate is ignored."
-                ),
+            errors.append(_make_error(
+                src, "duplicate_slug",
+                f"Module slug {slug!r} registered by project module"
+                f" {ep_name!r} conflicts with {accepted_ep_name!r}"
+                f"{pkg_note}; duplicate is ignored.",
                 candidate_slug=slug,
                 accepted_entry_point_name=accepted_ep_name,
                 accepted_package_name=accepted_pkg_name,
@@ -552,7 +790,7 @@ def _discover_project_modules(
 def discover_modules(
     *,
     entry_point_group: str = ENTRY_POINT_GROUP,
-    project_module_root: Path | None = None,
+    project_module_root: str | os.PathLike[str] | None = None,
 ) -> DiscoveryResult:
     """Discover installed Cauldron modules via Python entry points.
 
@@ -577,11 +815,14 @@ def discover_modules(
 
     # --- Project-folder pass (first, so project modules win slug races) ----
     if project_module_root is not None:
-        proj_records, proj_errors = _discover_project_modules(
-            project_module_root, seen_slugs=seen_slugs,
-        )
-        records.extend(proj_records)
-        errors.extend(proj_errors)
+        norm_root, norm_errors = _normalize_project_root(project_module_root)
+        errors.extend(norm_errors)
+        if norm_root is not None:
+            proj_records, proj_errors = _discover_project_modules(
+                norm_root, seen_slugs=seen_slugs,
+            )
+            records.extend(proj_records)
+            errors.extend(proj_errors)
 
     # --- Entry-point pass --------------------------------------------------
     raw_eps = entry_points(group=entry_point_group)
@@ -635,12 +876,15 @@ def discover_modules(
         slug = obj.slug
         if slug in seen_slugs:
             accepted_ep_name, accepted_pkg_name = seen_slugs[slug]
+            accepted_pkg_note = (
+                f" (package {accepted_pkg_name!r})" if accepted_pkg_name else ""
+            )
             errors.append(_make_error(
                 src, "duplicate_slug",
                 f"Module slug {slug!r} registered by {src.name!r}"
                 f" (package {src.display_package_name!r}) conflicts with"
                 f" {accepted_ep_name!r}"
-                f" (package {accepted_pkg_name!r}); duplicate is ignored.",
+                f"{accepted_pkg_note}; duplicate is ignored.",
                 candidate_slug=slug,
                 accepted_entry_point_name=accepted_ep_name,
                 accepted_package_name=accepted_pkg_name,
@@ -676,7 +920,7 @@ def get_module_apps(
     *,
     capability_overrides: dict[str, str] | None = None,
     entry_point_group: str = ENTRY_POINT_GROUP,
-    project_module_root: Path | None = None,
+    project_module_root: str | os.PathLike[str] | None = None,
 ) -> list[str]:
     """Return Django app labels for the given enabled module slugs in dependency order.
 

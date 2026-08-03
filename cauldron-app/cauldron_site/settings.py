@@ -92,6 +92,19 @@ CAULDRON_MODULES = {
 }
 
 # ---------------------------------------------------------------------------
+# Cauldron project-level modules
+#
+# Set CAULDRON_PROJECT_MODULE_ROOT to a directory of local Python packages
+# that each expose a ``module`` attribute satisfying the CauldronModule
+# protocol.  These are discovered alongside installed-package modules and
+# take priority on slug conflicts.  Defaults to BASE_DIR/modules/ when that
+# directory exists; leave unset (or set to None) to disable project discovery.
+# ---------------------------------------------------------------------------
+
+_project_modules_dir = BASE_DIR / "modules"
+CAULDRON_PROJECT_MODULE_ROOT = _project_modules_dir if _project_modules_dir.is_dir() else None
+
+# ---------------------------------------------------------------------------
 # Django application composition
 # ---------------------------------------------------------------------------
 
@@ -182,19 +195,6 @@ STORAGES = {
         "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
     },
 }
-
-# ---------------------------------------------------------------------------
-# Cauldron project-level modules
-#
-# Set CAULDRON_PROJECT_MODULE_ROOT to a directory of local Python packages
-# that each expose a ``module`` attribute satisfying the CauldronModule
-# protocol.  These are discovered alongside installed-package modules and
-# take priority on slug conflicts.  Defaults to BASE_DIR/modules/ when that
-# directory exists; leave unset (or set to None) to disable project discovery.
-# ---------------------------------------------------------------------------
-
-_project_modules_dir = BASE_DIR / "modules"
-CAULDRON_PROJECT_MODULE_ROOT = _project_modules_dir if _project_modules_dir.is_dir() else None
 
 # ---------------------------------------------------------------------------
 # Cauldron UI override directory

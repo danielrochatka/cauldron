@@ -930,22 +930,230 @@ class TestProjectModuleDiscovery:
         project_recs = [rec for rec in r.records if rec.source_type == "project"]
         assert project_recs == []
 
-    def test_discovery_skips_dirs_without_init(self, tmp_path):
-        (tmp_path / "no_init").mkdir()
+    def test_missing_init_produces_project_path_error(self, tmp_path):
+        (tmp_path / "nomod").mkdir()
         r = discover_modules(project_module_root=tmp_path)
-        project_recs = [rec for rec in r.records if rec.source_type == "project"]
-        assert project_recs == []
+        errors = [e for e in r.errors if e.kind == "project_path"]
+        assert len(errors) == 1
 
-    def test_discovery_skips_private_dirs(self, tmp_path):
-        private = tmp_path / "_private"
-        private.mkdir()
-        (private / "__init__.py").write_text(
+    def test_ignored_hidden_dir_silently_skipped(self, tmp_path):
+        hidden = tmp_path / ".hidden"
+        hidden.mkdir()
+        (hidden / "__init__.py").write_text("module = object()")
+        r = discover_modules(project_module_root=tmp_path)
+        assert not any(e.kind == "project_path" for e in r.errors)
+
+    def test_ignored_dunder_dir_silently_skipped(self, tmp_path):
+        dunder = tmp_path / "__cache__"
+        dunder.mkdir()
+        (dunder / "__init__.py").write_text("module = object()")
+        r = discover_modules(project_module_root=tmp_path)
+        assert not any(e.kind == "project_path" for e in r.errors)
+
+    def test_ignored_build_dir_silently_skipped(self, tmp_path):
+        build = tmp_path / "build"
+        build.mkdir()
+        (build / "__init__.py").write_text("module = object()")
+        r = discover_modules(project_module_root=tmp_path)
+        assert not any(e.kind == "project_path" for e in r.errors)
+
+    def test_ignored_dist_dir_silently_skipped(self, tmp_path):
+        dist = tmp_path / "dist"
+        dist.mkdir()
+        (dist / "__init__.py").write_text("module = object()")
+        r = discover_modules(project_module_root=tmp_path)
+        assert not any(e.kind == "project_path" for e in r.errors)
+
+    def test_ignored_egg_info_dir_silently_skipped(self, tmp_path):
+        egg = tmp_path / "mymod.egg-info"
+        egg.mkdir()
+        r = discover_modules(project_module_root=tmp_path)
+        assert not any(e.kind == "project_path" for e in r.errors)
+
+    def test_invalid_identifier_produces_project_path_error(self, tmp_path):
+        bad = tmp_path / "my-module"
+        bad.mkdir()
+        (bad / "__init__.py").write_text("x = 1")
+        r = discover_modules(project_module_root=tmp_path)
+        errors = [e for e in r.errors if e.kind == "project_path"]
+        assert len(errors) == 1
+        assert "my-module" in errors[0].message
+
+    def test_string_path_accepted(self, tmp_path):
+        _write_project_module(tmp_path, dir_name="mymod", slug="mymod.pkg")
+        r = discover_modules(project_module_root=str(tmp_path))
+        project_recs = [rec for rec in r.records if rec.source_type == "project"]
+        assert len(project_recs) == 1
+
+    def test_path_object_accepted(self, tmp_path):
+        _write_project_module(tmp_path, dir_name="mymod", slug="mymod.pkg")
+        r = discover_modules(project_module_root=tmp_path)  # Path object
+        project_recs = [rec for rec in r.records if rec.source_type == "project"]
+        assert len(project_recs) == 1
+
+    def test_pathlike_object_accepted(self, tmp_path):
+        import os
+
+        class FakePath(os.PathLike):
+            def __fspath__(self): return str(tmp_path)
+
+        _write_project_module(tmp_path, dir_name="mymod", slug="mymod.pkg")
+        r = discover_modules(project_module_root=FakePath())
+        project_recs = [rec for rec in r.records if rec.source_type == "project"]
+        assert len(project_recs) == 1
+
+    def test_integer_produces_project_path_error(self):
+        r = discover_modules(project_module_root=42)
+        errors = [e for e in r.errors if e.kind == "project_path"]
+        assert len(errors) == 1
+
+    def test_bool_produces_project_path_error(self):
+        r = discover_modules(project_module_root=True)
+        errors = [e for e in r.errors if e.kind == "project_path"]
+        assert len(errors) == 1
+
+    def test_empty_string_produces_project_path_error(self):
+        r = discover_modules(project_module_root="")
+        errors = [e for e in r.errors if e.kind == "project_path"]
+        assert len(errors) == 1
+
+    def test_whitespace_only_string_produces_project_path_error(self):
+        r = discover_modules(project_module_root="   ")
+        errors = [e for e in r.errors if e.kind == "project_path"]
+        assert len(errors) == 1
+
+    def test_empty_string_does_not_resolve_to_cwd(self):
+        """An empty string must error, not silently resolve to Path('.') = cwd."""
+        r = discover_modules(project_module_root="")
+        assert not any(rec.source_type == "project" for rec in r.records)
+        assert any(e.kind == "project_path" for e in r.errors)
+
+    def test_candidate_symlink_escape_produces_error(self, tmp_path):
+        external = tmp_path / "external_real"
+        external.mkdir()
+        (external / "__init__.py").write_text(
             "from cauldron.modules import BaseModule, ModuleManifest\n"
-            "module = BaseModule(ModuleManifest(slug='priv.mod', label='P'))\n"
+            "module = BaseModule(ModuleManifest(slug='ext.mod', label='Ext'))\n"
+        )
+        modules_root = tmp_path / "modules"
+        modules_root.mkdir()
+        link = modules_root / "ext_link"
+        link.symlink_to(external)  # symlink to dir outside modules_root
+        r = discover_modules(project_module_root=modules_root)
+        errors = [e for e in r.errors if e.kind == "project_path"]
+        assert len(errors) == 1
+
+    def test_init_symlink_escape_produces_error(self, tmp_path):
+        # __init__.py is a symlink pointing outside the project root
+        modules_root = tmp_path / "modules"
+        modules_root.mkdir()
+        external_init = tmp_path / "evil_init.py"
+        external_init.write_text("module = object()")
+        pkg = modules_root / "mymod"
+        pkg.mkdir()
+        (pkg / "__init__.py").symlink_to(external_init)  # escapes modules_root
+        r = discover_modules(project_module_root=modules_root)
+        errors = [e for e in r.errors if e.kind == "project_path"]
+        assert len(errors) == 1
+
+    def test_safe_internal_symlink_is_accepted(self, tmp_path):
+        modules_root = tmp_path / "modules"
+        modules_root.mkdir()
+        real_pkg = modules_root / "real_mymod"
+        real_pkg.mkdir()
+        (real_pkg / "__init__.py").write_text(
+            "from cauldron.modules import BaseModule, ModuleManifest\n"
+            "module = BaseModule(ModuleManifest(slug='safe.mod', label='Safe'))\n"
+        )
+        # A symlink INSIDE the modules_root pointing to another dir inside
+        link_pkg = modules_root / "alias_mymod"
+        link_pkg.symlink_to(real_pkg)
+        r = discover_modules(project_module_root=modules_root)
+        # Both the real dir and symlink may succeed if they both pass path checks
+        # At minimum, no project_path errors for the valid internal symlink
+        project_path_errors = [e for e in r.errors if e.kind == "project_path"]
+        # Internal symlink is safe — should not produce project_path errors
+        assert all("real_mymod" not in e.message and "alias_mymod" not in e.message
+                   for e in project_path_errors)
+
+    def test_absolute_path_absent_from_error_messages(self, tmp_path):
+        external = tmp_path / "outside"
+        external.mkdir()
+        modules_root = tmp_path / "modules"
+        modules_root.mkdir()
+        link = modules_root / "link"
+        link.symlink_to(external)
+        (link / "__init__.py").write_text("x = 1")  # will error since link escapes
+        r = discover_modules(project_module_root=modules_root)
+        for e in r.errors:
+            assert str(tmp_path) not in e.message, (
+                f"Absolute path leaked into error message: {e.message!r}"
+            )
+
+    def test_existing_sys_modules_package_outside_root_produces_error(self, tmp_path):
+        """If a top-level name is already in sys.modules from elsewhere, error."""
+        import types
+        modules_root = tmp_path / "modules"
+        modules_root.mkdir()
+        pkg = modules_root / "outsidepkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text(
+            "from cauldron.modules import BaseModule, ModuleManifest\n"
+            "module = BaseModule(ModuleManifest(slug='out.pkg', label='Out'))\n"
+        )
+        # Inject a fake module into sys.modules as if imported from elsewhere
+        fake_mod = types.ModuleType("outsidepkg")
+        fake_mod.__file__ = str(tmp_path / "other_location" / "outsidepkg" / "__init__.py")
+        sys.modules["outsidepkg"] = fake_mod
+        try:
+            r = discover_modules(project_module_root=modules_root)
+            errors = [e for e in r.errors if e.kind == "project_path"]
+            assert len(errors) == 1
+        finally:
+            sys.modules.pop("outsidepkg", None)
+
+    def test_callable_factory_module_is_accepted(self, tmp_path):
+        """If module attribute is a callable factory, calling it should work."""
+        pkg = tmp_path / "factmod"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text(
+            "from cauldron.modules import BaseModule, ModuleManifest\n"
+            "def module():\n"
+            "    return BaseModule(ModuleManifest(slug='fact.mod', label='Factory'))\n"
         )
         r = discover_modules(project_module_root=tmp_path)
         project_recs = [rec for rec in r.records if rec.source_type == "project"]
-        assert project_recs == []
+        assert len(project_recs) == 1
+        assert project_recs[0].slug == "fact.mod"
+
+    def test_module_attr_access_raising_produces_load_failure(self, tmp_path):
+        """If module attribute access raises, produce load_failure error."""
+        pkg = tmp_path / "raisemod"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text(
+            "class _Raising:\n"
+            "    def __getattr__(self, name):\n"
+            "        raise RuntimeError('access denied')\n"
+            "\n"
+            "import sys\n"
+            "sys.modules[__name__].__class__ = type(sys)  # module with __getattr__\n"
+            "# Override module-level getattr\n"
+            "def __getattr__(name):\n"
+            "    if name == 'module':\n"
+            "        raise RuntimeError('attribute access denied')\n"
+            "    raise AttributeError(name)\n"
+        )
+        r = discover_modules(project_module_root=tmp_path)
+        errors = [e for e in r.errors if e.kind == "load_failure"]
+        assert len(errors) == 1
+
+    def test_repeated_discovery_is_idempotent(self, tmp_path):
+        _write_project_module(tmp_path, dir_name="idempmod", slug="idemp.mod")
+        r1 = discover_modules(project_module_root=tmp_path)
+        r2 = discover_modules(project_module_root=tmp_path)
+        slugs1 = [rec.slug for rec in r1.records if rec.source_type == "project"]
+        slugs2 = [rec.slug for rec in r2.records if rec.source_type == "project"]
+        assert slugs1 == slugs2
 
     def test_import_error_produces_load_failure(self, tmp_path):
         pkg = tmp_path / "broken"

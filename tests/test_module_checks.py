@@ -220,6 +220,43 @@ class TestSettingsCheck:
         assert len(e002) >= 1
 
 
+class TestProjectPathChecks:
+    """E024/W024 for project_path discovery errors."""
+
+    def test_project_path_error_emits_e024_when_enabled(self):
+        from cauldron.modules.discovery import DiscoveryError
+        from cauldron.modules.registry import registry
+
+        err = DiscoveryError(
+            entry_point_name="",
+            kind="project_path",
+            message="CAULDRON_PROJECT_MODULE_ROOT does not exist.",
+            candidate_slug=None,
+        )
+        registry.populate([], discovery_errors=[err])
+        messages = django_checks.run_checks()
+        e024 = [m for m in messages if m.id == "cauldron.E024"]
+        assert len(e024) == 1
+
+    def test_project_path_error_with_known_candidate_and_disabled_module_emits_w024(self):
+        from cauldron.modules.discovery import DiscoveryError
+        from cauldron.modules.registry import registry
+
+        err = DiscoveryError(
+            entry_point_name="modules/bad",
+            kind="project_path",
+            message="bad project module directory.",
+            candidate_slug="bad.mod",
+        )
+        # "bad.mod" is NOT in enabled set
+        registry.populate([], enabled=set(), discovery_errors=[err])
+        messages = django_checks.run_checks()
+        w024 = [m for m in messages if m.id == "cauldron.W024"]
+        e024 = [m for m in messages if m.id == "cauldron.E024"]
+        assert len(w024) == 1
+        assert e024 == []
+
+
 class TestLifecycleErrorCheck:
     def test_lifecycle_error_emits_e030(self):
         from cauldron.modules.registry import LifecycleError, registry

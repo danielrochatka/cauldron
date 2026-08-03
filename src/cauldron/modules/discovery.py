@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from importlib.metadata import entry_points, packages_distributions
-from typing import TYPE_CHECKING, Any, Literal
+from importlib.metadata import entry_points
+from typing import TYPE_CHECKING, Any, Literal, Sequence
 
 if TYPE_CHECKING:
     from . import CauldronModule, ModuleManifest
@@ -14,30 +14,110 @@ logger = logging.getLogger(__name__)
 
 ENTRY_POINT_GROUP = "cauldron.modules"
 
+# Source types: "package" for entry-point discoveries (#33); "project" is
+# reserved for project-folder discovery (#34) and must not be produced here.
+SourceType = Literal["package", "project"]
 
-@dataclass
+
+@dataclass(frozen=True)
+class _EntryPointSource:
+    """Immutable per-entry-point metadata resolved exactly once before loading.
+
+    Using ``.dist`` as the authoritative source when available (Python 3.9+).
+    When ``.dist`` is absent the package metadata fields are empty strings.
+    The ``canonical_package_name`` uses PEP 503 normalisation for sort
+    stability; ``display_package_name`` preserves the original casing for
+    messages and serialisation.
+    """
+
+    group: str
+    name: str
+    value: str
+    display_package_name: str
+    canonical_package_name: str
+    package_version: str
+
+
+def _source_for_ep(ep: Any, group: str) -> _EntryPointSource:
+    """Resolve one :class:`_EntryPointSource` for *ep* without side effects.
+
+    Uses ``ep.dist`` exclusively; the ``packages_distributions()`` heuristic
+    is intentionally omitted because its ordering is not contractual and it
+    can select the wrong distribution.
+    """
+    from packaging.utils import canonicalize_name
+
+    name = getattr(ep, "name", "")
+    value = getattr(ep, "value", "")
+    display_name = ""
+    pkg_version = ""
+
+    try:
+        dist = getattr(ep, "dist", None)
+        if dist is not None:
+            display_name = dist.name or ""
+            pkg_version = dist.version or ""
+    except Exception:
+        pass
+
+    try:
+        canonical = canonicalize_name(display_name) if display_name else ""
+    except Exception:
+        canonical = ""
+
+    return _EntryPointSource(
+        group=group,
+        name=name,
+        value=value,
+        display_package_name=display_name,
+        canonical_package_name=canonical,
+        package_version=pkg_version,
+    )
+
+
+@dataclass(frozen=True)
 class DiscoveryError:
-    """Structured error produced while loading module entry points."""
+    """Structured error produced while loading module entry points.
+
+    All text in ``message`` is safe for user-facing output: it may identify
+    the exception class but never includes raw exception messages, tracebacks,
+    absolute filesystem paths, or credentials.
+
+    ``candidate_slug`` carries the module slug when it is determinable before
+    the error (e.g. duplicate_slug, manifest_validation with a valid manifest).
+    It is ``None`` for load_failure and early protocol failures.
+
+    For ``duplicate_slug`` errors, ``accepted_entry_point_name`` and
+    ``accepted_package_name`` identify the already-registered counterpart so
+    callers do not need to parse ``message``.
+    """
 
     entry_point_name: str
     kind: Literal["load_failure", "duplicate_slug", "manifest_validation"]
     message: str
+    entry_point_group: str = ""
+    entry_point_value: str = ""
+    package_name: str = ""
+    package_version: str = ""
+    candidate_slug: str | None = None
+    # Structured accepted-EP identity for duplicate_slug errors:
+    accepted_entry_point_name: str = ""
+    accepted_package_name: str = ""
 
 
 @dataclass(frozen=True)
 class DiscoveredModule:
     """Immutable record of one successfully discovered module.
 
-    Captures both the identity of the module and metadata about the entry
-    point and distribution package that provided it.  ``source_type`` is
-    always ``"package"`` for entry-point-discovered modules; future
-    discovery strategies (project folders, #34) will use different values.
+    Captures the module identity and the full entry-point / distribution
+    provenance.  ``source_type`` is ``"package"`` for entry-point-discovered
+    modules; ``"project"`` is reserved for project-folder discovery (#34).
     """
 
     slug: str
     label: str
     version: str
-    source_type: Literal["package"]
+    source_type: SourceType
     package_name: str
     package_version: str
     entry_point_group: str
@@ -47,7 +127,12 @@ class DiscoveredModule:
     module: CauldronModule
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a JSON-safe dict representation (no live objects)."""
+        """Return a JSON-safe dict (no live objects).
+
+        ``manifest`` is serialised via :meth:`ModuleManifest.to_dict`; the
+        live ``module`` object is excluded.  Mutating any list or dict in
+        the returned value does not affect the record or manifest.
+        """
         return {
             "slug": self.slug,
             "label": self.label,
@@ -58,6 +143,7 @@ class DiscoveredModule:
             "entry_point_group": self.entry_point_group,
             "entry_point_name": self.entry_point_name,
             "entry_point_value": self.entry_point_value,
+            "manifest": self.manifest.to_dict(),
         }
 
 
@@ -66,10 +152,13 @@ class DiscoveryResult:
     """Outcome of a module discovery pass.
 
     ``records`` is the canonical list of successfully discovered modules with
-    full source metadata.  ``modules`` is a compat property that returns just
-    the module objects for callers that do not need the extra metadata.
-    ``errors`` lists structured errors for all entry points that could not be
-    loaded, failed manifest validation, or registered a duplicate slug.
+    full source metadata.  ``modules`` is a backwards-compatible property
+    returning just the module objects.  ``errors`` lists structured errors for
+    every entry point that could not be loaded, failed manifest validation, or
+    registered a duplicate slug.
+
+    Construct via ``DiscoveryResult(records=..., errors=...)``.  The
+    ``modules`` attribute is an accessor, not a constructor parameter.
     """
 
     records: list[DiscoveredModule]
@@ -81,103 +170,198 @@ class DiscoveryResult:
         return [r.module for r in self.records]
 
 
-def _dist_info_for_ep(ep: Any) -> tuple[str, str]:
-    """Return (dist_name, dist_version) for *ep*, with empty-string fallbacks."""
-    try:
-        # In Python 3.12+ EntryPoint carries .dist; older versions use the
-        # packages_distributions mapping as a fallback heuristic.
-        dist = getattr(ep, "dist", None)
-        if dist is not None:
-            return dist.name, dist.version
-        module_name = ep.value.split(":")[0].split(".")[0]
-        mapping = packages_distributions()
-        dist_names = mapping.get(module_name, [])
-        if dist_names:
-            from importlib.metadata import distribution
-            d = distribution(dist_names[0])
-            return d.name, d.metadata["Version"]
-    except Exception:
-        pass
-    return "", ""
+def _make_error(
+    src: _EntryPointSource,
+    kind: Literal["load_failure", "duplicate_slug", "manifest_validation"],
+    message: str,
+    *,
+    candidate_slug: str | None = None,
+    accepted_entry_point_name: str = "",
+    accepted_package_name: str = "",
+) -> DiscoveryError:
+    """Construct a :class:`DiscoveryError` with all source fields populated."""
+    return DiscoveryError(
+        entry_point_name=src.name,
+        kind=kind,
+        message=message,
+        entry_point_group=src.group,
+        entry_point_value=src.value,
+        package_name=src.display_package_name,
+        package_version=src.package_version,
+        candidate_slug=candidate_slug,
+        accepted_entry_point_name=accepted_entry_point_name,
+        accepted_package_name=accepted_package_name,
+    )
 
 
-def _validate_manifest(ep_name: str, obj: Any) -> list[DiscoveryError]:
+def _validate_manifest(
+    src: _EntryPointSource, obj: Any,
+) -> list[DiscoveryError]:
     """Validate *obj* against the CauldronModule protocol and manifest contract.
 
     Returns a list of :class:`DiscoveryError` (kind ``"manifest_validation"``)
-    for every violation found.  An empty list means the module is valid.
+    for every violation.  An empty return means the module is valid.
+
+    All protocol attribute accesses are guarded; a property that raises does
+    not escape as an unhandled exception.
+
+    ``django_apps()`` return value is normalised to a tuple exactly once and
+    compared against ``manifest.django_apps`` including when that tuple is
+    empty.  ``str`` and ``bytes`` returns are rejected even though they are
+    technically sequences.
     """
     from . import CauldronModule, ModuleManifest
 
     errors: list[DiscoveryError] = []
 
+    # --- 1. Protocol check ------------------------------------------------
     if not isinstance(obj, CauldronModule):
-        errors.append(DiscoveryError(
-            entry_point_name=ep_name,
-            kind="manifest_validation",
-            message=(
-                f"Entry point {ep_name!r} yielded {type(obj).__name__!r} which does"
-                " not satisfy the CauldronModule protocol."
-            ),
+        errors.append(_make_error(
+            src, "manifest_validation",
+            f"Entry point {src.name!r} yielded {type(obj).__name__!r} which does"
+            " not satisfy the CauldronModule protocol.",
         ))
         return errors
 
-    manifest = obj.manifest
-    if not isinstance(manifest, ModuleManifest):
-        errors.append(DiscoveryError(
-            entry_point_name=ep_name,
-            kind="manifest_validation",
-            message=(
-                f"Module from {ep_name!r}: manifest must be a ModuleManifest instance,"
-                f" got {type(manifest).__name__!r}."
-            ),
-        ))
-        return errors
-
-    if obj.slug != manifest.slug:
-        errors.append(DiscoveryError(
-            entry_point_name=ep_name,
-            kind="manifest_validation",
-            message=(
-                f"Module from {ep_name!r}: module.slug {obj.slug!r} does not match"
-                f" manifest.slug {manifest.slug!r}."
-            ),
-        ))
-
-    if obj.label != manifest.label:
-        errors.append(DiscoveryError(
-            entry_point_name=ep_name,
-            kind="manifest_validation",
-            message=(
-                f"Module from {ep_name!r}: module.label {obj.label!r} does not match"
-                f" manifest.label {manifest.label!r}."
-            ),
-        ))
-
-    # django_apps() must return a tuple or list of strings consistent with
-    # manifest.django_apps (if declared).
+    # --- 2. Manifest type -------------------------------------------------
     try:
-        live_apps = obj.django_apps()
+        manifest = obj.manifest
     except Exception as exc:
-        errors.append(DiscoveryError(
-            entry_point_name=ep_name,
-            kind="manifest_validation",
-            message=(
-                f"Module from {ep_name!r}: django_apps() raised {type(exc).__name__}: {exc}."
-            ),
+        errors.append(_make_error(
+            src, "manifest_validation",
+            f"Entry point {src.name!r}: accessing .manifest raised"
+            f" {type(exc).__name__}.",
         ))
-        live_apps = None
+        return errors
 
-    if live_apps is not None and manifest.django_apps:
-        if tuple(live_apps) != tuple(manifest.django_apps):
-            errors.append(DiscoveryError(
-                entry_point_name=ep_name,
-                kind="manifest_validation",
-                message=(
-                    f"Module from {ep_name!r}: django_apps() returned {list(live_apps)!r}"
-                    f" but manifest.django_apps is {list(manifest.django_apps)!r}."
-                ),
+    if not isinstance(manifest, ModuleManifest):
+        errors.append(_make_error(
+            src, "manifest_validation",
+            f"Entry point {src.name!r}: manifest must be a ModuleManifest"
+            f" instance, got {type(manifest).__name__!r}.",
+        ))
+        return errors
+
+    # After confirming manifest type, we know the canonical slug.
+    candidate_slug: str | None = manifest.slug
+
+    # --- 3. Slug consistency ----------------------------------------------
+    try:
+        live_slug = obj.slug
+    except Exception as exc:
+        errors.append(_make_error(
+            src, "manifest_validation",
+            f"Entry point {src.name!r}: accessing .slug raised"
+            f" {type(exc).__name__}.",
+            candidate_slug=candidate_slug,
+        ))
+        live_slug = None
+
+    if live_slug is not None:
+        if not isinstance(live_slug, str) or not live_slug:
+            errors.append(_make_error(
+                src, "manifest_validation",
+                f"Entry point {src.name!r}: module.slug must be a non-empty"
+                f" string, got {live_slug!r}.",
+                candidate_slug=candidate_slug,
             ))
+        elif live_slug != manifest.slug:
+            errors.append(_make_error(
+                src, "manifest_validation",
+                f"Entry point {src.name!r}: module.slug {live_slug!r} does not"
+                f" match manifest.slug {manifest.slug!r}.",
+                candidate_slug=candidate_slug,
+            ))
+
+    # --- 4. Label consistency ---------------------------------------------
+    try:
+        live_label = obj.label
+    except Exception as exc:
+        errors.append(_make_error(
+            src, "manifest_validation",
+            f"Entry point {src.name!r}: accessing .label raised"
+            f" {type(exc).__name__}.",
+            candidate_slug=candidate_slug,
+        ))
+        live_label = None
+
+    if live_label is not None:
+        if not isinstance(live_label, str) or not live_label:
+            errors.append(_make_error(
+                src, "manifest_validation",
+                f"Entry point {src.name!r}: module.label must be a non-empty"
+                f" string, got {live_label!r}.",
+                candidate_slug=candidate_slug,
+            ))
+        elif live_label != manifest.label:
+            errors.append(_make_error(
+                src, "manifest_validation",
+                f"Entry point {src.name!r}: module.label {live_label!r} does"
+                f" not match manifest.label {manifest.label!r}.",
+                candidate_slug=candidate_slug,
+            ))
+
+    # --- 5. django_apps() -------------------------------------------------
+    try:
+        live_result = obj.django_apps()
+    except Exception as exc:
+        errors.append(_make_error(
+            src, "manifest_validation",
+            f"Entry point {src.name!r}: django_apps() raised"
+            f" {type(exc).__name__}.",
+            candidate_slug=candidate_slug,
+        ))
+        return errors
+
+    # Reject str/bytes (both are Sequence[str] but are not app-label lists).
+    if isinstance(live_result, (str, bytes)):
+        errors.append(_make_error(
+            src, "manifest_validation",
+            f"Entry point {src.name!r}: django_apps() returned"
+            f" {type(live_result).__name__!r}; expected a list or tuple of"
+            " app-label strings.",
+            candidate_slug=candidate_slug,
+        ))
+        return errors
+
+    # Normalise to tuple exactly once; handles generators and other iterables.
+    # str/bytes are already rejected above; everything else we try to consume.
+    try:
+        live_apps: tuple[Any, ...] = tuple(live_result)
+    except TypeError:
+        errors.append(_make_error(
+            src, "manifest_validation",
+            f"Entry point {src.name!r}: django_apps() returned"
+            f" {type(live_result).__name__!r}; expected a sequence.",
+            candidate_slug=candidate_slug,
+        ))
+        return errors
+
+    for i, app in enumerate(live_apps):
+        if not isinstance(app, str):
+            errors.append(_make_error(
+                src, "manifest_validation",
+                f"Entry point {src.name!r}: django_apps()[{i}] is"
+                f" {type(app).__name__!r}; every app label must be a string.",
+                candidate_slug=candidate_slug,
+            ))
+            return errors
+        if not app:
+            errors.append(_make_error(
+                src, "manifest_validation",
+                f"Entry point {src.name!r}: django_apps()[{i}] is an empty"
+                " string; every app label must be non-empty.",
+                candidate_slug=candidate_slug,
+            ))
+            return errors
+
+    if live_apps != manifest.django_apps:
+        errors.append(_make_error(
+            src, "manifest_validation",
+            f"Entry point {src.name!r}: django_apps() result does not match"
+            f" manifest.django_apps.",
+            candidate_slug=candidate_slug,
+        ))
 
     return errors
 
@@ -190,77 +374,87 @@ def discover_modules(*, entry_point_group: str = ENTRY_POINT_GROUP) -> Discovery
     any entry point that could not be loaded, failed manifest validation, or
     registered a duplicate slug.
 
-    Discovery is deterministic: when multiple entry points share the same
-    ``ep.name``, the composite key ``(ep.name, dist_name, ep.value)`` is used
-    so that the ordering is stable regardless of ``importlib.metadata``
-    iteration order.
+    Discovery is deterministic: entry points are sorted by the composite key
+    ``(ep.name, canonical_package_name, ep.value)``.  Distribution metadata
+    is resolved exactly once per entry point.
     """
     from . import CauldronModule
 
-    eps = entry_points(group=entry_point_group)
+    raw_eps = entry_points(group=entry_point_group)
+
+    # Resolve metadata exactly once per EP, then sort.
+    ep_pairs = [(ep, _source_for_ep(ep, entry_point_group)) for ep in raw_eps]
+    ep_pairs.sort(key=lambda pair: (
+        pair[1].name,
+        pair[1].canonical_package_name,
+        pair[1].value,
+    ))
+
     records: list[DiscoveredModule] = []
     errors: list[DiscoveryError] = []
-    seen_slugs: dict[str, tuple[str, str]] = {}  # slug -> (ep_name, dist_name)
+    # slug → (accepted_ep_name, accepted_pkg_name)
+    seen_slugs: dict[str, tuple[str, str]] = {}
 
-    def _sort_key(ep: Any) -> tuple[str, str, str]:
-        dist_name, _ = _dist_info_for_ep(ep)
-        return (ep.name, dist_name, getattr(ep, "value", ""))
-
-    for ep in sorted(eps, key=_sort_key):
-        dist_name, dist_version = _dist_info_for_ep(ep)
-
+    for ep, src in ep_pairs:
+        # --- Load ----------------------------------------------------------
         try:
             obj = ep.load()
             if callable(obj) and not isinstance(obj, CauldronModule):
                 obj = obj()
         except Exception as exc:
-            errors.append(DiscoveryError(
-                entry_point_name=ep.name,
-                kind="load_failure",
-                message=f"Entry point {ep.name!r} failed to load: {exc}",
+            errors.append(_make_error(
+                src, "load_failure",
+                f"Entry point {src.name!r} raised {type(exc).__name__} on"
+                " load.",
             ))
-            logger.debug("Entry point %r failed to load: %s", ep.name, exc)
+            logger.debug(
+                "Entry point %r failed to load: %s",
+                src.name, exc,
+                exc_info=True,
+            )
             continue
 
-        validation_errors = _validate_manifest(ep.name, obj)
+        # --- Manifest validation -------------------------------------------
+        validation_errors = _validate_manifest(src, obj)
         if validation_errors:
             errors.extend(validation_errors)
-            logger.debug("Entry point %r failed manifest validation.", ep.name)
+            logger.debug("Entry point %r failed manifest validation.", src.name)
             continue
 
+        # --- Duplicate slug -----------------------------------------------
         slug = obj.slug
         if slug in seen_slugs:
-            accepted_ep, accepted_dist = seen_slugs[slug]
-            errors.append(DiscoveryError(
-                entry_point_name=ep.name,
-                kind="duplicate_slug",
-                message=(
-                    f"Module slug {slug!r} registered by entry point {ep.name!r}"
-                    f" (package {dist_name!r}) conflicts with the already-accepted"
-                    f" entry point {accepted_ep!r} (package {accepted_dist!r});"
-                    f" the duplicate is ignored."
-                ),
+            accepted_ep_name, accepted_pkg_name = seen_slugs[slug]
+            errors.append(_make_error(
+                src, "duplicate_slug",
+                f"Module slug {slug!r} registered by {src.name!r}"
+                f" (package {src.display_package_name!r}) conflicts with"
+                f" {accepted_ep_name!r}"
+                f" (package {accepted_pkg_name!r}); duplicate is ignored.",
+                candidate_slug=slug,
+                accepted_entry_point_name=accepted_ep_name,
+                accepted_package_name=accepted_pkg_name,
             ))
             continue
 
-        seen_slugs[slug] = (ep.name, dist_name)
+        seen_slugs[slug] = (src.name, src.display_package_name)
         record = DiscoveredModule(
             slug=slug,
             label=obj.label,
             version=obj.manifest.version,
             source_type="package",
-            package_name=dist_name,
-            package_version=dist_version,
-            entry_point_group=entry_point_group,
-            entry_point_name=ep.name,
-            entry_point_value=getattr(ep, "value", ""),
+            package_name=src.display_package_name,
+            package_version=src.package_version,
+            entry_point_group=src.group,
+            entry_point_name=src.name,
+            entry_point_value=src.value,
             manifest=obj.manifest,
             module=obj,
         )
         records.append(record)
         logger.debug(
             "Discovered module %r from entry point %r (package %r %s).",
-            slug, ep.name, dist_name, dist_version,
+            slug, src.name, src.display_package_name, src.package_version,
         )
 
     records.sort(key=lambda r: r.slug)

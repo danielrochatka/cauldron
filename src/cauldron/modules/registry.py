@@ -26,14 +26,22 @@ class LifecycleError:
 
 @dataclass(frozen=True)
 class UnavailableModule:
-    """A slug listed in CAULDRON_MODULES that has no corresponding discovery record.
+    """A slug listed in CAULDRON_MODULES that could not be activated.
 
-    This occurs when a site enables a module slug but the corresponding
-    package is not installed (missing entry point).  It is surfaced as a
-    Django system check error (cauldron.E023).
+    ``reason`` describes why:
+
+    * ``"not_discovered"`` — no entry point with this slug was found at all.
+    * ``"load_failure"`` — the corresponding entry point raised on load.
+    * ``"manifest_validation"`` — the module failed validation after loading.
+
+    ``discovery_error_message`` carries the public-safe message from the
+    matching :class:`~discovery.DiscoveryError` when ``reason`` is not
+    ``"not_discovered"``; empty string otherwise.
     """
 
     slug: str
+    reason: Literal["not_discovered", "load_failure", "manifest_validation"] = "not_discovered"
+    discovery_error_message: str = ""
 
 
 class ModuleRegistry:
@@ -109,11 +117,32 @@ class ModuleRegistry:
             active_modules = {
                 slug: m for slug, m in self._discovered.items() if slug in enabled
             }
-            # Detect slugs that were enabled but not discovered at all.
+            # Build a map of candidate_slug → DiscoveryError for the errors
+            # we received, so we can attach accurate reasons to unavailable slugs.
+            error_by_candidate: dict[str, DiscoveryError] = {}
+            for err in self._discovery_errors:
+                if err.candidate_slug and err.candidate_slug not in error_by_candidate:
+                    error_by_candidate[err.candidate_slug] = err
+
             discovered_slugs = set(self._discovered)
             for slug in sorted(self._enabled):
                 if slug not in discovered_slugs:
-                    self._unavailable.append(UnavailableModule(slug=slug))
+                    err = error_by_candidate.get(slug)
+                    if err is not None:
+                        reason: Literal[
+                            "not_discovered", "load_failure", "manifest_validation"
+                        ] = (
+                            err.kind  # type: ignore[assignment]
+                            if err.kind in ("load_failure", "manifest_validation")
+                            else "not_discovered"
+                        )
+                        self._unavailable.append(UnavailableModule(
+                            slug=slug,
+                            reason=reason,
+                            discovery_error_message=err.message,
+                        ))
+                    else:
+                        self._unavailable.append(UnavailableModule(slug=slug))
 
         for slug, module in sorted(active_modules.items()):
             for cap in sorted(module.manifest.provides):
@@ -223,8 +252,12 @@ class ModuleRegistry:
     def lifecycle_errors(self) -> list[LifecycleError]:
         return list(self._lifecycle_errors)
 
+    def enabled_slugs(self) -> frozenset[str]:
+        """Return the set of slugs that were explicitly enabled at populate time."""
+        return frozenset(self._enabled)
+
     def unavailable_modules(self) -> list[UnavailableModule]:
-        """Slugs listed in CAULDRON_MODULES with no matching discovery record."""
+        """Slugs listed in CAULDRON_MODULES with no matching active discovery record."""
         return list(self._unavailable)
 
     def dependency_graph(self) -> dict[str, list[str]]:
@@ -244,6 +277,30 @@ class ModuleRegistry:
             graph[slug] = sorted(set(deps))
         return graph
 
+    def _blocked_slugs(self) -> frozenset[str]:
+        """Compute the set of slugs blocked by resolution errors (with propagation).
+
+        A module is blocked if:
+        - it has a direct resolution error (missing dep, version mismatch, etc.), or
+        - it has a required dependency that is blocked (transitive propagation).
+
+        Circular-dependency modules are already absent from ``_active``; this
+        method additionally captures modules in the load order that cannot be
+        safely activated because of unmet constraints.
+        """
+        directly_blocked = frozenset(e.module_slug for e in self._errors)
+        dep_graph = self.dependency_graph()
+
+        blocked: set[str] = set(directly_blocked)
+        changed = True
+        while changed:
+            changed = False
+            for slug, deps in dep_graph.items():
+                if slug not in blocked and any(dep in blocked for dep in deps):
+                    blocked.add(slug)
+                    changed = True
+        return frozenset(blocked)
+
     def inventory(self) -> list[dict[str, Any]]:
         """Rich inventory combining discovery metadata and resolution state.
 
@@ -251,55 +308,66 @@ class ModuleRegistry:
         contains:
 
         - **identity & source**: slug, label, version, source_type,
-          package_name, package_version, entry_point_name, entry_point_value
+          package_name, package_version, entry_point_group,
+          entry_point_name, entry_point_value
+        - **manifest**: the full serialized manifest dict
+        - **compatibility**: installed_cauldron_version,
+          cauldron_version_constraint, cauldron_version_ok (always bool)
         - **config & activation**: enabled, active, load_index, config
-        - **compatibility** (from manifest): cauldron_version
-        - **capabilities**: provides, requires, optional, deps, django_apps
-
-        Callers that only want the subset of keys from :meth:`graph_info`
-        should use that method instead.
+        - **convenience projections**: provides, requires, optional, deps,
+          django_apps (from manifest), requires_restart
         """
         from .resolver import version_satisfies
+
         try:
-            from cauldron import __version__ as cauldron_version
+            from cauldron import __version__ as installed_cauldron_version
         except Exception:
-            cauldron_version = ""
+            installed_cauldron_version = ""
 
         record_by_slug: dict[str, DiscoveredModule] = {
             r.slug: r for r in self._discovery_records
         }
         load_index_map = {slug: i for i, slug in enumerate(self._load_order)}
         dep_graph = self.dependency_graph()
+        blocked = self._blocked_slugs()
+
         result = []
         for slug in sorted(self._discovered):
             m = self._discovered[slug]
+            manifest = m.manifest
             rec = record_by_slug.get(slug)
-            constraint = m.manifest.cauldron_version
-            compat = (
-                version_satisfies(cauldron_version, constraint)
-                if cauldron_version and constraint
-                else None
-            )
+            constraint = manifest.cauldron_version
+            compat: bool = version_satisfies(installed_cauldron_version, constraint)
+            is_active = (slug in self._active) and (slug not in blocked)
             entry: dict[str, Any] = {
+                # identity & source
                 "slug": slug,
                 "label": m.label,
-                "version": m.manifest.version,
+                "version": manifest.version,
                 "source_type": rec.source_type if rec else None,
                 "package_name": rec.package_name if rec else None,
                 "package_version": rec.package_version if rec else None,
+                "entry_point_group": rec.entry_point_group if rec else None,
                 "entry_point_name": rec.entry_point_name if rec else None,
                 "entry_point_value": rec.entry_point_value if rec else None,
-                "enabled": slug in self._enabled,
-                "active": slug in self._active,
-                "load_index": load_index_map.get(slug),
-                "config": self.get_module_config(slug),
+                # manifest
+                "manifest": manifest.to_dict(),
+                # compatibility
+                "installed_cauldron_version": installed_cauldron_version,
                 "cauldron_version_constraint": constraint,
                 "cauldron_version_ok": compat,
-                "provides": sorted(m.manifest.provides),
-                "requires": [r.to_dict() for r in m.manifest.requires],
-                "optional": [r.to_dict() for r in m.manifest.optional],
+                # config & activation
+                "enabled": slug in self._enabled,
+                "active": is_active,
+                "load_index": load_index_map.get(slug) if is_active else None,
+                "config": self.get_module_config(slug),
+                # convenience projections (from manifest, not the live module)
+                "provides": sorted(manifest.provides),
+                "requires": [r.to_dict() for r in manifest.requires],
+                "optional": [r.to_dict() for r in manifest.optional],
                 "deps": dep_graph.get(slug, []),
-                "django_apps": list(m.django_apps()),
+                "django_apps": list(manifest.django_apps),
+                "requires_restart": manifest.requires_restart,
             }
             result.append(entry)
         return result

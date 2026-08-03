@@ -95,41 +95,98 @@ def cauldron_settings_check(app_configs, **kwargs):
 
 @register()
 def cauldron_module_graph_check(app_configs, **kwargs):
-    """Validate the module dependency graph and report active modules."""
+    """Validate the module dependency graph and report active modules.
+
+    Discovery-error severity is scoped to the enabled module set:
+
+    * Errors whose ``candidate_slug`` is in the enabled set retain their
+      blocking ``cauldron.E0xx`` ID.
+    * Errors whose ``candidate_slug`` is set but NOT in the enabled set are
+      downgraded to ``cauldron.W0xx`` warnings, because a broken third-party
+      package that is not enabled must not block a healthy installation.
+    * Errors without a ``candidate_slug`` (where the module identity is
+      unknown) are always treated as blocking Errors.
+    """
     from .modules.registry import registry
 
     messages = []
+    enabled = registry.enabled_slugs()
 
-    # Discovery errors -------------------------------------------------------
     _discovery_id_map = {
-        "load_failure": "cauldron.E020",
-        "duplicate_slug": "cauldron.E021",
-        "manifest_validation": "cauldron.E022",
+        "load_failure": ("cauldron.E020", "cauldron.W020"),
+        "duplicate_slug": ("cauldron.E021", "cauldron.W021"),
+        "manifest_validation": ("cauldron.E022", "cauldron.W022"),
     }
+
     for err in registry.discovery_errors():
-        messages.append(
-            Error(
-                err.message,
-                hint="Fix the entry-point registration or module package before starting.",
-                obj=err.entry_point_name,
-                id=_discovery_id_map.get(err.kind, "cauldron.E029"),
-            )
+        error_id, warning_id = _discovery_id_map.get(
+            err.kind, ("cauldron.E029", "cauldron.W029")
         )
 
-    # Unavailable configured slugs -------------------------------------------
-    for unavail in registry.unavailable_modules():
-        messages.append(
-            Error(
-                f"Module {unavail.slug!r} is listed in CAULDRON_MODULES but was not"
-                " found among installed entry points.",
-                hint=(
-                    f"Install the package that provides the 'cauldron.modules' entry"
-                    f" point for {unavail.slug!r}, or remove it from CAULDRON_MODULES."
-                ),
-                obj=unavail.slug,
-                id="cauldron.E023",
-            )
+        candidate = err.candidate_slug
+        # Relevant when: slug unknown, no enabled set, or slug is enabled.
+        is_relevant = (
+            candidate is None
+            or not enabled
+            or candidate in enabled
         )
+
+        if is_relevant:
+            messages.append(
+                Error(
+                    err.message,
+                    hint=(
+                        "Fix the entry-point registration or module package before"
+                        " starting."
+                    ),
+                    obj=err.entry_point_name,
+                    id=error_id,
+                )
+            )
+        else:
+            messages.append(
+                Warning(
+                    err.message,
+                    hint=(
+                        f"Module {candidate!r} is not enabled in CAULDRON_MODULES;"
+                        " this discovery problem does not affect the running"
+                        " application.  Fix or remove the broken package to suppress"
+                        " this warning."
+                    ),
+                    obj=err.entry_point_name,
+                    id=warning_id,
+                )
+            )
+
+    # Unavailable configured slugs ---------------------------------------
+    for unavail in registry.unavailable_modules():
+        if unavail.reason == "not_discovered":
+            messages.append(
+                Error(
+                    f"Module {unavail.slug!r} is listed in CAULDRON_MODULES but was"
+                    " not found among installed entry points.",
+                    hint=(
+                        f"Install the package that provides the 'cauldron.modules'"
+                        f" entry point for {unavail.slug!r}, or remove it from"
+                        " CAULDRON_MODULES."
+                    ),
+                    obj=unavail.slug,
+                    id="cauldron.E023",
+                )
+            )
+        else:
+            messages.append(
+                Error(
+                    f"Module {unavail.slug!r} is listed in CAULDRON_MODULES but could"
+                    f" not be activated ({unavail.reason.replace('_', ' ')}).",
+                    hint=(
+                        "See the accompanying cauldron.E020 or cauldron.E022 message"
+                        " for details."
+                    ),
+                    obj=unavail.slug,
+                    id="cauldron.E023",
+                )
+            )
 
     # Active-module summary --------------------------------------------------
     active = registry.all_active()

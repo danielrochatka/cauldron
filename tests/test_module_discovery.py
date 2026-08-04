@@ -2044,11 +2044,12 @@ class TestProjectModuleDiscovery:
         except OSError:
             pytest.skip("Cannot create symlinks on this platform")
 
-        # Confirm that resolve() actually raises on this platform/Python version
+        # Confirm that resolve() actually raises on this platform/Python version.
+        # Python 3.12 wraps the underlying OSError in RuntimeError; both are caught.
         try:
             link_a.resolve()
             pytest.skip("Path.resolve() does not raise for circular symlinks on this platform")
-        except OSError:
+        except (OSError, RuntimeError):
             pass  # expected — cycle detected
 
         r = discover_modules(project_module_root=modules_root)

@@ -116,49 +116,59 @@ def cauldron_module_graph_check(app_configs, **kwargs):
         "load_failure": ("cauldron.E020", "cauldron.W020"),
         "duplicate_slug": ("cauldron.E021", "cauldron.W021"),
         "manifest_validation": ("cauldron.E022", "cauldron.W022"),
-        "project_path": ("cauldron.E024", "cauldron.W024"),
     }
 
     for err in registry.discovery_errors():
-        error_id, warning_id = _discovery_id_map.get(
-            err.kind, ("cauldron.E029", "cauldron.W029")
-        )
-
-        candidate = err.candidate_slug
-        # Relevant when: slug unknown, or slug is explicitly enabled.
-        # An empty enabled set means no modules are enabled, so a known
-        # candidate is not enabled and must be a warning, not an error.
-        is_relevant = (
-            candidate is None
-            or candidate in enabled
-        )
-
-        if is_relevant:
-            messages.append(
-                Error(
-                    err.message,
-                    hint=(
-                        "Fix the entry-point registration or module package before"
-                        " starting."
-                    ),
-                    obj=err.entry_point_name,
-                    id=error_id,
-                )
-            )
+        if err.kind == "project_path":
+            # project_path errors are always path-level (no candidate slug);
+            # they always block the installation.
+            messages.append(Error(
+                err.message,
+                hint="Fix the CAULDRON_PROJECT_MODULE_ROOT path or remove the offending"
+                     " file before starting.",
+                obj=err.entry_point_name or None,
+                id="cauldron.E024",
+            ))
         else:
-            messages.append(
-                Warning(
-                    err.message,
-                    hint=(
-                        f"Module {candidate!r} is not enabled in CAULDRON_MODULES;"
-                        " this discovery problem does not affect the running"
-                        " application.  Fix or remove the broken package to suppress"
-                        " this warning."
-                    ),
-                    obj=err.entry_point_name,
-                    id=warning_id,
-                )
+            error_id, warning_id = _discovery_id_map.get(
+                err.kind, ("cauldron.E029", "cauldron.W029")
             )
+
+            candidate = err.candidate_slug
+            # Relevant when: slug unknown, or slug is explicitly enabled.
+            # An empty enabled set means no modules are enabled, so a known
+            # candidate is not enabled and must be a warning, not an error.
+            is_relevant = (
+                candidate is None
+                or candidate in enabled
+            )
+
+            if is_relevant:
+                messages.append(
+                    Error(
+                        err.message,
+                        hint=(
+                            "Fix the entry-point registration or module package before"
+                            " starting."
+                        ),
+                        obj=err.entry_point_name,
+                        id=error_id,
+                    )
+                )
+            else:
+                messages.append(
+                    Warning(
+                        err.message,
+                        hint=(
+                            f"Module {candidate!r} is not enabled in CAULDRON_MODULES;"
+                            " this discovery problem does not affect the running"
+                            " application.  Fix or remove the broken package to suppress"
+                            " this warning."
+                        ),
+                        obj=err.entry_point_name,
+                        id=warning_id,
+                    )
+                )
 
     # Unavailable configured slugs ---------------------------------------
     # E023 covers only genuinely absent modules (no entry point found).

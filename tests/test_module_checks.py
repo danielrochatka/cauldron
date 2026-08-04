@@ -1,5 +1,7 @@
 """Tests for Django system checks emitted by the module runtime."""
 
+import sys
+
 import pytest
 
 from django.core import checks as django_checks
@@ -238,7 +240,8 @@ class TestProjectPathChecks:
         e024 = [m for m in messages if m.id == "cauldron.E024"]
         assert len(e024) == 1
 
-    def test_project_path_error_with_known_candidate_and_disabled_module_emits_w024(self):
+    def test_project_path_error_always_emits_e024_regardless_of_candidate_slug(self):
+        """project_path errors always emit E024; the W024 branch is unreachable."""
         from cauldron.modules.discovery import DiscoveryError
         from cauldron.modules.registry import registry
 
@@ -246,15 +249,14 @@ class TestProjectPathChecks:
             entry_point_name="modules/bad",
             kind="project_path",
             message="bad project module directory.",
-            candidate_slug="bad.mod",
+            candidate_slug=None,  # project_path errors have no candidate_slug
         )
-        # "bad.mod" is NOT in enabled set
         registry.populate([], enabled=set(), discovery_errors=[err])
         messages = django_checks.run_checks()
-        w024 = [m for m in messages if m.id == "cauldron.W024"]
         e024 = [m for m in messages if m.id == "cauldron.E024"]
-        assert len(w024) == 1
-        assert e024 == []
+        w024 = [m for m in messages if m.id == "cauldron.W024"]
+        assert len(e024) == 1
+        assert w024 == []
 
 
 class TestSystemCheckWithRealDiscovery:
@@ -358,6 +360,53 @@ class TestSystemCheckWithRealDiscovery:
             )
             e023 = [m for m in messages if m.id == "cauldron.E023"]
             assert len(e023) >= 1
+        finally:
+            sys.path[:] = original_path
+            for key in list(sys.modules.keys()):
+                if key not in original_modules:
+                    del sys.modules[key]
+
+
+    def test_ep_duplicate_slug_emits_e021(self, tmp_path):
+        """Two EPs sharing a slug produce a real cauldron.E021 check error.
+
+        The duplicate slug must be in the enabled set so the error is not
+        downgraded to W021 (non-enabled modules get warnings, not errors).
+        """
+        from unittest.mock import patch
+        from cauldron.modules.discovery import discover_modules
+        from cauldron.modules.registry import registry
+
+        original_path = list(sys.path)
+        original_modules = set(sys.modules.keys())
+        try:
+            ep_a = BaseModule(ModuleManifest(slug="dup.slug", label="A"))
+            ep_b = BaseModule(ModuleManifest(slug="dup.slug", label="B"))
+
+            fake_ep_a = type("EP", (), {
+                "name": "dup.slug",
+                "value": "pkg_a:module",
+                "dist": None,
+                "load": lambda s: ep_a,
+            })()
+            fake_ep_b = type("EP", (), {
+                "name": "dup.slug",
+                "value": "pkg_b:module",
+                "dist": None,
+                "load": lambda s: ep_b,
+            })()
+
+            with patch("cauldron.modules.discovery.entry_points", return_value=[fake_ep_a, fake_ep_b]):
+                result = discover_modules()
+
+            # Inject into registry; enable "dup.slug" so E021 (not W021) fires.
+            registry._discovery_records = list(result.records)
+            registry._discovery_errors = list(result.errors)
+            registry._enabled = {"dup.slug"}
+
+            check_results = django_checks.run_checks()
+            e021 = [m for m in check_results if m.id == "cauldron.E021"]
+            assert e021, f"Expected cauldron.E021 for duplicate slug. Got: {[m.id for m in check_results]}"
         finally:
             sys.path[:] = original_path
             for key in list(sys.modules.keys()):

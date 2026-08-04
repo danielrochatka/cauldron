@@ -1222,19 +1222,41 @@ class TestProjectModuleDiscovery:
         dup_errors = [e for e in r.errors if e.kind == "duplicate_slug"]
         assert len(dup_errors) == 1
 
-    def test_root_added_to_sys_path(self, tmp_path):
-        _write_project_module(tmp_path, dir_name="mymod", slug="mymod.pkg")
-        resolved = str(tmp_path.resolve())
-        assert resolved not in sys.path
-        discover_modules(project_module_root=tmp_path)
-        assert resolved in sys.path
+    def test_sys_path_restored_after_discovery(self, tmp_path):
+        """sys.path must be identical before and after discover_modules()."""
+        from unittest.mock import patch
+        _write_project_module(tmp_path, dir_name="pathmod", slug="path.mod")
 
-    def test_root_not_added_to_sys_path_twice(self, tmp_path):
-        _write_project_module(tmp_path, dir_name="mymod", slug="mymod.pkg")
-        discover_modules(project_module_root=tmp_path)
-        discover_modules(project_module_root=tmp_path)
-        resolved = str(tmp_path.resolve())
-        assert sys.path.count(resolved) == 1
+        path_before = list(sys.path)
+        with patch("cauldron.modules.discovery.entry_points", return_value=[]):
+            discover_modules(project_module_root=tmp_path)
+
+        assert sys.path == path_before, (
+            f"sys.path changed after discovery.\n"
+            f"Before: {path_before}\nAfter: {sys.path}"
+        )
+
+    def test_sys_path_restored_after_discovery_with_ep(self, tmp_path):
+        """sys.path restoration holds even when EPs are present."""
+        from unittest.mock import patch
+        from cauldron.modules import BaseModule, ModuleManifest
+
+        _write_project_module(tmp_path, dir_name="pathmod2", slug="path.mod2")
+        ep_obj = BaseModule(ModuleManifest(slug="ep.path", label="EP Path"))
+        fake_ep = type("EP", (), {
+            "name": "ep.path",
+            "value": "ep_path_pkg:module",
+            "dist": None,
+            "load": lambda s: ep_obj,
+        })()
+
+        path_before = list(sys.path)
+        with patch("cauldron.modules.discovery.entry_points", return_value=[fake_ep]):
+            discover_modules(project_module_root=tmp_path)
+
+        assert sys.path == path_before, (
+            f"sys.path changed.\nBefore: {path_before}\nAfter: {sys.path}"
+        )
 
     def test_combined_records_sorted_by_slug(self, tmp_path):
         _write_project_module(tmp_path, dir_name="zzz_proj", slug="zzz.project")
@@ -1441,33 +1463,7 @@ class TestProjectModuleDiscovery:
         r = discover_modules(project_module_root=RaisingPathLike())
         assert any(e.kind == "project_path" for e in r.errors)
 
-    # --- Section 3: sys.path placement tests ---
-
-    def test_sys_path_root_placed_at_front(self, tmp_path):
-        _write_project_module(tmp_path, dir_name="mymod", slug="mymod.pkg")
-        # Pre-insert the root somewhere later in sys.path
-        resolved = str(tmp_path.resolve())
-        sys.path.append(resolved)
-        discover_modules(project_module_root=tmp_path)
-        assert sys.path[0] == resolved
-        assert sys.path.count(resolved) == 1
-
-    def test_sys_path_relative_duplicate_removed(self, tmp_path):
-        _write_project_module(tmp_path, dir_name="mymod", slug="mymod.pkg")
-        # Add a relative path equivalent to tmp_path
-        import os as _os
-        cwd = _os.getcwd()
-        try:
-            _os.chdir(tmp_path.parent)
-            rel = tmp_path.name  # e.g. "pytest-xyz/test_xxx"
-            sys.path.append(rel)
-            discover_modules(project_module_root=tmp_path)
-            resolved = str(tmp_path.resolve())
-            assert sys.path[0] == resolved
-            # Relative duplicate should have been removed
-            assert rel not in sys.path
-        finally:
-            _os.chdir(cwd)
+    # --- Section 3: sys.path safety tests ---
 
     def test_malformed_sys_path_entry_does_not_break_discovery(self, tmp_path):
         from unittest.mock import patch
@@ -1559,59 +1555,283 @@ class TestProjectModuleDiscovery:
         pkg_recs = [rec for rec in r.records if rec.source_type == "package"]
         assert any(rec.slug == "ep.module" for rec in pkg_recs)
 
-    def test_ep_not_shadowed_on_second_discovery_call(self, tmp_path):
-        """Second discover_modules call: same collision detected, EP still wins."""
+    def test_ep_not_shadowed_real_imports(self, tmp_path):
+        """EP loads from installed root, not project root, even when both exist.
+
+        Uses real importlib.import_module() in the EP's load() method.
+        Uses two separate filesystem roots with the same package name but
+        different SENTINEL values to verify which one was actually loaded.
+        """
+        from unittest.mock import patch
+        import importlib.util
+
+        pkg_name = "cauldron_real_shadow_test_pkg"
+
+        # Create installed-root package (sentinel = "installed")
+        installed_root = tmp_path / "installed"
+        installed_root.mkdir()
+        inst_pkg = installed_root / pkg_name
+        inst_pkg.mkdir()
+        (inst_pkg / "__init__.py").write_text(
+            f'SENTINEL = "installed"\n'
+            f'from cauldron.modules import BaseModule, ModuleManifest\n'
+            f'module = BaseModule(ModuleManifest(slug="ep.real", label="EP Real"))\n'
+        )
+
+        # Create project-root package (sentinel = "project")
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        proj_pkg = project_root / pkg_name
+        proj_pkg.mkdir()
+        (proj_pkg / "__init__.py").write_text(
+            f'SENTINEL = "project"\n'
+            f'from cauldron.modules import BaseModule, ModuleManifest\n'
+            f'module = BaseModule(ModuleManifest(slug="proj.real", label="Proj Real"))\n'
+        )
+
+        # Add installed_root to sys.path so the EP's real import can find it
+        sys.path.insert(0, str(installed_root))
+
+        # EP with real importlib.import_module() in load()
+        def ep_load(self=None):
+            import importlib as _il
+            return _il.import_module(pkg_name).module
+
+        fake_ep = type("EP", (), {
+            "name": "ep.real",
+            "value": f"{pkg_name}:module",
+            "dist": None,
+            "load": ep_load,
+        })()
+
+        with patch("cauldron.modules.discovery.entry_points", return_value=[fake_ep]):
+            r = discover_modules(project_module_root=project_root)
+
+        # Project candidate rejected: same import name as EP
+        proj_path_errors = [e for e in r.errors if e.kind == "project_path"]
+        assert any(pkg_name in e.message for e in proj_path_errors)
+
+        # No project record
+        assert not any(rec.source_type == "project" for rec in r.records)
+
+        # EP record: source_type="package", slug="ep.real"
+        pkg_recs = [rec for rec in r.records if rec.source_type == "package"]
+        assert any(rec.slug == "ep.real" for rec in pkg_recs)
+
+        # The loaded module came from installed_root (sentinel = "installed")
+        loaded_mod = sys.modules.get(pkg_name)
+        if loaded_mod is not None:
+            assert getattr(loaded_mod, "SENTINEL", None) == "installed", (
+                f"Expected installed sentinel but got: {getattr(loaded_mod, 'SENTINEL', None)}"
+            )
+
+    def test_ep_not_shadowed_when_project_already_cached(self, tmp_path):
+        """Even when project-origin module is in sys.modules, EP loads installed version.
+
+        Simulates the case where a previous pass or other code imported the project
+        version of the package. The EP loading phase must temporarily evict the
+        project-origin cache entry.
+        """
+        from unittest.mock import patch
+
+        pkg_name = "cauldron_cached_shadow_test_pkg"
+
+        installed_root = tmp_path / "installed"
+        installed_root.mkdir()
+        inst_pkg = installed_root / pkg_name
+        inst_pkg.mkdir()
+        (inst_pkg / "__init__.py").write_text(
+            f'SENTINEL = "installed"\n'
+            f'from cauldron.modules import BaseModule, ModuleManifest\n'
+            f'module = BaseModule(ModuleManifest(slug="ep.cached", label="EP Cached"))\n'
+        )
+
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        proj_pkg = project_root / pkg_name
+        proj_pkg.mkdir()
+        (proj_pkg / "__init__.py").write_text(
+            f'SENTINEL = "project"\n'
+            f'from cauldron.modules import BaseModule, ModuleManifest\n'
+            f'module = BaseModule(ModuleManifest(slug="proj.cached", label="Proj Cached"))\n'
+        )
+
+        sys.path.insert(0, str(installed_root))
+
+        # Pre-import the project version to simulate cached state
+        sys.path.insert(0, str(project_root))
+        try:
+            proj_mod = importlib.import_module(pkg_name)
+            assert proj_mod.SENTINEL == "project"
+        finally:
+            sys.path.remove(str(project_root))
+
+        def ep_load(self=None):
+            import importlib as _il
+            return _il.import_module(pkg_name).module
+
+        fake_ep = type("EP", (), {
+            "name": "ep.cached",
+            "value": f"{pkg_name}:module",
+            "dist": None,
+            "load": ep_load,
+        })()
+
+        with patch("cauldron.modules.discovery.entry_points", return_value=[fake_ep]):
+            r = discover_modules(project_module_root=project_root)
+
+        # Project candidate rejected (same import name as EP)
+        assert any(e.kind == "project_path" and pkg_name in e.message for e in r.errors)
+
+        # EP loads successfully with installed sentinel
+        pkg_recs = [rec for rec in r.records if rec.slug == "ep.cached"]
+        assert len(pkg_recs) == 1
+        assert pkg_recs[0].source_type == "package"
+
+        loaded_mod = sys.modules.get(pkg_name)
+        if loaded_mod is not None:
+            assert getattr(loaded_mod, "SENTINEL", None) == "installed"
+
+    def test_failed_ep_restores_project_cache(self, tmp_path):
+        """On EP load failure, the previously cached project-origin module is restored."""
+        from unittest.mock import patch
+
+        pkg_name = "cauldron_restore_test_pkg"
+
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        proj_pkg = project_root / pkg_name
+        proj_pkg.mkdir()
+        (proj_pkg / "__init__.py").write_text(
+            f'SENTINEL = "project"\n'
+            f'from cauldron.modules import BaseModule, ModuleManifest\n'
+            f'module = BaseModule(ModuleManifest(slug="proj.restore", label="Proj Restore"))\n'
+        )
+
+        # Pre-import the project version
+        sys.path.insert(0, str(project_root))
+        try:
+            proj_mod = importlib.import_module(pkg_name)
+        finally:
+            sys.path.remove(str(project_root))
+
+        # EP with same import name that fails to load
+        def bad_ep_load(self=None):
+            raise ImportError("intentional failure")
+
+        fake_ep = type("EP", (), {
+            "name": "ep.fail",
+            "value": f"{pkg_name}:module",
+            "dist": None,
+            "load": bad_ep_load,
+        })()
+
+        with patch("cauldron.modules.discovery.entry_points", return_value=[fake_ep]):
+            r = discover_modules(project_module_root=project_root)
+
+        # EP failed
+        assert any(e.kind == "load_failure" for e in r.errors)
+
+        # Project candidate rejected (import-name collision)
+        assert any(e.kind == "project_path" and pkg_name in e.message for e in r.errors)
+
+        # The cached project-origin module was restored after EP failure
+        assert sys.modules.get(pkg_name) is proj_mod, (
+            "Project-origin cached module should be restored after EP failure"
+        )
+
+    def test_two_ep_duplicates_with_project_winner(self, tmp_path):
+        """Two EPs share a slug that is also claimed by a project module.
+
+        Both EP duplicate errors must name the project record as the accepted source.
+        """
         from unittest.mock import patch
         from cauldron.modules import BaseModule, ModuleManifest
 
-        _write_project_module(tmp_path, dir_name="shared_name", slug="pkg.from.installed")
-        ep_obj = BaseModule(ModuleManifest(slug="ep.module", label="EP Module"))
-        fake_ep = type("EP", (), {
-            "name": "ep.module",
-            "value": "shared_name:module",
+        # Project module with slug "shared.slug"
+        _write_project_module(tmp_path, dir_name="projmod", slug="shared.slug")
+
+        # Two EPs with same slug, different import names (no import-name collision)
+        ep_a = BaseModule(ModuleManifest(slug="shared.slug", label="EP A"))
+        ep_b = BaseModule(ModuleManifest(slug="shared.slug", label="EP B"))
+
+        fake_ep_a = type("EP", (), {
+            "name": "shared.slug",
+            "value": "ep_pkg_a:module",  # different import name from "projmod"
             "dist": None,
-            "load": lambda s: ep_obj,
+            "load": lambda s: ep_a,
         })()
-        with patch("cauldron.modules.discovery.entry_points", return_value=[fake_ep]):
-            r1 = discover_modules(project_module_root=tmp_path)
-            r2 = discover_modules(project_module_root=tmp_path)
-
-        for r in (r1, r2):
-            project_path_errors = [e for e in r.errors if e.kind == "project_path"]
-            assert any("shared_name" in e.message for e in project_path_errors)
-            project_recs = [rec for rec in r.records if rec.source_type == "project"]
-            assert not any(rec.slug == "pkg.from.installed" for rec in project_recs)
-            pkg_recs = [rec for rec in r.records if rec.source_type == "package"]
-            assert any(rec.slug == "ep.module" for rec in pkg_recs)
-
-    def test_failed_ep_does_not_become_project_record_on_retry(self, tmp_path):
-        """EP that fails to load AND has import-name collision: project still rejected both times."""
-        from unittest.mock import patch
-
-        # Project dir "shared_name" — same name as EP's import target
-        _write_project_module(tmp_path, dir_name="shared_name", slug="shared.pkg")
-        # EP with value "shared_name:module" that fails to load
-        def bad_load():
-            raise ImportError("ep failed intentionally")
-
-        fake_ep = type("EP", (), {
-            "name": "ep.bad",
-            "value": "shared_name:module",
+        fake_ep_b = type("EP", (), {
+            "name": "shared.slug",
+            "value": "ep_pkg_b:module",  # different import name from "projmod"
             "dist": None,
-            "load": lambda s: bad_load(),
+            "load": lambda s: ep_b,
         })()
-        with patch("cauldron.modules.discovery.entry_points", return_value=[fake_ep]):
-            r1 = discover_modules(project_module_root=tmp_path)
-            r2 = discover_modules(project_module_root=tmp_path)
 
-        for r in (r1, r2):
-            # EP fails with load_failure
-            assert any(e.kind == "load_failure" for e in r.errors)
-            # Project candidate rejected (import-name collision with EP import name)
-            assert any(e.kind == "project_path" and "shared_name" in e.message
-                       for e in r.errors)
-            # No project record ever registered
-            assert not any(rec.source_type == "project" for rec in r.records)
+        with patch("cauldron.modules.discovery.entry_points", return_value=[fake_ep_a, fake_ep_b]):
+            r = discover_modules(project_module_root=tmp_path)
+
+        # Project record wins
+        assert len(r.records) == 1
+        assert r.records[0].source_type == "project"
+        assert r.records[0].slug == "shared.slug"
+
+        # Both EPs get duplicate errors naming the project record
+        dup_errors = [e for e in r.errors if e.kind == "duplicate_slug"]
+        assert len(dup_errors) == 2
+        for err in dup_errors:
+            # accepted_entry_point_name should be "modules/projmod" (the project EP name)
+            assert err.accepted_entry_point_name == "modules/projmod", (
+                f"Expected accepted_entry_point_name='modules/projmod', got {err.accepted_entry_point_name!r}"
+            )
+            assert err.accepted_package_name == ""  # project modules have no package name
+
+    def test_real_symlink_loop_produces_project_path_error(self, tmp_path):
+        """A directory-level symlink loop (if the platform supports it) produces a project_path error."""
+        import os as _os
+
+        modules_root = tmp_path / "mods"
+        modules_root.mkdir()
+        pkg = modules_root / "loopmod"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text(
+            "from cauldron.modules import BaseModule, ModuleManifest\n"
+            "module = BaseModule(ModuleManifest(slug='loop.mod', label='L'))\n"
+        )
+
+        # Attempt to create a real self-referential directory symlink
+        loop_link = pkg / "loop_back"
+        try:
+            _os.symlink(str(pkg), str(loop_link))
+        except OSError:
+            pytest.skip("Cannot create directory symlink on this platform")
+
+        # With followlinks=False in os.walk, the loop_link is listed as a directory.
+        # _validate_candidate_tree checks it: resolve() on a symlink pointing to pkg
+        # will succeed (no actual infinite loop), but all dir symlinks are removed from traversal.
+        # The test verifies the module still loads (no error for safe internal loop).
+        r = discover_modules(project_module_root=modules_root)
+        # No project_path error for the internal symlink (it's safe)
+        assert any(rec.slug == "loop.mod" for rec in r.records), (
+            f"Expected loop.mod to load. Errors: {r.errors}"
+        )
+
+        # Now create an escaping symlink
+        escaping_link = pkg / "escape_link"
+        try:
+            _os.symlink(str(tmp_path.parent), str(escaping_link))
+        except OSError:
+            pytest.skip("Cannot create escaping symlink")
+
+        # Clear the previous import state
+        for key in list(sys.modules.keys()):
+            if key == "loopmod" or key.startswith("loopmod."):
+                del sys.modules[key]
+
+        r2 = discover_modules(project_module_root=modules_root)
+        errors = [e for e in r2.errors if e.kind == "project_path"]
+        assert errors, f"Expected project_path error for escaping symlink"
+        assert not any(rec.slug == "loop.mod" for rec in r2.records)
 
     # --- Section 2: _resolve_safely and os.walk error callback tests ---
 
@@ -1810,39 +2030,55 @@ class TestPackagingTransition:
                 del sys.modules[key]
 
     def test_same_manifest_in_both_forms(self, tmp_path):
-        """The manifest from project-module discovery matches the packaged version.
+        """Identical __init__.py bytes produce equal manifests in project and package forms.
 
-        Both forms use the same __init__.py code.  The packaged EP loads via
-        real importlib.import_module() which reuses the already-imported module
-        from the project-form pass.  source_type and project_path differ.
+        After the project-form pass, sys.modules is cleared for the package and the
+        project root is removed from sys.path.  The packaged form loads via real
+        importlib.import_module() from the installed root.
         """
         from unittest.mock import patch
 
-        # Create the package — same __init__.py code used in both passes
-        pkg = tmp_path / "transmod"
-        pkg.mkdir()
-        (pkg / "__init__.py").write_text(
+        INIT_CODE = (
             "from cauldron.modules import BaseModule, ModuleManifest\n"
+            "SENTINEL = __file__\n"
             "module = BaseModule(ModuleManifest(\n"
             "    slug='trans.mod', label='Transition Module', version='2.0.0',\n"
             "    django_apps=('transmod',),\n"
             "))\n"
         )
 
-        # Add tmp_path to sys.path so importlib can find the package
-        sys.path.insert(0, str(tmp_path))
+        # Project form
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        proj_pkg = project_root / "transmod"
+        proj_pkg.mkdir()
+        (proj_pkg / "__init__.py").write_text(INIT_CODE)
 
-        # --- Project form ---
-        proj_result = discover_modules(project_module_root=tmp_path)
+        # Installed form (different directory, same code)
+        installed_root = tmp_path / "installed"
+        installed_root.mkdir()
+        inst_pkg = installed_root / "transmod"
+        inst_pkg.mkdir()
+        (inst_pkg / "__init__.py").write_text(INIT_CODE)
+
+        # --- Project form pass ---
+        proj_result = discover_modules(project_module_root=project_root)
         proj_recs = [r for r in proj_result.records if r.slug == "trans.mod"]
-        assert len(proj_recs) == 1
+        assert len(proj_recs) == 1, proj_result.errors
         proj_rec = proj_recs[0]
-        proj_manifest = proj_rec.manifest
         assert proj_rec.source_type == "project"
         assert proj_rec.project_path == "transmod"
+        proj_sentinel = getattr(sys.modules.get("transmod"), "SENTINEL", None)
 
-        # --- Packaged form (separate call, no project_module_root) ---
-        # EP's load() uses real importlib.import_module — reuses already-imported module
+        # --- Clear project-form state ---
+        for key in list(sys.modules.keys()):
+            if key == "transmod" or key.startswith("transmod."):
+                del sys.modules[key]
+        importlib.invalidate_caches()
+
+        # --- Installed form pass ---
+        sys.path.insert(0, str(installed_root))
+
         def ep_load(self=None):
             return importlib.import_module("transmod").module
 
@@ -1854,17 +2090,24 @@ class TestPackagingTransition:
         })()
         with patch("cauldron.modules.discovery.entry_points", return_value=[fake_ep]):
             pkg_result = discover_modules()  # no project_module_root
+
         pkg_recs = [r for r in pkg_result.records if r.slug == "trans.mod"]
-        assert len(pkg_recs) == 1
+        assert len(pkg_recs) == 1, pkg_result.errors
         pkg_rec = pkg_recs[0]
-        pkg_manifest = pkg_rec.manifest
         assert pkg_rec.source_type == "package"
         assert pkg_rec.project_path == ""
 
-        # Manifests must be identical (same __init__.py code)
-        assert proj_manifest.slug == pkg_manifest.slug
-        assert proj_manifest.label == pkg_manifest.label
-        assert proj_manifest.version == pkg_manifest.version
+        # The two module objects are NOT the same cached object (different imports)
+        inst_sentinel = getattr(sys.modules.get("transmod"), "SENTINEL", None)
+        assert proj_sentinel != inst_sentinel, (
+            "Project and installed sentinels should differ (different __file__)"
+        )
+
+        # Manifests are equal
+        assert proj_rec.manifest.slug == pkg_rec.manifest.slug
+        assert proj_rec.manifest.label == pkg_rec.manifest.label
+        assert proj_rec.manifest.version == pkg_rec.manifest.version
+        assert proj_rec.manifest.django_apps == pkg_rec.manifest.django_apps
 
     def test_both_in_same_pass_produces_duplicate_error(self, tmp_path):
         """Loading project + packaged versions of same slug produces a duplicate error.
@@ -1925,24 +2168,43 @@ class TestPackagingTransition:
         """manifest.django_apps is identical between project and package forms."""
         from unittest.mock import patch
 
-        pkg = tmp_path / "appsmod"
-        pkg.mkdir()
-        (pkg / "__init__.py").write_text(
+        INIT_CODE = (
             "from cauldron.modules import BaseModule, ModuleManifest\n"
             "module = BaseModule(ModuleManifest(\n"
             "    slug='apps.mod', label='Apps Module',\n"
             "    django_apps=('myapp_a', 'myapp_b'),\n"
             "))\n"
         )
-        sys.path.insert(0, str(tmp_path))
 
-        # Project form
-        proj_result = discover_modules(project_module_root=tmp_path)
+        # Project form (separate directory)
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        proj_pkg = project_root / "appsmod"
+        proj_pkg.mkdir()
+        (proj_pkg / "__init__.py").write_text(INIT_CODE)
+
+        # Installed form (different directory)
+        installed_root = tmp_path / "installed"
+        installed_root.mkdir()
+        inst_pkg = installed_root / "appsmod"
+        inst_pkg.mkdir()
+        (inst_pkg / "__init__.py").write_text(INIT_CODE)
+
+        # Project form pass
+        proj_result = discover_modules(project_module_root=project_root)
         proj_recs = [r for r in proj_result.records if r.slug == "apps.mod"]
         assert len(proj_recs) == 1
         proj_apps = proj_recs[0].manifest.django_apps
 
-        # Packaged form — EP load() reuses already-imported module
+        # Clear project-form state
+        for key in list(sys.modules.keys()):
+            if key == "appsmod" or key.startswith("appsmod."):
+                del sys.modules[key]
+        importlib.invalidate_caches()
+
+        # Installed form pass — EP load() uses installed_root
+        sys.path.insert(0, str(installed_root))
+
         def ep_load(self=None):
             return importlib.import_module("appsmod").module
 

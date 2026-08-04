@@ -1227,7 +1227,8 @@ def discover_modules(
             provisional_candidate = _provisional_slug(src.name)
 
             # Snapshot ALL sys.modules entries for this package prefix.
-            # project_before: project-origin entries to restore on failure.
+            # all_before: complete snapshot restored on failure.
+            # project_before: project-origin subset; evicted before load.
             all_before: dict[str, Any] = {}
             project_before: dict[str, Any] = {}
             if top_level:
@@ -1252,12 +1253,12 @@ def discover_modules(
 
             if load_exc is not None:
                 # Full cleanup: remove ALL currently installed/partial prefix entries,
-                # then restore project-origin exactly (by identity).
+                # then restore the complete pre-attempt snapshot (by identity).
                 if top_level:
                     for key in list(sys.modules.keys()):
                         if key == top_level or key.startswith(top_level + "."):
                             del sys.modules[key]
-                for key, mod in project_before.items():
+                for key, mod in all_before.items():
                     sys.modules[key] = mod
                 importlib.invalidate_caches()
                 ep_errors.append(_make_error(

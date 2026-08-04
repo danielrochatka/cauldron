@@ -3,6 +3,7 @@
 import importlib
 import json
 import sys
+from typing import Any
 
 import pytest
 
@@ -1971,6 +1972,156 @@ class TestProjectModuleDiscovery:
         assert current is proj_mod or current is None, (
             "After EP failure, sys.modules should have project-origin or nothing"
         )
+
+    def test_failed_ep_restores_preexisting_installed_package(self, tmp_path):
+        """EP failure restores a pre-existing installed (non-project) package by identity.
+
+        Before discovery an installed package and its submodule are imported.
+        The EP for that package name fails (missing attribute). On failure the
+        implementation must restore *all_before* — not just project-origin
+        entries — so the installed package and submodule survive unchanged.
+        """
+        from unittest.mock import patch
+
+        pkg_name = "cauldron_preinstalled_restore_pkg"
+
+        installed_root = tmp_path / "installed"
+        installed_root.mkdir()
+        inst_pkg = installed_root / pkg_name
+        inst_pkg.mkdir()
+        (inst_pkg / "__init__.py").write_text(
+            'SENTINEL = "installed"\n'
+            f'from {pkg_name} import helper\n'
+        )
+        (inst_pkg / "helper.py").write_text('HELPER_SENTINEL = "helper"\n')
+
+        # Import both the package and its submodule before discovery runs.
+        sys.path.insert(0, str(installed_root))
+        inst_mod = importlib.import_module(pkg_name)
+        inst_helper = importlib.import_module(f"{pkg_name}.helper")
+
+        # Capture the complete pre-attempt state.
+        before: dict[str, Any] = {
+            key: sys.modules[key]
+            for key in list(sys.modules.keys())
+            if key == pkg_name or key.startswith(pkg_name + ".")
+        }
+        assert len(before) >= 2, "package and helper must be pre-imported"
+
+        # EP whose load() raises AttributeError (missing attribute).
+        def ep_load(self=None):
+            import importlib as _il
+            mod = _il.import_module(pkg_name)
+            return getattr(mod, "does_not_exist")  # AttributeError
+
+        fake_ep = type("EP", (), {
+            "name": "ep.preinstalled",
+            "value": f"{pkg_name}:does_not_exist",
+            "dist": None,
+            "load": ep_load,
+        })()
+
+        with patch("cauldron.modules.discovery.entry_points", return_value=[fake_ep]):
+            r = discover_modules()
+
+        # EP must report load_failure.
+        assert any(e.kind == "load_failure" for e in r.errors)
+
+        # Complete prefix mapping must be identical to pre-attempt state.
+        after: dict[str, Any] = {
+            key: sys.modules[key]
+            for key in list(sys.modules.keys())
+            if key == pkg_name or key.startswith(pkg_name + ".")
+        }
+        assert after.keys() == before.keys(), (
+            f"sys.modules prefix keys changed: before={set(before)}, after={set(after)}"
+        )
+        for key in before:
+            assert after[key] is before[key], (
+                f"sys.modules[{key!r}] identity changed after EP failure"
+            )
+
+        # Explicit identity checks.
+        assert sys.modules.get(pkg_name) is inst_mod
+        assert sys.modules.get(f"{pkg_name}.helper") is inst_helper
+
+    def test_failed_factory_restores_preexisting_installed_package(self, tmp_path):
+        """Factory failure restores exact pre-attempt prefix state including submodules.
+
+        Before discovery an installed package and its helper submodule are in
+        sys.modules. The EP returns a callable factory that imports an extra
+        submodule and then raises. On failure:
+        - all current prefix entries are removed;
+        - all_before entries are restored by identity;
+        - the factory-introduced extra submodule is not present.
+        """
+        from unittest.mock import patch
+
+        pkg_name = "cauldron_factory_restore_pkg"
+
+        installed_root = tmp_path / "installed"
+        installed_root.mkdir()
+        inst_pkg = installed_root / pkg_name
+        inst_pkg.mkdir()
+        (inst_pkg / "__init__.py").write_text('SENTINEL = "installed"\n')
+        (inst_pkg / "helper.py").write_text('HELPER = True\n')
+        (inst_pkg / "extra.py").write_text('EXTRA = True\n')
+
+        # Pre-import package and helper (but NOT extra).
+        sys.path.insert(0, str(installed_root))
+        inst_mod = importlib.import_module(pkg_name)
+        inst_helper = importlib.import_module(f"{pkg_name}.helper")
+
+        before: dict[str, Any] = {
+            key: sys.modules[key]
+            for key in list(sys.modules.keys())
+            if key == pkg_name or key.startswith(pkg_name + ".")
+        }
+        assert f"{pkg_name}.extra" not in before, "extra must not be pre-imported"
+
+        # EP returns a factory that imports extra then raises.
+        def ep_load(self=None):
+            import importlib as _il
+
+            def factory():
+                _il.import_module(f"{pkg_name}.extra")  # side-effect import
+                raise RuntimeError("factory intentional failure")
+
+            return factory
+
+        fake_ep = type("EP", (), {
+            "name": "ep.factory.restore",
+            "value": f"{pkg_name}:factory",
+            "dist": None,
+            "load": ep_load,
+        })()
+
+        with patch("cauldron.modules.discovery.entry_points", return_value=[fake_ep]):
+            r = discover_modules()
+
+        assert any(e.kind == "load_failure" for e in r.errors)
+
+        # Complete prefix mapping must match before exactly.
+        after: dict[str, Any] = {
+            key: sys.modules[key]
+            for key in list(sys.modules.keys())
+            if key == pkg_name or key.startswith(pkg_name + ".")
+        }
+        assert after.keys() == before.keys(), (
+            f"prefix keys differ: extra keys={set(after)-set(before)}, "
+            f"missing keys={set(before)-set(after)}"
+        )
+        for key in before:
+            assert after[key] is before[key], (
+                f"sys.modules[{key!r}] identity changed after factory failure"
+            )
+
+        # Extra submodule introduced by the factory must not persist.
+        assert f"{pkg_name}.extra" not in sys.modules
+
+        # Original objects restored by identity.
+        assert sys.modules.get(pkg_name) is inst_mod
+        assert sys.modules.get(f"{pkg_name}.helper") is inst_helper
 
     def test_two_ep_duplicates_with_project_winner(self, tmp_path):
         """Two EPs share a slug that is also claimed by a project module.

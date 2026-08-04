@@ -2,8 +2,11 @@
 
 from django.urls import path
 
-from .views import health
+from .views import health, module_inventory
 
 app_name = "cauldron"
 
-urlpatterns = [path("health/", health, name="health")]
+urlpatterns = [
+    path("health/", health, name="health"),
+    path("modules/", module_inventory, name="modules-api"),
+]

@@ -1323,3 +1323,111 @@ class TestCapabilityBlockingSemantics:
         assert inv1["a"] is False
         assert inv1["b"] is False
         assert inv1["c"] is True
+
+
+class TestModuleLifecycleStates:
+    def test_discovered_state_set_for_enabled_modules(self, registry):
+        a = _mod("a")
+        registry.populate([a])
+        # Before activation, active module is "discovered"
+        assert registry.module_state("a") == "discovered"
+
+    def test_disabled_state_set_for_non_enabled_modules(self, registry):
+        a = _mod("a")
+        b = _mod("b")
+        registry.populate([a, b], enabled={"a"})
+        assert registry.module_state("b") == "disabled"
+        assert registry.module_state("a") == "discovered"
+
+    def test_unavailable_state_for_missing_enabled_slug(self, registry):
+        registry.populate([], enabled={"missing.slug"})
+        assert registry.module_state("missing.slug") == "unavailable"
+
+    def test_ready_state_after_successful_activation(self, registry):
+        a = _mod("a")
+        registry.populate([a])
+        registry.activate()
+        assert registry.module_state("a") == "ready"
+
+    def test_registered_state_for_module_without_on_ready(self, registry):
+        # BaseModule.on_ready() is a no-op (inherited), so after successful
+        # register AND on_ready, state should be "ready".
+        a = _mod("a")
+        registry.populate([a])
+        registry.activate()
+        # Since BaseModule.on_ready() is a no-op, state should be "ready"
+        assert registry.module_state("a") == "ready"
+
+    def test_failed_state_after_register_raises(self, registry):
+        class BadRegister(BaseModule):
+            def register(self, context):
+                raise ValueError("register fail")
+
+        a = BadRegister(ModuleManifest(slug="a", label="a"))
+        registry.populate([a])
+        registry.activate()
+        assert registry.module_state("a") == "failed"
+
+    def test_failed_state_after_on_ready_raises(self, registry):
+        class BadOnReady(BaseModule):
+            def on_ready(self):
+                raise RuntimeError("on_ready fail")
+
+        a = BadOnReady(ModuleManifest(slug="a", label="a"))
+        registry.populate([a])
+        registry.activate()
+        assert registry.module_state("a") == "failed"
+
+    def test_on_ready_skipped_when_register_fails(self, registry):
+        """register() failure must prevent on_ready() from being called."""
+        called = []
+
+        class FailRegister(BaseModule):
+            def register(self, context):
+                raise ValueError("bad")
+
+            def on_ready(self):
+                called.append(self.slug)
+
+        a = FailRegister(ModuleManifest(slug="a", label="a"))
+        registry.populate([a])
+        registry.activate()
+        assert called == [], "on_ready must not be called after register() fails"
+        assert registry.module_state("a") == "failed"
+
+    def test_successful_module_state_unaffected_by_sibling_failure(self, registry):
+        class Good(BaseModule):
+            pass  # uses no-op register/on_ready
+
+        class Bad(BaseModule):
+            def on_ready(self):
+                raise RuntimeError("crash")
+
+        a = Good(ModuleManifest(slug="a", label="a"))
+        b = Bad(ModuleManifest(slug="b", label="b"))
+        registry.populate([a, b])
+        registry.activate()
+        assert registry.module_state("a") == "ready"
+        assert registry.module_state("b") == "failed"
+
+    def test_module_states_returns_all_states(self, registry):
+        a = _mod("a")
+        b = _mod("b")
+        registry.populate([a, b], enabled={"a"})
+        states = registry.module_states()
+        assert states["a"] == "discovered"
+        assert states["b"] == "disabled"
+
+    def test_activate_idempotent(self, registry):
+        called = []
+
+        class Counter(BaseModule):
+            def on_ready(self):
+                called.append(1)
+
+        a = Counter(ModuleManifest(slug="a", label="a"))
+        registry.populate([a])
+        registry.activate()
+        registry.activate()  # second call should be no-op
+        assert len(called) == 1, "on_ready() must not be called twice"
+        assert registry.module_state("a") == "ready"

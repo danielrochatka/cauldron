@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+ModuleLifecycleState = Literal["discovered", "disabled", "unavailable", "registered", "ready", "failed"]
+
 
 @dataclass
 class LifecycleError:
@@ -122,6 +124,7 @@ class ModuleRegistry:
         self._enabled: set[str] = set()
         self._discovery_records: list[DiscoveredModule] = []
         self._unavailable: list[UnavailableModule] = []
+        self._module_states: dict[str, ModuleLifecycleState] = {}
         self._populated = False
         self._ready = False
 
@@ -170,6 +173,7 @@ class ModuleRegistry:
         self._lifecycle_errors = []
         self._discovery_records = list(discovery_records or [])
         self._unavailable = []
+        self._module_states = {}
         self._populated = False
         self._ready = False
 
@@ -211,6 +215,16 @@ class ModuleRegistry:
                     else:
                         self._unavailable.append(UnavailableModule(slug=slug))
 
+        # Set initial per-module lifecycle states.
+        self._module_states = {}
+        for slug in self._discovered:
+            if slug in self._enabled:
+                self._module_states[slug] = "discovered"
+            else:
+                self._module_states[slug] = "disabled"
+        for u in self._unavailable:
+            self._module_states[u.slug] = "unavailable"
+
         for slug, module in sorted(active_modules.items()):
             for cap in sorted(module.manifest.provides):
                 self._capability_providers.setdefault(cap, []).append(slug)
@@ -242,12 +256,19 @@ class ModuleRegistry:
         """Call ``register()`` then ``on_ready()`` on each active module in load order.
 
         Activation is skipped entirely if resolution errors exist (dependency
-        or version problems for active modules).  Discovery errors for modules
+        or version problems for active modules). Discovery errors for modules
         that are not enabled do not block activation of healthy modules.
 
-        Callers should run ``python manage.py check`` to surface all problems
-        before starting the application.
+        Safe to call multiple times: a second call after the first succeeds
+        is a no-op (idempotent). A second call after populate() has been
+        re-run will re-activate normally since populate() resets _ready.
+
+        If ``register()`` raises for a module, that module is marked ``failed``
+        and its ``on_ready()`` is skipped. Other modules continue normally.
         """
+        if self._ready:
+            return
+
         if self._errors:
             logger.error(
                 "Module activation skipped: resolve errors must be fixed first."
@@ -262,10 +283,12 @@ class ModuleRegistry:
             if module is None:
                 continue
 
+            register_ok = True
             if hasattr(module, "register"):
                 context = ModuleContext(slug=slug, config=self.get_module_config(slug))
                 try:
                     module.register(context)  # type: ignore[union-attr]
+                    self._module_states[slug] = "registered"
                 except Exception as exc:
                     self._lifecycle_errors.append(LifecycleError(
                         module_slug=slug,
@@ -273,11 +296,14 @@ class ModuleRegistry:
                         exception=exc,
                         message=f"Module {slug!r} raised in register(): {exc}",
                     ))
+                    self._module_states[slug] = "failed"
                     logger.exception("register() raised in module %r.", slug)
+                    register_ok = False
 
-            if hasattr(module, "on_ready"):
+            if register_ok and hasattr(module, "on_ready"):
                 try:
                     module.on_ready()  # type: ignore[union-attr]
+                    self._module_states[slug] = "ready"
                 except Exception as exc:
                     self._lifecycle_errors.append(LifecycleError(
                         module_slug=slug,
@@ -285,6 +311,7 @@ class ModuleRegistry:
                         exception=exc,
                         message=f"Module {slug!r} raised in on_ready(): {exc}",
                     ))
+                    self._module_states[slug] = "failed"
                     logger.exception("on_ready() raised in module %r.", slug)
 
         self._ready = True
@@ -318,6 +345,14 @@ class ModuleRegistry:
 
     def lifecycle_errors(self) -> list[LifecycleError]:
         return list(self._lifecycle_errors)
+
+    def module_state(self, slug: str) -> ModuleLifecycleState | None:
+        """Return the current lifecycle state for *slug*, or None if unknown."""
+        return self._module_states.get(slug)
+
+    def module_states(self) -> dict[str, ModuleLifecycleState]:
+        """Return a copy of all known module lifecycle states."""
+        return dict(self._module_states)
 
     def enabled_slugs(self) -> frozenset[str]:
         """Return the set of slugs that were explicitly enabled at populate time."""

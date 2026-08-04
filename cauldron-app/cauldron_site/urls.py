@@ -3,6 +3,7 @@ from django.contrib import admin
 from django.urls import include, path, re_path
 from django.views.generic import RedirectView
 
+from cauldron.views import module_inventory
 from cauldron_django_admin.urls import get_admin_urls, get_cauldron_urls
 from cauldron_site.views.public_site import serve_index, serve_page, serve_asset
 
@@ -21,6 +22,8 @@ urlpatterns = [
     path("cauldron/", include("cauldron_site_astro.urls", namespace="cauldron_site_astro")),
     # Content API
     path("cauldron/api/v1/", include("cauldron_content_api.urls")),
+    # Cauldron module inventory API
+    path("api/cauldron/modules/", module_inventory, name="cauldron-modules-api"),
     # Public site — MUST be last
     # Top-level generated files with extensions: theme.css, favicon.ico, robots.txt, etc.
     # Must come before the bare-slug redirect so /theme.css is served directly.

@@ -1118,23 +1118,11 @@ def discover_modules(
                     )
                     errors.extend(enum_errors)
 
-    # --- Phase 2: Build EP import-name set -----------------------------------
-    raw_eps = entry_points(group=entry_point_group)
-
-    ep_pairs = [(ep, _source_for_ep(ep, entry_point_group)) for ep in raw_eps]
-    ep_pairs.sort(key=lambda pair: (
-        pair[1].name,
-        pair[1].canonical_package_name,
-        pair[1].value,
-    ))
-
-    # Extract top-level import name from each EP's value field.
-    # e.g. "shared_name:module" → "shared_name", "mypkg.sub:attr" → "mypkg"
+    # Initialize EP structures before try so they're accessible in finally.
+    ep_pairs: list[tuple[Any, _EntryPointSource]] = []
     ep_import_names: set[str] = set()
-    for _ep, src in ep_pairs:
-        top_level = _ep_top_level(src.value)
-        if top_level:
-            ep_import_names.add(top_level)
+    ep_candidates: list[tuple[str, _EntryPointSource, Any]] = []
+    ep_errors: list[DiscoveryError] = []
 
     # --- Phase 3: Load EPs with project root temporarily removed and
     #     sys.modules cache isolation for project-origin entries --------------
@@ -1142,13 +1130,31 @@ def discover_modules(
     original_sys_path = list(sys.path)
 
     try:
-        # Remove project-root entries temporarily (so EP loading can't shadow)
+        # Remove project-root entries (single resolve per entry, no double-call).
         if canonical_root_str is not None:
-            sys.path[:] = [
-                e for e in sys.path
-                if not (isinstance(e, str) and _resolve_safely(Path(e)) is not None
-                        and str(_resolve_safely(Path(e))) == canonical_root_str)
-            ]
+            clean_path: list[str] = []
+            for e in sys.path:
+                if isinstance(e, str):
+                    resolved = _resolve_safely(Path(e))
+                    if resolved is not None and str(resolved) == canonical_root_str:
+                        continue
+                clean_path.append(e)
+            sys.path[:] = clean_path
+
+        # --- Phase 2 (moved inside): Build EP import-name set ------------------
+        # Called after project root removed so local .dist-info cannot be seen.
+        raw_eps = entry_points(group=entry_point_group)
+        ep_pairs = [(ep, _source_for_ep(ep, entry_point_group)) for ep in raw_eps]
+        ep_pairs.sort(key=lambda pair: (
+            pair[1].name,
+            pair[1].canonical_package_name,
+            pair[1].value,
+        ))
+        ep_import_names = {
+            top
+            for _ep, src in ep_pairs
+            for top in (_ep_top_level(src.value),) if top
+        }
 
         # Build surviving candidates: reject import-name collisions
         # and stdlib/installed package collisions (with root absent).
@@ -1175,22 +1181,31 @@ def discover_modules(
                     ))
                 else:
                     # Check for stdlib/installed collision while root is absent.
-                    # find_spec may find a cached sys.modules entry from the project
-                    # root itself (from a previous discovery pass); in that case we
-                    # check whether the spec origin is under canonical_root before
-                    # rejecting.
+                    # Evict project-origin cached modules for this prefix so
+                    # find_spec() sees installed packages rather than the cached
+                    # project module.
+                    saved_for_spec: dict[str, Any] = {}
+                    if canonical_root is not None:
+                        for key in list(sys.modules.keys()):
+                            if key == dir_name or key.startswith(dir_name + "."):
+                                mod = sys.modules[key]
+                                if _module_from_project(mod, canonical_root):
+                                    saved_for_spec[key] = mod
+                                    del sys.modules[key]
+                    if saved_for_spec:
+                        importlib.invalidate_caches()
                     try:
                         spec = importlib.util.find_spec(dir_name)
                     except (ModuleNotFoundError, ValueError):
                         spec = None
-                    spec_from_project = False
-                    if spec is not None and canonical_root is not None:
-                        origin = getattr(spec, "origin", None)
-                        if origin is not None:
-                            resolved_origin = _resolve_safely(Path(origin))
-                            if resolved_origin is not None and _is_under(resolved_origin, canonical_root):
-                                spec_from_project = True
-                    if spec is not None and not spec_from_project:
+                    finally:
+                        for key, mod in saved_for_spec.items():
+                            if key not in sys.modules:
+                                sys.modules[key] = mod
+                        if saved_for_spec:
+                            importlib.invalidate_caches()
+
+                    if spec is not None:
                         errors.append(DiscoveryError(
                             entry_point_name=ep_name,
                             kind="project_path",
@@ -1207,40 +1222,52 @@ def discover_modules(
         candidate_names = surviving_candidates
 
         # Load each EP with sys.modules cache management for project-origin entries
-        ep_candidates: list[tuple[str, _EntryPointSource, Any]] = []
-        ep_errors: list[DiscoveryError] = []
-
         for ep, src in ep_pairs:
             top_level = _ep_top_level(src.value)
             provisional_candidate = _provisional_slug(src.name)
 
-            # Temporarily hide project-origin cached modules for this import name
-            saved_modules: dict[str, Any] = {}
-            if top_level and canonical_root is not None:
+            # Snapshot ALL sys.modules entries for this package prefix.
+            # project_before: project-origin entries to restore on failure.
+            all_before: dict[str, Any] = {}
+            project_before: dict[str, Any] = {}
+            if top_level:
                 for key in list(sys.modules.keys()):
                     if key == top_level or key.startswith(top_level + "."):
                         mod = sys.modules[key]
-                        if _module_from_project(mod, canonical_root):
-                            saved_modules[key] = mod
-                            del sys.modules[key]
+                        all_before[key] = mod
+                        if canonical_root is not None and _module_from_project(mod, canonical_root):
+                            project_before[key] = mod
 
+            # Evict project-origin entries so EP loads from installed package.
+            for key in project_before:
+                del sys.modules[key]
+
+            load_exc: Exception | None = None
             try:
                 obj = ep.load()
                 if callable(obj) and not isinstance(obj, CauldronModule):
                     obj = obj()
             except Exception as exc:
-                # Restore project-origin cache on failure
-                for key, mod in saved_modules.items():
-                    if key not in sys.modules:
-                        sys.modules[key] = mod
+                load_exc = exc
+
+            if load_exc is not None:
+                # Full cleanup: remove ALL currently installed/partial prefix entries,
+                # then restore project-origin exactly (by identity).
+                if top_level:
+                    for key in list(sys.modules.keys()):
+                        if key == top_level or key.startswith(top_level + "."):
+                            del sys.modules[key]
+                for key, mod in project_before.items():
+                    sys.modules[key] = mod
+                importlib.invalidate_caches()
                 ep_errors.append(_make_error(
                     src, "load_failure",
-                    f"Entry point {src.name!r} raised {type(exc).__name__} on load.",
+                    f"Entry point {src.name!r} raised {type(load_exc).__name__} on load.",
                     candidate_slug=provisional_candidate,
                 ))
-                logger.debug("Entry point %r failed to load: %s", src.name, exc, exc_info=True)
+                logger.debug("Entry point %r failed to load: %s", src.name, load_exc)
                 continue
-            # On success: keep installed package state (don't restore saved_modules)
+            # On success: keep installed package state.
 
             validation_errors = _validate_manifest(src, obj, provisional_candidate=provisional_candidate)
             if validation_errors:

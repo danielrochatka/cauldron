@@ -80,9 +80,11 @@ _STARTUP_SCRIPT = textwrap.dedent("""\
     modules_root = os.environ["_CAULDRON_TEST_MODULES_ROOT"]
     marker_dir = os.environ["_CAULDRON_TEST_MARKER_DIR"]
 
-    # --- Settings-level composition (before django.setup()) ---
     from pathlib import Path
     from cauldron.django.compose import compose_django_settings
+
+    # Snapshot sys.path before composition
+    sys_path_before = list(sys.path)
 
     plan = compose_django_settings(
         installed_apps=["cauldron"],
@@ -92,9 +94,13 @@ _STARTUP_SCRIPT = textwrap.dedent("""\
     assert "lifecycle_mod" in plan.installed_apps, (
         f"lifecycle_mod not in installed_apps: {plan.installed_apps}"
     )
+
+    # sys.path must be identical after composition
+    assert sys.path == sys_path_before, (
+        f"sys.path changed after compose_django_settings: before={sys_path_before}, after={sys.path}"
+    )
     print("APPS_BEFORE_SETUP:", ",".join(plan.installed_apps))
 
-    # --- Full Django setup ---
     import django
     from django.conf import settings
     settings.configure(
@@ -106,6 +112,11 @@ _STARTUP_SCRIPT = textwrap.dedent("""\
         DEFAULT_AUTO_FIELD="django.db.models.BigAutoField",
     )
     django.setup()
+
+    # sys.path must still be identical after django.setup()
+    assert sys.path == sys_path_before, (
+        f"sys.path changed after django.setup(): before={sys_path_before}, after={sys.path}"
+    )
 
     from cauldron.modules.registry import registry
     records = [r for r in registry._discovery_records if r.source_type == "project"]

@@ -34,7 +34,8 @@ class CauldronConfig(AppConfig):
 
         capability_overrides: dict = getattr(settings, "CAULDRON_CAPABILITY_PROVIDERS", {})
 
-        result = discover_modules()
+        project_module_root = getattr(settings, "CAULDRON_PROJECT_MODULE_ROOT", None)
+        result = discover_modules(project_module_root=project_module_root)
         registry.populate(
             result.modules,
             enabled=enabled,

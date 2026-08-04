@@ -119,61 +119,83 @@ def cauldron_module_graph_check(app_configs, **kwargs):
     }
 
     for err in registry.discovery_errors():
-        error_id, warning_id = _discovery_id_map.get(
-            err.kind, ("cauldron.E029", "cauldron.W029")
-        )
-
-        candidate = err.candidate_slug
-        # Relevant when: slug unknown, or slug is explicitly enabled.
-        # An empty enabled set means no modules are enabled, so a known
-        # candidate is not enabled and must be a warning, not an error.
-        is_relevant = (
-            candidate is None
-            or candidate in enabled
-        )
-
-        if is_relevant:
-            messages.append(
-                Error(
-                    err.message,
-                    hint=(
-                        "Fix the entry-point registration or module package before"
-                        " starting."
-                    ),
-                    obj=err.entry_point_name,
-                    id=error_id,
-                )
-            )
+        if err.kind == "project_path":
+            # project_path errors are always path-level (no candidate slug);
+            # they always block the installation.
+            messages.append(Error(
+                err.message,
+                hint="Fix the CAULDRON_PROJECT_MODULE_ROOT path or remove the offending"
+                     " file before starting.",
+                obj=err.entry_point_name or None,
+                id="cauldron.E024",
+            ))
         else:
-            messages.append(
-                Warning(
-                    err.message,
-                    hint=(
-                        f"Module {candidate!r} is not enabled in CAULDRON_MODULES;"
-                        " this discovery problem does not affect the running"
-                        " application.  Fix or remove the broken package to suppress"
-                        " this warning."
-                    ),
-                    obj=err.entry_point_name,
-                    id=warning_id,
-                )
+            error_id, warning_id = _discovery_id_map.get(
+                err.kind, ("cauldron.E029", "cauldron.W029")
             )
+
+            candidate = err.candidate_slug
+            # Relevant when: slug unknown, or slug is explicitly enabled.
+            # An empty enabled set means no modules are enabled, so a known
+            # candidate is not enabled and must be a warning, not an error.
+            is_relevant = (
+                candidate is None
+                or candidate in enabled
+            )
+
+            if is_relevant:
+                messages.append(
+                    Error(
+                        err.message,
+                        hint=(
+                            "Fix the entry-point registration or module package before"
+                            " starting."
+                        ),
+                        obj=err.entry_point_name,
+                        id=error_id,
+                    )
+                )
+            else:
+                messages.append(
+                    Warning(
+                        err.message,
+                        hint=(
+                            f"Module {candidate!r} is not enabled in CAULDRON_MODULES;"
+                            " this discovery problem does not affect the running"
+                            " application.  Fix or remove the broken package to suppress"
+                            " this warning."
+                        ),
+                        obj=err.entry_point_name,
+                        id=warning_id,
+                    )
+                )
 
     # Unavailable configured slugs ---------------------------------------
     # E023 covers only genuinely absent modules (no entry point found).
     # load_failure and manifest_validation are already reported by E020/E022
     # above; emitting E023 again for those would be noise.
+    from django.conf import settings as _settings
+    _has_project_root = bool(getattr(_settings, "CAULDRON_PROJECT_MODULE_ROOT", None))
     for unavail in registry.unavailable_modules():
         if unavail.reason == "not_discovered":
+            if _has_project_root:
+                hint = (
+                    f"Install the package that provides the 'cauldron.modules'"
+                    f" entry point for {unavail.slug!r}, or add a project module"
+                    f" directory for it under CAULDRON_PROJECT_MODULE_ROOT,"
+                    " or remove it from CAULDRON_MODULES."
+                )
+            else:
+                hint = (
+                    f"Install the package that provides the 'cauldron.modules'"
+                    f" entry point for {unavail.slug!r}, or remove it from"
+                    " CAULDRON_MODULES."
+                )
             messages.append(
                 Error(
                     f"Module {unavail.slug!r} is listed in CAULDRON_MODULES but was"
-                    " not found among installed entry points.",
-                    hint=(
-                        f"Install the package that provides the 'cauldron.modules'"
-                        f" entry point for {unavail.slug!r}, or remove it from"
-                        " CAULDRON_MODULES."
-                    ),
+                    " not found among installed entry points or project modules.",
+                    hint=hint,
                     obj=unavail.slug,
                     id="cauldron.E023",
                 )

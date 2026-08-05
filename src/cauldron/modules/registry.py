@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+ModuleLifecycleState = Literal["discovered", "disabled", "unavailable", "registered", "ready", "failed"]
+
 
 @dataclass
 class LifecycleError:
@@ -122,6 +124,7 @@ class ModuleRegistry:
         self._enabled: set[str] = set()
         self._discovery_records: list[DiscoveredModule] = []
         self._unavailable: list[UnavailableModule] = []
+        self._module_states: dict[str, ModuleLifecycleState] = {}
         self._populated = False
         self._ready = False
 
@@ -170,6 +173,7 @@ class ModuleRegistry:
         self._lifecycle_errors = []
         self._discovery_records = list(discovery_records or [])
         self._unavailable = []
+        self._module_states = {}
         self._populated = False
         self._ready = False
 
@@ -211,6 +215,16 @@ class ModuleRegistry:
                     else:
                         self._unavailable.append(UnavailableModule(slug=slug))
 
+        # Set initial per-module lifecycle states.
+        self._module_states = {}
+        for slug in self._discovered:
+            if slug in self._enabled:
+                self._module_states[slug] = "discovered"
+            else:
+                self._module_states[slug] = "disabled"
+        for u in self._unavailable:
+            self._module_states[u.slug] = "unavailable"
+
         for slug, module in sorted(active_modules.items()):
             for cap in sorted(module.manifest.provides):
                 self._capability_providers.setdefault(cap, []).append(slug)
@@ -230,6 +244,15 @@ class ModuleRegistry:
             for slug in result.load_order
             if slug in active_modules
         }
+
+        # Resolution-blocked enabled modules cannot enter lifecycle activation;
+        # reflect this in their state so callers do not see them as "discovered".
+        if self._errors:
+            blocked_by_resolution = self._blocked_slugs()
+            for slug in blocked_by_resolution:
+                if self._module_states.get(slug) == "discovered":
+                    self._module_states[slug] = "unavailable"
+
         self._populated = True
 
         total_errors = len(self._errors) + len(self._discovery_errors)
@@ -242,12 +265,19 @@ class ModuleRegistry:
         """Call ``register()`` then ``on_ready()`` on each active module in load order.
 
         Activation is skipped entirely if resolution errors exist (dependency
-        or version problems for active modules).  Discovery errors for modules
+        or version problems for active modules). Discovery errors for modules
         that are not enabled do not block activation of healthy modules.
 
-        Callers should run ``python manage.py check`` to surface all problems
-        before starting the application.
+        Safe to call multiple times: a second call after the first succeeds
+        is a no-op (idempotent). A second call after populate() has been
+        re-run will re-activate normally since populate() resets _ready.
+
+        If ``register()`` raises for a module, that module is marked ``failed``
+        and its ``on_ready()`` is skipped. Other modules continue normally.
         """
+        if self._ready:
+            return
+
         if self._errors:
             logger.error(
                 "Module activation skipped: resolve errors must be fixed first."
@@ -262,10 +292,12 @@ class ModuleRegistry:
             if module is None:
                 continue
 
+            register_ok = True
             if hasattr(module, "register"):
                 context = ModuleContext(slug=slug, config=self.get_module_config(slug))
                 try:
                     module.register(context)  # type: ignore[union-attr]
+                    self._module_states[slug] = "registered"
                 except Exception as exc:
                     self._lifecycle_errors.append(LifecycleError(
                         module_slug=slug,
@@ -273,11 +305,14 @@ class ModuleRegistry:
                         exception=exc,
                         message=f"Module {slug!r} raised in register(): {exc}",
                     ))
+                    self._module_states[slug] = "failed"
                     logger.exception("register() raised in module %r.", slug)
+                    register_ok = False
 
-            if hasattr(module, "on_ready"):
+            if register_ok and hasattr(module, "on_ready"):
                 try:
                     module.on_ready()  # type: ignore[union-attr]
+                    self._module_states[slug] = "ready"
                 except Exception as exc:
                     self._lifecycle_errors.append(LifecycleError(
                         module_slug=slug,
@@ -285,6 +320,7 @@ class ModuleRegistry:
                         exception=exc,
                         message=f"Module {slug!r} raised in on_ready(): {exc}",
                     ))
+                    self._module_states[slug] = "failed"
                     logger.exception("on_ready() raised in module %r.", slug)
 
         self._ready = True
@@ -318,6 +354,14 @@ class ModuleRegistry:
 
     def lifecycle_errors(self) -> list[LifecycleError]:
         return list(self._lifecycle_errors)
+
+    def module_state(self, slug: str) -> ModuleLifecycleState | None:
+        """Return the current lifecycle state for *slug*, or None if unknown."""
+        return self._module_states.get(slug)
+
+    def module_states(self) -> dict[str, ModuleLifecycleState]:
+        """Return a copy of all known module lifecycle states."""
+        return dict(self._module_states)
 
     def enabled_slugs(self) -> frozenset[str]:
         """Return the set of slugs that were explicitly enabled at populate time."""
@@ -399,18 +443,24 @@ class ModuleRegistry:
     def inventory(self) -> list[dict[str, Any]]:
         """Rich inventory combining discovery metadata and resolution state.
 
-        Returns one entry per discovered module, sorted by slug.  Each entry
-        contains:
+        Returns one entry per module (discovered *or* unavailable), sorted by
+        slug.  Each entry contains:
 
-        - **identity & source**: slug, label, version, source_type,
+        - **identity & source**: slug, label, version, source_type, source,
           package_name, package_version, entry_point_group,
           entry_point_name, entry_point_value
-        - **manifest**: the full serialized manifest dict
+        - **manifest**: the full serialized manifest dict (``None`` for
+          unavailable modules that were never loaded)
         - **compatibility**: installed_cauldron_version,
           cauldron_version_constraint, cauldron_version_ok (always bool)
+        - **lifecycle**: state (one of :data:`ModuleLifecycleState`)
         - **config & activation**: enabled, active, load_index, config
         - **convenience projections**: provides, requires, optional, deps,
           django_apps (from manifest), requires_restart
+        - **errors**: combined safe list — resolution errors (``kind``,
+          ``message``); discovery errors (``kind="discovery"``, ``message``);
+          lifecycle errors (``kind="lifecycle"``, ``phase``,
+          ``exception_type`` — never the raw exception message)
         """
         from .resolver import version_satisfies
 
@@ -426,6 +476,30 @@ class ModuleRegistry:
         dep_graph = self.dependency_graph()
         blocked = self._blocked_slugs()
 
+        # --- Build safe error indices keyed by slug ---
+        resolution_errors_by_slug: dict[str, list[dict[str, Any]]] = {}
+        for err in self._errors:
+            resolution_errors_by_slug.setdefault(err.module_slug, []).append({
+                "kind": err.kind.value,
+                "message": err.message,
+            })
+
+        discovery_errors_by_slug: dict[str, list[dict[str, Any]]] = {}
+        for err in self._discovery_errors:
+            if err.candidate_slug:
+                discovery_errors_by_slug.setdefault(err.candidate_slug, []).append({
+                    "kind": "discovery",
+                    "message": err.message,
+                })
+
+        lifecycle_errors_by_slug: dict[str, list[dict[str, Any]]] = {}
+        for err in self._lifecycle_errors:
+            lifecycle_errors_by_slug.setdefault(err.module_slug, []).append({
+                "kind": "lifecycle",
+                "phase": err.phase,
+                "exception_type": type(err.exception).__name__,
+            })
+
         result = []
         for slug in sorted(self._discovered):
             m = self._discovered[slug]
@@ -434,12 +508,27 @@ class ModuleRegistry:
             constraint = manifest.cauldron_version
             compat: bool = version_satisfies(installed_cauldron_version, constraint)
             is_active = (slug in self._active) and (slug not in blocked)
+
+            if rec and rec.source_type == "project":
+                source = rec.project_path  # root-relative POSIX — no absolute paths
+            elif rec and rec.package_name:
+                source = rec.package_name
+            else:
+                source = ""
+
+            errors: list[dict[str, Any]] = (
+                resolution_errors_by_slug.get(slug, [])
+                + discovery_errors_by_slug.get(slug, [])
+                + lifecycle_errors_by_slug.get(slug, [])
+            )
+
             entry: dict[str, Any] = {
                 # identity & source
                 "slug": slug,
                 "label": m.label,
                 "version": manifest.version,
                 "source_type": rec.source_type if rec else None,
+                "source": source,
                 "package_name": rec.package_name if rec else None,
                 "package_version": rec.package_version if rec else None,
                 "entry_point_group": rec.entry_point_group if rec else None,
@@ -451,6 +540,8 @@ class ModuleRegistry:
                 "installed_cauldron_version": installed_cauldron_version,
                 "cauldron_version_constraint": constraint,
                 "cauldron_version_ok": compat,
+                # lifecycle
+                "state": self._module_states.get(slug, "discovered"),
                 # config & activation
                 "enabled": slug in self._enabled,
                 "active": is_active,
@@ -463,18 +554,61 @@ class ModuleRegistry:
                 "deps": dep_graph.get(slug, []),
                 "django_apps": list(manifest.django_apps),
                 "requires_restart": manifest.requires_restart,
+                # errors (safe: no raw exception messages, no absolute paths)
+                "errors": errors,
             }
             result.append(entry)
+
+        # Include enabled slugs that were never successfully discovered.
+        discovered_slugs = set(self._discovered)
+        for u in self._unavailable:
+            if u.slug in discovered_slugs:
+                continue
+            disc_errors = discovery_errors_by_slug.get(u.slug, [])
+            if not disc_errors and u.discovery_error_message:
+                disc_errors = [{"kind": "discovery", "message": u.discovery_error_message}]
+            result.append({
+                "slug": u.slug,
+                "label": None,
+                "version": None,
+                "source_type": None,
+                "source": "",
+                "package_name": None,
+                "package_version": None,
+                "entry_point_group": None,
+                "entry_point_name": None,
+                "entry_point_value": None,
+                "manifest": None,
+                "installed_cauldron_version": installed_cauldron_version,
+                "cauldron_version_constraint": None,
+                "cauldron_version_ok": None,
+                "state": "unavailable",
+                "enabled": True,
+                "active": False,
+                "load_index": None,
+                "config": self.get_module_config(u.slug),
+                "provides": [],
+                "requires": [],
+                "optional": [],
+                "deps": [],
+                "django_apps": [],
+                "requires_restart": False,
+                "errors": disc_errors,
+            })
+
+        result.sort(key=lambda e: e["slug"])
         return result
 
     def graph_info(self) -> list[dict[str, Any]]:
         """Rich module graph for tooling and visualizers.
 
-        Returns one entry per discovered module, sorted by slug.  Each entry
-        contains identity, status, load position, capabilities, requirements,
-        resolved dependencies, and Django apps.
+        Returns one entry per **discovered** module, sorted by slug.  Enabled
+        slugs that were never successfully loaded (``manifest is None``) are
+        excluded — they appear in :meth:`inventory` but carry no graph data.
 
-        This is a stable subset of :meth:`inventory` keys.
+        Each entry is a stable subset of :meth:`inventory` keys: identity,
+        status, load position, capabilities, requirements, resolved
+        dependencies, and Django apps.
         """
         return [
             {
@@ -490,6 +624,7 @@ class ModuleRegistry:
                 "django_apps": e["django_apps"],
             }
             for e in self.inventory()
+            if e["manifest"] is not None
         ]
 
     # ----------------------------------------------------------------- flags

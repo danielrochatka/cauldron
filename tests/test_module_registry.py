@@ -673,6 +673,32 @@ class TestInventory:
                     f"graph_info[{slug!r}][{key!r}] != inventory[{slug!r}][{key!r}]"
                 )
 
+    def test_graph_info_excludes_unavailable_placeholder(self, registry):
+        """Enabled-but-undiscovered slug must appear in inventory() but not graph_info()."""
+        a = _mod("a")
+        registry.populate([a], enabled={"a", "ghost.slug"})
+
+        inv_slugs = [e["slug"] for e in registry.inventory()]
+        graph_slugs = [e["slug"] for e in registry.graph_info()]
+
+        # ghost.slug has no discovered module: in inventory, absent from graph_info
+        assert "ghost.slug" in inv_slugs
+        assert "ghost.slug" not in graph_slugs
+
+        # discovered module is in both
+        assert "a" in inv_slugs
+        assert "a" in graph_slugs
+
+    def test_graph_info_ordering_deterministic_with_unavailable(self, registry):
+        """graph_info() slug order must be sorted even when unavailable slugs exist."""
+        z = _mod("z")
+        a = _mod("a")
+        registry.populate([z, a], enabled={"z", "a", "ghost"})
+
+        slugs = [e["slug"] for e in registry.graph_info()]
+        assert slugs == sorted(slugs)
+        assert "ghost" not in slugs
+
 
 class TestEnabledSetStorage:
     """Tests that _enabled is stored and drives enabled flag in inventory."""
@@ -1323,3 +1349,478 @@ class TestCapabilityBlockingSemantics:
         assert inv1["a"] is False
         assert inv1["b"] is False
         assert inv1["c"] is True
+
+
+class TestModuleLifecycleStates:
+    def test_discovered_state_set_for_enabled_modules(self, registry):
+        a = _mod("a")
+        registry.populate([a])
+        # Before activation, active module is "discovered"
+        assert registry.module_state("a") == "discovered"
+
+    def test_disabled_state_set_for_non_enabled_modules(self, registry):
+        a = _mod("a")
+        b = _mod("b")
+        registry.populate([a, b], enabled={"a"})
+        assert registry.module_state("b") == "disabled"
+        assert registry.module_state("a") == "discovered"
+
+    def test_unavailable_state_for_missing_enabled_slug(self, registry):
+        registry.populate([], enabled={"missing.slug"})
+        assert registry.module_state("missing.slug") == "unavailable"
+
+    def test_ready_state_after_successful_activation(self, registry):
+        a = _mod("a")
+        registry.populate([a])
+        registry.activate()
+        assert registry.module_state("a") == "ready"
+
+    def test_registered_state_for_module_without_on_ready(self, registry):
+        # BaseModule.on_ready() is a no-op (inherited), so after successful
+        # register AND on_ready, state should be "ready".
+        a = _mod("a")
+        registry.populate([a])
+        registry.activate()
+        # Since BaseModule.on_ready() is a no-op, state should be "ready"
+        assert registry.module_state("a") == "ready"
+
+    def test_failed_state_after_register_raises(self, registry):
+        class BadRegister(BaseModule):
+            def register(self, context):
+                raise ValueError("register fail")
+
+        a = BadRegister(ModuleManifest(slug="a", label="a"))
+        registry.populate([a])
+        registry.activate()
+        assert registry.module_state("a") == "failed"
+
+    def test_failed_state_after_on_ready_raises(self, registry):
+        class BadOnReady(BaseModule):
+            def on_ready(self):
+                raise RuntimeError("on_ready fail")
+
+        a = BadOnReady(ModuleManifest(slug="a", label="a"))
+        registry.populate([a])
+        registry.activate()
+        assert registry.module_state("a") == "failed"
+
+    def test_on_ready_skipped_when_register_fails(self, registry):
+        """register() failure must prevent on_ready() from being called."""
+        called = []
+
+        class FailRegister(BaseModule):
+            def register(self, context):
+                raise ValueError("bad")
+
+            def on_ready(self):
+                called.append(self.slug)
+
+        a = FailRegister(ModuleManifest(slug="a", label="a"))
+        registry.populate([a])
+        registry.activate()
+        assert called == [], "on_ready must not be called after register() fails"
+        assert registry.module_state("a") == "failed"
+
+    def test_successful_module_state_unaffected_by_sibling_failure(self, registry):
+        class Good(BaseModule):
+            pass  # uses no-op register/on_ready
+
+        class Bad(BaseModule):
+            def on_ready(self):
+                raise RuntimeError("crash")
+
+        a = Good(ModuleManifest(slug="a", label="a"))
+        b = Bad(ModuleManifest(slug="b", label="b"))
+        registry.populate([a, b])
+        registry.activate()
+        assert registry.module_state("a") == "ready"
+        assert registry.module_state("b") == "failed"
+
+    def test_module_states_returns_all_states(self, registry):
+        a = _mod("a")
+        b = _mod("b")
+        registry.populate([a, b], enabled={"a"})
+        states = registry.module_states()
+        assert states["a"] == "discovered"
+        assert states["b"] == "disabled"
+
+    def test_activate_idempotent(self, registry):
+        called = []
+
+        class Counter(BaseModule):
+            def on_ready(self):
+                called.append(1)
+
+        a = Counter(ModuleManifest(slug="a", label="a"))
+        registry.populate([a])
+        registry.activate()
+        registry.activate()  # second call should be no-op
+        assert len(called) == 1, "on_ready() must not be called twice"
+        assert registry.module_state("a") == "ready"
+
+
+def _make_record(manifest, mod, source_type="package", **kwargs):
+    from cauldron.modules.discovery import DiscoveredModule
+
+    defaults = dict(
+        slug=mod.slug,
+        label=mod.label,
+        version=mod.manifest.version,
+        source_type=source_type,
+        package_name="test-pkg" if source_type == "package" else "",
+        package_version="1.0.0" if source_type == "package" else "",
+        entry_point_group="cauldron.modules" if source_type == "package" else "",
+        entry_point_name=mod.slug if source_type == "package" else "",
+        entry_point_value="mod:obj" if source_type == "package" else mod.slug,
+        manifest=manifest,
+        module=mod,
+    )
+    defaults.update(kwargs)
+    return DiscoveredModule(**defaults)
+
+
+class TestInventoryExtended:
+    """inventory() must expose state, source, and safe errors for all modules."""
+
+    # ------ lifecycle state field -------
+
+    def test_state_discovered_for_enabled_not_yet_activated(self, registry):
+        a = _mod("a")
+        registry.populate([a], enabled={"a"})
+        entry = registry.inventory()[0]
+        assert entry["state"] == "discovered"
+
+    def test_state_disabled_for_non_enabled_module(self, registry):
+        a = _mod("a")
+        b = _mod("b")
+        registry.populate([a, b], enabled={"a"})
+        by_slug = {e["slug"]: e for e in registry.inventory()}
+        assert by_slug["b"]["state"] == "disabled"
+
+    def test_state_ready_after_activation(self, registry):
+        a = _mod("a")
+        registry.populate([a])
+        registry.activate()
+        entry = registry.inventory()[0]
+        assert entry["state"] == "ready"
+
+    def test_state_failed_after_lifecycle_exception(self, registry):
+        class Boom(BaseModule):
+            def on_ready(self):
+                raise RuntimeError("boom")
+
+        a = Boom(ModuleManifest(slug="a", label="a"))
+        registry.populate([a])
+        registry.activate()
+        entry = registry.inventory()[0]
+        assert entry["state"] == "failed"
+
+    def test_state_unavailable_for_resolution_blocked_module(self, registry):
+        b = _mod("b", requires=(ModuleRequirement(slug="missing"),))
+        registry.populate([b], enabled={"b"})
+        entry = registry.inventory()[0]
+        assert entry["state"] == "unavailable"
+
+    def test_state_unavailable_for_missing_enabled_slug(self, registry):
+        registry.populate([], enabled={"ghost"})
+        inv = registry.inventory()
+        assert len(inv) == 1
+        assert inv[0]["slug"] == "ghost"
+        assert inv[0]["state"] == "unavailable"
+
+    # ------ source field -------
+
+    def test_source_is_package_name_for_package_source(self, registry):
+        manifest = ModuleManifest(slug="a", label="a", version="1.0.0")
+        mod = BaseModule(manifest)
+        rec = _make_record(manifest, mod, source_type="package", package_name="my-pkg")
+        registry.populate([mod], discovery_records=[rec])
+        entry = registry.inventory()[0]
+        assert entry["source"] == "my-pkg"
+        assert entry["source_type"] == "package"
+
+    def test_source_is_project_path_for_project_source(self, registry):
+        manifest = ModuleManifest(slug="a", label="a", version="1.0.0")
+        mod = BaseModule(manifest)
+        rec = _make_record(
+            manifest, mod,
+            source_type="project",
+            project_path="modules/my_module",
+        )
+        registry.populate([mod], discovery_records=[rec])
+        entry = registry.inventory()[0]
+        assert entry["source"] == "modules/my_module"
+        assert entry["source_type"] == "project"
+
+    def test_source_no_absolute_paths(self, registry):
+        manifest = ModuleManifest(slug="a", label="a", version="1.0.0")
+        mod = BaseModule(manifest)
+        rec = _make_record(
+            manifest, mod,
+            source_type="project",
+            project_path="modules/my_module",
+        )
+        registry.populate([mod], discovery_records=[rec])
+        entry = registry.inventory()[0]
+        assert not entry["source"].startswith("/"), (
+            f"source must not be an absolute path: {entry['source']!r}"
+        )
+
+    def test_source_empty_without_discovery_record(self, registry):
+        a = _mod("a")
+        registry.populate([a])
+        entry = registry.inventory()[0]
+        assert entry["source"] == ""
+
+    # ------ errors field — resolution errors -------
+
+    def test_errors_empty_for_healthy_module(self, registry):
+        a = _mod("a")
+        registry.populate([a])
+        entry = registry.inventory()[0]
+        assert entry["errors"] == []
+
+    def test_errors_contains_resolution_error_for_missing_dep(self, registry):
+        b = _mod("b", requires=(ModuleRequirement(slug="missing"),))
+        registry.populate([b])
+        entry = registry.inventory()[0]
+        kinds = [e["kind"] for e in entry["errors"]]
+        assert "missing_dependency" in kinds
+
+    def test_errors_contains_version_constraint_error(self, registry):
+        a = _mod("a", version="1.0.0")
+        b = _mod("b", requires=(ModuleRequirement(slug="a", version=">=2.0.0"),))
+        registry.populate([a, b])
+        by_slug = {e["slug"]: e for e in registry.inventory()}
+        b_kinds = [e["kind"] for e in by_slug["b"]["errors"]]
+        assert "version_constraint" in b_kinds
+
+    def test_errors_contains_missing_capability_error(self, registry):
+        b = _mod("b", requires=(ModuleRequirement(slug="no.cap", kind="capability"),))
+        registry.populate([b])
+        entry = registry.inventory()[0]
+        kinds = [e["kind"] for e in entry["errors"]]
+        assert "missing_capability" in kinds
+
+    def test_errors_contains_circular_dependency_error(self, registry):
+        a = _mod("a", requires=(ModuleRequirement(slug="b"),))
+        b = _mod("b", requires=(ModuleRequirement(slug="a"),))
+        registry.populate([a, b])
+        by_slug = {e["slug"]: e for e in registry.inventory()}
+        for slug in ("a", "b"):
+            kinds = [e["kind"] for e in by_slug[slug]["errors"]]
+            assert any(k in kinds for k in ("circular_dependency", "blocked_dependency")), (
+                f"{slug} has no circular/blocked error: {by_slug[slug]['errors']}"
+            )
+
+    def test_state_unavailable_for_transitive_consumer(self, registry):
+        """A module blocked by a transitive dep failure must have state=unavailable."""
+        b = _mod("b", requires=(ModuleRequirement(slug="missing"),))
+        c = _mod("c", requires=(ModuleRequirement(slug="b"),))
+        registry.populate([b, c])
+        by_slug = {e["slug"]: e for e in registry.inventory()}
+        assert by_slug["c"]["state"] == "unavailable"
+        assert by_slug["c"]["active"] is False
+
+    def test_resolution_error_has_message_field(self, registry):
+        b = _mod("b", requires=(ModuleRequirement(slug="missing"),))
+        registry.populate([b])
+        entry = registry.inventory()[0]
+        assert entry["errors"]
+        for err in entry["errors"]:
+            assert "message" in err
+            assert isinstance(err["message"], str)
+
+    # ------ errors field — discovery errors -------
+
+    def test_errors_contains_discovery_error_for_unavailable_slug(self, registry):
+        from cauldron.modules.discovery import DiscoveryError
+
+        err = DiscoveryError(
+            entry_point_name="bad.ep",
+            kind="load_failure",
+            message="import failed safely",
+            candidate_slug="broken.mod",
+        )
+        registry.populate([], enabled={"broken.mod"}, discovery_errors=[err])
+        inv = registry.inventory()
+        entry = next(e for e in inv if e["slug"] == "broken.mod")
+        kinds = [e["kind"] for e in entry["errors"]]
+        assert "discovery" in kinds
+
+    def test_discovery_error_message_present(self, registry):
+        from cauldron.modules.discovery import DiscoveryError
+
+        err = DiscoveryError(
+            entry_point_name="ep",
+            kind="load_failure",
+            message="safe error text",
+            candidate_slug="failing.mod",
+        )
+        registry.populate([], enabled={"failing.mod"}, discovery_errors=[err])
+        inv = registry.inventory()
+        entry = next(e for e in inv if e["slug"] == "failing.mod")
+        disc_errors = [e for e in entry["errors"] if e["kind"] == "discovery"]
+        assert disc_errors
+        assert disc_errors[0]["message"] == "safe error text"
+
+    # ------ errors field — lifecycle errors -------
+
+    def test_lifecycle_error_redacted_no_raw_message(self, registry):
+        class Boom(BaseModule):
+            def on_ready(self):
+                raise ValueError("raw internal detail that must not leak")
+
+        a = Boom(ModuleManifest(slug="a", label="a"))
+        registry.populate([a])
+        registry.activate()
+        entry = registry.inventory()[0]
+        lc_errors = [e for e in entry["errors"] if e.get("kind") == "lifecycle"]
+        assert lc_errors, "Expected at least one lifecycle error entry"
+        for err in lc_errors:
+            assert "raw internal detail" not in str(err), (
+                f"Raw exception message leaked into lifecycle error: {err}"
+            )
+            assert "exception_type" in err
+            assert err["exception_type"] == "ValueError"
+            assert "phase" in err
+
+    def test_lifecycle_error_has_no_exception_message_key(self, registry):
+        class Boom(BaseModule):
+            def register(self, ctx):
+                raise RuntimeError("secret")
+
+        a = Boom(ModuleManifest(slug="a", label="a"))
+        registry.populate([a])
+        registry.activate()
+        entry = registry.inventory()[0]
+        lc_errors = [e for e in entry["errors"] if e.get("kind") == "lifecycle"]
+        for err in lc_errors:
+            assert "message" not in err, (
+                f"lifecycle error must not expose 'message': {err}"
+            )
+
+    # ------ unavailable slugs in inventory -------
+
+    def test_unavailable_slug_appears_in_inventory(self, registry):
+        registry.populate([], enabled={"ghost.module"})
+        inv = registry.inventory()
+        slugs = [e["slug"] for e in inv]
+        assert "ghost.module" in slugs
+
+    def test_unavailable_slug_has_state_unavailable(self, registry):
+        registry.populate([], enabled={"ghost.module"})
+        entry = next(e for e in registry.inventory() if e["slug"] == "ghost.module")
+        assert entry["state"] == "unavailable"
+
+    def test_unavailable_slug_has_enabled_true(self, registry):
+        registry.populate([], enabled={"ghost.module"})
+        entry = next(e for e in registry.inventory() if e["slug"] == "ghost.module")
+        assert entry["enabled"] is True
+
+    def test_unavailable_slug_has_null_manifest(self, registry):
+        registry.populate([], enabled={"ghost.module"})
+        entry = next(e for e in registry.inventory() if e["slug"] == "ghost.module")
+        assert entry["manifest"] is None
+
+    def test_inventory_sorted_when_unavailable_slugs_present(self, registry):
+        a = _mod("a")
+        registry.populate([a], enabled={"a", "ghost.module"})
+        slugs = [e["slug"] for e in registry.inventory()]
+        assert slugs == sorted(slugs)
+
+    def test_unavailable_count_included_in_inventory_length(self, registry):
+        a = _mod("a")
+        registry.populate([a], enabled={"a", "ghost.module"})
+        assert len(registry.inventory()) == 2
+
+
+class TestCapabilityConflictInventory:
+    """inventory() must surface capability conflicts via state and errors."""
+
+    def test_conflict_sets_consumer_state_unavailable(self, registry):
+        """Consumer requiring an ambiguous capability must have state=unavailable."""
+        p1 = _mod("p1", provides=("shared.cap",))
+        p2 = _mod("p2", provides=("shared.cap",))
+        consumer = _mod("consumer", requires=(ModuleRequirement(slug="shared.cap", kind="capability"),))
+        registry.populate([p1, p2, consumer])
+        by_slug = {e["slug"]: e for e in registry.inventory()}
+        assert by_slug["consumer"]["state"] == "unavailable"
+
+    def test_conflict_errors_contain_capability_conflict(self, registry):
+        """consumer errors list must include a capability_conflict entry."""
+        p1 = _mod("p1", provides=("shared.cap",))
+        p2 = _mod("p2", provides=("shared.cap",))
+        consumer = _mod("consumer", requires=(ModuleRequirement(slug="shared.cap", kind="capability"),))
+        registry.populate([p1, p2, consumer])
+        by_slug = {e["slug"]: e for e in registry.inventory()}
+        kinds = [e["kind"] for e in by_slug["consumer"]["errors"]]
+        assert "capability_conflict" in kinds
+
+    def test_conflict_providers_remain_in_inventory(self, registry):
+        """Both providers must still appear in inventory with correct slugs."""
+        p1 = _mod("p1", provides=("shared.cap",))
+        p2 = _mod("p2", provides=("shared.cap",))
+        consumer = _mod("consumer", requires=(ModuleRequirement(slug="shared.cap", kind="capability"),))
+        registry.populate([p1, p2, consumer])
+        inv_slugs = {e["slug"] for e in registry.inventory()}
+        assert "p1" in inv_slugs
+        assert "p2" in inv_slugs
+
+    def test_conflict_activate_skips_lifecycle_hooks(self, registry):
+        """activate() must not call on_ready() when resolver errors exist."""
+        called = []
+
+        class Tracked(BaseModule):
+            def on_ready(self):
+                called.append(self.slug)
+
+        p1 = Tracked(ModuleManifest(slug="p1", label="p1", provides=("shared.cap",)))
+        p2 = Tracked(ModuleManifest(slug="p2", label="p2", provides=("shared.cap",)))
+        consumer = Tracked(ModuleManifest(
+            slug="consumer", label="consumer",
+            requires=(ModuleRequirement(slug="shared.cap", kind="capability"),),
+        ))
+        registry.populate([p1, p2, consumer])
+        registry.activate()
+        assert called == [], f"on_ready() must not be called when resolver errors exist; called={called}"
+
+    def test_conflict_resolved_by_override(self, registry):
+        """A valid CAULDRON_CAPABILITY_PROVIDERS override resolves the conflict."""
+        called = []
+
+        class Tracked(BaseModule):
+            def on_ready(self):
+                called.append(self.slug)
+
+        p1 = Tracked(ModuleManifest(slug="p1", label="p1", provides=("shared.cap",)))
+        p2 = Tracked(ModuleManifest(slug="p2", label="p2", provides=("shared.cap",)))
+        consumer = Tracked(ModuleManifest(
+            slug="consumer", label="consumer",
+            requires=(ModuleRequirement(slug="shared.cap", kind="capability"),),
+        ))
+        registry.populate(
+            [p1, p2, consumer],
+            capability_overrides={"shared.cap": "p1"},
+        )
+        assert not registry.errors(), f"Expected no errors after override; got {registry.errors()}"
+        registry.activate()
+        # All three modules should have run on_ready
+        assert "p1" in called
+        assert "p2" in called
+        assert "consumer" in called
+
+    def test_conflict_resolved_consumer_state_ready(self, registry):
+        """Consumer state must reach ready after conflict is resolved via override."""
+        p1 = _mod("p1", provides=("shared.cap",))
+        p2 = _mod("p2", provides=("shared.cap",))
+        consumer = _mod("consumer", requires=(ModuleRequirement(slug="shared.cap", kind="capability"),))
+        registry.populate(
+            [p1, p2, consumer],
+            capability_overrides={"shared.cap": "p1"},
+        )
+        registry.activate()
+        by_slug = {e["slug"]: e for e in registry.inventory()}
+        assert by_slug["consumer"]["state"] in ("registered", "ready"), (
+            f"consumer state after override+activate: {by_slug['consumer']['state']!r}"
+        )

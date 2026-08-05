@@ -24,9 +24,10 @@
         <th>Slug</th>
         <th>Label</th>
         <th>Version</th>
-        <th>Status</th>
-        <th>Health</th>
+        <th>State</th>
+        <th>Enabled</th>
         <th>Load</th>
+        <th>Source</th>
         <th>Provides</th>
         <th>Dependencies</th>
         <th>Django apps</th>
@@ -37,12 +38,16 @@
       {% for mod in modules %}
       <tr>
         <td><code>{{ mod.slug }}</code></td>
-        <td>{{ mod.label }}</td>
-        <td>{{ mod.version }}</td>
-        <td>{% include "cauldron_admin/includes/status_badge.html" with status=mod.status %}</td>
-        <td>{{ mod.health }}</td>
+        <td>{% if mod.label %}{{ mod.label }}{% else %}<span class="cui-text-muted">—</span>{% endif %}</td>
+        <td>{% if mod.version %}{{ mod.version }}{% else %}<span class="cui-text-muted">—</span>{% endif %}</td>
+        <td>{% include "cauldron_admin/includes/status_badge.html" with status=mod.state %}</td>
+        <td>{% if mod.enabled %}Yes{% else %}<span class="cui-text-muted">No</span>{% endif %}</td>
         <td>
           {% if mod.load_index is not None %}{{ mod.load_index }}{% else %}<span class="cui-text-muted">—</span>{% endif %}
+        </td>
+        <td>
+          {% if mod.source_type %}<span class="cui-badge">{{ mod.source_type }}</span>{% endif %}
+          {% if mod.source %}<code>{{ mod.source }}</code>{% else %}<span class="cui-text-muted">—</span>{% endif %}
         </td>
         <td>
           {% for cap in mod.provides %}
@@ -73,8 +78,22 @@
           {% endfor %}
         </td>
       </tr>
+      {% if mod.errors %}
+      <tr class="cui-table-row--detail">
+        <td colspan="11">
+          {% for err in mod.errors %}
+          <div class="cui-inline-error">
+            <code>{{ err.kind }}</code>
+            {% if err.phase %}<span>phase: {{ err.phase }}</span>{% endif %}
+            {% if err.exception_type %}<span>{{ err.exception_type }}</span>{% endif %}
+            {% if err.message %}&mdash; {{ err.message }}{% endif %}
+          </div>
+          {% endfor %}
+        </td>
+      </tr>
+      {% endif %}
       {% empty %}
-      <tr><td colspan="10">No modules registered.</td></tr>
+      <tr><td colspan="11">No modules registered.</td></tr>
       {% endfor %}
     </tbody>
   </table>

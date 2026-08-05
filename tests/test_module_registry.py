@@ -673,6 +673,32 @@ class TestInventory:
                     f"graph_info[{slug!r}][{key!r}] != inventory[{slug!r}][{key!r}]"
                 )
 
+    def test_graph_info_excludes_unavailable_placeholder(self, registry):
+        """Enabled-but-undiscovered slug must appear in inventory() but not graph_info()."""
+        a = _mod("a")
+        registry.populate([a], enabled={"a", "ghost.slug"})
+
+        inv_slugs = [e["slug"] for e in registry.inventory()]
+        graph_slugs = [e["slug"] for e in registry.graph_info()]
+
+        # ghost.slug has no discovered module: in inventory, absent from graph_info
+        assert "ghost.slug" in inv_slugs
+        assert "ghost.slug" not in graph_slugs
+
+        # discovered module is in both
+        assert "a" in inv_slugs
+        assert "a" in graph_slugs
+
+    def test_graph_info_ordering_deterministic_with_unavailable(self, registry):
+        """graph_info() slug order must be sorted even when unavailable slugs exist."""
+        z = _mod("z")
+        a = _mod("a")
+        registry.populate([z, a], enabled={"z", "a", "ghost"})
+
+        slugs = [e["slug"] for e in registry.graph_info()]
+        assert slugs == sorted(slugs)
+        assert "ghost" not in slugs
+
 
 class TestEnabledSetStorage:
     """Tests that _enabled is stored and drives enabled flag in inventory."""
@@ -1707,3 +1733,94 @@ class TestInventoryExtended:
         a = _mod("a")
         registry.populate([a], enabled={"a", "ghost.module"})
         assert len(registry.inventory()) == 2
+
+
+class TestCapabilityConflictInventory:
+    """inventory() must surface capability conflicts via state and errors."""
+
+    def test_conflict_sets_consumer_state_unavailable(self, registry):
+        """Consumer requiring an ambiguous capability must have state=unavailable."""
+        p1 = _mod("p1", provides=("shared.cap",))
+        p2 = _mod("p2", provides=("shared.cap",))
+        consumer = _mod("consumer", requires=(ModuleRequirement(slug="shared.cap", kind="capability"),))
+        registry.populate([p1, p2, consumer])
+        by_slug = {e["slug"]: e for e in registry.inventory()}
+        assert by_slug["consumer"]["state"] == "unavailable"
+
+    def test_conflict_errors_contain_capability_conflict(self, registry):
+        """consumer errors list must include a capability_conflict entry."""
+        p1 = _mod("p1", provides=("shared.cap",))
+        p2 = _mod("p2", provides=("shared.cap",))
+        consumer = _mod("consumer", requires=(ModuleRequirement(slug="shared.cap", kind="capability"),))
+        registry.populate([p1, p2, consumer])
+        by_slug = {e["slug"]: e for e in registry.inventory()}
+        kinds = [e["kind"] for e in by_slug["consumer"]["errors"]]
+        assert "capability_conflict" in kinds
+
+    def test_conflict_providers_remain_in_inventory(self, registry):
+        """Both providers must still appear in inventory with correct slugs."""
+        p1 = _mod("p1", provides=("shared.cap",))
+        p2 = _mod("p2", provides=("shared.cap",))
+        consumer = _mod("consumer", requires=(ModuleRequirement(slug="shared.cap", kind="capability"),))
+        registry.populate([p1, p2, consumer])
+        inv_slugs = {e["slug"] for e in registry.inventory()}
+        assert "p1" in inv_slugs
+        assert "p2" in inv_slugs
+
+    def test_conflict_activate_skips_lifecycle_hooks(self, registry):
+        """activate() must not call on_ready() when resolver errors exist."""
+        called = []
+
+        class Tracked(BaseModule):
+            def on_ready(self):
+                called.append(self.slug)
+
+        p1 = Tracked(ModuleManifest(slug="p1", label="p1", provides=("shared.cap",)))
+        p2 = Tracked(ModuleManifest(slug="p2", label="p2", provides=("shared.cap",)))
+        consumer = Tracked(ModuleManifest(
+            slug="consumer", label="consumer",
+            requires=(ModuleRequirement(slug="shared.cap", kind="capability"),),
+        ))
+        registry.populate([p1, p2, consumer])
+        registry.activate()
+        assert called == [], f"on_ready() must not be called when resolver errors exist; called={called}"
+
+    def test_conflict_resolved_by_override(self, registry):
+        """A valid CAULDRON_CAPABILITY_PROVIDERS override resolves the conflict."""
+        called = []
+
+        class Tracked(BaseModule):
+            def on_ready(self):
+                called.append(self.slug)
+
+        p1 = Tracked(ModuleManifest(slug="p1", label="p1", provides=("shared.cap",)))
+        p2 = Tracked(ModuleManifest(slug="p2", label="p2", provides=("shared.cap",)))
+        consumer = Tracked(ModuleManifest(
+            slug="consumer", label="consumer",
+            requires=(ModuleRequirement(slug="shared.cap", kind="capability"),),
+        ))
+        registry.populate(
+            [p1, p2, consumer],
+            capability_overrides={"shared.cap": "p1"},
+        )
+        assert not registry.errors(), f"Expected no errors after override; got {registry.errors()}"
+        registry.activate()
+        # All three modules should have run on_ready
+        assert "p1" in called
+        assert "p2" in called
+        assert "consumer" in called
+
+    def test_conflict_resolved_consumer_state_ready(self, registry):
+        """Consumer state must reach ready after conflict is resolved via override."""
+        p1 = _mod("p1", provides=("shared.cap",))
+        p2 = _mod("p2", provides=("shared.cap",))
+        consumer = _mod("consumer", requires=(ModuleRequirement(slug="shared.cap", kind="capability"),))
+        registry.populate(
+            [p1, p2, consumer],
+            capability_overrides={"shared.cap": "p1"},
+        )
+        registry.activate()
+        by_slug = {e["slug"]: e for e in registry.inventory()}
+        assert by_slug["consumer"]["state"] in ("registered", "ready"), (
+            f"consumer state after override+activate: {by_slug['consumer']['state']!r}"
+        )

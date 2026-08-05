@@ -602,11 +602,13 @@ class ModuleRegistry:
     def graph_info(self) -> list[dict[str, Any]]:
         """Rich module graph for tooling and visualizers.
 
-        Returns one entry per discovered module, sorted by slug.  Each entry
-        contains identity, status, load position, capabilities, requirements,
-        resolved dependencies, and Django apps.
+        Returns one entry per **discovered** module, sorted by slug.  Enabled
+        slugs that were never successfully loaded (``manifest is None``) are
+        excluded — they appear in :meth:`inventory` but carry no graph data.
 
-        This is a stable subset of :meth:`inventory` keys.
+        Each entry is a stable subset of :meth:`inventory` keys: identity,
+        status, load position, capabilities, requirements, resolved
+        dependencies, and Django apps.
         """
         return [
             {
@@ -622,6 +624,7 @@ class ModuleRegistry:
                 "django_apps": e["django_apps"],
             }
             for e in self.inventory()
+            if e["manifest"] is not None
         ]
 
     # ----------------------------------------------------------------- flags

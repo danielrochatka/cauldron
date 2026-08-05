@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+from functools import wraps
 from typing import Any
 
 from django.contrib.auth.decorators import login_required
@@ -11,7 +12,7 @@ from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import render
 from django.views.decorators.http import require_POST
 
-from cauldron_module_tree.graph import build_graph
+from cauldron_module_tree.graph import build_graph, ModuleGraph
 
 logger = logging.getLogger(__name__)
 
@@ -19,9 +20,33 @@ _VIEW_PERM = "cauldron_module_tree.view_module_tree"
 _CHANGE_PERM = "cauldron_module_tree.change_module_state"
 
 
+# --------------------------------------------------------------------------- #
+# Helpers                                                                      #
+# --------------------------------------------------------------------------- #
+
 def _get_registry():
     from cauldron.modules.registry import registry
     return registry
+
+
+def _get_data_dir():
+    """Return the Django app's data directory (BASE_DIR/data)."""
+    from django.conf import settings
+    base_dir = getattr(settings, "BASE_DIR", None)
+    if base_dir is None:
+        return None
+    return base_dir / "data"
+
+
+def _update_overlay(slug: str, enabled: bool) -> None:
+    """Atomically update the module-state overlay for one slug."""
+    from cauldron.modules.overlay import load_overlay, save_overlay
+    data_dir = _get_data_dir()
+    if data_dir is None:
+        return
+    overrides, _ = load_overlay(data_dir)
+    overrides[slug] = {"enabled": enabled}
+    save_overlay(data_dir, overrides)
 
 
 def _parse_json_body(request: HttpRequest) -> dict[str, Any]:
@@ -34,11 +59,39 @@ def _parse_json_body(request: HttpRequest) -> dict[str, Any]:
         raise ValueError(f"Invalid JSON body: {exc}") from exc
 
 
-@login_required
+# --------------------------------------------------------------------------- #
+# Permission decorators                                                        #
+# --------------------------------------------------------------------------- #
+
+def _require_perm(perm: str):
+    """Decorator factory: requires login and the given Django permission."""
+    def decorator(view):
+        @login_required
+        @wraps(view)
+        def wrapped(request: HttpRequest, *args, **kwargs):
+            if not request.user.has_perm(perm):
+                if request.accepts("application/json"):
+                    return JsonResponse(
+                        {"error": "Permission denied.", "type": "PermissionDenied"},
+                        status=403,
+                    )
+                raise PermissionDenied
+            return view(request, *args, **kwargs)
+        return wrapped
+    return decorator
+
+
+_view_required = _require_perm(_VIEW_PERM)
+_change_required = _require_perm(_CHANGE_PERM)
+
+
+# --------------------------------------------------------------------------- #
+# Views                                                                        #
+# --------------------------------------------------------------------------- #
+
+@_view_required
 def tree_view(request: HttpRequest) -> HttpResponse:
     """Render the module dependency tree page."""
-    if not request.user.has_perm(_VIEW_PERM):
-        raise PermissionDenied
     context = {
         "breadcrumbs": [
             {"label": "Modules", "url": "/cauldron/modules/"},
@@ -48,18 +101,14 @@ def tree_view(request: HttpRequest) -> HttpResponse:
     return render(request, "cauldron_module_tree/tree.html", context)
 
 
-@login_required
+@_view_required
 def graph_api(request: HttpRequest) -> JsonResponse:
     """Return the full module graph as JSON."""
-    if not request.user.has_perm(_VIEW_PERM):
-        return JsonResponse(
-            {"error": "Permission denied.", "type": "PermissionDenied"},
-            status=403,
-        )
     try:
         registry = _get_registry()
-        graph_data = build_graph(registry)
-        return JsonResponse(graph_data)
+        graph: ModuleGraph = build_graph(registry)
+        data = graph.to_api_dict()
+        return JsonResponse(data)
     except Exception as exc:
         logger.exception("graph_api: failed to build module graph")
         return JsonResponse(
@@ -68,16 +117,10 @@ def graph_api(request: HttpRequest) -> JsonResponse:
         )
 
 
-@login_required
 @require_POST
+@_change_required
 def preview_change(request: HttpRequest, module_slug: str) -> JsonResponse:
     """Preview the effect of enabling or disabling a module."""
-    if not request.user.has_perm(_CHANGE_PERM):
-        return JsonResponse(
-            {"error": "Permission denied.", "type": "PermissionDenied"},
-            status=403,
-        )
-
     try:
         body = _parse_json_body(request)
     except ValueError as exc:
@@ -96,9 +139,9 @@ def preview_change(request: HttpRequest, module_slug: str) -> JsonResponse:
     try:
         registry = _get_registry()
         inventory = registry.inventory()
-        graph_entries = registry.graph_info()
 
-        # Locate the target module in the inventory.
+        # Independently validate: locate module in the registry (don't trust
+        # any prior state; revalidate from fresh inventory).
         target_entry: dict[str, Any] | None = None
         for entry in inventory:
             if entry["slug"] == module_slug:
@@ -111,21 +154,46 @@ def preview_change(request: HttpRequest, module_slug: str) -> JsonResponse:
         missing_dependencies: list[str] = []
         restart_required = False
 
-        if target_entry is not None:
+        if target_entry is None:
+            validation_errors.append(
+                f"Module '{module_slug}' was not found in the registry."
+            )
+        else:
             restart_required = bool(target_entry.get("requires_restart", False))
 
-        if action == "disable":
-            # Affected modules: those in graph_info that list module_slug in their deps.
-            for g in graph_entries:
-                if module_slug in (g.get("deps") or []):
-                    affected_modules.append(g["slug"])
-            if affected_modules:
-                warnings.append(
-                    f"Disabling this module will affect: {', '.join(affected_modules)}."
-                )
-        else:
-            # action == "enable": find missing dependencies.
-            if target_entry is not None:
+            # Use the ModuleGraph domain model for transitive impact analysis
+            graph: ModuleGraph = build_graph(registry)
+
+            if action == "disable":
+                # Primary: use transitive graph impact (follows required/capability edges)
+                if module_slug in graph.nodes:
+                    impact = graph.transitive_disable_impact(module_slug)
+                    affected_set: set[str] = set(impact - {module_slug})
+                else:
+                    affected_set = set()
+
+                # Secondary: also scan the deps field (flat direct-dependency list from
+                # the registry's dependency_graph projection) to catch dependents that
+                # are registered without explicit requires entries.
+                for entry in inventory:
+                    if module_slug in (entry.get("deps") or []):
+                        affected_set.add(entry["slug"])
+
+                affected_modules = sorted(affected_set)
+                if affected_modules:
+                    warnings.append(
+                        f"Disabling this module will affect: {', '.join(affected_modules)}."
+                    )
+
+            else:
+                # action == "enable": verify module isn't permanently failed
+                state = target_entry.get("state", "")
+                if state in ("failed", "unavailable"):
+                    validation_errors.append(
+                        f"Module '{module_slug}' is in state '{state}' and cannot be enabled."
+                    )
+
+                # Find missing required dependencies
                 node_slugs = {e["slug"] for e in inventory}
                 for req in target_entry.get("requires") or []:
                     if req.get("kind") == "module" and req["slug"] not in node_slugs:
@@ -134,9 +202,6 @@ def preview_change(request: HttpRequest, module_slug: str) -> JsonResponse:
                     validation_errors.append(
                         f"Missing required modules: {', '.join(missing_dependencies)}."
                     )
-
-        if target_entry is None:
-            validation_errors.append(f"Module '{module_slug}' was not found in the registry.")
 
         return JsonResponse({
             "allowed": len(validation_errors) == 0,
@@ -157,27 +222,17 @@ def preview_change(request: HttpRequest, module_slug: str) -> JsonResponse:
         )
 
 
-@login_required
 @require_POST
+@_change_required
 def enable_module(request: HttpRequest, module_slug: str) -> JsonResponse:
     """Persist an enable override for a module."""
-    if not request.user.has_perm(_CHANGE_PERM):
-        return JsonResponse(
-            {"error": "Permission denied.", "type": "PermissionDenied"},
-            status=403,
-        )
     return _store_override(request, module_slug, enabled=True)
 
 
-@login_required
 @require_POST
+@_change_required
 def disable_module(request: HttpRequest, module_slug: str) -> JsonResponse:
     """Persist a disable override for a module."""
-    if not request.user.has_perm(_CHANGE_PERM):
-        return JsonResponse(
-            {"error": "Permission denied.", "type": "PermissionDenied"},
-            status=403,
-        )
     return _store_override(request, module_slug, enabled=False)
 
 
@@ -197,6 +252,23 @@ def _store_override(
         from cauldron_module_tree.models import ModuleEnabledOverride
         from cauldron.modules.registry import registry
 
+        # Independently validate: verify module exists in registry and compute impact
+        inventory = registry.inventory()
+
+        runtime_active = False
+        for entry in inventory:
+            if entry["slug"] == module_slug:
+                runtime_active = bool(entry.get("active", False))
+                break
+
+        # Compute transitive impact using the domain model
+        graph: ModuleGraph = build_graph(registry)
+        if enabled:
+            affected = sorted(graph.transitive_enable_impact(module_slug))
+        else:
+            impact = graph.transitive_disable_impact(module_slug)
+            affected = sorted(impact - {module_slug})
+
         override, _created = ModuleEnabledOverride.objects.update_or_create(
             slug=module_slug,
             defaults={
@@ -206,18 +278,22 @@ def _store_override(
             },
         )
 
-        # Determine the current runtime active state from the registry.
-        runtime_active = False
-        for entry in registry.inventory():
-            if entry["slug"] == module_slug:
-                runtime_active = bool(entry.get("active", False))
-                break
+        # Write the overlay file so the change survives server restarts.
+        try:
+            _update_overlay(module_slug, enabled)
+        except Exception:
+            logger.exception(
+                "_store_override: failed to write overlay for module %r", module_slug
+            )
 
+        action = "enable" if enabled else "disable"
         return JsonResponse({
             "slug": module_slug,
+            "action": action,
             "configured_enabled": enabled,
             "runtime_active": runtime_active,
             "restart_required": True,
+            "affected_modules": affected,
             "message": "Override saved. Restart the server to apply the change.",
         })
 

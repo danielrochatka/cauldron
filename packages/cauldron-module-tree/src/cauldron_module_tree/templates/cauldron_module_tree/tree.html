@@ -379,6 +379,8 @@
   </select>
   <button id="btn-fit" type="button">Fit to view</button>
   <button id="btn-reset-layout" type="button">Reset layout</button>
+  <button id="btn-focus" type="button" aria-pressed="false" title="Show only the selected module's dependency neighborhood">Focus</button>
+  <button id="btn-show-all" type="button">Show all</button>
   <button id="btn-view-graph" type="button" class="is-active" aria-pressed="true">Graph</button>
   <button id="btn-view-table" type="button" aria-pressed="false">Table</button>
 </div>
@@ -442,5 +444,6 @@
 {% endblock %}
 
 {% block extra_js %}
-<script type="module" src="{% static 'cauldron_module_tree/tree.js' %}"></script>
+{# Production bundle built from frontend/src/ using Vite + ELK.js #}
+<script type="module" src="{% static 'cauldron_module_tree/module-tree.js' %}"></script>
 {% endblock %}

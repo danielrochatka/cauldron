@@ -87,7 +87,7 @@ def test_unknown_future_module_appears_in_graph_nodes():
     future_slug = "future.unknown.module"
     e = _entry(future_slug)
     registry = _make_registry([e])
-    result = build_graph(registry)
+    result = build_graph(registry).to_api_dict()
     slugs = [n["slug"] for n in result["nodes"]]
     assert future_slug in slugs, f"Expected {future_slug!r} in nodes; got {slugs}"
 
@@ -105,7 +105,7 @@ def test_future_module_with_no_presentation_gets_fallback_icon():
     )
     e = _entry(slug, manifest=manifest.to_dict())
     registry = _make_registry([e])
-    result = build_graph(registry)
+    result = build_graph(registry).to_api_dict()
     node = next(n for n in result["nodes"] if n["slug"] == slug)
     assert node["icon_svg"] != "", "Expected non-empty fallback icon_svg"
     assert "<svg" in node["icon_svg"]
@@ -121,7 +121,7 @@ def test_future_module_parents_derived_correctly():
     future = _entry(future_slug)
     consumer = _entry(consumer_slug, requires=[{"slug": future_slug, "kind": "module"}])
     registry = _make_registry([consumer, future])
-    result = build_graph(registry)
+    result = build_graph(registry).to_api_dict()
 
     node_by_slug = {n["slug"]: n for n in result["nodes"]}
     assert future_slug in node_by_slug
@@ -139,7 +139,7 @@ def test_future_module_edges_created():
     future = _entry(future_slug, requires=[{"slug": dep_slug, "kind": "module"}])
     dep = _entry(dep_slug)
     registry = _make_registry([future, dep])
-    result = build_graph(registry)
+    result = build_graph(registry).to_api_dict()
 
     edges = result["edges"]
     matching = [

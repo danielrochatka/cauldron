@@ -440,6 +440,26 @@ class ModuleRegistry:
                     changed = True
         return frozenset(blocked)
 
+    def _selected_providers_for(self, slug: str, manifest: Any) -> dict[str, str]:
+        """Return {capability_slug: selected_provider_slug} for each capability
+        requirement of *slug* where a single provider was resolved.
+
+        Used by :meth:`inventory` to expose which provider was actually selected
+        so that graph visualisers can draw precise capability edges.
+        """
+        result: dict[str, str] = {}
+        for req in manifest.requires:
+            if req.kind != "capability":
+                continue
+            providers = sorted(self._capability_providers.get(req.slug, []))
+            if len(providers) == 1:
+                result[req.slug] = providers[0]
+            elif len(providers) > 1:
+                override = self._capability_overrides.get(req.slug)
+                if override and override in providers:
+                    result[req.slug] = override
+        return result
+
     def inventory(self) -> list[dict[str, Any]]:
         """Rich inventory combining discovery metadata and resolution state.
 
@@ -554,6 +574,10 @@ class ModuleRegistry:
                 "deps": dep_graph.get(slug, []),
                 "django_apps": list(manifest.django_apps),
                 "requires_restart": manifest.requires_restart,
+                # per-module selected capability providers: {capability_slug: provider_slug}
+                # populated for capability requirements where a provider was unambiguously
+                # selected (single provider or explicit override).
+                "selected_providers": self._selected_providers_for(slug, manifest),
                 # errors (safe: no raw exception messages, no absolute paths)
                 "errors": errors,
             }

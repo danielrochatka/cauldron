@@ -3,8 +3,11 @@ from cauldron.modules import (
     BaseModule,
     ModuleManifest,
     ModuleNavigationDeclaration,
+    ModulePresentation,
     ModuleRequirement,
 )
+
+_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>"""
 
 _manifest = ModuleManifest(
     slug="cauldron.admin.content",
@@ -91,6 +94,13 @@ _manifest = ModuleManifest(
             url_prefix="/cauldron/content/audit/",
             description="View content audit history",
         ),
+    ),
+    presentation=ModulePresentation(
+        title="Admin Content",
+        summary="Admin interface for browsing, editing, and publishing content from the operator shell.",
+        icon_svg=_ICON_SVG,
+        group="Content",
+        display_order=40,
     ),
 )
 

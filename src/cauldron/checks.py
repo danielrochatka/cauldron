@@ -262,3 +262,21 @@ def cauldron_module_graph_check(app_configs, **kwargs):
         )
 
     return messages
+
+
+@register()
+def check_module_overlay(app_configs, **kwargs):
+    """Warn when the module_state.json overlay file is malformed."""
+    from django.conf import settings
+    from cauldron.modules.overlay import load_overlay
+    base_dir = getattr(settings, "BASE_DIR", None)
+    if base_dir is None:
+        return []
+    _, warning = load_overlay(base_dir / "data")
+    if warning:
+        return [Warning(
+            f"module_state.json overlay: {warning}",
+            hint="Fix or delete data/module_state.json to resolve this warning.",
+            id="cauldron.W011",
+        )]
+    return []

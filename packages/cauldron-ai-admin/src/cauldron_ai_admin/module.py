@@ -5,9 +5,12 @@ from cauldron.modules import (
     ModuleMigrationDeclaration,
     ModuleNavigationDeclaration,
     ModulePermissionDeclaration,
+    ModulePresentation,
     ModuleRequirement,
     ModuleSettingsDeclaration,
 )
+
+_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M12 11V5"/><circle cx="12" cy="4" r="1"/><path d="M8 11V9"/><path d="M16 11V9"/><path d="M8 15h.01"/><path d="M12 15h.01"/><path d="M16 15h.01"/></svg>"""
 
 _manifest = ModuleManifest(
     slug="cauldron.ai.admin",
@@ -182,6 +185,13 @@ _manifest = ModuleManifest(
             url_prefix="/cauldron/admin/ai/settings/",
             description="Configure the Admin AI module",
         ),
+    ),
+    presentation=ModulePresentation(
+        title="Admin AI",
+        summary="AI admin interface — AI-assisted content operations accessible from the operator shell.",
+        icon_svg=_ICON_SVG,
+        group="AI",
+        display_order=30,
     ),
     ai_tools=(
         "content.list_collections",

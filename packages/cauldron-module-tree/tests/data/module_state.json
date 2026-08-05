@@ -1,0 +1,14 @@
+{
+  "overrides": {
+    "disabletarget": {
+      "enabled": false
+    },
+    "enabletarget": {
+      "enabled": true
+    },
+    "restartmod": {
+      "enabled": true
+    }
+  },
+  "version": 1
+}

@@ -107,6 +107,22 @@ _project_modules_dir = BASE_DIR / "modules"
 CAULDRON_PROJECT_MODULE_ROOT = _project_modules_dir if _project_modules_dir.is_dir() else None
 
 # ---------------------------------------------------------------------------
+# Module-state overlay (persisted by the UI, read at startup)
+# ---------------------------------------------------------------------------
+# Load enable/disable overrides from data/module_state.json if present.
+# This is the only place the overlay is read; compose_django_settings() then
+# sees the merged module_settings so disabled modules are fully excluded from
+# INSTALLED_APPS and the module registry.
+from cauldron.modules.overlay import load_overlay, apply_overlay as _apply_overlay
+
+_OVERLAY_DIR = BASE_DIR / "data"
+_overlay_overrides, _overlay_warning = load_overlay(_OVERLAY_DIR)
+if _overlay_warning:
+    import warnings as _warnings
+    _warnings.warn(f"Cauldron module overlay: {_overlay_warning}", stacklevel=1)
+CAULDRON_MODULES = _apply_overlay(CAULDRON_MODULES, _overlay_overrides)
+
+# ---------------------------------------------------------------------------
 # Django application composition
 # ---------------------------------------------------------------------------
 

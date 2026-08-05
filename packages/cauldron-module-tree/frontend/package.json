@@ -1,0 +1,20 @@
+{
+  "name": "cauldron-module-tree-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite build --watch",
+    "check": "node scripts/check-bundle.js",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "elkjs": "^0.9.3"
+  },
+  "devDependencies": {
+    "jsdom": "^25.0.0",
+    "vite": "^5.4.0",
+    "vitest": "^2.0.0"
+  }
+}

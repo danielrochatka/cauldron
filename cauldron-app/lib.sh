@@ -118,16 +118,60 @@ check_node_version() {
   echo "--> Node.js $raw OK"
 }
 
+# _kill_port PORT
+#
+# Kill any process listening on PORT so the server can bind cleanly.
+# Used by launch_server before starting a new process.
+_kill_port() {
+  local port="$1"
+  local pid
+  # ss is available on all modern Linux; fuser is a portable fallback.
+  if command -v ss &>/dev/null; then
+    pid=$(ss -tlnp "sport = :$port" 2>/dev/null \
+      | grep -oP '(?<=pid=)\d+' | head -1) || true
+  elif command -v fuser &>/dev/null; then
+    pid=$(fuser "${port}/tcp" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' | head -1) || true
+  fi
+  if [ -n "${pid:-}" ]; then
+    echo "    Stopping existing process on port $port (pid $pid)..."
+    kill -TERM "$pid" 2>/dev/null || true
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 15 ]; do
+      sleep 1; waited=$((waited + 1))
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+}
+
 # launch_server CAULDRON_DIR PORT
 #
 # Starts Gunicorn in daemon mode, or falls back to Django's dev server.
 # Called from ./start and ./update so each performs this step exactly once.
+#
+# Always kills whatever is on PORT first so a stale server from a previous
+# run (especially a dev-mode runserver without a PID file) does not shadow
+# the new process or fool the health check.
 launch_server() {
   local cauldron_dir="$1"
   local port="$2"
   local pid_file="$cauldron_dir/data/cauldron.pid"
 
+  _kill_port "$port"
+
   if command -v gunicorn &>/dev/null; then
+    # Re-source config.env so SECRET_KEY and other env vars are guaranteed
+    # available to gunicorn workers regardless of whether the caller already
+    # exported them.  This makes launch_server self-contained and prevents the
+    # "SECRET_KEY is not set" crash that occurs when variables exported early
+    # in ./update are lost before the server starts (e.g. after re-sourcing
+    # lib.sh between the export and the gunicorn call).
+    if [ -f "$cauldron_dir/config.env" ]; then
+      set -a
+      # shellcheck source=/dev/null
+      source "$cauldron_dir/config.env"
+      set +a
+    fi
+
     gunicorn \
       --chdir "$cauldron_dir" \
       --bind "${CAULDRON_HOST:-0.0.0.0}:$port" \
@@ -138,10 +182,34 @@ launch_server() {
       --error-logfile "$cauldron_dir/logs/error.log" \
       --daemon \
       cauldron_site.wsgi:application
-    echo "Cauldron started on http://localhost:$port (gunicorn)"
+
+    # Poll for the PID file: gunicorn writes it when the master starts.
+    # A missing PID file means the master crashed before forking workers,
+    # which the HTTP health check would never catch (no process to respond).
+    local waited=0
+    while [ ! -f "$pid_file" ] && [ "$waited" -lt 5 ]; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+
+    if [ ! -f "$pid_file" ]; then
+      echo "ERROR: Gunicorn master did not write a PID file within ${waited}s." >&2
+      echo "       The master process may have crashed immediately." >&2
+      echo "       Last lines of error log:" >&2
+      tail -10 "$cauldron_dir/logs/error.log" 2>/dev/null | sed 's/^/         /' >&2 || true
+      return 1
+    fi
+
+    echo "Cauldron started on http://localhost:$port (gunicorn, pid $(cat "$pid_file"))"
   else
-    echo "Cauldron starting on http://localhost:$port (press Ctrl+C to stop)"
-    "$cauldron_dir/manage" runserver "0.0.0.0:$port"
+    # Dev-server fallback: background it, write our own PID file so ./stop and
+    # future ./update runs can terminate it cleanly.
+    echo "Cauldron starting on http://localhost:$port (dev server — logs to stderr)"
+    "$cauldron_dir/manage" runserver "0.0.0.0:$port" &
+    local dev_pid=$!
+    echo "$dev_pid" > "$pid_file"
+    # Disown so the process survives the shell exiting (./start use case).
+    disown "$dev_pid" 2>/dev/null || true
   fi
 }
 

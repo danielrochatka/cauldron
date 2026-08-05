@@ -1,0 +1,468 @@
+{% extends "cauldron_admin/base.html" %}
+{% load static %}
+
+{% block head_title %}Module Dependency Tree{% endblock %}
+
+{% block extra_css %}
+<style>
+  /* ── Tree canvas ───────────────────────────────────────────────────── */
+  #tree-root {
+    position: relative;
+    overflow: auto;
+    width: 100%;
+    min-height: 500px;
+    border: 1px solid var(--cui-border, #e5e7eb);
+    border-radius: 4px;
+    cursor: grab;
+    touch-action: none;
+  }
+  #tree-root.is-panning {
+    cursor: grabbing;
+  }
+  #tree-canvas {
+    position: relative;
+    transform-origin: 0 0;
+  }
+
+  /* ── Module nodes ──────────────────────────────────────────────────── */
+  .module-node {
+    position: absolute;
+    cursor: pointer;
+    user-select: none;
+  }
+  .node-card {
+    background: white;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    padding: 8px 12px;
+    min-width: 160px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    transition: box-shadow 0.15s, border-color 0.15s;
+  }
+  .node-card:hover,
+  .module-node.is-selected .node-card {
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+    border-color: #6366f1;
+  }
+  .module-node.is-dimmed .node-card {
+    opacity: 0.3;
+  }
+  .node-icon {
+    flex-shrink: 0;
+    width: 32px;
+    height: 32px;
+    overflow: hidden;
+    border-radius: 4px;
+  }
+  .node-icon svg {
+    width: 32px;
+    height: 32px;
+  }
+  .node-body {
+    flex: 1;
+    min-width: 0;
+  }
+  .node-title {
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1.3;
+    color: #111827;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .node-slug {
+    font-size: 11px;
+    color: #6b7280;
+    font-family: monospace;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .node-meta {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-top: 4px;
+  }
+
+  /* ── State border colours ──────────────────────────────────────────── */
+  .node-state-ready        { border-left: 3px solid #10b981; }
+  .node-state-failed       { border-left: 3px solid #ef4444; }
+  .node-state-disabled,
+  .node-state-unavailable  { border-left: 3px solid #9ca3af; opacity: 0.7; }
+  .node-state-discovered,
+  .node-state-registered   { border-left: 3px solid #f59e0b; }
+
+  /* ── State badges ──────────────────────────────────────────────────── */
+  .state-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.4;
+  }
+  .badge-ready        { background: #d1fae5; color: #065f46; }
+  .badge-failed       { background: #fee2e2; color: #991b1b; }
+  .badge-disabled     { background: #f3f4f6; color: #4b5563; }
+  .badge-unavailable  { background: #f3f4f6; color: #4b5563; }
+  .badge-discovered   { background: #fef3c7; color: #92400e; }
+  .badge-registered   { background: #fef3c7; color: #92400e; }
+
+  /* ── SVG edge overlay ──────────────────────────────────────────────── */
+  .edge-svg {
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
+    overflow: visible;
+  }
+
+  /* ── Detail panel ──────────────────────────────────────────────────── */
+  #detail-panel {
+    position: fixed;
+    right: 0;
+    top: 0;
+    width: 360px;
+    height: 100vh;
+    background: white;
+    box-shadow: -2px 0 8px rgba(0, 0, 0, 0.15);
+    overflow-y: auto;
+    z-index: 100;
+    transition: transform 0.2s ease;
+    transform: translateX(100%);
+    display: flex;
+    flex-direction: column;
+  }
+  #detail-panel.is-open {
+    transform: translateX(0);
+  }
+  .detail-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 16px;
+    border-bottom: 1px solid #e5e7eb;
+    position: sticky;
+    top: 0;
+    background: white;
+    z-index: 1;
+  }
+  .detail-header-icon {
+    width: 36px;
+    height: 36px;
+    flex-shrink: 0;
+    overflow: hidden;
+    border-radius: 4px;
+  }
+  .detail-header-icon svg {
+    width: 36px;
+    height: 36px;
+  }
+  .detail-title {
+    flex: 1;
+    min-width: 0;
+  }
+  .detail-title h2 {
+    font-size: 15px;
+    font-weight: 700;
+    margin: 0;
+    line-height: 1.3;
+    word-break: break-word;
+  }
+  .detail-title .detail-slug {
+    font-size: 11px;
+    font-family: monospace;
+    color: #6b7280;
+  }
+  .detail-close {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 18px;
+    color: #6b7280;
+    line-height: 1;
+    padding: 4px;
+    border-radius: 4px;
+    flex-shrink: 0;
+  }
+  .detail-close:hover { background: #f3f4f6; color: #111827; }
+  .detail-body {
+    padding: 16px;
+    flex: 1;
+  }
+  .detail-section {
+    margin-bottom: 16px;
+  }
+  .detail-section-label {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #6b7280;
+    margin-bottom: 4px;
+  }
+  .detail-section-value {
+    font-size: 13px;
+    color: #111827;
+    line-height: 1.5;
+  }
+  .detail-section-value.is-muted { color: #6b7280; }
+  .detail-chip-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .detail-chip {
+    display: inline-block;
+    padding: 2px 8px;
+    background: #f3f4f6;
+    border-radius: 12px;
+    font-size: 12px;
+    font-family: monospace;
+    cursor: pointer;
+    color: #1d4ed8;
+    border: 1px solid #e5e7eb;
+  }
+  .detail-chip:hover { background: #e0e7ff; border-color: #6366f1; }
+  .detail-actions {
+    display: flex;
+    gap: 8px;
+    padding: 16px;
+    border-top: 1px solid #e5e7eb;
+  }
+  .cui-btn {
+    padding: 6px 14px;
+    border-radius: 4px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .cui-btn-primary { background: #6366f1; color: white; }
+  .cui-btn-primary:hover { background: #4f46e5; }
+  .cui-btn-danger  { background: #ef4444; color: white; }
+  .cui-btn-danger:hover  { background: #dc2626; }
+  .cui-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .error-item {
+    font-size: 12px;
+    color: #991b1b;
+    background: #fee2e2;
+    border-radius: 4px;
+    padding: 4px 8px;
+    margin-bottom: 4px;
+  }
+  .pending-banner {
+    background: #fef3c7;
+    border: 1px solid #fcd34d;
+    border-radius: 4px;
+    padding: 8px 12px;
+    font-size: 13px;
+    font-weight: 600;
+    color: #92400e;
+    margin-bottom: 12px;
+  }
+  .state-pending-warning {
+    color: #92400e;
+    font-weight: 600;
+  }
+  .restart-warning {
+    font-size: 12px;
+    color: #b45309;
+    align-self: center;
+  }
+
+  /* ── Toolbar ───────────────────────────────────────────────────────── */
+  .tree-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+  }
+  .tree-toolbar input[type="search"] {
+    padding: 5px 10px;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
+    font-size: 13px;
+    min-width: 180px;
+  }
+  .tree-toolbar select {
+    padding: 5px 10px;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
+    font-size: 13px;
+  }
+  .tree-toolbar button {
+    padding: 5px 12px;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
+    font-size: 13px;
+    background: white;
+    cursor: pointer;
+  }
+  .tree-toolbar button:hover { background: #f9fafb; }
+  .tree-toolbar button.is-active { background: #e0e7ff; border-color: #6366f1; color: #4338ca; }
+
+  /* ── Loading / empty states ────────────────────────────────────────── */
+  .tree-loading,
+  .tree-error,
+  .tree-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 300px;
+    gap: 12px;
+    color: #6b7280;
+    font-size: 14px;
+  }
+  .spinner {
+    width: 32px;
+    height: 32px;
+    border: 3px solid #e5e7eb;
+    border-top-color: #6366f1;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Fallback table ────────────────────────────────────────────────── */
+  #tree-table { margin-top: 8px; }
+  #tree-table table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  #tree-table th,
+  #tree-table td {
+    text-align: left;
+    padding: 6px 10px;
+    border-bottom: 1px solid #e5e7eb;
+  }
+  #tree-table th { font-weight: 600; background: #f9fafb; }
+
+  /* ── Confirm modal ─────────────────────────────────────────────────── */
+  #confirm-modal {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 200;
+    background: rgba(0,0,0,0.4);
+    align-items: center;
+    justify-content: center;
+  }
+  #confirm-modal.is-open { display: flex; }
+  .confirm-dialog {
+    background: white;
+    border-radius: 8px;
+    padding: 24px;
+    max-width: 440px;
+    width: 100%;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.18);
+  }
+  .confirm-dialog h3 { margin: 0 0 12px; font-size: 16px; }
+  .confirm-dialog p  { font-size: 14px; color: #374151; margin: 0 0 8px; }
+  .confirm-dialog ul { margin: 4px 0 12px 16px; font-size: 13px; color: #374151; }
+  .confirm-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+</style>
+{% endblock %}
+
+{% block page_title %}Module Dependency Tree{% endblock %}
+
+{% block content %}
+{# ── Toolbar ─────────────────────────────────────────────────────────── #}
+<div class="tree-toolbar" role="toolbar" aria-label="Tree controls">
+  <input
+    type="search"
+    id="tree-search"
+    placeholder="Search modules…"
+    aria-label="Search modules"
+    autocomplete="off"
+  >
+  <select id="state-filter" aria-label="Filter by state">
+    <option value="">All states</option>
+    <option value="ready">Ready</option>
+    <option value="failed">Failed</option>
+    <option value="disabled">Disabled</option>
+    <option value="unavailable">Unavailable</option>
+    <option value="discovered">Discovered</option>
+    <option value="registered">Registered</option>
+  </select>
+  <select id="group-filter" aria-label="Filter by group">
+    <option value="">All groups</option>
+  </select>
+  <button id="btn-fit" type="button">Fit to view</button>
+  <button id="btn-reset-layout" type="button">Reset layout</button>
+  <button id="btn-focus" type="button" aria-pressed="false" title="Show only the selected module's dependency neighborhood">Focus</button>
+  <button id="btn-show-all" type="button">Show all</button>
+  <button id="btn-view-graph" type="button" class="is-active" aria-pressed="true">Graph</button>
+  <button id="btn-view-table" type="button" aria-pressed="false">Table</button>
+</div>
+
+{# ── Graph canvas ────────────────────────────────────────────────────── #}
+<div
+  id="tree-root"
+  data-graph-url="{% url 'cauldron_module_tree:graph_api' %}"
+  data-preview-url="/cauldron/module-tree/api/modules/__slug__/preview-change/"
+  data-enable-url="/cauldron/module-tree/api/modules/__slug__/enable/"
+  data-disable-url="/cauldron/module-tree/api/modules/__slug__/disable/"
+  data-can-change="{% if perms.cauldron_module_tree.change_module_state %}1{% else %}0{% endif %}"
+>
+  <div id="tree-loading" class="tree-loading" aria-live="polite">
+    <div class="spinner" role="status" aria-label="Loading module tree"></div>
+    <span>Loading module dependency tree…</span>
+  </div>
+</div>
+
+{# ── Fallback table (hidden by default, shown in table view) ─────────── #}
+<div id="tree-table" style="display:none" aria-hidden="true">
+  <table>
+    <thead>
+      <tr>
+        <th>Module</th>
+        <th>State</th>
+        <th>Group</th>
+        <th>Version</th>
+        <th>Dependencies</th>
+      </tr>
+    </thead>
+    <tbody id="tree-table-body"></tbody>
+  </table>
+</div>
+
+{# ── Detail side panel ───────────────────────────────────────────────── #}
+<aside id="detail-panel" aria-label="Module details" aria-hidden="true">
+  <div class="detail-header">
+    <div class="detail-header-icon" id="detail-icon"></div>
+    <div class="detail-title">
+      <h2 id="detail-title-text"></h2>
+      <div class="detail-slug" id="detail-slug-text"></div>
+    </div>
+    <button class="detail-close" id="detail-close" aria-label="Close detail panel">&#x2715;</button>
+  </div>
+  <div class="detail-body" id="detail-body"></div>
+  <div class="detail-actions" id="detail-actions" style="display:none"></div>
+</aside>
+
+{# ── Confirm modal ───────────────────────────────────────────────────── #}
+<div id="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+  <div class="confirm-dialog">
+    <h3 id="confirm-title">Confirm action</h3>
+    <div id="confirm-body"></div>
+    <div class="confirm-actions">
+      <button id="confirm-cancel" type="button" class="cui-btn" style="background:#f3f4f6;border-color:#d1d5db;">Cancel</button>
+      <button id="confirm-ok" type="button" class="cui-btn cui-btn-primary">Confirm</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+{# Production bundle built from frontend/src/ using Vite + ELK.js #}
+<script type="module" src="{% static 'cauldron_module_tree/module-tree.js' %}"></script>
+{% endblock %}

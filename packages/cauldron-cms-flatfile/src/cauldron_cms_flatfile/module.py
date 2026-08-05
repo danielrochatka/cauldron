@@ -1,5 +1,7 @@
 """Cauldron flat-file CMS module definition."""
-from cauldron.modules import BaseModule, ModuleManifest, ModuleRequirement, ModuleSettingsDeclaration
+from cauldron.modules import BaseModule, ModuleManifest, ModulePresentation, ModuleRequirement, ModuleSettingsDeclaration
+
+_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>"""
 
 _manifest = ModuleManifest(
     slug="cauldron.cms.flatfile",
@@ -39,6 +41,13 @@ _manifest = ModuleManifest(
             required=False,
             description="Path to schema directory relative to site_root. Defaults to 'schemas'.",
         ),
+    ),
+    presentation=ModulePresentation(
+        title="Flat-File CMS",
+        summary="Flat-file CMS backend — reads and writes content pages as Markdown + YAML frontmatter.",
+        icon_svg=_ICON_SVG,
+        group="Integration",
+        display_order=10,
     ),
 )
 

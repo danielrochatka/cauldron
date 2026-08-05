@@ -68,6 +68,9 @@ jobs:
         run: |
           pip install -e packages/cauldron-site-astro
 
+      - name: Install module-tree
+        run: pip install -e packages/cauldron-module-tree
+
       - name: Test (core)
         run: pytest tests/ -v
 
@@ -79,6 +82,9 @@ jobs:
 
       - name: Test (cauldron-django-admin)
         run: pytest packages/cauldron-django-admin/tests/ -v
+
+      - name: Test (cauldron-module-tree)
+        run: pytest packages/cauldron-module-tree/tests/ -v
 
       - name: Test (cauldron-content)
         run: pytest packages/cauldron-content/tests/ -v
@@ -165,33 +171,33 @@ jobs:
           /tmp/cauldron_ai_wheel_test/bin/pip install packages/cauldron-ai/dist/cauldron_ai-*.whl
           /tmp/cauldron_ai_wheel_test/bin/python -c "from cauldron_ai.contracts import AIModelRequest; print('ok')"
 
-      - name: Content control plane example: migrate
+      - name: "Content control plane example: migrate"
         working-directory: examples/django-content-control-plane
         run: |
           pip install -e ../../packages/cauldron-cms-flatfile
           python manage.py migrate --noinput
 
-      - name: Content control plane example: check
+      - name: "Content control plane example: check"
         working-directory: examples/django-content-control-plane
         run: python manage.py check
 
-      - name: Content control plane example: operations status
+      - name: "Content control plane example: operations status"
         working-directory: examples/django-content-control-plane
         run: python manage.py cauldron_content_operations_status
 
-      - name: Content control plane example: operations status JSON
+      - name: "Content control plane example: operations status JSON"
         working-directory: examples/django-content-control-plane
         run: python manage.py cauldron_content_operations_status --json
 
-      - name: Content control plane example: reconcile dry-run
+      - name: "Content control plane example: reconcile dry-run"
         working-directory: examples/django-content-control-plane
         run: python manage.py cauldron_content_reconcile --dry-run
 
-      - name: Content control plane example: reconcile dry-run JSON
+      - name: "Content control plane example: reconcile dry-run JSON"
         working-directory: examples/django-content-control-plane
         run: python manage.py cauldron_content_reconcile --dry-run --json
 
-      - name: Content control plane example: run tests
+      - name: "Content control plane example: run tests"
         working-directory: examples/django-content-control-plane
         run: python -m pytest tests/ -v
 
@@ -224,19 +230,48 @@ jobs:
           .venv-wheel/bin/pip install packages/cauldron-site-astro/dist/cauldron_site_astro-*.whl
           .venv-wheel/bin/pip install pytest pytest-django
 
-      - name: Content control plane example: migrate (wheel)
+      - name: "Content control plane example: migrate (wheel)"
         working-directory: examples/django-content-control-plane
         run: |
           rm -f db.sqlite3
           ../../.venv-wheel/bin/python manage.py migrate --noinput
 
-      - name: Content control plane example: check (wheel)
+      - name: "Content control plane example: check (wheel)"
         working-directory: examples/django-content-control-plane
         run: ../../.venv-wheel/bin/python manage.py check
 
-      - name: Content control plane example: run tests (wheel)
+      - name: "Content control plane example: run tests (wheel)"
         working-directory: examples/django-content-control-plane
         run: ../../.venv-wheel/bin/python -m pytest tests/ -v
+
+  frontend:
+    name: Frontend (cauldron-module-tree)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        working-directory: packages/cauldron-module-tree/frontend
+        run: npm ci
+
+      - name: Test
+        working-directory: packages/cauldron-module-tree/frontend
+        run: npm test
+
+      - name: Build bundle
+        working-directory: packages/cauldron-module-tree/frontend
+        run: npm run build
+
+      - name: Check bundle sanity
+        working-directory: packages/cauldron-module-tree/frontend
+        run: node scripts/check-bundle.js
+
+      - name: Verify committed bundle matches source
+        run: git diff --exit-code packages/cauldron-module-tree/src/cauldron_module_tree/static/cauldron_module_tree/module-tree.js
 
   typescript:
     name: TypeScript

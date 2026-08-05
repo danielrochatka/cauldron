@@ -1,5 +1,7 @@
 """Cauldron Content API module definition."""
-from cauldron.modules import BaseModule, ModuleManifest, ModuleRequirement
+from cauldron.modules import BaseModule, ModuleManifest, ModulePresentation, ModuleRequirement
+
+_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>"""
 
 _manifest = ModuleManifest(
     slug="cauldron.content.api",
@@ -22,6 +24,13 @@ _manifest = ModuleManifest(
     public_api=(
         "cauldron_content_api.views",
         "cauldron_content_api.urls",
+    ),
+    presentation=ModulePresentation(
+        title="Content API",
+        summary="REST API for content access and change-set management by external consumers.",
+        icon_svg=_ICON_SVG,
+        group="Content",
+        display_order=30,
     ),
 )
 

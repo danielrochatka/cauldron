@@ -3,9 +3,12 @@ from cauldron.modules import (
     BaseModule,
     ModuleManifest,
     ModuleNavigationDeclaration,
+    ModulePresentation,
     ModuleRequirement,
     ModuleSettingsDeclaration,
 )
+
+_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z"/></svg>"""
 
 _manifest = ModuleManifest(
     slug="cauldron.django.admin",
@@ -74,6 +77,13 @@ _manifest = ModuleManifest(
             url_prefix="/cauldron/modules/",
             description="Active Cauldron modules and capabilities",
         ),
+    ),
+    presentation=ModulePresentation(
+        title="Django Admin",
+        summary="Cauldron admin shell — navigation, breadcrumbs, sidebar, and the authenticated operator interface.",
+        icon_svg=_ICON_SVG,
+        group="Foundation",
+        display_order=30,
     ),
 )
 

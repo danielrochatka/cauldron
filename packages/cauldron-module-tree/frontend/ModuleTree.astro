@@ -1,0 +1,423 @@
+---
+/**
+ * ModuleTree.astro — Canonical Astro island source for the Cauldron module
+ * dependency tree visualisation.
+ *
+ * ARCHITECTURE NOTE
+ * -----------------
+ * This file is the *canonical source* that documents the intended
+ * Astro + ELK.js architecture.  It is NOT built or imported by the Django
+ * admin shell.  The compiled equivalent shipped to the admin is:
+ *
+ *   static/cauldron_module_tree/tree.js
+ *
+ * That file is a self-contained ES module implementing the same algorithm
+ * without build tooling.  If you ever wire up an Astro build step, replace
+ * tree.js with the output of this component.
+ *
+ * USAGE (in an Astro page that wraps the Django admin, e.g. a Storybook
+ * canvas or a standalone Vite dev server):
+ *
+ *   <ModuleTree graphUrl="/cauldron/module-tree/api/graph/" client:load />
+ *
+ * The `client:load` directive hydrates the component immediately on the
+ * client, which is correct here because the tree cannot be server-rendered
+ * without the live registry data.
+ */
+
+import type { ComponentProps } from "astro";
+
+// ── Props ─────────────────────────────────────────────────────────────────────
+
+export interface GraphNode {
+  slug:             string;
+  title:            string;
+  summary:          string;
+  version:          string;
+  icon_svg:         string;
+  group:            string;
+  display_order:    number;
+  documentation_url: string;
+  state:            "ready" | "failed" | "disabled" | "unavailable" | "discovered" | "registered";
+  enabled:          boolean;
+  active:           boolean;
+  requires_restart: boolean;
+  source_type:      string | null;
+  source:           string;
+  provides:         string[];
+  errors:           string[];
+  parents:          string[];
+  children:         string[];
+}
+
+export interface GraphEdge {
+  source:     string;
+  target:     string;
+  kind:       "required" | "optional" | "capability";
+  capability: string | null;
+  status:     "resolved" | "missing" | "blocked" | "conflict";
+}
+
+export interface GraphData {
+  nodes:    GraphNode[];
+  edges:    GraphEdge[];
+  metadata: {
+    generated_at:    string;
+    restart_required: boolean;
+  };
+}
+
+export interface Props {
+  /** URL of the graph API endpoint, e.g. /cauldron/module-tree/api/graph/ */
+  graphUrl: string;
+  /** Whether the current user may enable/disable modules. */
+  canChange?: boolean;
+}
+
+const { graphUrl, canChange = false } = Astro.props;
+---
+
+<!--
+  The outer shell is rendered server-side; the interactive island is
+  hydrated client-side via client:load.  On first paint the loading
+  skeleton is visible; once hydrated, JavaScript replaces it.
+-->
+<div
+  class="module-tree-root"
+  data-graph-url={graphUrl}
+  data-can-change={canChange ? "1" : "0"}
+>
+  <!-- Loading skeleton shown before hydration -->
+  <div class="tree-skeleton" aria-busy="true">
+    <span class="sr-only">Loading module dependency tree…</span>
+  </div>
+</div>
+
+<script>
+/**
+ * Client-side island — runs after hydration.
+ *
+ * Imports ELK.js for automatic graph layout.  ELK (Eclipse Layout Kernel)
+ * produces high-quality layered layouts via a WebWorker, so it does not
+ * block the main thread.
+ *
+ * Install with:  npm install elkjs
+ *
+ * For the worker-based API used here, also copy the worker bundle:
+ *   node_modules/elkjs/lib/elk-worker.min.js → public/elk-worker.min.js
+ */
+import ELK from "elkjs/lib/elk.bundled.js";
+
+// ── Types (re-declared here so the script block is self-contained) ────────────
+
+/** @typedef {{ slug:string, title:string, summary:string, version:string, icon_svg:string, group:string, display_order:number, documentation_url:string, state:string, enabled:boolean, active:boolean, requires_restart:boolean, source_type:string|null, source:string, provides:string[], errors:string[], parents:string[], children:string[] }} GraphNode */
+/** @typedef {{ source:string, target:string, kind:string, capability:string|null, status:string }} GraphEdge */
+/** @typedef {{ nodes:GraphNode[], edges:GraphEdge[], metadata:object }} GraphData */
+
+// ── ELK layout algorithm ──────────────────────────────────────────────────────
+
+const elk = new ELK({
+  // Point ELK at the bundled worker so layout runs off the main thread.
+  // Adjust the path if your public directory differs.
+  workerUrl: "/static/cauldron_module_tree/elk-worker.min.js",
+});
+
+/**
+ * Convert the graph API response into an ELK graph descriptor and run layout.
+ *
+ * ELK layered layout options used:
+ *   - elk.algorithm: "layered"         — Sugiyama/dot-style layer assignment
+ *   - elk.direction: "DOWN"            — roots at the top, leaves at bottom
+ *   - elk.layered.spacing.nodeNodeBetweenLayers: 60
+ *   - elk.spacing.nodeNode: 30
+ *
+ * @param {GraphData} graphData
+ * @returns {Promise<Record<string, {x:number, y:number}>>} slug → position
+ */
+async function computeElkLayout(graphData) {
+  const NODE_W = 190;
+  const NODE_H = 80;
+
+  /** @type {import("elkjs").ElkNode} */
+  const elkGraph = {
+    id:       "root",
+    layoutOptions: {
+      "elk.algorithm":    "layered",
+      "elk.direction":    "DOWN",
+      "elk.layered.spacing.nodeNodeBetweenLayers": "60",
+      "elk.spacing.nodeNode": "30",
+      "elk.layered.nodePlacement.strategy": "BRANDES_KOEPF",
+    },
+    children: graphData.nodes.map(n => ({
+      id:     n.slug,
+      width:  NODE_W,
+      height: NODE_H,
+    })),
+    edges: graphData.edges
+      .filter(e =>
+        // Only include edges between known nodes (missing targets would error).
+        graphData.nodes.some(n => n.slug === e.source) &&
+        graphData.nodes.some(n => n.slug === e.target)
+      )
+      .map((e, i) => ({
+        id:      `e${i}`,
+        sources: [e.source],
+        targets: [e.target],
+      })),
+  };
+
+  const laid = await elk.layout(elkGraph);
+
+  /** @type {Record<string, {x:number, y:number}>} */
+  const positions = {};
+  for (const child of (laid.children || [])) {
+    positions[child.id] = { x: child.x ?? 0, y: child.y ?? 0 };
+  }
+  return positions;
+}
+
+// ── Rendering helpers (same as tree.js, kept in sync) ─────────────────────────
+
+function esc(str) {
+  return String(str ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function defaultIcon(slug) {
+  const initials = (slug || "?").split(".").pop().slice(0, 2).toUpperCase();
+  return `<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">
+    <rect width="32" height="32" rx="4" fill="#e0e7ff"/>
+    <text x="16" y="21" text-anchor="middle" font-size="13"
+          font-family="sans-serif" fill="#4338ca" font-weight="600">${initials}</text>
+  </svg>`;
+}
+
+// ── Bootstrap ─────────────────────────────────────────────────────────────────
+
+const rootEl = document.querySelector(".module-tree-root");
+if (rootEl) {
+  const graphUrl  = rootEl.dataset.graphUrl;
+  const canChange = rootEl.dataset.canChange === "1";
+
+  (async () => {
+    // 1. Fetch graph data.
+    let graphData;
+    try {
+      const resp = await fetch(graphUrl, {
+        headers:     { "Accept": "application/json" },
+        credentials: "same-origin",
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      graphData = await resp.json();
+    } catch (err) {
+      rootEl.innerHTML = `<p class="tree-error">Failed to load graph: ${esc(err.message)}</p>`;
+      return;
+    }
+
+    if (!graphData.nodes?.length) {
+      rootEl.innerHTML = `<p class="tree-empty">No modules found in the registry.</p>`;
+      return;
+    }
+
+    // 2. Run ELK layout (off main thread via WebWorker).
+    let positions;
+    try {
+      positions = await computeElkLayout(graphData);
+    } catch (err) {
+      // ELK failed (e.g. no worker) — fall back to simple BFS layout.
+      console.warn("ELK layout failed, using fallback BFS layout:", err);
+      positions = bfsFallbackLayout(graphData);
+    }
+
+    // 3. Render.
+    renderGraph(rootEl, graphData, positions, canChange);
+  })();
+}
+
+/**
+ * Simple BFS layered fallback used when ELK is unavailable.
+ * Identical algorithm to tree.js _computeLayout().
+ *
+ * @param {GraphData} graphData
+ * @returns {Record<string, {x:number, y:number}>}
+ */
+function bfsFallbackLayout(graphData) {
+  const NODE_W = 190, NODE_H = 80, GAP_X = 30, GAP_Y = 130, PAD = 40;
+  const parentSet = {};
+  const children  = {};
+
+  for (const n of graphData.nodes) {
+    parentSet[n.slug] = new Set();
+    children[n.slug]  = [];
+  }
+  for (const e of graphData.edges) {
+    if (children[e.source] && children[e.target]) {
+      children[e.source].push(e.target);
+      parentSet[e.target].add(e.source);
+    }
+  }
+
+  const depth   = {};
+  const visited = new Set();
+  const roots   = graphData.nodes.filter(n => parentSet[n.slug].size === 0).map(n => n.slug);
+  const queue   = [...roots];
+  for (const r of roots) depth[r] = 0;
+
+  while (queue.length) {
+    const slug = queue.shift();
+    if (visited.has(slug)) continue;
+    visited.add(slug);
+    for (const c of (children[slug] || [])) {
+      if (!visited.has(c)) {
+        depth[c] = Math.max(depth[c] ?? 0, (depth[slug] ?? 0) + 1);
+        queue.push(c);
+      }
+    }
+  }
+  for (const n of graphData.nodes) if (depth[n.slug] === undefined) depth[n.slug] = 0;
+
+  const layers = {};
+  for (const n of graphData.nodes) {
+    const d = depth[n.slug];
+    (layers[d] = layers[d] || []).push(n.slug);
+  }
+
+  const positions = {};
+  for (const [d, slugs] of Object.entries(layers)) {
+    slugs.forEach((slug, i) => {
+      positions[slug] = {
+        x: PAD + i * (NODE_W + GAP_X),
+        y: PAD + Number(d) * (NODE_H + GAP_Y),
+      };
+    });
+  }
+  return positions;
+}
+
+/**
+ * Mount the graph DOM into `rootEl`.
+ *
+ * @param {HTMLElement}                          rootEl
+ * @param {GraphData}                            graphData
+ * @param {Record<string, {x:number, y:number}>} positions
+ * @param {boolean}                              canChange
+ */
+function renderGraph(rootEl, graphData, positions, canChange) {
+  // This function mirrors tree.js ModuleTreeApp._render().
+  // In a real Astro/Svelte/React island you would use reactive state here;
+  // for this canonical doc we keep it as plain DOM manipulation.
+
+  rootEl.innerHTML = "";
+  rootEl.style.position = "relative";
+  rootEl.style.overflow = "auto";
+
+  let maxX = 0, maxY = 0;
+  for (const pos of Object.values(positions)) {
+    maxX = Math.max(maxX, pos.x + 190);
+    maxY = Math.max(maxY, pos.y + 80);
+  }
+
+  const canvas = document.createElement("div");
+  canvas.style.cssText = `position:relative;width:${maxX + 40}px;height:${maxY + 40}px`;
+  rootEl.appendChild(canvas);
+
+  // Render nodes.
+  for (const node of graphData.nodes) {
+    const pos = positions[node.slug];
+    if (!pos) continue;
+
+    const el = document.createElement("div");
+    el.className = `module-node node-state-${node.state}`;
+    el.style.cssText = `position:absolute;left:${pos.x}px;top:${pos.y}px;width:190px;cursor:pointer`;
+    el.innerHTML = `
+      <div class="node-card">
+        <div class="node-icon">${node.icon_svg || defaultIcon(node.slug)}</div>
+        <div class="node-body">
+          <div class="node-title">${esc(node.title)}</div>
+          <div class="node-slug">${esc(node.slug)}</div>
+          <span class="state-badge badge-${node.state}">${node.state}</span>
+        </div>
+      </div>
+    `;
+    canvas.appendChild(el);
+  }
+
+  // Render edge SVG.
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "edge-svg");
+  svg.setAttribute("width", maxX + 40);
+  svg.setAttribute("height", maxY + 40);
+  svg.style.cssText = "position:absolute;top:0;left:0;pointer-events:none;overflow:visible";
+  canvas.insertBefore(svg, canvas.firstChild);
+
+  const EDGE_COLORS = { required: "#3b82f6", optional: "#9ca3af", capability: "#8b5cf6" };
+  for (const edge of graphData.edges) {
+    const s = positions[edge.source], t = positions[edge.target];
+    if (!s || !t) continue;
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    const x1 = s.x + 95, y1 = s.y + 80, x2 = t.x + 95, y2 = t.y;
+    const midY = (y1 + y2) / 2;
+    path.setAttribute("d", `M${x1},${y1} L${x1},${midY} L${x2},${midY} L${x2},${y2}`);
+    path.setAttribute("fill", "none");
+    path.setAttribute("stroke", EDGE_COLORS[edge.kind] ?? "#9ca3af");
+    path.setAttribute("stroke-width", "1.5");
+    if (edge.status !== "resolved") path.setAttribute("stroke-dasharray", "4 3");
+    svg.appendChild(path);
+  }
+
+  // Expose `canChange` for action wiring (omitted here for brevity — see tree.js).
+  void canChange;
+}
+</script>
+
+<style>
+  /* Scoped styles for the Astro island.  These duplicate the inline <style>
+     in tree.html so the island works standalone (e.g. in Storybook). */
+
+  .module-tree-root {
+    position: relative;
+    overflow: auto;
+    width: 100%;
+    min-height: 500px;
+    border: 1px solid var(--cui-border, #e5e7eb);
+    border-radius: 4px;
+  }
+
+  .tree-skeleton {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 300px;
+    background: linear-gradient(90deg, #f3f4f6 25%, #e5e7eb 50%, #f3f4f6 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+    border-radius: 4px;
+  }
+
+  @keyframes shimmer {
+    0%   { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+  }
+
+  .tree-error,
+  .tree-empty {
+    padding: 32px;
+    color: #6b7280;
+    text-align: center;
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+</style>

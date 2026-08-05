@@ -4,8 +4,11 @@ from cauldron.modules import (
     ModuleManifest,
     ModuleMigrationDeclaration,
     ModulePermissionDeclaration,
+    ModulePresentation,
     ModuleRequirement,
 )
+
+_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 19.07a10 10 0 0 1 0-14.14"/><line x1="12" y1="2" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="2" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>"""
 
 _manifest = ModuleManifest(
     slug="cauldron.content.operations",
@@ -96,6 +99,13 @@ _manifest = ModuleManifest(
             name="Can view content audit history",
             app_label="cauldron_content_operations",
         ),
+    ),
+    presentation=ModulePresentation(
+        title="Content Operations",
+        summary="Content mutation operations — create, update, delete, publish, and approval workflows.",
+        icon_svg=_ICON_SVG,
+        group="Content",
+        display_order=20,
     ),
 )
 

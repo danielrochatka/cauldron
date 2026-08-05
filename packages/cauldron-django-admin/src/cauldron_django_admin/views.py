@@ -38,7 +38,6 @@ def modules_view(request):
     try:
         from cauldron.modules.registry import registry as mod_registry
     except ImportError:
-        # cauldron.modules is not installed — nothing to display.
         return render(request, "cauldron_admin/modules.html", {
             "modules": modules,
             "registry_errors": registry_errors,
@@ -56,9 +55,9 @@ def modules_view(request):
         })
 
     try:
-        graph_list = mod_registry.graph_info() or []
+        inventory = mod_registry.inventory() or []
     except Exception as exc:
-        graph_list = []
+        inventory = []
         registry_errors.append({"kind": type(exc).__name__, "module": ""})
 
     try:
@@ -68,10 +67,6 @@ def modules_view(request):
         cap_map = {}
         registry_errors.append({"kind": type(exc).__name__, "module": ""})
 
-    # Capability provider selections come from Django settings — the same
-    # source the resolver consults for CAULDRON_CAPABILITY_PROVIDERS. We
-    # surface them per-module so operators can see which provider they
-    # explicitly chose for each capability the module offers.
     from django.conf import settings
     cap_providers_setting_raw = getattr(
         settings, "CAULDRON_CAPABILITY_PROVIDERS", None,
@@ -84,54 +79,22 @@ def modules_view(request):
     else:
         cap_providers_setting = {}
 
-    # Slugs with any resolution/lifecycle error — we degrade their status so
-    # the modules page surfaces problems inline rather than only in the
-    # diagnostics block at the bottom. An operator scanning the list should
-    # see the failed module marked red without reading the error section.
-    error_slugs: set[str] = set()
-
-    def _collect_error_slugs(iterable) -> None:
-        for err in (iterable or []):
-            for attr in ("module_slug", "slug", "module"):
-                val = getattr(err, attr, "") or ""
-                if isinstance(val, str) and val:
-                    error_slugs.add(val)
-                    break
-
-    try:
-        _collect_error_slugs(mod_registry.errors())
-    except Exception:
-        pass
-    try:
-        _collect_error_slugs(mod_registry.lifecycle_errors())
-    except Exception:
-        pass
-
-    for info in graph_list:
+    for info in inventory:
         if not isinstance(info, dict):
             continue
         slug = info.get("slug", "") or ""
+        state = info.get("state") or "discovered"
         is_active = bool(info.get("active", False))
+        is_enabled = bool(info.get("enabled", False))
         provided_caps = list(info.get("provides", []) or [])
         requires = list(info.get("requires", []) or [])
         deps = list(info.get("deps", []) or [])
         django_apps = list(info.get("django_apps", []) or [])
         load_index = info.get("load_index")
+        source_type = info.get("source_type")
+        source = info.get("source") or ""
+        module_errors = list(info.get("errors", []) or [])
 
-        # Status: resolution or lifecycle errors override active/inactive
-        # with "error" so failures are visible on the row itself.
-        if slug in error_slugs:
-            status = "error"
-            health = "degraded"
-        elif is_active:
-            status = "active"
-            health = "healthy"
-        else:
-            status = "inactive"
-            health = "unknown"
-
-        # Only surface a selected provider when the module actually provides
-        # that capability AND the operator picked it in settings.
         selected_providers = {
             cap: cap_providers_setting[cap]
             for cap in provided_caps
@@ -140,12 +103,14 @@ def modules_view(request):
 
         modules.append({
             "slug": slug,
-            "label": info.get("label", slug) or slug,
-            "version": info.get("version", "") or "",
-            "status": status,
-            "health": health,
+            "label": info.get("label") or slug,
+            "version": info.get("version") or "",
+            "state": state,
+            "enabled": is_enabled,
             "active": is_active,
             "load_index": load_index,
+            "source_type": source_type,
+            "source": source,
             "provides": provided_caps,
             "requires": requires,
             "deps": deps,
@@ -155,9 +120,10 @@ def modules_view(request):
                 cap for cap, providers in cap_map.items()
                 if isinstance(providers, (list, tuple)) and slug in providers
             ),
+            "errors": module_errors,
         })
 
-    # Diagnostic errors — redacted to type-name + module slug only.
+    # Global diagnostics block — errors from all registry sources.
     try:
         for err in (mod_registry.errors() or []):
             _add_error(err)

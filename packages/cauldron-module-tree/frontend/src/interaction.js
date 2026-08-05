@@ -216,6 +216,7 @@ export function initInteraction(app, container, graphData, { canChange }) {
     const panel = document.getElementById("detail-panel");
     if (!panel) return;
     panel.removeAttribute("aria-hidden");
+    panel.classList.add("is-open");
     panel.innerHTML = `
       <div class="detail-header">
         <div class="detail-icon">${n.icon_svg || ""}</div>
@@ -223,7 +224,7 @@ export function initInteraction(app, container, graphData, { canChange }) {
           <div class="detail-title">${escHtml(n.title || n.slug)}</div>
           <div class="detail-slug">${escHtml(n.slug)}</div>
         </div>
-        <button class="detail-close" onclick="this.closest('#detail-panel').setAttribute('aria-hidden','true')" aria-label="Close">&times;</button>
+        <button class="detail-close" id="detail-close-btn" aria-label="Close">&times;</button>
       </div>
       <div class="detail-body">
         <p>${escHtml(n.summary || "")}</p>
@@ -238,6 +239,7 @@ export function initInteraction(app, container, graphData, { canChange }) {
         ${n.errors?.length ? `<div class="detail-errors"><strong>Errors:</strong><ul>${n.errors.map((e) => `<li>${escHtml(e.message || JSON.stringify(e))}</li>`).join("")}</ul></div>` : ""}
         ${canChange ? renderActions(n) : ""}
       </div>`;
+    document.getElementById("detail-close-btn")?.addEventListener("click", hideDetailPanel);
   }
 
   function renderActions(n) {
@@ -252,7 +254,10 @@ export function initInteraction(app, container, graphData, { canChange }) {
   }
 
   function hideDetailPanel() {
-    document.getElementById("detail-panel")?.setAttribute("aria-hidden", "true");
+    const panel = document.getElementById("detail-panel");
+    if (!panel) return;
+    panel.setAttribute("aria-hidden", "true");
+    panel.classList.remove("is-open");
   }
 
   // Enable/disable actions (delegated)

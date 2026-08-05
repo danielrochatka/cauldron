@@ -235,9 +235,9 @@ class ModuleGraph:
         for edge in self._edges:
             src, tgt = edge.source, edge.target
             if edge.kind in ("required", "capability"):
-                if tgt in children_map:
+                if src in children_map:
                     children_map[src].append(tgt)
-                if src in parents_map:
+                if tgt in parents_map:
                     parents_map[tgt].append(src)
 
         nodes_list = []
@@ -356,11 +356,20 @@ def _edge_status(
 # Graph builder                                                                #
 # --------------------------------------------------------------------------- #
 
-def build_graph(registry: Any) -> ModuleGraph:
+def build_graph(
+    registry: Any,
+    *,
+    configured_overrides: dict[str, bool] | None = None,
+) -> ModuleGraph:
     """Build a :class:`ModuleGraph` from *registry*.
 
     Uses only ``registry.inventory()``, ``registry.capabilities()``, and
     ``registry.errors()``.  Never hardcodes slugs.
+
+    Pass ``configured_overrides`` (slug → bool) from the JSON overlay so that
+    ``node.configured_enabled`` reflects pending UI changes that have not yet
+    been applied via a server restart, while ``node.runtime_enabled`` (= active)
+    reflects the live state.
 
     Edge building rules
     -------------------
@@ -386,6 +395,10 @@ def build_graph(registry: Any) -> ModuleGraph:
         pres = _presentation_fields(entry)
         enabled = bool(entry.get("enabled"))
         active = bool(entry.get("active"))
+        if configured_overrides is not None:
+            configured = configured_overrides.get(slug, enabled)
+        else:
+            configured = enabled
 
         graph_nodes.append(ModuleGraphNode(
             slug=slug,
@@ -395,7 +408,7 @@ def build_graph(registry: Any) -> ModuleGraph:
             state=entry.get("state") or "unavailable",
             enabled=enabled,
             active=active,
-            configured_enabled=enabled,
+            configured_enabled=configured,
             runtime_enabled=active,
             requires_restart=pres["requires_restart"],
             icon_svg=pres["icon_svg"],

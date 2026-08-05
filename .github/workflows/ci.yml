@@ -68,6 +68,9 @@ jobs:
         run: |
           pip install -e packages/cauldron-site-astro
 
+      - name: Install module-tree
+        run: pip install -e packages/cauldron-module-tree
+
       - name: Test (core)
         run: pytest tests/ -v
 
@@ -79,6 +82,9 @@ jobs:
 
       - name: Test (cauldron-django-admin)
         run: pytest packages/cauldron-django-admin/tests/ -v
+
+      - name: Test (cauldron-module-tree)
+        run: pytest packages/cauldron-module-tree/tests/ -v
 
       - name: Test (cauldron-content)
         run: pytest packages/cauldron-content/tests/ -v
@@ -237,6 +243,31 @@ jobs:
       - name: Content control plane example: run tests (wheel)
         working-directory: examples/django-content-control-plane
         run: ../../.venv-wheel/bin/python -m pytest tests/ -v
+
+  frontend:
+    name: Frontend (cauldron-module-tree)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        working-directory: packages/cauldron-module-tree/frontend
+        run: npm ci
+
+      - name: Build bundle
+        working-directory: packages/cauldron-module-tree/frontend
+        run: npm run build
+
+      - name: Check bundle sanity
+        working-directory: packages/cauldron-module-tree/frontend
+        run: node scripts/check-bundle.js
+
+      - name: Verify committed bundle matches source
+        run: git diff --exit-code packages/cauldron-module-tree/src/cauldron_module_tree/static/cauldron_module_tree/module-tree.js
 
   typescript:
     name: TypeScript

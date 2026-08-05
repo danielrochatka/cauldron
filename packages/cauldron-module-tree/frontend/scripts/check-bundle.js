@@ -1,16 +1,15 @@
 #!/usr/bin/env node
 /**
- * CI check: verify the committed bundle is current by comparing a hash
- * of the source files against a stored manifest.
- * Exits 0 if clean, 1 with a message if the bundle needs rebuilding.
+ * CI sanity check: verify the bundle file exists and is not empty.
+ * Bundle freshness (committed == rebuilt) is checked by the CI job via
+ * `git diff --exit-code` after running `npm run build`.
+ * Exits 0 if the bundle passes the sanity check, 1 otherwise.
  */
 import fs from "fs";
 import path from "path";
-import crypto from "crypto";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const srcDir = path.join(__dirname, "../src");
 const bundlePath = path.join(
   __dirname,
   "../../src/cauldron_module_tree/static/cauldron_module_tree/module-tree.js"

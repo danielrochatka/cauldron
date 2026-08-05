@@ -249,3 +249,126 @@ def test_future_module_auto_discovered():
     result = build_graph(registry).to_api_dict()
     slugs = [n["slug"] for n in result["nodes"]]
     assert "future.unknown.mod" in slugs
+
+
+def test_missing_dep_target_does_not_raise_key_error():
+    """to_api_dict() must not raise KeyError when an edge target is missing from nodes."""
+    from cauldron_module_tree.graph import build_graph
+    # A requires B, but B is not in inventory — creates a "missing" edge
+    a = _entry("mod.a", requires=[{"slug": "mod.missing", "kind": "module"}])
+    registry = _make_registry([a])
+    result = build_graph(registry).to_api_dict()  # must not raise
+    assert len(result["nodes"]) == 1
+    missing_edges = [e for e in result["edges"] if e["status"] == "missing"]
+    assert len(missing_edges) == 1
+
+
+def test_configured_overrides_propagate_to_nodes():
+    """configured_enabled reflects overlay state independently from runtime enabled."""
+    from cauldron_module_tree.graph import build_graph
+    # Module is active at runtime (enabled=True, active=True)
+    e = _entry("mod.a", enabled=True, active=True)
+    registry = _make_registry([e])
+    # Overlay says it should be disabled (pending restart)
+    graph = build_graph(registry, configured_overrides={"mod.a": False})
+    result = graph.to_api_dict()
+    node = result["nodes"][0]
+    assert node["runtime_enabled"] is True     # still running
+    assert node["configured_enabled"] is False  # pending disable after restart
+
+
+def test_configured_overrides_absent_falls_back_to_enabled():
+    """Without configured_overrides, configured_enabled mirrors enabled."""
+    from cauldron_module_tree.graph import build_graph
+    e = _entry("mod.a", enabled=True, active=True)
+    registry = _make_registry([e])
+    result = build_graph(registry).to_api_dict()
+    node = result["nodes"][0]
+    assert node["configured_enabled"] is True
+    assert node["runtime_enabled"] is True
+
+
+def test_100_node_synthetic_graph():
+    """100-module graph with shared deps, cycle, missing targets, disconnected components.
+
+    Verifies: correct node count, missing edges, cycle detection, multiple
+    connected components, correct parent/child mapping, deterministic output,
+    and no KeyError from to_api_dict().
+    """
+    from cauldron_module_tree.graph import build_graph
+
+    # All slugs use letter-prefixed segments to satisfy [a-z][a-z0-9]* per segment.
+    def dep(i):     return f"syn.dep.d{i}"
+    def shared(i):  return f"syn.shared.s{i}"
+    def missing(i): return f"syn.missing.m{i}"
+    def islanda(i): return f"syn.island.ia{i}"
+    def islandb(i): return f"syn.island.ib{i}"
+    def node(i):    return f"syn.node.n{i}"
+
+    entries = []
+
+    # Chain: dep.d0 → dep.d1 → ... → dep.d9 (d0 requires d1, etc.)
+    for i in range(10):
+        requires = [{"slug": dep(i + 1), "kind": "module"}] if i < 9 else []
+        entries.append(_entry(dep(i), requires=requires))
+
+    # Fan-in: shared.s0 … shared.s9 all require dep.d0
+    for i in range(10):
+        entries.append(_entry(shared(i), requires=[{"slug": dep(0), "kind": "module"}]))
+
+    # Cycle: cycle.a → cycle.b → cycle.c → cycle.a
+    entries.append(_entry("syn.cycle.a", requires=[{"slug": "syn.cycle.b", "kind": "module"}]))
+    entries.append(_entry("syn.cycle.b", requires=[{"slug": "syn.cycle.c", "kind": "module"}]))
+    entries.append(_entry("syn.cycle.c", requires=[{"slug": "syn.cycle.a", "kind": "module"}]))
+
+    # Missing targets: 7 modules each require a non-existent slug
+    for i in range(7):
+        entries.append(_entry(missing(i), requires=[{"slug": "syn.nonexistent", "kind": "module"}]))
+
+    # Disconnected island pairs: ia.N ← ib.N, no connection to main graph
+    for i in range(15):
+        entries.append(_entry(islanda(i)))
+        entries.append(_entry(islandb(i), requires=[{"slug": islanda(i), "kind": "module"}]))
+
+    # Remaining nodes fanning into the chain
+    for i in range(60, 100):
+        entries.append(_entry(node(i), requires=[{"slug": dep((i * 3) % 10), "kind": "module"}]))
+
+    assert len(entries) == 100
+
+    registry = _make_registry(entries)
+    graph = build_graph(registry)
+
+    result = graph.to_api_dict()  # must not raise
+
+    # Basic counts
+    assert len(result["nodes"]) == 100
+    assert len(result["edges"]) > 0
+
+    # Missing edges present for the 7 missing-target modules
+    missing_edges = [e for e in result["edges"] if e["status"] == "missing"]
+    assert len(missing_edges) == 7
+
+    # Cycles detected (the 3-node cycle a→b→c→a)
+    cycles = result["metadata"]["cycles"]
+    assert len(cycles) > 0
+    cycle_slugs = {slug for cycle in cycles for slug in cycle}
+    assert {"syn.cycle.a", "syn.cycle.b", "syn.cycle.c"}.issubset(cycle_slugs)
+
+    # Disconnected components (islands are separate from the main chain)
+    assert result["metadata"]["components_count"] > 1
+
+    # Parent/child mapping: dep.d0 should have shared.s0…s9 as parents
+    node_map = {n["slug"]: n for n in result["nodes"]}
+    dep0_parents = set(node_map[dep(0)]["parents"])
+    for i in range(10):
+        assert shared(i) in dep0_parents, f"{shared(i)} missing from {dep(0)} parents"
+
+    # dep.d0 children should include dep.d1 (dep.d0 requires dep.d1)
+    dep0_children = set(node_map[dep(0)]["children"])
+    assert dep(1) in dep0_children
+
+    # Deterministic serialisation
+    result2 = graph.to_api_dict()
+    assert result["nodes"] == result2["nodes"]
+    assert result["edges"] == result2["edges"]

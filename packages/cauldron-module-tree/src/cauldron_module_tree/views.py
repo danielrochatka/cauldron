@@ -38,12 +38,32 @@ def _get_data_dir():
     return base_dir / "data"
 
 
+def _load_configured_overrides() -> dict[str, bool]:
+    """Read the module-state overlay and return {slug: bool} for all overrides."""
+    from cauldron.modules.overlay import load_overlay
+    data_dir = _get_data_dir()
+    if data_dir is None:
+        return {}
+    overrides, _ = load_overlay(data_dir)
+    return {
+        slug: data["enabled"]
+        for slug, data in overrides.items()
+        if isinstance(data.get("enabled"), bool)
+    }
+
+
 def _update_overlay(slug: str, enabled: bool) -> None:
-    """Atomically update the module-state overlay for one slug."""
+    """Atomically update the module-state overlay for one slug.
+
+    Raises if data_dir is unavailable or the write fails — callers that rely
+    on the overlay for restart-authoritative state must not swallow this.
+    """
     from cauldron.modules.overlay import load_overlay, save_overlay
     data_dir = _get_data_dir()
     if data_dir is None:
-        return
+        raise RuntimeError(
+            "BASE_DIR is not configured; cannot persist module state overlay."
+        )
     overrides, _ = load_overlay(data_dir)
     overrides[slug] = {"enabled": enabled}
     save_overlay(data_dir, overrides)
@@ -106,7 +126,8 @@ def graph_api(request: HttpRequest) -> JsonResponse:
     """Return the full module graph as JSON."""
     try:
         registry = _get_registry()
-        graph: ModuleGraph = build_graph(registry)
+        configured_overrides = _load_configured_overrides()
+        graph: ModuleGraph = build_graph(registry, configured_overrides=configured_overrides)
         data = graph.to_api_dict()
         return JsonResponse(data)
     except Exception as exc:
@@ -252,16 +273,55 @@ def _store_override(
         from cauldron_module_tree.models import ModuleEnabledOverride
         from cauldron.modules.registry import registry
 
-        # Independently validate: verify module exists in registry and compute impact
         inventory = registry.inventory()
 
-        runtime_active = False
+        # 1. Reject unknown modules — never act on slugs not in the registry.
+        target_entry: dict[str, Any] | None = None
         for entry in inventory:
             if entry["slug"] == module_slug:
-                runtime_active = bool(entry.get("active", False))
+                target_entry = entry
                 break
 
-        # Compute transitive impact using the domain model
+        if target_entry is None:
+            return JsonResponse(
+                {
+                    "error": f"Module '{module_slug}' not found in the registry.",
+                    "type": "NotFound",
+                },
+                status=404,
+            )
+
+        # 2. Re-run the same validation checks as preview_change.
+        if enabled:
+            state = target_entry.get("state", "")
+            if state in ("failed", "unavailable"):
+                return JsonResponse(
+                    {
+                        "error": (
+                            f"Module '{module_slug}' is in state '{state}' and cannot be enabled."
+                        ),
+                        "type": "ValueError",
+                    },
+                    status=400,
+                )
+            node_slugs = {e["slug"] for e in inventory}
+            missing_deps = [
+                req["slug"]
+                for req in (target_entry.get("requires") or [])
+                if req.get("kind") == "module" and req["slug"] not in node_slugs
+            ]
+            if missing_deps:
+                return JsonResponse(
+                    {
+                        "error": f"Missing required modules: {', '.join(missing_deps)}.",
+                        "type": "ValueError",
+                    },
+                    status=400,
+                )
+
+        runtime_active = bool(target_entry.get("active", False))
+
+        # Compute transitive impact using the domain model.
         graph: ModuleGraph = build_graph(registry)
         if enabled:
             affected = sorted(graph.transitive_enable_impact(module_slug))
@@ -269,21 +329,25 @@ def _store_override(
             impact = graph.transitive_disable_impact(module_slug)
             affected = sorted(impact - {module_slug})
 
-        override, _created = ModuleEnabledOverride.objects.update_or_create(
-            slug=module_slug,
-            defaults={
-                "enabled": enabled,
-                "changed_by": request.user if request.user.is_authenticated else None,
-                "reason": reason,
-            },
-        )
+        # 3. Write overlay FIRST — it is the restart-authoritative record.
+        #    If this fails the whole request fails with 500 (outer except).
+        _update_overlay(module_slug, enabled)
 
-        # Write the overlay file so the change survives server restarts.
+        # 4. Write DB for audit trail; failure here is non-fatal since overlay
+        #    is already durable.
         try:
-            _update_overlay(module_slug, enabled)
+            ModuleEnabledOverride.objects.update_or_create(
+                slug=module_slug,
+                defaults={
+                    "enabled": enabled,
+                    "changed_by": request.user if request.user.is_authenticated else None,
+                    "reason": reason,
+                },
+            )
         except Exception:
             logger.exception(
-                "_store_override: failed to write overlay for module %r", module_slug
+                "_store_override: DB write failed for module %r (overlay already written)",
+                module_slug,
             )
 
         action = "enable" if enabled else "disable"

@@ -93,8 +93,9 @@ function buildElkGraph(graphData) {
       ],
     })),
     edges: graphData.edges
-      .filter((e) => e.status !== "missing")
-      .map((e, idx) => {
+      .map((e, originalIdx) => ({ e, originalIdx }))
+      .filter(({ e }) => e.status !== "missing")
+      .map(({ e, originalIdx }) => {
         const outIdx = outgoingEdgesFor(e.source, graphData.edges).findIndex(
           (x) => x === e || (x.source === e.source && x.target === e.target && x.kind === e.kind)
         );
@@ -102,7 +103,7 @@ function buildElkGraph(graphData) {
           (x) => x === e || (x.source === e.source && x.target === e.target && x.kind === e.kind)
         );
         return {
-          id: `edge_${idx}`,
+          id: `edge_${originalIdx}`,
           sources: [`${e.source}__out__${Math.max(0, outIdx)}`],
           targets: [`${e.target}__in__${Math.max(0, inIdx)}`],
           labels: e.capability ? [{ text: e.capability }] : [],

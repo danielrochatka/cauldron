@@ -81,6 +81,8 @@ CAULDRON_MODULES = {
     "cauldron.ai.admin": {
         "provider": _ai_provider,
     },
+    # Optional module dependency graph viewer (requires cauldron-module-tree package).
+    "cauldron.module.tree": {},
     # Astro static-site builder — generates public HTML from published pages.
     # output_root is served by Django at / and /<slug>/.
     "cauldron.site.astro": {

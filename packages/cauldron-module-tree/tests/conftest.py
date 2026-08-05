@@ -68,14 +68,10 @@ def pytest_configure(config):
         # Pre-register the navigation sections that cauldron_module_tree.navigation
         # expects to exist when its AppConfig.ready() runs.
         #
-        # cauldron_django_admin.apps registers the "system" section and the
-        # "cauldron.modules" *item* but not a "cauldron.modules" *section*.
-        # cauldron_module_tree.navigation.py registers its tree item under the
-        # "cauldron.modules" section — so we pre-create it here (idempotently)
-        # before django.setup() is called by pytest-django.
-        #
-        # The navigation module is pure Python and safe to import before Django
-        # app setup completes.
+        # cauldron_django_admin.apps registers the "system" section; navigation.py
+        # in this package registers its tree item under that same "system" section.
+        # We pre-create it here idempotently before django.setup() is called by
+        # pytest-django, because AppConfig.ready() ordering is not guaranteed.
         try:
             from cauldron_django_admin.navigation import (
                 AdminNavigationSection,
@@ -85,9 +81,9 @@ def pytest_configure(config):
             nav_registry = get_navigation_registry()
             try:
                 nav_registry.register_section(AdminNavigationSection(
-                    key="cauldron.modules",
-                    label="Modules",
-                    order=50,
+                    key="system",
+                    label="System",
+                    order=900,
                 ))
             except ValueError:
                 # Already registered — idempotent re-run.

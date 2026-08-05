@@ -4,7 +4,19 @@
  */
 import { buildStateRows, buildActionHtml, pendingWarning, escHtml, escapeAttr } from './state.js';
 
-export function initInteraction(app, container, graphData, { canChange }) {
+/**
+ * focusedSlug   – present when already in focused mode (the selected root slug)
+ * fullGraphData – the original full-graph data (used for re-focus on node click)
+ * onEnterFocus  – async callback(slug) to enter focused mode
+ * onExitFocus   – async callback() to exit back to full graph
+ */
+export function initInteraction(app, container, graphData, {
+  canChange,
+  focusedSlug = null,
+  fullGraphData = null,
+  onEnterFocus = null,
+  onExitFocus = null,
+}) {
   const { canvas, nodeEls, slugColor } = app;
   let scale = 1, panX = 0, panY = 0;
   let selectedSlug = null;
@@ -120,11 +132,30 @@ export function initInteraction(app, container, graphData, { canChange }) {
   for (const [slug, { el }] of Object.entries(nodeEls)) {
     el.addEventListener("click", (e) => {
       e.stopPropagation();
-      if (selectedSlug === slug) clearSelection();
-      else selectNode(slug);
+      if (onEnterFocus) {
+        // In focused or full-graph mode with controller: clicking any node
+        // (re-)focuses around it. Clicking the already-selected root just
+        // refreshes the detail panel.
+        if (focusedSlug && slug === focusedSlug) {
+          selectNode(slug);
+        } else {
+          onEnterFocus(slug);
+        }
+      } else {
+        // Legacy path (no controller): toggle selection/dim
+        if (selectedSlug === slug) clearSelection();
+        else selectNode(slug);
+      }
     });
     el.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectNode(slug); }
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        if (onEnterFocus && !(focusedSlug && slug === focusedSlug)) {
+          onEnterFocus(slug);
+        } else {
+          selectNode(slug);
+        }
+      }
     });
     el.setAttribute("tabindex", "0");
     el.setAttribute("role", "button");
@@ -132,8 +163,25 @@ export function initInteraction(app, container, graphData, { canChange }) {
   }
   container.addEventListener("click", () => clearSelection());
 
-  // Show all / focus
-  document.getElementById("btn-show-all")?.addEventListener("click", clearSelection);
+  // "Show all" button and breadcrumb "All modules" link — exit focused mode
+  const exitToFull = () => { if (onExitFocus) onExitFocus(); else clearSelection(); };
+  document.getElementById("btn-show-all")?.addEventListener("click", exitToFull);
+  document.addEventListener("click", (e) => {
+    if (e.target.closest("#bc-all-btn")) exitToFull();
+  });
+
+  // Escape: close detail panel first; if already closed, exit focus mode
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    const panel = document.getElementById("detail-panel");
+    if (panel?.classList.contains("is-open")) {
+      hideDetailPanel();
+    } else if (onExitFocus) {
+      onExitFocus();
+    }
+  });
+
+  // Legacy dimming focus button
   document.getElementById("btn-focus")?.addEventListener("click", () => {
     if (selectedSlug) toggleFocusMode(selectedSlug);
   });

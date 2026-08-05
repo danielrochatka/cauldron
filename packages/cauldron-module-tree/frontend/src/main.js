@@ -1,13 +1,17 @@
 /**
  * cauldron-module-tree production bundle.
  * Loaded by the Django template via {% static 'cauldron_module_tree/module-tree.js' %}.
- * Reads data-* attributes from #tree-root, fetches the graph API, runs ELK
- * for layered orthogonal layout, and renders the interactive graph.
+ *
+ * Two rendering modes:
+ *   full     – complete system graph; ELK layout of all modules
+ *   focused  – reduced graph around one selected module; fresh ELK layout of
+ *              just the focused subset (selected + transitive deps + direct parents)
  */
 import ELK from "elkjs/lib/elk.bundled.js";
 import { renderGraph } from "./graph-renderer.js";
 import { initInteraction } from "./interaction.js";
 import { slugColor } from "./colors.js";
+import { buildFocusedSubgraph, makeFocusedLayoutCache } from "./focused.js";
 
 const ELK_OPTIONS = {
   "elk.algorithm": "layered",
@@ -26,11 +30,7 @@ async function init() {
   const graphUrl = root.dataset.graphUrl;
   const canChange = root.dataset.canChange === "1";
 
-  // Show loading state
-  root.innerHTML = `<div class="tree-loading" role="status">
-    <div class="spinner" aria-label="Loading..."></div>
-    <span>Loading module dependency tree…</span>
-  </div>`;
+  showLoading(root, "Loading module dependency tree…");
 
   let graphData;
   try {
@@ -52,54 +52,174 @@ async function init() {
     return;
   }
 
-  try {
-    const elk = new ELK();
-    const elkGraph = buildElkGraph(graphData);
-    const layout = await elk.layout(elkGraph, { layoutOptions: ELK_OPTIONS });
-    root.innerHTML = "";
-    const app = renderGraph(root, layout, graphData, { canChange, slugColor });
-    initInteraction(app, root, graphData, { canChange });
-  } catch (e) {
-    console.error("ELK layout error:", e);
-    root.innerHTML = `<div class="tree-error" role="alert">
-      <strong>Graph layout failed:</strong> ${escapeHtml(e.message)}
-    </div>`;
+  // Monotonically increasing token; stale ELK results check against this.
+  let renderToken = 0;
+  const layoutCache = makeFocusedLayoutCache();
+  const graphRevision = graphData.metadata?.generated_at ?? Date.now();
+
+  // State callbacks exposed to interaction.js
+  const controller = {
+    async enterFocus(slug) {
+      const token = ++renderToken;
+      announceMode(`Focused on ${slug}`);
+      updateUrl(slug);
+      updateBreadcrumb(slug, graphData);
+      showLoading(root, `Building focused graph for ${slug}…`);
+      try {
+        await renderFocused(root, graphData, slug, canChange, layoutCache, graphRevision, token, () => renderToken, controller);
+      } catch (e) {
+        if (renderToken !== token) return;  // stale
+        root.innerHTML = `<div class="tree-error" role="alert">
+          <strong>Focused layout failed:</strong> ${escapeHtml(e.message)}
+        </div>`;
+      }
+    },
+    async exitFocus() {
+      const token = ++renderToken;
+      announceMode("Full module graph");
+      updateUrl(null);
+      updateBreadcrumb(null, graphData);
+      showLoading(root, "Loading full module graph…");
+      try {
+        await renderFull(root, graphData, canChange, token, () => renderToken, controller);
+      } catch (e) {
+        if (renderToken !== token) return;
+        root.innerHTML = `<div class="tree-error" role="alert">
+          <strong>Full graph layout failed:</strong> ${escapeHtml(e.message)}
+        </div>`;
+      }
+    },
+  };
+
+  // Handle browser back/forward
+  window.addEventListener("popstate", (ev) => {
+    const slug = ev.state?.focus ?? getFocusFromUrl();
+    if (slug) controller.enterFocus(slug);
+    else controller.exitFocus();
+  });
+
+  // Initial render: check URL for ?focus=slug
+  const initialFocus = getFocusFromUrl();
+  if (initialFocus) {
+    const exists = graphData.nodes.some((n) => n.slug === initialFocus);
+    if (exists) {
+      updateBreadcrumb(initialFocus, graphData);
+      announceMode(`Focused on ${initialFocus}`);
+      await renderFocused(root, graphData, initialFocus, canChange, layoutCache, graphRevision, ++renderToken, () => renderToken, controller);
+    } else {
+      // Invalid slug: fall back to full graph with a message
+      showInvalidFocusMessage(root, initialFocus);
+      updateUrl(null);
+      await renderFull(root, graphData, canChange, ++renderToken, () => renderToken, controller);
+    }
+  } else {
+    updateBreadcrumb(null, graphData);
+    await renderFull(root, graphData, canChange, ++renderToken, () => renderToken, controller);
   }
 }
 
-function buildElkGraph(graphData) {
+// --------------------------------------------------------------------------- //
+// Render modes                                                                 //
+// --------------------------------------------------------------------------- //
+
+async function renderFull(root, graphData, canChange, token, getToken, controller) {
+  const elk = new ELK();
+  const elkGraph = buildElkGraph(graphData.nodes, graphData.edges);
+  const layout = await elk.layout(elkGraph, { layoutOptions: ELK_OPTIONS });
+  if (getToken() !== token) return;  // stale: a newer focus/defocus was triggered
+  root.innerHTML = "";
+  const app = renderGraph(root, layout, graphData, { canChange, slugColor });
+  initInteraction(app, root, graphData, {
+    canChange,
+    onEnterFocus: controller?.enterFocus.bind(controller),
+    onExitFocus: controller?.exitFocus.bind(controller),
+  });
+  // Restore normal toolbar visibility
+  document.getElementById("tree-toolbar")?.style?.removeProperty("display");
+  document.getElementById("focused-toolbar")?.style?.setProperty("display", "none");
+}
+
+async function renderFocused(root, graphData, slug, canChange, layoutCache, graphRevision, token, getToken, controller) {
+  // Derive focused subgraph from already-loaded data
+  const focused = buildFocusedSubgraph(graphData, slug);
+
+  // Check layout cache
+  let layout = layoutCache.get(slug, graphRevision);
+  if (!layout) {
+    const elk = new ELK();
+    const elkGraph = buildElkGraph(focused.nodes, focused.layoutEdges);
+    layout = await elk.layout(elkGraph, { layoutOptions: ELK_OPTIONS });
+    layoutCache.set(slug, graphRevision, layout);
+  }
+
+  if (getToken() !== token) return;  // stale
+
+  // Assemble a graphData-shaped object for renderGraph
+  const focusedGraphData = {
+    ...graphData,
+    nodes: focused.nodes,
+    edges: focused.displayEdges,
+  };
+
+  root.innerHTML = "";
+  const app = renderGraph(root, layout, focusedGraphData, {
+    canChange,
+    slugColor,
+    focusConfig: {
+      roles: focused.roles,
+      displayEdges: focused.displayEdges,
+    },
+  });
+
+  // Re-init interaction with the focused graph and pass controller callbacks
+  // so clicking any node (dep or parent) re-focuses around it.
+  initInteraction(app, root, focusedGraphData, {
+    canChange,
+    focusedSlug: slug,
+    fullGraphData: graphData,
+    onEnterFocus: controller?.enterFocus.bind(controller),
+    onExitFocus: controller?.exitFocus.bind(controller),
+  });
+
+  // Announce focused stats via toolbar
+  updateFocusedToolbar(focused.metadata, root);
+}
+
+// --------------------------------------------------------------------------- //
+// ELK graph builder                                                            //
+// --------------------------------------------------------------------------- //
+
+function buildElkGraph(nodes, edges) {
   const NODE_W = 200, NODE_H = 72;
+  const nodeSet = new Set(nodes.map((n) => n.slug));
+
   return {
     id: "root",
-    children: graphData.nodes.map((n) => ({
+    children: nodes.map((n) => ({
       id: n.slug,
       width: NODE_W,
       height: NODE_H,
       labels: [{ text: n.title || n.slug }],
-      layoutOptions: {
-        "elk.portConstraints": "FIXED_ORDER",
-      },
+      layoutOptions: { "elk.portConstraints": "FIXED_ORDER" },
       ports: [
-        // One dedicated output port per outgoing edge (keeps lanes separate)
-        ...outgoingEdgesFor(n.slug, graphData.edges).map((e, i) => ({
+        ...outgoingEdgesFor(n.slug, edges, nodeSet).map((_, i) => ({
           id: `${n.slug}__out__${i}`,
           properties: { "port.side": "SOUTH", "port.index": String(i) },
         })),
-        // One dedicated input port per incoming edge
-        ...incomingEdgesFor(n.slug, graphData.edges).map((e, i) => ({
+        ...incomingEdgesFor(n.slug, edges, nodeSet).map((_, i) => ({
           id: `${n.slug}__in__${i}`,
           properties: { "port.side": "NORTH", "port.index": String(i) },
         })),
       ],
     })),
-    edges: graphData.edges
+    edges: edges
       .map((e, originalIdx) => ({ e, originalIdx }))
-      .filter(({ e }) => e.status !== "missing")
+      .filter(({ e }) => e.status !== "missing" && nodeSet.has(e.source) && nodeSet.has(e.target))
       .map(({ e, originalIdx }) => {
-        const outIdx = outgoingEdgesFor(e.source, graphData.edges).findIndex(
+        const outIdx = outgoingEdgesFor(e.source, edges, nodeSet).findIndex(
           (x) => x === e || (x.source === e.source && x.target === e.target && x.kind === e.kind)
         );
-        const inIdx = incomingEdgesFor(e.target, graphData.edges).findIndex(
+        const inIdx = incomingEdgesFor(e.target, edges, nodeSet).findIndex(
           (x) => x === e || (x.source === e.source && x.target === e.target && x.kind === e.kind)
         );
         return {
@@ -113,12 +233,101 @@ function buildElkGraph(graphData) {
   };
 }
 
-function outgoingEdgesFor(slug, edges) {
-  return edges.filter((e) => e.source === slug);
+function outgoingEdgesFor(slug, edges, nodeSet) {
+  return edges.filter((e) => e.source === slug && (!nodeSet || nodeSet.has(e.target)));
 }
-function incomingEdgesFor(slug, edges) {
-  return edges.filter((e) => e.target === slug);
+function incomingEdgesFor(slug, edges, nodeSet) {
+  return edges.filter((e) => e.target === slug && (!nodeSet || nodeSet.has(e.source)));
 }
+
+// --------------------------------------------------------------------------- //
+// Breadcrumb                                                                   //
+// --------------------------------------------------------------------------- //
+
+function updateBreadcrumb(slug, graphData) {
+  const bc = document.getElementById("tree-breadcrumb");
+  if (!bc) return;
+  if (!slug) {
+    bc.innerHTML = '<span class="bc-current">All modules</span>';
+    bc.setAttribute("aria-label", "Breadcrumb: all modules");
+  } else {
+    const node = graphData.nodes.find((n) => n.slug === slug);
+    const title = node?.title || slug;
+    bc.innerHTML = `<button class="bc-all" id="bc-all-btn" type="button">All modules</button>
+      <span class="bc-sep" aria-hidden="true">›</span>
+      <span class="bc-current" aria-current="page">${escapeHtml(title)}</span>`;
+    bc.setAttribute("aria-label", `Breadcrumb: all modules / ${title}`);
+  }
+}
+
+// --------------------------------------------------------------------------- //
+// Focused toolbar                                                              //
+// --------------------------------------------------------------------------- //
+
+function updateFocusedToolbar(meta, root) {
+  const toolbar = document.getElementById("focused-toolbar");
+  if (!toolbar) return;
+  toolbar.style.display = "flex";
+  toolbar.innerHTML = `
+    <span class="focused-stat"><strong>${escapeHtml(meta.selected)}</strong></span>
+    <span class="focused-stat">${meta.dependencyCount} dep${meta.dependencyCount !== 1 ? "s" : ""}</span>
+    <span class="focused-stat">${meta.parentCount} parent${meta.parentCount !== 1 ? "s" : ""}</span>
+    <span class="focused-stat">depth ${meta.maxDepth}</span>
+  `;
+  document.getElementById("tree-toolbar")?.style?.setProperty("display", "none");
+}
+
+// --------------------------------------------------------------------------- //
+// URL / history helpers                                                        //
+// --------------------------------------------------------------------------- //
+
+function getFocusFromUrl() {
+  return new URLSearchParams(window.location.search).get("focus") || null;
+}
+
+function updateUrl(slug) {
+  const url = new URL(window.location.href);
+  if (slug) {
+    url.searchParams.set("focus", slug);
+  } else {
+    url.searchParams.delete("focus");
+  }
+  history.pushState({ focus: slug }, "", url);
+}
+
+// --------------------------------------------------------------------------- //
+// ARIA announcements                                                           //
+// --------------------------------------------------------------------------- //
+
+function announceMode(message) {
+  const region = document.getElementById("tree-aria-live");
+  if (!region) return;
+  region.textContent = "";
+  // Force a reflow so screen readers detect the change
+  void region.offsetWidth;
+  region.textContent = message;
+}
+
+// --------------------------------------------------------------------------- //
+// Misc helpers                                                                 //
+// --------------------------------------------------------------------------- //
+
+function showLoading(root, message) {
+  root.innerHTML = `<div class="tree-loading" role="status">
+    <div class="spinner" aria-label="Loading..."></div>
+    <span>${escapeHtml(message)}</span>
+  </div>`;
+}
+
+function showInvalidFocusMessage(root, slug) {
+  const banner = document.createElement("div");
+  banner.className = "tree-invalid-focus";
+  banner.setAttribute("role", "alert");
+  banner.textContent = `Module "${slug}" not found — showing full graph instead.`;
+  root.parentElement?.insertBefore(banner, root);
+  setTimeout(() => banner.remove(), 5000);
+}
+
 function escapeHtml(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }

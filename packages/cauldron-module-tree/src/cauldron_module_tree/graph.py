@@ -48,9 +48,89 @@ class ModuleGraphNode:
 class ModuleGraphEdge:
     source: str
     target: str
-    kind: str          # "required" | "optional" | "capability"
+    kind: str          # "required" | "optional" | "capability" | "parent_context"
     capability: str | None
     status: str        # "resolved" | "missing" | "blocked" | "conflict" | "cycle"
+
+
+# --------------------------------------------------------------------------- #
+# FocusedModuleGraph                                                           #
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class FocusedModuleGraph:
+    """Focused subgraph around a selected module.
+
+    Contains the selected module, its full transitive dependency closure, and
+    optionally the direct parent (dependent) modules for context.
+
+    Roles
+    -----
+    - ``"selected"``       — the module the user chose
+    - ``"dependency"``     — transitive dependency of selected
+    - ``"parent_context"`` — direct dependent of selected (shown faded above)
+    """
+
+    selected_slug: str
+    nodes: dict[str, ModuleGraphNode]       # slug → node for focused set
+    edges: tuple[ModuleGraphEdge, ...]      # dep edges + parent_context edges
+    roles: dict[str, str]                   # slug → "selected"|"dependency"|"parent_context"
+    max_depth: int                          # longest dep chain from selected
+
+    def to_api_dict(self) -> dict[str, Any]:
+        """Serialize for JSON API / frontend consumption."""
+        nodes_list = []
+        for slug, node in sorted(self.nodes.items()):
+            nodes_list.append({
+                "slug": node.slug,
+                "title": node.title,
+                "summary": node.summary,
+                "version": node.version,
+                "state": node.state,
+                "enabled": node.enabled,
+                "active": node.active,
+                "configured_enabled": node.configured_enabled,
+                "pending_restart": node.pending_restart,
+                "runtime_enabled": node.runtime_enabled,
+                "requires_restart": node.requires_restart,
+                "icon_svg": node.icon_svg,
+                "visual_color": node.visual_color,
+                "group": node.group,
+                "display_order": node.display_order,
+                "documentation_url": node.documentation_url,
+                "source_type": node.source_type,
+                "source": node.source,
+                "provides": list(node.provides),
+                "errors": list(node.errors),
+                "focus_role": self.roles.get(slug, "dependency"),
+            })
+
+        edges_list = []
+        for e in self.edges:
+            entry: dict[str, Any] = {
+                "source": e.source,
+                "target": e.target,
+                "kind": e.kind,
+                "capability": e.capability,
+                "status": e.status,
+            }
+            if e.kind == "parent_context":
+                entry["direction_label"] = "used by"
+            edges_list.append(entry)
+
+        dep_count = sum(1 for r in self.roles.values() if r == "dependency")
+        parent_count = sum(1 for r in self.roles.values() if r == "parent_context")
+
+        return {
+            "nodes": nodes_list,
+            "edges": edges_list,
+            "metadata": {
+                "selected_slug": self.selected_slug,
+                "dependency_count": dep_count,
+                "parent_count": parent_count,
+                "max_depth": self.max_depth,
+            },
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -222,6 +302,110 @@ class ModuleGraph:
             if edge.target not in self._nodes:
                 result.append((edge.source, edge.target))
         return result
+
+    def focused_subgraph(
+        self,
+        slug: str,
+        *,
+        include_optional: bool = True,
+        include_direct_parents: bool = True,
+    ) -> "FocusedModuleGraph":
+        """Build a :class:`FocusedModuleGraph` centred on *slug*.
+
+        Inclusion rules
+        ---------------
+        - ``selected``       — *slug* itself
+        - ``dependency``     — full transitive dependency closure of *slug*
+          (follows required, capability, and optional edges when
+          ``include_optional`` is True)
+        - ``parent_context`` — modules that *directly* depend on *slug*
+          (one level only; their own dependency trees are excluded)
+
+        The returned graph is cycle-safe, preserves missing-target edges
+        within the focused set, and does not mutate this graph.
+
+        Raises :exc:`ValueError` when *slug* is not registered.
+        """
+        if slug not in self._nodes:
+            raise ValueError(f"Module {slug!r} not found in graph")
+
+        # Transitive dependency closure (BFS forward from slug)
+        dep_closure: set[str] = set()
+        visited: set[str] = {slug}
+        queue: deque[str] = deque([slug])
+        while queue:
+            current = queue.popleft()
+            neighbors = set(self._fwd_required.get(current, set()))
+            if include_optional:
+                neighbors |= self._fwd_all.get(current, set()) - self._fwd_required.get(current, set())
+            for neighbor in neighbors:
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    dep_closure.add(neighbor)
+                    if neighbor in self._nodes:  # only recurse into real nodes
+                        queue.append(neighbor)
+
+        # Direct parents (one-level reverse; exclude nodes already in dep closure)
+        parent_slugs: set[str] = set()
+        if include_direct_parents:
+            for parent in self._rev_required.get(slug, set()):
+                if parent in self._nodes and parent not in dep_closure and parent != slug:
+                    parent_slugs.add(parent)
+
+        # Assign roles
+        roles: dict[str, str] = {slug: "selected"}
+        for dep in dep_closure:
+            roles[dep] = "dependency"
+        for parent in parent_slugs:
+            roles[parent] = "parent_context"
+
+        focused_slugs = {slug} | dep_closure | parent_slugs
+        dep_only_slugs = {slug} | dep_closure
+
+        # Collect focused nodes
+        focused_nodes: dict[str, ModuleGraphNode] = {
+            s: self._nodes[s] for s in focused_slugs if s in self._nodes
+        }
+
+        # Edges within dependency closure (skip edges that touch parent_context nodes)
+        dep_edges = [
+            e for e in self._edges
+            if e.source in dep_only_slugs and e.target in dep_only_slugs
+        ]
+
+        # Parent-context edges: from selected to each parent ("used by" direction)
+        parent_edges = [
+            ModuleGraphEdge(
+                source=slug,
+                target=parent,
+                kind="parent_context",
+                capability=None,
+                status="resolved",
+            )
+            for parent in sorted(parent_slugs)
+        ]
+
+        all_edges = tuple(dep_edges) + tuple(parent_edges)
+
+        # Compute max dependency depth via BFS from slug
+        max_depth = 0
+        depth_visited: set[str] = {slug}
+        depth_queue: deque[tuple[str, int]] = deque([(slug, 0)])
+        while depth_queue:
+            current, depth = depth_queue.popleft()
+            max_depth = max(max_depth, depth)
+            for neighbor in self._fwd_all.get(current, set()):
+                if neighbor in dep_closure and neighbor not in depth_visited:
+                    depth_visited.add(neighbor)
+                    depth_queue.append((neighbor, depth + 1))
+
+        return FocusedModuleGraph(
+            selected_slug=slug,
+            nodes=focused_nodes,
+            edges=all_edges,
+            roles=roles,
+            max_depth=max_depth,
+        )
 
     def to_api_dict(self) -> dict[str, Any]:
         """Serialize for JSON API response."""

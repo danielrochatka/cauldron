@@ -128,9 +128,9 @@ _kill_port() {
   # ss is available on all modern Linux; fuser is a portable fallback.
   if command -v ss &>/dev/null; then
     pid=$(ss -tlnp "sport = :$port" 2>/dev/null \
-      | grep -oP '(?<=pid=)\d+' | head -1)
+      | grep -oP '(?<=pid=)\d+' | head -1) || true
   elif command -v fuser &>/dev/null; then
-    pid=$(fuser "${port}/tcp" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' | head -1)
+    pid=$(fuser "${port}/tcp" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' | head -1) || true
   fi
   if [ -n "${pid:-}" ]; then
     echo "    Stopping existing process on port $port (pid $pid)..."

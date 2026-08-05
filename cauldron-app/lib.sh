@@ -118,14 +118,45 @@ check_node_version() {
   echo "--> Node.js $raw OK"
 }
 
+# _kill_port PORT
+#
+# Kill any process listening on PORT so the server can bind cleanly.
+# Used by launch_server before starting a new process.
+_kill_port() {
+  local port="$1"
+  local pid
+  # ss is available on all modern Linux; fuser is a portable fallback.
+  if command -v ss &>/dev/null; then
+    pid=$(ss -tlnp "sport = :$port" 2>/dev/null \
+      | grep -oP '(?<=pid=)\d+' | head -1)
+  elif command -v fuser &>/dev/null; then
+    pid=$(fuser "${port}/tcp" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' | head -1)
+  fi
+  if [ -n "${pid:-}" ]; then
+    echo "    Stopping existing process on port $port (pid $pid)..."
+    kill -TERM "$pid" 2>/dev/null || true
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 15 ]; do
+      sleep 1; waited=$((waited + 1))
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+}
+
 # launch_server CAULDRON_DIR PORT
 #
 # Starts Gunicorn in daemon mode, or falls back to Django's dev server.
 # Called from ./start and ./update so each performs this step exactly once.
+#
+# Always kills whatever is on PORT first so a stale server from a previous
+# run (especially a dev-mode runserver without a PID file) does not shadow
+# the new process or fool the health check.
 launch_server() {
   local cauldron_dir="$1"
   local port="$2"
   local pid_file="$cauldron_dir/data/cauldron.pid"
+
+  _kill_port "$port"
 
   if command -v gunicorn &>/dev/null; then
     gunicorn \
@@ -140,8 +171,14 @@ launch_server() {
       cauldron_site.wsgi:application
     echo "Cauldron started on http://localhost:$port (gunicorn)"
   else
-    echo "Cauldron starting on http://localhost:$port (press Ctrl+C to stop)"
-    "$cauldron_dir/manage" runserver "0.0.0.0:$port"
+    # Dev-server fallback: background it, write our own PID file so ./stop and
+    # future ./update runs can terminate it cleanly.
+    echo "Cauldron starting on http://localhost:$port (dev server — logs to stderr)"
+    "$cauldron_dir/manage" runserver "0.0.0.0:$port" &
+    local dev_pid=$!
+    echo "$dev_pid" > "$pid_file"
+    # Disown so the process survives the shell exiting (./start use case).
+    disown "$dev_pid" 2>/dev/null || true
   fi
 }
 

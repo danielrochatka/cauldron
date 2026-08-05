@@ -159,6 +159,19 @@ launch_server() {
   _kill_port "$port"
 
   if command -v gunicorn &>/dev/null; then
+    # Re-source config.env so SECRET_KEY and other env vars are guaranteed
+    # available to gunicorn workers regardless of whether the caller already
+    # exported them.  This makes launch_server self-contained and prevents the
+    # "SECRET_KEY is not set" crash that occurs when variables exported early
+    # in ./update are lost before the server starts (e.g. after re-sourcing
+    # lib.sh between the export and the gunicorn call).
+    if [ -f "$cauldron_dir/config.env" ]; then
+      set -a
+      # shellcheck source=/dev/null
+      source "$cauldron_dir/config.env"
+      set +a
+    fi
+
     gunicorn \
       --chdir "$cauldron_dir" \
       --bind "${CAULDRON_HOST:-0.0.0.0}:$port" \
@@ -169,7 +182,25 @@ launch_server() {
       --error-logfile "$cauldron_dir/logs/error.log" \
       --daemon \
       cauldron_site.wsgi:application
-    echo "Cauldron started on http://localhost:$port (gunicorn)"
+
+    # Poll for the PID file: gunicorn writes it when the master starts.
+    # A missing PID file means the master crashed before forking workers,
+    # which the HTTP health check would never catch (no process to respond).
+    local waited=0
+    while [ ! -f "$pid_file" ] && [ "$waited" -lt 5 ]; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+
+    if [ ! -f "$pid_file" ]; then
+      echo "ERROR: Gunicorn master did not write a PID file within ${waited}s." >&2
+      echo "       The master process may have crashed immediately." >&2
+      echo "       Last lines of error log:" >&2
+      tail -10 "$cauldron_dir/logs/error.log" 2>/dev/null | sed 's/^/         /' >&2 || true
+      return 1
+    fi
+
+    echo "Cauldron started on http://localhost:$port (gunicorn, pid $(cat "$pid_file"))"
   else
     # Dev-server fallback: background it, write our own PID file so ./stop and
     # future ./update runs can terminate it cleanly.

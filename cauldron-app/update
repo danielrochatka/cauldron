@@ -186,7 +186,7 @@ _rollback() {
   # Reinstall packages from the restored commit and restart.
   source "$VENV/bin/activate"
   install_python_projects "$REPO_DIR" "$CAULDRON_DIR/requirements.txt"
-  "$CAULDRON_DIR/start" 2>/dev/null || true
+  "$CAULDRON_DIR/start" || true
 
   echo ""
   echo "!!! Cauldron rolled back to commit ${PREV_COMMIT:0:8}."
@@ -287,6 +287,8 @@ done
 
 if [ "$HEALTHY" -eq 0 ]; then
   echo "ERROR: Server did not respond on port $PORT after 20 seconds."
+  echo "       Last lines of error log:"
+  tail -20 "$CAULDRON_DIR/logs/error.log" 2>/dev/null | sed 's/^/         /' || true
   false  # Triggers the ERR trap → _rollback
 fi
 

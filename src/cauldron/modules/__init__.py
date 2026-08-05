@@ -393,6 +393,72 @@ class ProvidedCapability:
         )
 
 
+@dataclass(frozen=True)
+class ModulePresentation:
+    """Optional human-facing presentation metadata for a module.
+
+    Used by the module inventory and management UIs to display contextual
+    information about a module without reading its source.
+
+    Fields
+    ------
+    title
+        Short display name — defaults to the manifest ``label`` when empty.
+    summary
+        One-to-two sentence description shown in module cards and listings.
+    icon_svg
+        Inline SVG markup for the module icon.  Must not contain scripts.
+        Empty string means "use the default icon".
+    group
+        Logical grouping for the module catalogue UI (e.g. ``"Core"``).
+    display_order
+        Non-negative integer controlling the sort position within a group.
+        Lower values sort earlier.
+    documentation_url
+        URL to the module's documentation.  Empty string means no docs link.
+    """
+
+    title: str = ""
+    summary: str = ""
+    icon_svg: str = ""
+    group: str = ""
+    display_order: int = 0
+    documentation_url: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.display_order, int) or self.display_order < 0:
+            raise ValueError(
+                "ModulePresentation.display_order must be a non-negative int; "
+                f"got {self.display_order!r}."
+            )
+        if not isinstance(self.documentation_url, str):
+            raise ValueError(
+                "ModulePresentation.documentation_url must be a string; "
+                f"got {self.documentation_url!r}."
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "title": self.title,
+            "summary": self.summary,
+            "icon_svg": self.icon_svg,
+            "group": self.group,
+            "display_order": self.display_order,
+            "documentation_url": self.documentation_url,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ModulePresentation:
+        return cls(
+            title=data.get("title", ""),
+            summary=data.get("summary", ""),
+            icon_svg=data.get("icon_svg", ""),
+            group=data.get("group", ""),
+            display_order=data.get("display_order", 0),
+            documentation_url=data.get("documentation_url", ""),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Core manifest
 # ---------------------------------------------------------------------------
@@ -468,6 +534,7 @@ class ModuleManifest:
     ai_tools: tuple[str, ...] = field(default_factory=tuple)
     prompt_templates: tuple[str, ...] = field(default_factory=tuple)
     provided_capabilities: tuple[ProvidedCapability, ...] = field(default_factory=tuple)
+    presentation: ModulePresentation = field(default_factory=ModulePresentation)
 
     # ------------------------------------------------------------------
     # Computed property
@@ -667,6 +734,13 @@ class ModuleManifest:
                             "owned by this module but is not under public_api."
                         )
 
+        # presentation: must be a ModulePresentation instance
+        if not isinstance(self.presentation, ModulePresentation):
+            raise ValueError(
+                f"ModuleManifest.presentation must be a ModulePresentation instance; "
+                f"got {type(self.presentation)!r}."
+            )
+
     # ------------------------------------------------------------------
     # Serialization
     # ------------------------------------------------------------------
@@ -697,6 +771,7 @@ class ModuleManifest:
             "ai_tools": list(self.ai_tools),
             "prompt_templates": list(self.prompt_templates),
             "provided_capabilities": [c.to_dict() for c in self.provided_capabilities],
+            "presentation": self.presentation.to_dict(),
         }
 
     @classmethod
@@ -748,6 +823,7 @@ class ModuleManifest:
                 ProvidedCapability.from_dict(c)
                 for c in data.get("provided_capabilities", [])
             ),
+            presentation=ModulePresentation.from_dict(data.get("presentation", {})),
         )
 
 

@@ -211,33 +211,20 @@ def test_metadata_generated_at_is_string():
 
 
 def test_metadata_restart_required_false_when_none_active():
-    """No active restart modules — restart_required is False."""
+    """No pending configured-state change — restart_required is False."""
     from cauldron_module_tree.graph import build_graph
-    from cauldron.modules import ModuleManifest
-    manifest = ModuleManifest(
-        slug="my.module",
-        label="My Module",
-        restart_required=True,
-    )
-    e = _entry("my.module", manifest=manifest.to_dict(), active=False)
+    e = _entry("my.module", active=False)
     registry = _make_registry([e])
     result = build_graph(registry).to_api_dict()
     assert result["metadata"]["restart_required"] is False
 
 
-def test_metadata_restart_required_true_when_active_restart_module():
-    """Active module with requires_restart=True sets restart_required=True."""
+def test_metadata_restart_required_true_when_pending_override():
+    """A configured_overrides mismatch sets restart_required=True."""
     from cauldron_module_tree.graph import build_graph
-    from cauldron.modules import ModuleManifest
-    # django_apps triggers requires_restart on the manifest
-    manifest = ModuleManifest(
-        slug="my.module",
-        label="My Module",
-        django_apps=("django.contrib.auth",),
-    )
-    e = _entry("my.module", manifest=manifest.to_dict(), active=True)
+    e = _entry("my.module", enabled=True, active=True)
     registry = _make_registry([e])
-    result = build_graph(registry).to_api_dict()
+    result = build_graph(registry, configured_overrides={"my.module": False}).to_api_dict()
     assert result["metadata"]["restart_required"] is True
 
 
@@ -372,3 +359,70 @@ def test_100_node_synthetic_graph():
     result2 = graph.to_api_dict()
     assert result["nodes"] == result2["nodes"]
     assert result["edges"] == result2["edges"]
+
+
+def test_pending_restart_set_when_configured_differs_from_enabled():
+    """configured_enabled != enabled produces pending_restart=True on the node."""
+    from cauldron_module_tree.graph import build_graph
+    e = _entry("my.module", enabled=True, active=True)
+    registry = _make_registry([e])
+    graph = build_graph(registry, configured_overrides={"my.module": False})
+    result = graph.to_api_dict()
+    node = result["nodes"][0]
+    assert node["pending_restart"] is True
+
+
+def test_pending_restart_false_when_no_override():
+    """Without any override, pending_restart is False."""
+    from cauldron_module_tree.graph import build_graph
+    e = _entry("my.module", enabled=True, active=True)
+    registry = _make_registry([e])
+    result = build_graph(registry).to_api_dict()
+    node = result["nodes"][0]
+    assert node["pending_restart"] is False
+
+
+def test_pending_restart_count_in_metadata():
+    """pending_restart_count counts modules with a pending change."""
+    from cauldron_module_tree.graph import build_graph
+    a = _entry("mod.a", enabled=True, active=True)
+    b = _entry("mod.b", enabled=True, active=True)
+    c = _entry("mod.c", enabled=True, active=True)
+    registry = _make_registry([a, b, c])
+    result = build_graph(
+        registry,
+        configured_overrides={"mod.a": False, "mod.b": False},
+    ).to_api_dict()
+    assert result["metadata"]["pending_restart_count"] == 2
+
+
+def test_inactive_enabled_differs_from_disabled():
+    """enabled=True, active=False is NOT the same as disabled in the API dict."""
+    from cauldron_module_tree.graph import build_graph
+    e = _entry("my.module", enabled=True, active=False)
+    registry = _make_registry([e])
+    result = build_graph(registry).to_api_dict()
+    node = result["nodes"][0]
+    assert node["enabled"] is True
+    assert node["active"] is False
+
+
+def test_configured_state_survives_serialization():
+    """configured_enabled is present in every node of the API response."""
+    from cauldron_module_tree.graph import build_graph
+    entries = [_entry(f"mod.n{i}", enabled=True, active=True) for i in range(5)]
+    registry = _make_registry(entries)
+    result = build_graph(registry).to_api_dict()
+    for node in result["nodes"]:
+        assert "configured_enabled" in node
+
+
+def test_absent_overlay_falls_back_to_enabled():
+    """build_graph with no configured_overrides: configured_enabled == enabled."""
+    from cauldron_module_tree.graph import build_graph
+    e = _entry("my.module", enabled=False, active=False)
+    registry = _make_registry([e])
+    result = build_graph(registry).to_api_dict()
+    node = result["nodes"][0]
+    assert node["configured_enabled"] == node["enabled"]
+    assert node["pending_restart"] is False

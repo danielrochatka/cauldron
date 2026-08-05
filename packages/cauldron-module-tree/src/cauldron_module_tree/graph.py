@@ -25,7 +25,8 @@ class ModuleGraphNode:
     state: str
     enabled: bool
     active: bool
-    configured_enabled: bool   # from JSON overlay (same as enabled for now)
+    configured_enabled: bool   # desired state from the persisted overlay
+    pending_restart: bool
     runtime_enabled: bool      # same as active
     requires_restart: bool
     icon_svg: str              # sanitized
@@ -251,6 +252,7 @@ class ModuleGraph:
                 "enabled": node.enabled,
                 "active": node.active,
                 "configured_enabled": node.configured_enabled,
+                "pending_restart": node.pending_restart,
                 "runtime_enabled": node.runtime_enabled,
                 "requires_restart": node.requires_restart,
                 "icon_svg": node.icon_svg,
@@ -277,9 +279,7 @@ class ModuleGraph:
             for e in self._edges
         ]
 
-        restart_required = any(
-            n.requires_restart and n.active for n in self._nodes.values()
-        )
+        restart_required = any(n.pending_restart for n in self._nodes.values())
 
         return {
             "nodes": nodes_list,
@@ -287,6 +287,7 @@ class ModuleGraph:
             "metadata": {
                 "generated_at": generated_at,
                 "restart_required": restart_required,
+                "pending_restart_count": sum(1 for n in self._nodes.values() if n.pending_restart),
                 "nodes_count": len(self._nodes),
                 "edges_count": len(self._edges),
                 "cycles": cycle_list,
@@ -409,6 +410,7 @@ def build_graph(
             enabled=enabled,
             active=active,
             configured_enabled=configured,
+            pending_restart=configured != enabled,
             runtime_enabled=active,
             requires_restart=pres["requires_restart"],
             icon_svg=pres["icon_svg"],

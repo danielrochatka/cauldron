@@ -2,6 +2,8 @@
  * Interaction layer: pan, zoom, node selection, focus mode, search,
  * state/group filters, enable/disable workflow.
  */
+import { buildStateRows, buildActionHtml, pendingWarning, escHtml, escapeAttr } from './state.js';
+
 export function initInteraction(app, container, graphData, { canChange }) {
   const { canvas, nodeEls, slugColor } = app;
   let scale = 1, panX = 0, panY = 0;
@@ -228,8 +230,10 @@ export function initInteraction(app, container, graphData, { canChange }) {
       </div>
       <div class="detail-body">
         <p>${escHtml(n.summary || "")}</p>
+        ${pendingWarning(n) ? `<div class="pending-banner" role="alert">⚠ ${escHtml(pendingWarning(n))}</div>` : ""}
         <dl>
-          <dt>State</dt><dd><span class="state-badge badge-${n.state}">${n.state}</span></dd>
+          ${buildStateRows(n)}
+          <dt>State badge</dt><dd><span class="state-badge badge-${n.state}">${n.state}</span></dd>
           <dt>Version</dt><dd>${escHtml(n.version || "—")}</dd>
           <dt>Group</dt><dd>${escHtml(n.group || "—")}</dd>
           <dt>Source</dt><dd>${escHtml(n.source || "—")}</dd>
@@ -243,14 +247,8 @@ export function initInteraction(app, container, graphData, { canChange }) {
   }
 
   function renderActions(n) {
-    const actionLabel = n.enabled ? "Disable" : "Enable";
     const previewUrl = container.dataset.previewUrl?.replace("__slug__", n.slug);
-    return `<div class="detail-actions">
-      <button class="cui-btn cui-btn-outline" data-action="${n.enabled ? "disable" : "enable"}" data-slug="${escapeAttr(n.slug)}" data-preview-url="${escapeAttr(previewUrl || "")}">
-        ${actionLabel}
-      </button>
-      ${n.requires_restart ? '<span class="restart-warning">⚠ Requires restart</span>' : ""}
-    </div>`;
+    return buildActionHtml(n, previewUrl);
   }
 
   function hideDetailPanel() {
@@ -332,10 +330,4 @@ export function initInteraction(app, container, graphData, { canChange }) {
     return document.cookie.split(";").find((c) => c.trim().startsWith("csrftoken="))?.split("=")[1] || "";
   }
 
-  function escHtml(s) {
-    return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  }
-  function escapeAttr(s) {
-    return String(s ?? "").replace(/"/g, "&quot;");
-  }
 }

@@ -258,6 +258,10 @@ jobs:
         working-directory: packages/cauldron-module-tree/frontend
         run: npm ci
 
+      - name: Test
+        working-directory: packages/cauldron-module-tree/frontend
+        run: npm test
+
       - name: Build bundle
         working-directory: packages/cauldron-module-tree/frontend
         run: npm run build

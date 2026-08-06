@@ -34,11 +34,11 @@ export function renderGraph(container, elkLayout, graphData, { canChange, slugCo
     if (!node) continue;
     const color = slugColor(node.slug);
     const role = focusRoles[node.slug] ?? null;
-    const isParentCtx = role === "parent_context";
+    const isRequires = role === "requires";
     const isSelected = role === "selected";
 
     const el = document.createElement("div");
-    el.className = `module-node node-state-${node.state}${isParentCtx ? " is-parent-context" : ""}${isSelected ? " is-focus-selected" : ""}`;
+    el.className = `module-node node-state-${node.state}${isRequires ? " is-requires" : ""}${isSelected ? " is-focus-selected" : ""}`;
     el.dataset.slug = node.slug;
     if (role) el.dataset.focusRole = role;
     el.style.cssText = `position:absolute;left:${en.x}px;top:${en.y}px;width:${en.width}px;`;
@@ -55,7 +55,7 @@ export function renderGraph(container, elkLayout, graphData, { canChange, slugCo
         <div class="node-slug">${escHtml(node.slug)}</div>
         <span class="state-badge badge-${node.state}">${node.state}</span>
         ${isSelected ? '<span class="focus-selected-badge">Selected</span>' : ""}
-        ${isParentCtx ? '<span class="focus-parent-badge">Used by</span>' : ""}
+        ${isRequires ? '<span class="focus-requires-badge">Requires</span>' : ""}
       </div>
     </div>`;
     canvas.appendChild(el);
@@ -71,7 +71,7 @@ export function renderGraph(container, elkLayout, graphData, { canChange, slugCo
 
   const defs = makeSvgEl("defs");
   // Arrowhead markers per edge kind
-  for (const [kind, color] of [["required","#6366f1"],["optional","#9ca3af"],["capability","#8b5cf6"],["error","#ef4444"],["parent_context","#9ca3af"]]) {
+  for (const [kind, color] of [["required","#6366f1"],["optional","#9ca3af"],["capability","#8b5cf6"],["error","#ef4444"],["requires","#9ca3af"],["used_by","#6b7280"]]) {
     defs.appendChild(makeArrowMarker(kind, color));
   }
   svg.appendChild(defs);
@@ -82,15 +82,18 @@ export function renderGraph(container, elkLayout, graphData, { canChange, slugCo
     elkEdgeMap[ee.id] = ee;
   }
 
-  // Draw display edges. For parent_context edges ELK routed a reversed layout
-  // edge (parent → selected); we reverse the geometry to draw selected → parent.
+  // Draw display edges.
+  // - "requires": ELK routed a reversed layout edge (req → selected); reverse geometry
+  //   to draw selected → req (arrows point upward toward requirements).
+  // - "used_by": layout and display use the same reversed-original direction;
+  //   use ELK geometry directly (arrows flow downward toward consumers).
+  // - All other kinds: regular dependency edges using ELK geometry directly.
   for (let idx = 0; idx < displayEdges.length; idx++) {
     const edge = displayEdges[idx];
 
-    if (edge.kind === "parent_context") {
-      // layoutEdges and displayEdges share the same indices, so edge_${idx} is
-      // the corresponding parent_context_layout ELK edge (parent → selected).
-      // Reversing its geometry gives us the correct selected → parent path.
+    if (edge.kind === "requires") {
+      // layoutEdges[idx] is the requires_layout edge (req → selected).
+      // Reversing its geometry gives selected → req (upward arrow to requirement).
       const ee = elkEdgeMap[`edge_${idx}`];
       if (!ee) continue;
 
@@ -102,12 +105,33 @@ export function renderGraph(container, elkLayout, graphData, { canChange, slugCo
       path.setAttribute("stroke", "#9ca3af");
       path.setAttribute("stroke-width", "1.5");
       path.setAttribute("stroke-dasharray", dashArray);
-      path.setAttribute("marker-end", "url(#arrow-parent_context)");
+      path.setAttribute("marker-end", "url(#arrow-requires)");
       path.setAttribute("d", buildReversedElkPath(ee));
       path.dataset.source = edge.source;
       path.dataset.target = edge.target;
-      path.dataset.kind = "parent_context";
-      path.setAttribute("aria-label", `Used by ${edge.target}`);
+      path.dataset.kind = "requires";
+      path.setAttribute("aria-label", `Requires ${edge.target}`);
+      svg.appendChild(path);
+      continue;
+    }
+
+    if (edge.kind === "used_by") {
+      // layoutEdges[idx] is the same reversed edge (dependency → consumer).
+      // Use ELK geometry directly; arrows flow downward toward consumers.
+      const ee = elkEdgeMap[`edge_${idx}`];
+      if (!ee) continue;
+
+      const strokeColor = slugColor(edge.source);
+
+      const path = makeSvgEl("path");
+      path.setAttribute("fill", "none");
+      path.setAttribute("stroke", strokeColor);
+      path.setAttribute("stroke-width", "2");
+      path.setAttribute("marker-end", "url(#arrow-used_by)");
+      path.setAttribute("d", buildElkPath(ee, elkLayout));
+      path.dataset.source = edge.source;
+      path.dataset.target = edge.target;
+      path.dataset.kind = "used_by";
       svg.appendChild(path);
       continue;
     }
@@ -166,7 +190,7 @@ function buildElkPath(elkEdge, layout) {
 
 function buildReversedElkPath(elkEdge) {
   // Collect all points across all sections in forward order, then reverse.
-  // Used for parent_context edges: ELK routed parent→selected, we draw selected→parent.
+  // Used for requires edges: ELK routed req→selected, we draw selected→req.
   const sections = elkEdge.sections || [];
   if (!sections.length) return "";
   const allPoints = [];

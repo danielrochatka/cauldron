@@ -48,10 +48,10 @@ class ModuleGraphNode:
 class ModuleGraphEdge:
     source: str
     target: str
-    kind: str                       # "required" | "optional" | "capability" | "parent_context"
+    kind: str                       # "required" | "optional" | "capability" | "requires" | "used_by"
     capability: str | None
     status: str                     # "resolved" | "missing" | "blocked" | "conflict" | "cycle"
-    relationship_kind: str | None = None  # original kind for parent_context edges
+    relationship_kind: str | None = None  # original edge kind for focused-graph edges
 
 
 # --------------------------------------------------------------------------- #
@@ -62,22 +62,23 @@ class ModuleGraphEdge:
 class FocusedModuleGraph:
     """Focused subgraph around a selected module.
 
-    Contains the selected module, its full transitive dependency closure, and
-    optionally the direct parent (dependent) modules for context.
+    Contains the selected module, its direct requirements (one hop forward),
+    and all modules that transitively depend on it (used-by closure).
 
     Roles
     -----
-    - ``"selected"``       — the module the user chose
-    - ``"dependency"``     — transitive dependency of selected
-    - ``"parent_context"`` — direct dependent of selected (shown faded above)
+    - ``"selected"`` — the module the user chose
+    - ``"requires"`` — direct requirement of selected (one hop forward, shown faded above)
+    - ``"used_by"``  — transitive dependent of selected (full reverse closure, shown below)
     """
 
     selected_slug: str
     nodes: dict[str, ModuleGraphNode]       # slug → node for focused set
-    edges: tuple[ModuleGraphEdge, ...]      # dep edges + parent_context edges
-    roles: dict[str, str]                   # slug → "selected"|"dependency"|"parent_context"
-    max_depth: int                          # longest dep chain from selected
-    missing_targets: frozenset[str] = field(default_factory=frozenset)  # unregistered dep slugs
+    edges: tuple[ModuleGraphEdge, ...]      # requires edges + used_by edges
+    roles: dict[str, str]                   # slug → "selected"|"requires"|"used_by"
+    missing_targets: frozenset[str] = field(default_factory=frozenset)  # unregistered req slugs
+    requires_list: tuple[dict, ...] = field(default_factory=tuple)  # [{slug, name}, ...]
+    used_by_list: tuple[dict, ...] = field(default_factory=tuple)   # [{slug, name}, ...]
 
     def to_api_dict(self) -> dict[str, Any]:
         """Serialize for JSON API / frontend consumption."""
@@ -104,9 +105,9 @@ class FocusedModuleGraph:
                 "source": node.source,
                 "provides": list(node.provides),
                 "errors": list(node.errors),
-                "focus_role": self.roles.get(slug, "dependency"),
+                "focus_role": self.roles.get(slug, "used_by"),
             })
-        # Synthetic terminal nodes for unregistered dependency targets —
+        # Synthetic terminal nodes for unregistered direct requirement targets —
         # serialized in sorted order so output is deterministic.
         for missing_slug in sorted(self.missing_targets):
             nodes_list.append({
@@ -130,7 +131,7 @@ class FocusedModuleGraph:
                 "source": "",
                 "provides": [],
                 "errors": [],
-                "focus_role": "dependency",
+                "focus_role": "requires",
                 "is_synthetic": True,
             })
 
@@ -143,24 +144,23 @@ class FocusedModuleGraph:
                 "capability": e.capability,
                 "status": e.status,
             }
-            if e.kind == "parent_context":
-                entry["direction_label"] = "used by"
-                if e.relationship_kind:
-                    entry["relationship_kind"] = e.relationship_kind
+            if e.relationship_kind:
+                entry["relationship_kind"] = e.relationship_kind
             edges_list.append(entry)
 
-        dep_count = sum(1 for r in self.roles.values() if r == "dependency")
-        parent_count = sum(1 for r in self.roles.values() if r == "parent_context")
+        requires_count = sum(1 for r in self.roles.values() if r == "requires")
+        used_by_count = sum(1 for r in self.roles.values() if r == "used_by")
 
         return {
             "nodes": nodes_list,
             "edges": edges_list,
             "metadata": {
                 "selected_slug": self.selected_slug,
-                "dependency_count": dep_count,
-                "parent_count": parent_count,
+                "requires_count": requires_count + len(self.missing_targets),
+                "used_by_count": used_by_count,
                 "missing_count": len(self.missing_targets),
-                "max_depth": self.max_depth,
+                "requires_list": list(self.requires_list),
+                "used_by_list": list(self.used_by_list),
             },
         }
 
@@ -339,115 +339,135 @@ class ModuleGraph:
         self,
         slug: str,
         *,
-        include_optional: bool = True,
-        include_direct_parents: bool = True,
+        include_used_by: bool = True,
     ) -> "FocusedModuleGraph":
         """Build a :class:`FocusedModuleGraph` centred on *slug*.
 
         Inclusion rules
         ---------------
-        - ``selected``       — *slug* itself
-        - ``dependency``     — full transitive dependency closure of *slug*
-          (follows required, capability, and optional edges when
-          ``include_optional`` is True)
-        - ``parent_context`` — modules that *directly* depend on *slug*
-          (one level only; their own dependency trees are excluded)
+        - ``selected`` — *slug* itself
+        - ``requires`` — direct requirements of *slug* (one hop forward, all edge kinds)
+        - ``used_by``  — full transitive reverse closure: all modules that depend on
+          *slug*, directly or transitively (shown when ``include_used_by`` is True)
 
-        The returned graph is cycle-safe, preserves missing-target edges
-        within the focused set, and does not mutate this graph.
+        The returned graph is cycle-safe and does not mutate this graph.
+        Direct requirements that point to unregistered slugs are tracked as
+        ``missing_targets`` and serialised as synthetic terminal nodes.
 
         Raises :exc:`ValueError` when *slug* is not registered.
         """
         if slug not in self._nodes:
             raise ValueError(f"Module {slug!r} not found in graph")
 
-        # Transitive dependency closure (BFS forward from slug).
-        # Missing targets (unregistered slugs) are tracked but not recursed into.
-        dep_closure: set[str] = set()
+        # Direct requires: one-hop forward from slug, all edge kinds.
+        # Store the first complete edge per target so capability and status are preserved.
+        requires_edge_map: dict[str, ModuleGraphEdge] = {}  # target → first edge
         missing_targets: set[str] = set()
-        visited: set[str] = {slug}
-        queue: deque[str] = deque([slug])
-        while queue:
-            current = queue.popleft()
-            neighbors = set(self._fwd_required.get(current, set()))
-            if include_optional:
-                neighbors |= self._fwd_all.get(current, set()) - self._fwd_required.get(current, set())
-            for neighbor in neighbors:
-                if neighbor not in visited:
-                    visited.add(neighbor)
-                    if neighbor in self._nodes:
-                        dep_closure.add(neighbor)
-                        queue.append(neighbor)
-                    else:
-                        missing_targets.add(neighbor)
+        for edge in self._edges:
+            if edge.source != slug or edge.target == slug:
+                continue
+            target = edge.target
+            if target in self._nodes:
+                if target not in requires_edge_map:
+                    requires_edge_map[target] = edge
+            else:
+                missing_targets.add(target)
+        requires_slugs: set[str] = set(requires_edge_map.keys())
 
-        # Direct parents: all modules with any incoming edge to slug (all edge kinds).
-        # Store the first observed edge kind per parent for relationship_kind semantics.
-        parent_info: dict[str, str] = {}  # slug → edge kind
-        if include_direct_parents:
-            for edge in self._edges:
-                if edge.target == slug and edge.source in self._nodes:
-                    parent = edge.source
-                    if parent not in dep_closure and parent != slug:
-                        if parent not in parent_info:
-                            parent_info[parent] = edge.kind
-        parent_slugs: set[str] = set(parent_info.keys())
+        # Used-by closure: full transitive reverse BFS from slug (all edge kinds).
+        used_by_closure: set[str] = set()
+        if include_used_by:
+            ub_visited: set[str] = {slug}
+            ub_queue: deque[str] = deque([slug])
+            while ub_queue:
+                current = ub_queue.popleft()
+                for edge in self._edges:
+                    if edge.target != current:
+                        continue
+                    consumer = edge.source
+                    if consumer not in ub_visited and consumer in self._nodes:
+                        ub_visited.add(consumer)
+                        used_by_closure.add(consumer)
+                        ub_queue.append(consumer)
+            # Requires takes priority over used_by (resolves mutual-dependency cycles)
+            used_by_closure -= requires_slugs
 
         # Assign roles
         roles: dict[str, str] = {slug: "selected"}
-        for dep in dep_closure:
-            roles[dep] = "dependency"
-        for parent in parent_slugs:
-            roles[parent] = "parent_context"
+        for req in requires_slugs:
+            roles[req] = "requires"
+        for ub in used_by_closure:
+            roles[ub] = "used_by"
 
-        focused_slugs = {slug} | dep_closure | parent_slugs
-        dep_only_slugs = {slug} | dep_closure
+        focused_slugs = {slug} | requires_slugs | used_by_closure
 
         # Collect focused nodes
         focused_nodes: dict[str, ModuleGraphNode] = {
             s: self._nodes[s] for s in focused_slugs if s in self._nodes
         }
 
-        # Edges within dep-only set, or pointing to a missing target
-        dep_edges = [
-            e for e in self._edges
-            if e.source in dep_only_slugs and (e.target in dep_only_slugs or e.target in missing_targets)
-        ]
-
-        # Parent-context edges: from selected to each parent ("used by" direction)
-        parent_edges = [
+        # Requires edges: selected → each direct requirement.
+        # Preserve capability and status from the original edge.
+        req_edges: list[ModuleGraphEdge] = [
             ModuleGraphEdge(
                 source=slug,
-                target=parent,
-                kind="parent_context",
-                capability=None,
-                status="resolved",
-                relationship_kind=parent_info[parent],
+                target=req,
+                kind="requires",
+                capability=orig.capability,
+                status=orig.status,
+                relationship_kind=orig.kind,  # original kind → relationship_kind
             )
-            for parent in sorted(parent_info.keys())
+            for req, orig in sorted(requires_edge_map.items())
+        ]
+        # Edges for missing requirement targets (unregistered slugs)
+        for missing_slug in sorted(missing_targets):
+            req_edges.append(ModuleGraphEdge(
+                source=slug,
+                target=missing_slug,
+                kind="requires",
+                capability=None,
+                status="missing",
+            ))
+
+        # Used-by edges: original directed edges within the used-by closure,
+        # re-wrapped with kind="used_by" so callers can filter by kind.
+        # requiresSlugs is included in used_by_set so cycle-priority nodes can
+        # still bridge used-by edges from consumers that depend on them.
+        used_by_set = {slug} | used_by_closure | requires_slugs
+        ub_edges = [
+            ModuleGraphEdge(
+                source=e.source,
+                target=e.target,
+                kind="used_by",
+                capability=e.capability,
+                status=e.status,
+                relationship_kind=e.kind,  # preserve original edge kind
+            )
+            for e in self._edges
+            if e.source in used_by_closure and e.target in used_by_set
         ]
 
-        all_edges = tuple(dep_edges) + tuple(parent_edges)
+        all_edges = tuple(req_edges) + tuple(ub_edges)
 
-        # Compute max dependency depth via BFS from slug
-        max_depth = 0
-        depth_visited: set[str] = {slug}
-        depth_queue: deque[tuple[str, int]] = deque([(slug, 0)])
-        while depth_queue:
-            current, depth = depth_queue.popleft()
-            max_depth = max(max_depth, depth)
-            for neighbor in self._fwd_all.get(current, set()):
-                if neighbor in dep_closure and neighbor not in depth_visited:
-                    depth_visited.add(neighbor)
-                    depth_queue.append((neighbor, depth + 1))
+        # Module name lists for the detail panel.
+        # Missing targets included so requires_list length matches requires_count.
+        req_list = tuple(
+            [{"slug": r, "name": self._nodes[r].title or r} for r in sorted(requires_edge_map.keys())]
+            + [{"slug": m, "name": f"Missing: {m}", "is_missing": True} for m in sorted(missing_targets)]
+        )
+        ub_list = tuple(
+            {"slug": u, "name": self._nodes[u].title or u}
+            for u in sorted(used_by_closure)
+        )
 
         return FocusedModuleGraph(
             selected_slug=slug,
             nodes=focused_nodes,
             edges=all_edges,
             roles=roles,
-            max_depth=max_depth,
             missing_targets=frozenset(missing_targets),
+            requires_list=req_list,
+            used_by_list=ub_list,
         )
 
     def to_api_dict(self) -> dict[str, Any]:

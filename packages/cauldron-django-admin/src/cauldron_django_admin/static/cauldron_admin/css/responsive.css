@@ -1,6 +1,6 @@
 /* ==========================================================================
    Cauldron responsive layout
-   Target widths: 320px mobile · 768px tablet · 1024px desktop · 1440px wide
+   Target widths: 320px mobile · 768px tablet · 1024px desktop · 1920px wide
    ========================================================================== */
 
 /* --- Sidebar backdrop (mobile drawer overlay) --- */
@@ -44,7 +44,7 @@
     display: block;
   }
 
-  /* Full-width main */
+  /* Full-width main — gutter from clamp token collapses to minimum */
   .cui-main {
     width: 100%;
   }
@@ -100,7 +100,7 @@
 
   /* Dashboard: 1–2 columns depending on available width */
   .cui-dashboard-grid {
-    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr));
   }
 
   /* Page header can share a row when space permits */
@@ -139,18 +139,9 @@
     align-items: flex-start;
   }
 
-  /* Up to three columns on the dashboard */
+  /* Up to four columns on the dashboard at 1024px+ */
   .cui-dashboard-grid {
-    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-  }
-}
-
-/* ==========================================================================
-   Large desktop  (1440 px +)
-   ========================================================================== */
-@media (min-width: 1440px) {
-  .cui-main__inner {
-    padding: var(--cui-space-8) var(--cui-space-8);
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
   }
 }
 

@@ -1,14 +1,35 @@
 /**
  * Interaction layer: pan, zoom, node selection, focus mode, search,
  * state/group filters, enable/disable workflow.
+ *
+ * Returns { dispose, fitToView }.
+ * dispose() removes all event listeners registered by this interaction instance
+ * and closes any open panels/modals. Call it before replacing the canvas.
  */
 import { buildStateRows, buildActionHtml, pendingWarning, escHtml, escapeAttr } from './state.js';
 
-export function initInteraction(app, container, graphData, { canChange }) {
+/**
+ * focusedSlug   – present when already in focused mode (the selected root slug)
+ * fullGraphData – the original full-graph data (used for re-focus on node click)
+ * onEnterFocus  – async callback(slug) to enter focused mode
+ * onExitFocus   – async callback() to exit back to full graph
+ */
+export function initInteraction(app, container, graphData, {
+  canChange,
+  focusedSlug = null,
+  fullGraphData = null,
+  onEnterFocus = null,
+  onExitFocus = null,
+}) {
   const { canvas, nodeEls, slugColor } = app;
   let scale = 1, panX = 0, panY = 0;
   let selectedSlug = null;
   let focusMode = false;
+
+  // AbortController: all listeners registered here share this signal.
+  // dispose() calls ac.abort() which atomically removes every listener.
+  const ac = new AbortController();
+  const { signal } = ac;
 
   // Build adjacency for focus mode
   const adj = {}, revAdj = {};
@@ -38,30 +59,30 @@ export function initInteraction(app, container, graphData, { canChange }) {
     panStart = { x: e.clientX, y: e.clientY };
     panOrigin = { x: panX, y: panY };
     container.classList.add("is-panning");
-  });
+  }, { signal });
   window.addEventListener("mousemove", (e) => {
     if (!isPanning) return;
     panX = panOrigin.x + e.clientX - panStart.x;
     panY = panOrigin.y + e.clientY - panStart.y;
     applyTransform();
-  });
+  }, { signal });
   window.addEventListener("mouseup", () => {
     isPanning = false;
     container.classList.remove("is-panning");
-  });
+  }, { signal });
   container.addEventListener("wheel", (e) => {
     e.preventDefault();
     const factor = e.deltaY < 0 ? 1.1 : 0.9;
     scale = Math.max(0.2, Math.min(3, scale * factor));
     applyTransform();
-  }, { passive: false });
+  }, { passive: false, signal });
 
   function applyTransform() {
     canvas.style.transform = `translate(${panX}px,${panY}px) scale(${scale})`;
   }
 
   // Fit to view
-  document.getElementById("btn-fit")?.addEventListener("click", fitToView);
+  document.getElementById("btn-fit")?.addEventListener("click", fitToView, { signal });
   function fitToView() {
     const cr = container.getBoundingClientRect();
     const cw = parseFloat(canvas.style.width) || 800;
@@ -76,7 +97,7 @@ export function initInteraction(app, container, graphData, { canChange }) {
   // Reset view
   document.getElementById("btn-reset-layout")?.addEventListener("click", () => {
     scale = 1; panX = 0; panY = 0; applyTransform();
-  });
+  }, { signal });
 
   // Node selection & focus mode
   function selectNode(slug) {
@@ -120,23 +141,59 @@ export function initInteraction(app, container, graphData, { canChange }) {
   for (const [slug, { el }] of Object.entries(nodeEls)) {
     el.addEventListener("click", (e) => {
       e.stopPropagation();
-      if (selectedSlug === slug) clearSelection();
-      else selectNode(slug);
-    });
+      if (onEnterFocus) {
+        // In focused or full-graph mode with controller: clicking any node
+        // (re-)focuses around it. Clicking the already-selected root just
+        // refreshes the detail panel.
+        if (focusedSlug && slug === focusedSlug) {
+          selectNode(slug);
+        } else {
+          onEnterFocus(slug);
+        }
+      } else {
+        // Legacy path (no controller): toggle selection/dim
+        if (selectedSlug === slug) clearSelection();
+        else selectNode(slug);
+      }
+    }, { signal });
     el.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectNode(slug); }
-    });
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        if (onEnterFocus && !(focusedSlug && slug === focusedSlug)) {
+          onEnterFocus(slug);
+        } else {
+          selectNode(slug);
+        }
+      }
+    }, { signal });
     el.setAttribute("tabindex", "0");
     el.setAttribute("role", "button");
     el.setAttribute("aria-label", `Module: ${slug}`);
   }
-  container.addEventListener("click", () => clearSelection());
+  container.addEventListener("click", () => clearSelection(), { signal });
 
-  // Show all / focus
-  document.getElementById("btn-show-all")?.addEventListener("click", clearSelection);
+  // "Show all" button and breadcrumb "All modules" link — exit focused mode
+  const exitToFull = () => { if (onExitFocus) onExitFocus(); else clearSelection(); };
+  document.getElementById("btn-show-all")?.addEventListener("click", exitToFull, { signal });
+  document.addEventListener("click", (e) => {
+    if (e.target.closest("#bc-all-btn")) exitToFull();
+  }, { signal });
+
+  // Escape: close detail panel first; if already closed, exit focus mode
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    const panel = document.getElementById("detail-panel");
+    if (panel?.classList.contains("is-open")) {
+      hideDetailPanel();
+    } else if (onExitFocus) {
+      onExitFocus();
+    }
+  }, { signal });
+
+  // Legacy dimming focus button
   document.getElementById("btn-focus")?.addEventListener("click", () => {
     if (selectedSlug) toggleFocusMode(selectedSlug);
-  });
+  }, { signal });
 
   function toggleFocusMode(slug) {
     focusMode = !focusMode;
@@ -155,22 +212,11 @@ export function initInteraction(app, container, graphData, { canChange }) {
 
   // Search
   const searchInput = document.getElementById("tree-search");
-  searchInput?.addEventListener("input", applyFilters);
+  searchInput?.addEventListener("input", applyFilters, { signal });
 
-  // State / group filters
-  document.getElementById("state-filter")?.addEventListener("change", applyFilters);
-  document.getElementById("group-filter")?.addEventListener("change", applyFilters);
-
-  // Populate group filter
-  const groups = [...new Set(graphData.nodes.map((n) => n.group).filter(Boolean))].sort();
-  const gf = document.getElementById("group-filter");
-  if (gf) {
-    for (const g of groups) {
-      const opt = document.createElement("option");
-      opt.value = g; opt.textContent = g;
-      gf.appendChild(opt);
-    }
-  }
+  // State / group filters — group options are populated once by main.js
+  document.getElementById("state-filter")?.addEventListener("change", applyFilters, { signal });
+  document.getElementById("group-filter")?.addEventListener("change", applyFilters, { signal });
 
   function applyFilters() {
     const q = (searchInput?.value || "").toLowerCase();
@@ -192,13 +238,13 @@ export function initInteraction(app, container, graphData, { canChange }) {
     container.style.display = "";
     document.getElementById("tree-table").style.display = "none";
     populateTable();
-  });
+  }, { signal });
   document.getElementById("btn-view-table")?.addEventListener("click", () => {
     container.style.display = "none";
     const tt = document.getElementById("tree-table");
     tt.style.display = "";
     populateTable();
-  });
+  }, { signal });
 
   function populateTable() {
     const tbody = document.getElementById("tree-table-body");
@@ -286,7 +332,7 @@ export function initInteraction(app, container, graphData, { canChange }) {
       btn.disabled = false;
       btn.textContent = action === "disable" ? "Disable" : "Enable";
     }
-  });
+  }, { signal });
 
   function showConfirmModal(slug, action, preview, container) {
     const modal = document.getElementById("confirm-modal") || createConfirmModal();
@@ -301,7 +347,7 @@ export function initInteraction(app, container, graphData, { canChange }) {
       </div>
     </div>`;
     modal.classList.add("is-open");
-    document.getElementById("confirm-cancel")?.addEventListener("click", () => modal.classList.remove("is-open"));
+    document.getElementById("confirm-cancel")?.addEventListener("click", () => modal.classList.remove("is-open"), { signal });
     document.getElementById("confirm-ok")?.addEventListener("click", async () => {
       modal.classList.remove("is-open");
       const url = action === "disable"
@@ -316,7 +362,7 @@ export function initInteraction(app, container, graphData, { canChange }) {
       });
       if (r.ok) location.reload();
       else alert("Action failed: " + r.status);
-    });
+    }, { signal });
   }
 
   function createConfirmModal() {
@@ -330,4 +376,12 @@ export function initInteraction(app, container, graphData, { canChange }) {
     return document.cookie.split(";").find((c) => c.trim().startsWith("csrftoken="))?.split("=")[1] || "";
   }
 
+  return {
+    dispose() {
+      hideDetailPanel();
+      document.getElementById("confirm-modal")?.classList.remove("is-open");
+      ac.abort();
+    },
+    fitToView,
+  };
 }

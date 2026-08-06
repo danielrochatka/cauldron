@@ -1,9 +1,15 @@
 /**
  * Renders the ELK layout result as positioned DOM nodes with an SVG edge overlay.
  * Returns an app object used by interaction.js.
+ *
+ * focusConfig (optional):
+ *   roles         – { [slug]: "selected"|"dependency"|"parent_context" }
+ *   displayEdges  – edges to render (may differ from ELK layout edges)
  */
-export function renderGraph(container, elkLayout, graphData, { canChange, slugColor }) {
+export function renderGraph(container, elkLayout, graphData, { canChange, slugColor, focusConfig = null }) {
   const nodeMap = Object.fromEntries(graphData.nodes.map((n) => [n.slug, n]));
+  const focusRoles = focusConfig?.roles ?? {};
+  const displayEdges = focusConfig?.displayEdges ?? graphData.edges;
 
   // Canvas wrapper for pan/zoom
   const canvas = document.createElement("div");
@@ -27,17 +33,29 @@ export function renderGraph(container, elkLayout, graphData, { canChange, slugCo
     const node = nodeMap[en.id];
     if (!node) continue;
     const color = slugColor(node.slug);
+    const role = focusRoles[node.slug] ?? null;
+    const isParentCtx = role === "parent_context";
+    const isSelected = role === "selected";
+
     const el = document.createElement("div");
-    el.className = `module-node node-state-${node.state}`;
+    el.className = `module-node node-state-${node.state}${isParentCtx ? " is-parent-context" : ""}${isSelected ? " is-focus-selected" : ""}`;
     el.dataset.slug = node.slug;
+    if (role) el.dataset.focusRole = role;
     el.style.cssText = `position:absolute;left:${en.x}px;top:${en.y}px;width:${en.width}px;`;
     el.style.setProperty("--module-color", color);
-    el.innerHTML = `<div class="node-card" style="border-top:3px solid ${escapeAttr(color)}">
+
+    const cardStyle = isSelected
+      ? `border-top:3px solid ${escapeAttr(color)};border:2px solid ${escapeAttr(color)};`
+      : `border-top:3px solid ${escapeAttr(color)};`;
+
+    el.innerHTML = `<div class="node-card" style="${cardStyle}">
       <div class="node-icon" aria-hidden="true">${node.icon_svg || defaultIcon(node.slug, color)}</div>
       <div class="node-body">
         <div class="node-title">${escHtml(node.title || node.slug)}</div>
         <div class="node-slug">${escHtml(node.slug)}</div>
         <span class="state-badge badge-${node.state}">${node.state}</span>
+        ${isSelected ? '<span class="focus-selected-badge">Selected</span>' : ""}
+        ${isParentCtx ? '<span class="focus-parent-badge">Used by</span>' : ""}
       </div>
     </div>`;
     canvas.appendChild(el);
@@ -53,19 +71,50 @@ export function renderGraph(container, elkLayout, graphData, { canChange, slugCo
 
   const defs = makeSvgEl("defs");
   // Arrowhead markers per edge kind
-  for (const [kind, color] of [["required","#6366f1"],["optional","#9ca3af"],["capability","#8b5cf6"],["error","#ef4444"]]) {
+  for (const [kind, color] of [["required","#6366f1"],["optional","#9ca3af"],["capability","#8b5cf6"],["error","#ef4444"],["parent_context","#9ca3af"]]) {
     defs.appendChild(makeArrowMarker(kind, color));
   }
   svg.appendChild(defs);
 
-  // Draw edges using ELK's computed bend points (orthogonal routing)
+  // Build a map from ELK edge id → ELK edge (for layout-edge lookup)
   const elkEdgeMap = {};
   for (const ee of elkLayout.edges || []) {
     elkEdgeMap[ee.id] = ee;
   }
 
-  for (let idx = 0; idx < graphData.edges.length; idx++) {
-    const edge = graphData.edges[idx];
+  // Draw display edges. For parent_context edges ELK routed a reversed layout
+  // edge (parent → selected); we reverse the geometry to draw selected → parent.
+  for (let idx = 0; idx < displayEdges.length; idx++) {
+    const edge = displayEdges[idx];
+
+    if (edge.kind === "parent_context") {
+      // layoutEdges and displayEdges share the same indices, so edge_${idx} is
+      // the corresponding parent_context_layout ELK edge (parent → selected).
+      // Reversing its geometry gives us the correct selected → parent path.
+      const ee = elkEdgeMap[`edge_${idx}`];
+      if (!ee) continue;
+
+      const dk = edge.relationship_kind;
+      const dashArray = dk === "optional" ? "6 3" : dk === "capability" ? "2 3" : "5 3";
+
+      const path = makeSvgEl("path");
+      path.setAttribute("fill", "none");
+      path.setAttribute("stroke", "#9ca3af");
+      path.setAttribute("stroke-width", "1.5");
+      path.setAttribute("stroke-dasharray", dashArray);
+      path.setAttribute("marker-end", "url(#arrow-parent_context)");
+      path.setAttribute("d", buildReversedElkPath(ee));
+      path.dataset.source = edge.source;
+      path.dataset.target = edge.target;
+      path.dataset.kind = "parent_context";
+      path.setAttribute("aria-label", `Used by ${edge.target}`);
+      svg.appendChild(path);
+      continue;
+    }
+
+    // Regular dependency edge: find the corresponding ELK layout edge
+    // The layout edges are indexed in the order they appear in layoutEdges,
+    // which may differ from displayEdges when focused. Use a stable id lookup.
     const ee = elkEdgeMap[`edge_${idx}`];
     if (!ee) continue;
 
@@ -113,6 +162,23 @@ function buildElkPath(elkEdge, layout) {
     parts.push(`L${e.x},${e.y}`);
   }
   return parts.join(" ");
+}
+
+function buildReversedElkPath(elkEdge) {
+  // Collect all points across all sections in forward order, then reverse.
+  // Used for parent_context edges: ELK routed parent→selected, we draw selected→parent.
+  const sections = elkEdge.sections || [];
+  if (!sections.length) return "";
+  const allPoints = [];
+  for (const sec of sections) {
+    const { startPoint: s, endPoint: e, bendPoints: bends = [] } = sec;
+    if (allPoints.length === 0) allPoints.push(s);
+    for (const b of bends) allPoints.push(b);
+    allPoints.push(e);
+  }
+  allPoints.reverse();
+  const [first, ...rest] = allPoints;
+  return `M${first.x},${first.y}` + rest.map((p) => ` L${p.x},${p.y}`).join("");
 }
 
 function makeArrowMarker(id, color) {

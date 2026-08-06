@@ -360,19 +360,19 @@ class ModuleGraph:
             raise ValueError(f"Module {slug!r} not found in graph")
 
         # Direct requires: one-hop forward from slug, all edge kinds.
-        # Track first observed edge kind per target for relationship_kind semantics.
-        requires_info: dict[str, str] = {}  # target → first edge kind
+        # Store the first complete edge per target so capability and status are preserved.
+        requires_edge_map: dict[str, ModuleGraphEdge] = {}  # target → first edge
         missing_targets: set[str] = set()
         for edge in self._edges:
             if edge.source != slug or edge.target == slug:
                 continue
             target = edge.target
             if target in self._nodes:
-                if target not in requires_info:
-                    requires_info[target] = edge.kind
+                if target not in requires_edge_map:
+                    requires_edge_map[target] = edge
             else:
                 missing_targets.add(target)
-        requires_slugs: set[str] = set(requires_info.keys())
+        requires_slugs: set[str] = set(requires_edge_map.keys())
 
         # Used-by closure: full transitive reverse BFS from slug (all edge kinds).
         used_by_closure: set[str] = set()
@@ -406,22 +406,34 @@ class ModuleGraph:
             s: self._nodes[s] for s in focused_slugs if s in self._nodes
         }
 
-        # Requires edges: selected → each direct requirement
-        req_edges = [
+        # Requires edges: selected → each direct requirement.
+        # Preserve capability and status from the original edge.
+        req_edges: list[ModuleGraphEdge] = [
             ModuleGraphEdge(
                 source=slug,
                 target=req,
                 kind="requires",
-                capability=None,
-                status="resolved",
-                relationship_kind=requires_info[req],
+                capability=orig.capability,
+                status=orig.status,
+                relationship_kind=orig.kind,  # original kind → relationship_kind
             )
-            for req in sorted(requires_info.keys())
+            for req, orig in sorted(requires_edge_map.items())
         ]
+        # Edges for missing requirement targets (unregistered slugs)
+        for missing_slug in sorted(missing_targets):
+            req_edges.append(ModuleGraphEdge(
+                source=slug,
+                target=missing_slug,
+                kind="requires",
+                capability=None,
+                status="missing",
+            ))
 
         # Used-by edges: original directed edges within the used-by closure,
         # re-wrapped with kind="used_by" so callers can filter by kind.
-        used_by_set = {slug} | used_by_closure
+        # requiresSlugs is included in used_by_set so cycle-priority nodes can
+        # still bridge used-by edges from consumers that depend on them.
+        used_by_set = {slug} | used_by_closure | requires_slugs
         ub_edges = [
             ModuleGraphEdge(
                 source=e.source,
@@ -437,10 +449,11 @@ class ModuleGraph:
 
         all_edges = tuple(req_edges) + tuple(ub_edges)
 
-        # Module name lists for the detail panel
+        # Module name lists for the detail panel.
+        # Missing targets included so requires_list length matches requires_count.
         req_list = tuple(
-            {"slug": r, "name": self._nodes[r].title or r}
-            for r in sorted(requires_info.keys())
+            [{"slug": r, "name": self._nodes[r].title or r} for r in sorted(requires_edge_map.keys())]
+            + [{"slug": m, "name": f"Missing: {m}", "is_missing": True} for m in sorted(missing_targets)]
         )
         ub_list = tuple(
             {"slug": u, "name": self._nodes[u].title or u}

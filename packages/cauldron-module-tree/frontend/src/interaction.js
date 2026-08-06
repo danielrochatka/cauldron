@@ -307,8 +307,10 @@ export function initInteraction(app, container, graphData, {
     let relationshipHtml;
     if (focusedSlug && slug === focusedSlug && focusedMeta) {
       const reqChips = focusedMeta.requiresList.length
-        ? focusedMeta.requiresList.map(({ slug: s, name }) =>
-            `<button class="detail-chip" data-slug="${escapeAttr(s)}" type="button">${escHtml(name)}</button>`
+        ? focusedMeta.requiresList.map(({ slug: s, name, isMissing }) =>
+            isMissing
+              ? `<span class="detail-chip detail-chip--missing">${escHtml(name)}</span>`
+              : `<button class="detail-chip" data-slug="${escapeAttr(s)}" type="button">${escHtml(name)}</button>`
           ).join("")
         : "<span class=\"detail-chip-empty\">None</span>";
       const ubChips = focusedMeta.usedByList.length

@@ -236,6 +236,27 @@ describe("buildFocusedSubgraph — requires edges", () => {
     const reqEdge = result.displayEdges.find((e) => e.kind === "requires");
     expect(reqEdge.relationship_kind).toBe("optional");
   });
+
+  it("requires edge preserves capability and status from original edge", () => {
+    const data = makeData(
+      [makeNode("sel"), makeNode("cap-provider")],
+      [{ source: "sel", target: "cap-provider", kind: "capability", capability: "my.cap", status: "conflict" }],
+    );
+    const result = buildFocusedSubgraph(data, "sel");
+    const reqEdge = result.displayEdges.find((e) => e.kind === "requires");
+    expect(reqEdge.capability).toBe("my.cap");
+    expect(reqEdge.status).toBe("conflict");
+  });
+
+  it("missing requirement display edge has status 'missing'", () => {
+    const data = makeData(
+      [makeNode("sel")],
+      [makeEdge("sel", "ghost")],
+    );
+    const result = buildFocusedSubgraph(data, "sel");
+    const missingEdge = result.displayEdges.find((e) => e.target === "ghost");
+    expect(missingEdge.status).toBe("missing");
+  });
 });
 
 // --------------------------------------------------------------------------- //
@@ -346,6 +367,22 @@ describe("buildFocusedSubgraph — edge cases", () => {
     const keys = Object.keys(result.metadata).join(" ");
     expect(keys).not.toMatch(/ancestor|descendant|dependency|parent_context/);
   });
+
+  it("cycle bridge: consumer of a cycle-requires node still has a used-by edge", () => {
+    // sel → b (requires), b → sel (cycle, b promoted to requires then dropped from usedBy),
+    // c → b (c is a consumer of b — should still have an edge to b in the graph)
+    const data = makeData(
+      [makeNode("sel"), makeNode("b"), makeNode("c")],
+      [makeEdge("sel", "b"), makeEdge("b", "sel"), makeEdge("c", "b")],
+    );
+    const result = buildFocusedSubgraph(data, "sel");
+    // c is in used-by closure (c→b→sel path)
+    expect(result.roles["c"]).toBe("used_by");
+    // The c→b edge should appear in usedByEdges (reversed: b→c) so c is connected
+    const cEdge = result.displayEdges.find((e) => e.kind === "used_by" && e.target === "c");
+    expect(cEdge).toBeTruthy();
+    expect(cEdge.source).toBe("b");
+  });
 });
 
 // --------------------------------------------------------------------------- //
@@ -374,6 +411,27 @@ describe("buildFocusedSubgraph — missing requires targets", () => {
     const result = buildFocusedSubgraph(data, "sel");
     expect(result.metadata.requiresCount).toBe(1);
     expect(result.metadata.missingCount).toBe(1);
+  });
+
+  it("missing target appears in requiresList with isMissing flag", () => {
+    const data = makeData(
+      [makeNode("sel")],
+      [makeEdge("sel", "ghost")],
+    );
+    const result = buildFocusedSubgraph(data, "sel");
+    expect(result.metadata.requiresList.length).toBe(1);
+    expect(result.metadata.requiresList[0].slug).toBe("ghost");
+    expect(result.metadata.requiresList[0].isMissing).toBe(true);
+  });
+
+  it("requiresList length matches requiresCount", () => {
+    // One registered requirement and one missing
+    const data = makeData(
+      [makeNode("sel"), makeNode("real")],
+      [makeEdge("sel", "real"), makeEdge("sel", "ghost")],
+    );
+    const result = buildFocusedSubgraph(data, "sel");
+    expect(result.metadata.requiresList.length).toBe(result.metadata.requiresCount);
   });
 });
 

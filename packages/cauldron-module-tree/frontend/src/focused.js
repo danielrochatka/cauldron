@@ -55,18 +55,19 @@ export function buildFocusedSubgraph(data, slug) {
     (revAll[e.target] ||= []).push({ source: e.source, kind: e.kind });
   }
 
-  // Direct requires: one-hop forward from selected, deduplicating by target
-  const requiresInfo = new Map(); // target → first edge kind
+  // Direct requires: one-hop forward from selected, deduplicating by target.
+  // Store the full first edge per target so capability and status are preserved.
+  const requiresEdgeMap = new Map(); // target → first complete edge object
   const missingTargets = new Set();
   for (const e of data.edges) {
     if (e.source !== slug || e.target === slug) continue;
     if (nodeMap[e.target]) {
-      if (!requiresInfo.has(e.target)) requiresInfo.set(e.target, e.kind);
+      if (!requiresEdgeMap.has(e.target)) requiresEdgeMap.set(e.target, e);
     } else {
       missingTargets.add(e.target);
     }
   }
-  const requiresSlugs = new Set(requiresInfo.keys());
+  const requiresSlugs = new Set(requiresEdgeMap.keys());
 
   // Used-by closure: full transitive reverse BFS from selected (all edge kinds)
   const usedByClosure = new Set();
@@ -144,20 +145,23 @@ export function buildFocusedSubgraph(data, slug) {
   ];
 
   const requiresDisplayEdges = [
-    ...sortedReqSlugs.map((req) => ({
-      source: slug,
-      target: req,
-      kind: "requires",
-      relationship_kind: requiresInfo.get(req),
-      capability: null,
-      status: "resolved",
-    })),
+    ...sortedReqSlugs.map((req) => {
+      const orig = requiresEdgeMap.get(req);
+      return {
+        source: slug,
+        target: req,
+        kind: "requires",
+        relationship_kind: orig.kind,    // original edge kind (required/optional/capability)
+        capability: orig.capability ?? null,
+        status: orig.status,             // preserves blocked/conflict/missing
+      };
+    }),
     ...sortedMissing.map((m) => ({
       source: slug,
       target: m,
       kind: "requires",
       capability: null,
-      status: "resolved",
+      status: "missing",
     })),
   ];
 
@@ -165,7 +169,10 @@ export function buildFocusedSubgraph(data, slug) {
   // Original: consumer → dependency; Reversed: dependency → consumer
   // The same reversed edges are used for both layout and display so ELK
   // places consumers below selected without needing path reversal in the renderer.
-  const usedBySet = new Set([slug, ...usedByClosure]);
+  // requiresSlugs is included in usedBySet so that a node removed from
+  // usedByClosure due to cycle priority can still serve as a bridge target
+  // for consumers that depend on it (e.g. a→b, b→a, c→b focusing a: c→b preserved).
+  const usedBySet = new Set([slug, ...usedByClosure, ...requiresSlugs]);
   const usedByEdges = data.edges
     .filter((e) => usedByClosure.has(e.source) && usedBySet.has(e.target))
     .map((e) => ({
@@ -185,11 +192,19 @@ export function buildFocusedSubgraph(data, slug) {
   const layoutEdges = [...requiresLayoutEdges, ...usedByEdges];
   const displayEdges = [...requiresDisplayEdges, ...usedByEdges];
 
-  // Module name lists for the detail panel
-  const requiresList = sortedReqSlugs.map((req) => ({
-    slug: req,
-    name: nodeMap[req]?.title || req,
-  }));
+  // Module name lists for the detail panel.
+  // Missing targets are included so requiresCount matches the list length.
+  const requiresList = [
+    ...sortedReqSlugs.map((req) => ({
+      slug: req,
+      name: nodeMap[req]?.title || req,
+    })),
+    ...sortedMissing.map((m) => ({
+      slug: m,
+      name: `Missing: ${m}`,
+      isMissing: true,
+    })),
+  ];
   const usedByList = [...usedByClosure].sort().map((ub) => ({
     slug: ub,
     name: nodeMap[ub]?.title || ub,

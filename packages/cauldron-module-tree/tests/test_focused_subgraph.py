@@ -220,6 +220,63 @@ def test_used_by_edges_preserved():
     assert any(e.source == "parent" and e.target == "sel" for e in ub_edges)
 
 
+def test_requires_edge_preserves_capability_and_status():
+    # a requires b; should preserve the original edge's capability and status
+    g = _build([_entry("a", requires=("b",)), _entry("b")])
+    f = g.focused_subgraph("a")
+    req_edges = [e for e in f.edges if e.kind == "requires" and e.target == "b"]
+    assert len(req_edges) == 1
+    # status should be "resolved" (both nodes exist, no errors)
+    assert req_edges[0].status == "resolved"
+    # relationship_kind preserves original edge kind
+    assert req_edges[0].relationship_kind == "required"
+
+
+def test_missing_target_edge_emitted_in_python():
+    # a requires x.missing; backend should emit a "requires" edge for the missing target
+    g = _build([_entry("a", requires=("x.missing",))])
+    f = g.focused_subgraph("a")
+    req_edges = [e for e in f.edges if e.kind == "requires"]
+    assert any(e.target == "x.missing" for e in req_edges), (
+        "A requires edge to the missing target must be emitted"
+    )
+    missing_edge = next(e for e in req_edges if e.target == "x.missing")
+    assert missing_edge.status == "missing"
+
+
+def test_cycle_bridge_consumer_edge_present():
+    # sel → b (cycle: b also requires sel); c → b (c is a consumer of b)
+    # c should appear in used_by, and a used_by edge c→b should exist
+    g = _build([
+        _entry("sel", requires=("b",)),
+        _entry("b", requires=("sel",)),
+        _entry("c", requires=("b",)),
+    ])
+    f = g.focused_subgraph("sel")
+    assert f.roles["c"] == "used_by"
+    ub_edges = [e for e in f.edges if e.kind == "used_by"]
+    assert any(e.source == "c" and e.target == "b" for e in ub_edges), (
+        "used_by edge c→b must be present so c is connected to the graph"
+    )
+
+
+def test_requires_list_includes_missing_targets():
+    g = _build([_entry("a", requires=("x.missing",))])
+    d = g.focused_subgraph("a").to_api_dict()
+    req_list = d["metadata"]["requires_list"]
+    assert any(item["slug"] == "x.missing" for item in req_list)
+    missing_item = next(item for item in req_list if item["slug"] == "x.missing")
+    assert missing_item.get("is_missing") is True
+
+
+def test_requires_list_length_matches_requires_count():
+    # One registered + one missing
+    g = _build([_entry("a", requires=("b", "x.missing")), _entry("b")])
+    d = g.focused_subgraph("a").to_api_dict()
+    meta = d["metadata"]
+    assert len(meta["requires_list"]) == meta["requires_count"]
+
+
 # --------------------------------------------------------------------------- #
 # Cycles                                                                       #
 # --------------------------------------------------------------------------- #

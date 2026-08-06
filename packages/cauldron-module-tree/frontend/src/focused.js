@@ -8,16 +8,35 @@
  * Inclusion rules
  * ---------------
  * - selected      : the chosen slug
- * - dependency    : full transitive closure (required + capability + optional)
- * - parent_context: direct dependents of the selected module (one level only)
+ * - dependency    : full transitive closure (all edge kinds: required,
+ *                   capability, optional)
+ * - parent_context: ALL direct incoming dependency relationships to the
+ *                   selected module (required, capability, and optional)
  *
- * Returns an object with:
- *   nodes        – focused node list with added focus_role
- *   layoutEdges  – edges for ELK (dependency direction only; parents added as
- *                  reversed edges so ELK positions them above the selected node)
- *   displayEdges – all edges for rendering (includes parent_context edges)
- *   roles        – { [slug]: "selected"|"dependency"|"parent_context" }
- *   metadata     – { selected, dependencyCount, parentCount, maxDepth }
+ * Missing targets
+ * ---------------
+ * If a dependency edge points to a slug that is not registered, a synthetic
+ * terminal node is added so the relationship remains visible in the focused
+ * view.  Synthetic nodes have state "missing" and are never recursed into.
+ *
+ * Parent-context edges
+ * --------------------
+ * Each parent_context edge carries the original relationship_kind
+ * ("required", "optional", "capability") so the renderer can preserve
+ * line-style semantics.  The semantic direction is selected → parent ("used
+ * by"), but a reversed layout edge (parent → selected) is included in
+ * layoutEdges so ELK positions parents above the selected node.
+ *
+ * Returns
+ * -------
+ * {
+ *   nodes          – focused node list with added focus_role
+ *   layoutEdges    – edges for ELK (dep edges + reversed parent_context_layout)
+ *   displayEdges   – all edges for rendering (dep edges + parent_context)
+ *   roles          – { [slug]: "selected"|"dependency"|"parent_context" }
+ *   missingTargets – Set of slugs that were synthesised as missing terminals
+ *   metadata       – { selected, dependencyCount, parentCount, missingCount, maxDepth }
+ * }
  */
 export function buildFocusedSubgraph(data, slug) {
   const nodeMap = Object.fromEntries(data.nodes.map((n) => [n.slug, n]));
@@ -25,18 +44,18 @@ export function buildFocusedSubgraph(data, slug) {
     throw new Error(`Module not found: ${slug}`);
   }
 
-  // Build adjacency from full graph edges
-  const fwdAll = {};   // slug → [target slugs] (required + capability + optional)
-  const revRequired = {};  // slug → [source slugs] (required + capability only)
+  // Build adjacency from full graph edges — all edge kinds
+  const fwdAll = {};   // slug → [target slugs]
+  const revAll = {};   // slug → [{ source, kind }]  (all incoming)
   for (const e of data.edges) {
     (fwdAll[e.source] ||= []).push(e.target);
-    if (e.kind === "required" || e.kind === "capability") {
-      (revRequired[e.target] ||= []).push(e.source);
-    }
+    (revAll[e.target] ||= []).push({ source: e.source, kind: e.kind });
   }
 
-  // BFS forward from slug to collect full transitive dependency closure
+  // BFS forward to collect full transitive dependency closure.
+  // Real nodes enter the queue; missing-target stubs are noted but not recursed.
   const depClosure = new Set();
+  const missingTargets = new Set();
   const visited = new Set([slug]);
   const queue = [slug];
   while (queue.length) {
@@ -45,68 +64,97 @@ export function buildFocusedSubgraph(data, slug) {
       if (!visited.has(neighbor)) {
         visited.add(neighbor);
         if (nodeMap[neighbor]) {
-          // Only track real nodes as dependencies; unknown targets are skipped
           depClosure.add(neighbor);
           queue.push(neighbor);
+        } else if (neighbor !== slug) {
+          // Missing dependency: synthetic terminal node, no recursion
+          missingTargets.add(neighbor);
         }
       }
     }
   }
 
-  // Direct parents: modules that require the selected module (one level only)
-  const parentSlugs = new Set();
-  for (const parent of revRequired[slug] || []) {
+  // Direct parents: ALL modules with any incoming edge to the selected module.
+  // Store the original relationship kind for visual semantics.
+  const parentInfo = new Map(); // slug → relationship kind
+  for (const { source: parent, kind } of revAll[slug] || []) {
     if (nodeMap[parent] && !depClosure.has(parent) && parent !== slug) {
-      parentSlugs.add(parent);
+      if (!parentInfo.has(parent)) parentInfo.set(parent, kind);
     }
   }
+  const parentSlugs = new Set(parentInfo.keys());
 
   // Roles
   const roles = { [slug]: "selected" };
   for (const dep of depClosure) roles[dep] = "dependency";
+  for (const miss of missingTargets) roles[miss] = "dependency";
   for (const p of parentSlugs) roles[p] = "parent_context";
 
   const depOnlySlugs = new Set([slug, ...depClosure]);
   const focusedSlugs = new Set([slug, ...depClosure, ...parentSlugs]);
 
-  // Focused node list with focus_role attached
-  const nodes = data.nodes
+  // Focused real nodes with focus_role attached
+  const realNodes = data.nodes
     .filter((n) => focusedSlugs.has(n.slug))
     .map((n) => ({ ...n, focus_role: roles[n.slug] }));
 
-  // Dependency edges (within dep-only set): used for ELK layout AND rendering
+  // Synthetic terminal nodes for missing targets
+  const syntheticNodes = [...missingTargets].sort().map((target) => ({
+    slug: target,
+    title: `Missing: ${target}`,
+    state: "missing",
+    version: "",
+    group: "",
+    summary: "",
+    icon_svg: null,
+    visual_color: "#9ca3af",
+    enabled: false,
+    active: false,
+    configured_enabled: false,
+    pending_restart: false,
+    errors: [],
+    focus_role: "dependency",
+    isSynthetic: true,
+  }));
+
+  const nodes = [...realNodes, ...syntheticNodes];
+
+  // Dependency edges — within dep-only set OR pointing to a missing target
   const depEdges = data.edges.filter(
-    (e) => depOnlySlugs.has(e.source) && depOnlySlugs.has(e.target),
+    (e) =>
+      depOnlySlugs.has(e.source) &&
+      (depOnlySlugs.has(e.target) || missingTargets.has(e.target)),
   );
 
-  // Parent-context edges for rendering only (source=selected, target=parent)
+  // Parent-context display edges (selected → parent, semantic "used by")
   const parentContextEdges = [...parentSlugs].sort().map((parent) => ({
     source: slug,
     target: parent,
     kind: "parent_context",
+    relationship_kind: parentInfo.get(parent),
     direction_label: "used by",
     capability: null,
     status: "resolved",
   }));
 
-  // ELK layout edges:
-  //   - dependency edges flow downward (selected → deps)
-  //   - parent nodes need to appear ABOVE selected, so we add a REVERSED
-  //     layout-only edge (parent → selected); ELK with DIR=DOWN will place
-  //     the source (parent) above the target (selected).
+  // Parent-context layout edges for ELK: REVERSED (parent → selected)
+  // so ELK's layered DOWN algorithm places parents above the selected node.
   const parentLayoutEdges = [...parentSlugs].sort().map((parent) => ({
     source: parent,
     target: slug,
-    kind: "parent_context_layout",   // internal; not rendered
-    direction_label: null,
+    kind: "parent_context_layout",
     capability: null,
     status: "resolved",
   }));
 
+  // layoutEdges: dep edges + reversed parent layout edges
+  // displayEdges: dep edges + semantic parent_context edges
+  // Both arrays share the same indices for dep edges (0..n-1) and parent edges
+  // (n..n+k), which is critical for the renderer to look up ELK routing by index.
   const layoutEdges = [...depEdges, ...parentLayoutEdges];
   const displayEdges = [...depEdges, ...parentContextEdges];
 
-  // Max dependency depth (BFS from selected through dep edges)
+  // Max dependency depth via BFS from selected
   let maxDepth = 0;
   const depVisited = new Set([slug]);
   const depQueue = [[slug, 0]];
@@ -126,10 +174,12 @@ export function buildFocusedSubgraph(data, slug) {
     layoutEdges,
     displayEdges,
     roles,
+    missingTargets,
     metadata: {
       selected: slug,
       dependencyCount: depClosure.size,
       parentCount: parentSlugs.size,
+      missingCount: missingTargets.size,
       maxDepth,
     },
   };
@@ -138,7 +188,6 @@ export function buildFocusedSubgraph(data, slug) {
 /**
  * Cache for focused ELK layouts.
  * Key: slug + "@" + graph revision token.
- * Returns cached layout or undefined.
  */
 export function makeFocusedLayoutCache() {
   const cache = new Map();

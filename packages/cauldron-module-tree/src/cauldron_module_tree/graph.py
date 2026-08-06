@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import datetime
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
 from cauldron.modules import ModuleManifest
@@ -48,9 +48,10 @@ class ModuleGraphNode:
 class ModuleGraphEdge:
     source: str
     target: str
-    kind: str          # "required" | "optional" | "capability" | "parent_context"
+    kind: str                       # "required" | "optional" | "capability" | "parent_context"
     capability: str | None
-    status: str        # "resolved" | "missing" | "blocked" | "conflict" | "cycle"
+    status: str                     # "resolved" | "missing" | "blocked" | "conflict" | "cycle"
+    relationship_kind: str | None = None  # original kind for parent_context edges
 
 
 # --------------------------------------------------------------------------- #
@@ -76,6 +77,7 @@ class FocusedModuleGraph:
     edges: tuple[ModuleGraphEdge, ...]      # dep edges + parent_context edges
     roles: dict[str, str]                   # slug → "selected"|"dependency"|"parent_context"
     max_depth: int                          # longest dep chain from selected
+    missing_targets: frozenset[str] = field(default_factory=frozenset)  # unregistered dep slugs
 
     def to_api_dict(self) -> dict[str, Any]:
         """Serialize for JSON API / frontend consumption."""
@@ -116,6 +118,8 @@ class FocusedModuleGraph:
             }
             if e.kind == "parent_context":
                 entry["direction_label"] = "used by"
+                if e.relationship_kind:
+                    entry["relationship_kind"] = e.relationship_kind
             edges_list.append(entry)
 
         dep_count = sum(1 for r in self.roles.values() if r == "dependency")
@@ -128,6 +132,7 @@ class FocusedModuleGraph:
                 "selected_slug": self.selected_slug,
                 "dependency_count": dep_count,
                 "parent_count": parent_count,
+                "missing_count": len(self.missing_targets),
                 "max_depth": self.max_depth,
             },
         }
@@ -329,8 +334,10 @@ class ModuleGraph:
         if slug not in self._nodes:
             raise ValueError(f"Module {slug!r} not found in graph")
 
-        # Transitive dependency closure (BFS forward from slug)
+        # Transitive dependency closure (BFS forward from slug).
+        # Missing targets (unregistered slugs) are tracked but not recursed into.
         dep_closure: set[str] = set()
+        missing_targets: set[str] = set()
         visited: set[str] = {slug}
         queue: deque[str] = deque([slug])
         while queue:
@@ -341,16 +348,23 @@ class ModuleGraph:
             for neighbor in neighbors:
                 if neighbor not in visited:
                     visited.add(neighbor)
-                    dep_closure.add(neighbor)
-                    if neighbor in self._nodes:  # only recurse into real nodes
+                    if neighbor in self._nodes:
+                        dep_closure.add(neighbor)
                         queue.append(neighbor)
+                    else:
+                        missing_targets.add(neighbor)
 
-        # Direct parents (one-level reverse; exclude nodes already in dep closure)
-        parent_slugs: set[str] = set()
+        # Direct parents: all modules with any incoming edge to slug (all edge kinds).
+        # Store the first observed edge kind per parent for relationship_kind semantics.
+        parent_info: dict[str, str] = {}  # slug → edge kind
         if include_direct_parents:
-            for parent in self._rev_required.get(slug, set()):
-                if parent in self._nodes and parent not in dep_closure and parent != slug:
-                    parent_slugs.add(parent)
+            for edge in self._edges:
+                if edge.target == slug and edge.source in self._nodes:
+                    parent = edge.source
+                    if parent not in dep_closure and parent != slug:
+                        if parent not in parent_info:
+                            parent_info[parent] = edge.kind
+        parent_slugs: set[str] = set(parent_info.keys())
 
         # Assign roles
         roles: dict[str, str] = {slug: "selected"}
@@ -367,10 +381,10 @@ class ModuleGraph:
             s: self._nodes[s] for s in focused_slugs if s in self._nodes
         }
 
-        # Edges within dependency closure (skip edges that touch parent_context nodes)
+        # Edges within dep-only set, or pointing to a missing target
         dep_edges = [
             e for e in self._edges
-            if e.source in dep_only_slugs and e.target in dep_only_slugs
+            if e.source in dep_only_slugs and (e.target in dep_only_slugs or e.target in missing_targets)
         ]
 
         # Parent-context edges: from selected to each parent ("used by" direction)
@@ -381,8 +395,9 @@ class ModuleGraph:
                 kind="parent_context",
                 capability=None,
                 status="resolved",
+                relationship_kind=parent_info[parent],
             )
-            for parent in sorted(parent_slugs)
+            for parent in sorted(parent_info.keys())
         ]
 
         all_edges = tuple(dep_edges) + tuple(parent_edges)
@@ -405,6 +420,7 @@ class ModuleGraph:
             edges=all_edges,
             roles=roles,
             max_depth=max_depth,
+            missing_targets=frozenset(missing_targets),
         )
 
     def to_api_dict(self) -> dict[str, Any]:

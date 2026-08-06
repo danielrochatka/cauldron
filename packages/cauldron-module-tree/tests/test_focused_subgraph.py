@@ -186,6 +186,46 @@ def test_parent_context_edges_serialized_with_direction_label():
     assert pc_edges[0]["direction_label"] == "used by"
 
 
+def test_optional_parent_included_as_context():
+    # parent has an optional dependency on sel — still counts as a parent context
+    g = _build([
+        _entry("parent", optional=("sel",)),
+        _entry("sel"),
+    ])
+    f = g.focused_subgraph("sel")
+    assert "parent" in f.nodes
+    assert f.roles["parent"] == "parent_context"
+
+
+def test_parent_context_edge_carries_relationship_kind():
+    g = _build([
+        _entry("req.parent", requires=("sel",)),
+        _entry("opt.parent", optional=("sel",)),
+        _entry("sel"),
+    ])
+    f = g.focused_subgraph("sel")
+    pc_edges = {e.target: e for e in f.edges if e.kind == "parent_context"}
+    assert pc_edges["req.parent"].relationship_kind == "required"
+    assert pc_edges["opt.parent"].relationship_kind == "optional"
+
+
+def test_parent_context_relationship_kind_in_serialization():
+    g = _build([
+        _entry("req.parent", requires=("sel",)),
+        _entry("sel"),
+    ])
+    d = g.focused_subgraph("sel").to_api_dict()
+    pc_edges = [e for e in d["edges"] if e["kind"] == "parent_context"]
+    assert len(pc_edges) == 1
+    assert pc_edges[0]["relationship_kind"] == "required"
+
+
+def test_metadata_includes_missing_count():
+    g = _build([_entry("a", requires=("x", "y"))])
+    d = g.focused_subgraph("a").to_api_dict()
+    assert d["metadata"]["missing_count"] == 2
+
+
 # --------------------------------------------------------------------------- #
 # Dependency edges preserved                                                   #
 # --------------------------------------------------------------------------- #
@@ -230,7 +270,9 @@ def test_missing_target_does_not_raise():
     g = _build([_entry("a", requires=("x",))])
     f = g.focused_subgraph("a")
     assert "a" in f.nodes
-    # x is not in nodes (it's missing) but no exception
+    # x is unregistered — tracked as a missing terminal, not in nodes
+    assert "x" not in f.nodes
+    assert "x" in f.missing_targets
 
 
 # --------------------------------------------------------------------------- #

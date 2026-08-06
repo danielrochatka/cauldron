@@ -57,16 +57,18 @@ async function init() {
   const layoutCache = makeFocusedLayoutCache();
   const graphRevision = graphData.metadata?.generated_at ?? Date.now();
 
-  // State callbacks exposed to interaction.js
+  // Holds the currently mounted interaction so it can be disposed before redraw.
+  const interactionRef = { current: null };
+
   const controller = {
-    async enterFocus(slug) {
+    async enterFocus(slug, { historyMode = "push" } = {}) {
       const token = ++renderToken;
       announceMode(`Focused on ${slug}`);
-      updateUrl(slug);
+      updateUrl(slug, historyMode);
       updateBreadcrumb(slug, graphData);
       showLoading(root, `Building focused graph for ${slug}…`);
       try {
-        await renderFocused(root, graphData, slug, canChange, layoutCache, graphRevision, token, () => renderToken, controller);
+        await renderFocused(root, graphData, slug, canChange, layoutCache, graphRevision, token, () => renderToken, controller, interactionRef);
       } catch (e) {
         if (renderToken !== token) return;  // stale
         root.innerHTML = `<div class="tree-error" role="alert">
@@ -74,14 +76,14 @@ async function init() {
         </div>`;
       }
     },
-    async exitFocus() {
+    async exitFocus({ historyMode = "push" } = {}) {
       const token = ++renderToken;
       announceMode("Full module graph");
-      updateUrl(null);
+      updateUrl(null, historyMode);
       updateBreadcrumb(null, graphData);
       showLoading(root, "Loading full module graph…");
       try {
-        await renderFull(root, graphData, canChange, token, () => renderToken, controller);
+        await renderFull(root, graphData, canChange, token, () => renderToken, controller, interactionRef);
       } catch (e) {
         if (renderToken !== token) return;
         root.innerHTML = `<div class="tree-error" role="alert">
@@ -91,11 +93,15 @@ async function init() {
     },
   };
 
-  // Handle browser back/forward
+  // Bind focused toolbar buttons once — their HTML is stable and never replaced.
+  document.getElementById("btn-show-all-focused")?.addEventListener("click", () => controller.exitFocus());
+  document.getElementById("btn-fit-focused")?.addEventListener("click", () => interactionRef.current?.fitToView());
+
+  // Handle browser back/forward — never push/replace state from popstate
   window.addEventListener("popstate", (ev) => {
     const slug = ev.state?.focus ?? getFocusFromUrl();
-    if (slug) controller.enterFocus(slug);
-    else controller.exitFocus();
+    if (slug) controller.enterFocus(slug, { historyMode: "none" });
+    else controller.exitFocus({ historyMode: "none" });
   });
 
   // Initial render: check URL for ?focus=slug
@@ -105,16 +111,16 @@ async function init() {
     if (exists) {
       updateBreadcrumb(initialFocus, graphData);
       announceMode(`Focused on ${initialFocus}`);
-      await renderFocused(root, graphData, initialFocus, canChange, layoutCache, graphRevision, ++renderToken, () => renderToken, controller);
+      await renderFocused(root, graphData, initialFocus, canChange, layoutCache, graphRevision, ++renderToken, () => renderToken, controller, interactionRef);
     } else {
       // Invalid slug: fall back to full graph with a message
       showInvalidFocusMessage(root, initialFocus);
-      updateUrl(null);
-      await renderFull(root, graphData, canChange, ++renderToken, () => renderToken, controller);
+      updateUrl(null, "replace");
+      await renderFull(root, graphData, canChange, ++renderToken, () => renderToken, controller, interactionRef);
     }
   } else {
     updateBreadcrumb(null, graphData);
-    await renderFull(root, graphData, canChange, ++renderToken, () => renderToken, controller);
+    await renderFull(root, graphData, canChange, ++renderToken, () => renderToken, controller, interactionRef);
   }
 }
 
@@ -122,14 +128,15 @@ async function init() {
 // Render modes                                                                 //
 // --------------------------------------------------------------------------- //
 
-async function renderFull(root, graphData, canChange, token, getToken, controller) {
+async function renderFull(root, graphData, canChange, token, getToken, controller, interactionRef) {
   const elk = new ELK();
   const elkGraph = buildElkGraph(graphData.nodes, graphData.edges);
   const layout = await elk.layout(elkGraph, { layoutOptions: ELK_OPTIONS });
   if (getToken() !== token) return;  // stale: a newer focus/defocus was triggered
+  interactionRef.current?.dispose();
   root.innerHTML = "";
   const app = renderGraph(root, layout, graphData, { canChange, slugColor });
-  initInteraction(app, root, graphData, {
+  interactionRef.current = initInteraction(app, root, graphData, {
     canChange,
     onEnterFocus: controller?.enterFocus.bind(controller),
     onExitFocus: controller?.exitFocus.bind(controller),
@@ -139,7 +146,7 @@ async function renderFull(root, graphData, canChange, token, getToken, controlle
   document.getElementById("focused-toolbar")?.style?.setProperty("display", "none");
 }
 
-async function renderFocused(root, graphData, slug, canChange, layoutCache, graphRevision, token, getToken, controller) {
+async function renderFocused(root, graphData, slug, canChange, layoutCache, graphRevision, token, getToken, controller, interactionRef) {
   // Derive focused subgraph from already-loaded data
   const focused = buildFocusedSubgraph(graphData, slug);
 
@@ -153,6 +160,7 @@ async function renderFocused(root, graphData, slug, canChange, layoutCache, grap
   }
 
   if (getToken() !== token) return;  // stale
+  interactionRef.current?.dispose();
 
   // Assemble a graphData-shaped object for renderGraph
   const focusedGraphData = {
@@ -173,7 +181,7 @@ async function renderFocused(root, graphData, slug, canChange, layoutCache, grap
 
   // Re-init interaction with the focused graph and pass controller callbacks
   // so clicking any node (dep or parent) re-focuses around it.
-  initInteraction(app, root, focusedGraphData, {
+  interactionRef.current = initInteraction(app, root, focusedGraphData, {
     canChange,
     focusedSlug: slug,
     fullGraphData: graphData,
@@ -181,8 +189,8 @@ async function renderFocused(root, graphData, slug, canChange, layoutCache, grap
     onExitFocus: controller?.exitFocus.bind(controller),
   });
 
-  // Announce focused stats via toolbar
-  updateFocusedToolbar(focused.metadata, root);
+  // Update focused stats in toolbar (buttons are stable — only stats div changes)
+  updateFocusedToolbar(focused.metadata);
 }
 
 // --------------------------------------------------------------------------- //
@@ -214,7 +222,7 @@ function buildElkGraph(nodes, edges) {
     })),
     edges: edges
       .map((e, originalIdx) => ({ e, originalIdx }))
-      .filter(({ e }) => e.status !== "missing" && nodeSet.has(e.source) && nodeSet.has(e.target))
+      .filter(({ e }) => nodeSet.has(e.source) && nodeSet.has(e.target))
       .map(({ e, originalIdx }) => {
         const outIdx = outgoingEdgesFor(e.source, edges, nodeSet).findIndex(
           (x) => x === e || (x.source === e.source && x.target === e.target && x.kind === e.kind)
@@ -264,16 +272,20 @@ function updateBreadcrumb(slug, graphData) {
 // Focused toolbar                                                              //
 // --------------------------------------------------------------------------- //
 
-function updateFocusedToolbar(meta, root) {
+function updateFocusedToolbar(meta) {
   const toolbar = document.getElementById("focused-toolbar");
   if (!toolbar) return;
   toolbar.style.display = "flex";
-  toolbar.innerHTML = `
-    <span class="focused-stat"><strong>${escapeHtml(meta.selected)}</strong></span>
-    <span class="focused-stat">${meta.dependencyCount} dep${meta.dependencyCount !== 1 ? "s" : ""}</span>
-    <span class="focused-stat">${meta.parentCount} parent${meta.parentCount !== 1 ? "s" : ""}</span>
-    <span class="focused-stat">depth ${meta.maxDepth}</span>
-  `;
+  // Only update the stats section — buttons are stable and must not be replaced.
+  const stats = document.getElementById("focused-toolbar-stats");
+  if (stats) {
+    stats.innerHTML = `
+      <span class="focused-stat"><strong>${escapeHtml(meta.selected)}</strong></span>
+      <span class="focused-stat">${meta.dependencyCount} dep${meta.dependencyCount !== 1 ? "s" : ""}</span>
+      <span class="focused-stat">${meta.parentCount} parent${meta.parentCount !== 1 ? "s" : ""}</span>
+      <span class="focused-stat">depth ${meta.maxDepth}</span>
+    `;
+  }
   document.getElementById("tree-toolbar")?.style?.setProperty("display", "none");
 }
 
@@ -285,14 +297,16 @@ function getFocusFromUrl() {
   return new URLSearchParams(window.location.search).get("focus") || null;
 }
 
-function updateUrl(slug) {
+function updateUrl(slug, historyMode = "push") {
   const url = new URL(window.location.href);
   if (slug) {
     url.searchParams.set("focus", slug);
   } else {
     url.searchParams.delete("focus");
   }
-  history.pushState({ focus: slug }, "", url);
+  if (historyMode === "push") history.pushState({ focus: slug }, "", url);
+  else if (historyMode === "replace") history.replaceState({ focus: slug }, "", url);
+  // "none": popstate handler — URL is already correct, don't touch history
 }
 
 // --------------------------------------------------------------------------- //

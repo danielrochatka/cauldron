@@ -96,6 +96,7 @@
   .node-state-unavailable  { border-left: 3px solid #9ca3af; opacity: 0.7; }
   .node-state-discovered,
   .node-state-registered   { border-left: 3px solid #f59e0b; }
+  .node-state-missing      { border-left: 3px solid #9ca3af; opacity: 0.5; border-style: dashed; }
 
   /* ── Accessibility ─────────────────────────────────────────────────── */
   .visually-hidden {
@@ -204,6 +205,7 @@
   .badge-unavailable  { background: #f3f4f6; color: #4b5563; }
   .badge-discovered   { background: #fef3c7; color: #92400e; }
   .badge-registered   { background: #fef3c7; color: #92400e; }
+  .badge-missing      { background: #f3f4f6; color: #9ca3af; font-style: italic; }
 
   /* ── SVG edge overlay ──────────────────────────────────────────────── */
   .edge-svg {
@@ -477,8 +479,9 @@
 
 {# ── Focused toolbar (shown only in focused mode) ─────────────────────── #}
 <div id="focused-toolbar" role="toolbar" aria-label="Focused graph controls">
-  <button id="btn-show-all-focused" type="button" onclick="document.getElementById('btn-show-all').click()">Show all modules</button>
-  <button id="btn-fit-focused" type="button" onclick="document.getElementById('btn-fit').click()">Fit to view</button>
+  <button id="btn-show-all-focused" type="button">Show all modules</button>
+  <button id="btn-fit-focused" type="button">Fit to view</button>
+  <div id="focused-toolbar-stats" class="focused-stats-row"></div>
 </div>
 
 {# ── Toolbar ─────────────────────────────────────────────────────────── #}

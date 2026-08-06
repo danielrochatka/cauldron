@@ -82,32 +82,28 @@ export function renderGraph(container, elkLayout, graphData, { canChange, slugCo
     elkEdgeMap[ee.id] = ee;
   }
 
-  // Draw display edges. For parent_context edges there is no ELK layout edge
-  // (ELK used a reversed layout edge); we draw them as straight lines between
-  // node centers instead.
+  // Draw display edges. For parent_context edges ELK routed a reversed layout
+  // edge (parent → selected); we reverse the geometry to draw selected → parent.
   for (let idx = 0; idx < displayEdges.length; idx++) {
     const edge = displayEdges[idx];
 
     if (edge.kind === "parent_context") {
-      // Draw a muted straight/bent line from selected node up to parent node
-      const srcEl = nodeEls[edge.source];
-      const tgtEl = nodeEls[edge.target];
-      if (!srcEl || !tgtEl) continue;
+      // layoutEdges and displayEdges share the same indices, so edge_${idx} is
+      // the corresponding parent_context_layout ELK edge (parent → selected).
+      // Reversing its geometry gives us the correct selected → parent path.
+      const ee = elkEdgeMap[`edge_${idx}`];
+      if (!ee) continue;
 
-      const sx = srcEl.elkNode.x + srcEl.elkNode.width / 2;
-      const sy = srcEl.elkNode.y;  // top of selected
-      const tx = tgtEl.elkNode.x + tgtEl.elkNode.width / 2;
-      const ty = tgtEl.elkNode.y + tgtEl.elkNode.height;  // bottom of parent
+      const dk = edge.relationship_kind;
+      const dashArray = dk === "optional" ? "6 3" : dk === "capability" ? "2 3" : "5 3";
 
       const path = makeSvgEl("path");
       path.setAttribute("fill", "none");
       path.setAttribute("stroke", "#9ca3af");
       path.setAttribute("stroke-width", "1.5");
-      path.setAttribute("stroke-dasharray", "5 3");
+      path.setAttribute("stroke-dasharray", dashArray);
       path.setAttribute("marker-end", "url(#arrow-parent_context)");
-      // Simple L-shaped path: go up to midpoint y, then across to target x
-      const midY = (sy + ty) / 2;
-      path.setAttribute("d", `M${sx},${sy} L${sx},${midY} L${tx},${midY} L${tx},${ty}`);
+      path.setAttribute("d", buildReversedElkPath(ee));
       path.dataset.source = edge.source;
       path.dataset.target = edge.target;
       path.dataset.kind = "parent_context";
@@ -166,6 +162,23 @@ function buildElkPath(elkEdge, layout) {
     parts.push(`L${e.x},${e.y}`);
   }
   return parts.join(" ");
+}
+
+function buildReversedElkPath(elkEdge) {
+  // Collect all points across all sections in forward order, then reverse.
+  // Used for parent_context edges: ELK routed parent→selected, we draw selected→parent.
+  const sections = elkEdge.sections || [];
+  if (!sections.length) return "";
+  const allPoints = [];
+  for (const sec of sections) {
+    const { startPoint: s, endPoint: e, bendPoints: bends = [] } = sec;
+    if (allPoints.length === 0) allPoints.push(s);
+    for (const b of bends) allPoints.push(b);
+    allPoints.push(e);
+  }
+  allPoints.reverse();
+  const [first, ...rest] = allPoints;
+  return `M${first.x},${first.y}` + rest.map((p) => ` L${p.x},${p.y}`).join("");
 }
 
 function makeArrowMarker(id, color) {

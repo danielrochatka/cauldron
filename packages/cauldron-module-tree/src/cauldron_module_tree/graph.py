@@ -434,18 +434,23 @@ class ModuleGraph:
         # requiresSlugs is included in used_by_set so cycle-priority nodes can
         # still bridge used-by edges from consumers that depend on them.
         used_by_set = {slug} | used_by_closure | requires_slugs
-        ub_edges = [
-            ModuleGraphEdge(
+        ub_seen: set[tuple[str, str]] = set()
+        ub_edges: list[ModuleGraphEdge] = []
+        for e in self._edges:
+            if e.source not in used_by_closure or e.target not in used_by_set:
+                continue
+            pair = (e.source, e.target)
+            if pair in ub_seen:
+                continue
+            ub_seen.add(pair)
+            ub_edges.append(ModuleGraphEdge(
                 source=e.source,
                 target=e.target,
                 kind="used_by",
                 capability=e.capability,
                 status=e.status,
-                relationship_kind=e.kind,  # preserve original edge kind
-            )
-            for e in self._edges
-            if e.source in used_by_closure and e.target in used_by_set
-        ]
+                relationship_kind=e.kind,
+            ))
 
         all_edges = tuple(req_edges) + tuple(ub_edges)
 

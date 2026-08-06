@@ -433,19 +433,26 @@ class ModuleGraph:
         # re-wrapped with kind="used_by" so callers can filter by kind.
         # requiresSlugs is included in used_by_set so cycle-priority nodes can
         # still bridge used-by edges from consumers that depend on them.
+        # Deduplicate by (source, target) pair to avoid parallel edges that
+        # ELK would route as separate orthogonal segments, producing a "ladder" artifact.
         used_by_set = {slug} | used_by_closure | requires_slugs
-        ub_edges = [
-            ModuleGraphEdge(
+        ub_seen: set[tuple[str, str]] = set()
+        ub_edges: list[ModuleGraphEdge] = []
+        for e in self._edges:
+            if e.source not in used_by_closure or e.target not in used_by_set:
+                continue
+            pair = (e.source, e.target)
+            if pair in ub_seen:
+                continue
+            ub_seen.add(pair)
+            ub_edges.append(ModuleGraphEdge(
                 source=e.source,
                 target=e.target,
                 kind="used_by",
                 capability=e.capability,
                 status=e.status,
                 relationship_kind=e.kind,  # preserve original edge kind
-            )
-            for e in self._edges
-            if e.source in used_by_closure and e.target in used_by_set
-        ]
+            ))
 
         all_edges = tuple(req_edges) + tuple(ub_edges)
 

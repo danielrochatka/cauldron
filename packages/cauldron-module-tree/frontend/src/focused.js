@@ -172,16 +172,27 @@ export function buildFocusedSubgraph(data, slug) {
   // requiresSlugs is included in usedBySet so that a node removed from
   // usedByClosure due to cycle priority can still serve as a bridge target
   // for consumers that depend on it (e.g. a→b, b→a, c→b focusing a: c→b preserved).
+  //
+  // Deduplicate by (source, target) pair: when a module has multiple edge kinds
+  // to the same dependency (required + optional, capability, etc.), all would
+  // reverse into parallel paths that ELK routes as separate orthogonal segments,
+  // producing the rectangular "ladder" visual artifact.  One edge per pair suffices.
   const usedBySet = new Set([slug, ...usedByClosure, ...requiresSlugs]);
-  const usedByEdges = data.edges
-    .filter((e) => usedByClosure.has(e.source) && usedBySet.has(e.target))
-    .map((e) => ({
+  const usedByEdgeSeen = new Set();
+  const usedByEdges = [];
+  for (const e of data.edges) {
+    if (!usedByClosure.has(e.source) || !usedBySet.has(e.target)) continue;
+    const key = `${e.target}\0${e.source}`;  // reversed pair key
+    if (usedByEdgeSeen.has(key)) continue;
+    usedByEdgeSeen.add(key);
+    usedByEdges.push({
       source: e.target,  // reversed: dependency becomes source
       target: e.source,  // reversed: consumer becomes target
       kind: "used_by",
       capability: e.capability,
       status: e.status,
-    }));
+    });
+  }
 
   // layoutEdges and displayEdges MUST share the same indices (critical for renderer
   // ELK geometry lookup via edge_${idx}).

@@ -412,3 +412,73 @@ describe("ResizeObserver / fit-mode", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 4. Initial fit timer cancellation (interaction before the 50 ms timer fires)
+// ---------------------------------------------------------------------------
+
+describe("initial fit timer cancellation", () => {
+  let canvas, container, result;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    document.body.innerHTML = "";
+
+    const n = makeNode();
+    const { root, app, graphData } = buildMinimalDom(n);
+    canvas = app.canvas;
+    canvas.style.width = "800px";
+    canvas.style.height = "600px";
+    container = root;
+    result = initInteraction(app, root, graphData, { canChange: false });
+    // The initial 50 ms fit timer is pending but has NOT yet fired.
+  });
+
+  afterEach(() => {
+    result.dispose();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  it("immediate wheel zoom cancels the initial fit", () => {
+    expect(vi.getTimerCount()).toBe(1); // initTimer pending
+
+    container.dispatchEvent(new WheelEvent("wheel", { deltaY: 10, bubbles: true }));
+
+    expect(vi.getTimerCount()).toBe(0); // leaveFitMode() cleared initTimer
+    vi.advanceTimersByTime(100);
+    // wheel set scale=0.9, pan unchanged; fitToView never ran
+    expect(canvas.style.transform).toBe("translate(0px,0px) scale(0.9)");
+  });
+
+  it("immediate pointer movement cancels the initial fit", () => {
+    expect(vi.getTimerCount()).toBe(1);
+
+    container.dispatchEvent(new MouseEvent("mousedown", { clientX: 0, clientY: 0, bubbles: true }));
+    window.dispatchEvent(new MouseEvent("mousemove", { clientX: 30, clientY: 0 }));
+
+    expect(vi.getTimerCount()).toBe(0); // leaveFitMode() cleared initTimer
+    vi.advanceTimersByTime(100);
+    // pan moved panX to 30, scale unchanged at 1; fitToView never ran
+    expect(canvas.style.transform).toBe("translate(30px,0px) scale(1)");
+  });
+
+  it("background mousedown without movement still allows the initial fit", () => {
+    container.dispatchEvent(new MouseEvent("mousedown", { clientX: 0, clientY: 0, bubbles: true }));
+    // No mousemove → leaveFitMode() not called → initTimer still pending.
+    expect(vi.getTimerCount()).toBe(1);
+
+    vi.advanceTimersByTime(50); // fire initTimer → fitToView runs
+    expect(canvas.style.transform).not.toBe(""); // fitToView set the transform
+  });
+
+  it("disposal before 50ms prevents the initial fit", () => {
+    expect(vi.getTimerCount()).toBe(1);
+
+    result.dispose(); // sets disposed=true, clears initTimer
+    expect(vi.getTimerCount()).toBe(0);
+
+    vi.advanceTimersByTime(100);
+    expect(canvas.style.transform).toBe(""); // fitToView never ran
+  });
+});

@@ -57,9 +57,12 @@ export function initInteraction(app, container, graphData, {
   // the container grows (e.g. window resize after browser zoom change).
   let isFitMode = true;
   let resizeTimer = null;
+  let initTimer = null;
 
   function leaveFitMode() {
     isFitMode = false;
+    clearTimeout(initTimer);
+    initTimer = null;
     clearTimeout(resizeTimer);
     resizeTimer = null;
   }
@@ -107,7 +110,10 @@ export function initInteraction(app, container, graphData, {
     panY = 20;
     applyTransform();
   }
-  const initTimer = setTimeout(fitToView, 50);
+  initTimer = setTimeout(() => {
+    initTimer = null;
+    if (!disposed && isFitMode) fitToView();
+  }, 50);
 
   // ResizeObserver: refit when the container grows (fluid layout, browser zoom).
   // Only refits if the user has not manually panned or zoomed since the last fit.
@@ -408,6 +414,7 @@ export function initInteraction(app, container, graphData, {
     dispose() {
       disposed = true;
       clearTimeout(initTimer);
+      initTimer = null;
       clearTimeout(resizeTimer);
       resizeTimer = null;
       ro.disconnect();

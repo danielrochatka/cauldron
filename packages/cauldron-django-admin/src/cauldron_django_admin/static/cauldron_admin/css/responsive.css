@@ -100,7 +100,7 @@
 
   /* Dashboard: 1–2 columns depending on available width */
   .cui-dashboard-grid {
-    grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
   }
 
   /* Page header can share a row when space permits */
@@ -141,7 +141,7 @@
 
   /* Up to four columns on the dashboard at 1024px+ */
   .cui-dashboard-grid {
-    grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
   }
 }
 

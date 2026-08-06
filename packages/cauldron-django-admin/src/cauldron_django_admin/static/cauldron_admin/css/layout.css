@@ -98,11 +98,11 @@
 }
 
 /* ── Dashboard grid ──────────────────────────────────────────────────────── */
-/* min() prevents overflow on narrow viewports; auto-fill allows 4+ columns
-   at 1920px+ where the fluid main region is ~1640px wide. */
+/* auto-fit collapses empty tracks so cards fill available row space; min()
+   prevents overflow at narrow viewports. Four+ columns appear at 1920px+. */
 .cui-dashboard-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
   gap: var(--cui-space-6);
 }
 

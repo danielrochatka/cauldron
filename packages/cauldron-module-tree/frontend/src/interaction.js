@@ -56,11 +56,17 @@ export function initInteraction(app, container, graphData, {
   // pan/zoom since last fitToView call). ResizeObserver uses this to refit when
   // the container grows (e.g. window resize after browser zoom change).
   let isFitMode = true;
+  let resizeTimer = null;
+
+  function leaveFitMode() {
+    isFitMode = false;
+    clearTimeout(resizeTimer);
+    resizeTimer = null;
+  }
 
   let isPanning = false, panStart = null, panOrigin = null;
   container.addEventListener("mousedown", (e) => {
     if (e.target.closest(".module-node")) return;
-    isFitMode = false;
     isPanning = true;
     panStart = { x: e.clientX, y: e.clientY };
     panOrigin = { x: panX, y: panY };
@@ -68,6 +74,7 @@ export function initInteraction(app, container, graphData, {
   }, { signal });
   window.addEventListener("mousemove", (e) => {
     if (!isPanning) return;
+    leaveFitMode();
     panX = panOrigin.x + e.clientX - panStart.x;
     panY = panOrigin.y + e.clientY - panStart.y;
     applyTransform();
@@ -78,7 +85,7 @@ export function initInteraction(app, container, graphData, {
   }, { signal });
   container.addEventListener("wheel", (e) => {
     e.preventDefault();
-    isFitMode = false;
+    leaveFitMode();
     const factor = e.deltaY < 0 ? 1.1 : 0.9;
     scale = Math.max(0.2, Math.min(3, scale * factor));
     applyTransform();
@@ -100,15 +107,18 @@ export function initInteraction(app, container, graphData, {
     panY = 20;
     applyTransform();
   }
-  setTimeout(fitToView, 50);
+  const initTimer = setTimeout(fitToView, 50);
 
   // ResizeObserver: refit when the container grows (fluid layout, browser zoom).
   // Only refits if the user has not manually panned or zoomed since the last fit.
-  let _roTimer = null;
+  let disposed = false;
   const ro = new ResizeObserver(() => {
-    if (!isFitMode) return;
-    clearTimeout(_roTimer);
-    _roTimer = setTimeout(fitToView, 60);
+    if (disposed || !isFitMode) return;
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      resizeTimer = null;
+      if (isFitMode) fitToView();
+    }, 60);
   });
   ro.observe(container);
 
@@ -396,7 +406,10 @@ export function initInteraction(app, container, graphData, {
 
   return {
     dispose() {
-      clearTimeout(_roTimer);
+      disposed = true;
+      clearTimeout(initTimer);
+      clearTimeout(resizeTimer);
+      resizeTimer = null;
       ro.disconnect();
       hideDetailPanel();
       document.getElementById("confirm-modal")?.classList.remove("is-open");

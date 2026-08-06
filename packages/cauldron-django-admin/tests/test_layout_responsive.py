@@ -248,12 +248,12 @@ def test_field_full_modifier():
 # §8 — Dashboard grid                                                          #
 # --------------------------------------------------------------------------- #
 
-def test_dashboard_grid_uses_auto_fill():
-    """.cui-dashboard-grid must use auto-fill for responsive column count."""
+def test_dashboard_grid_uses_auto_fit():
+    """.cui-dashboard-grid must use auto-fit so empty tracks collapse."""
     css = _css("layout.css")
     grid = re.search(r'\.cui-dashboard-grid\s*\{([^}]+)\}', css, re.DOTALL)
     assert grid, ".cui-dashboard-grid not found"
-    assert "auto-fill" in grid.group(1)
+    assert "auto-fit" in grid.group(1)
 
 
 def test_dashboard_grid_uses_min_function():

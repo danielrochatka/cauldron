@@ -5,7 +5,7 @@
  *   1. Pure HTML builders from state.js  (no DOM needed)
  *   2. DOM behaviour via initInteraction  (jsdom environment)
  */
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { buildActionHtml, buildStateRows, pendingWarning } from "./state.js";
 import { initInteraction } from "./interaction.js";
 
@@ -271,5 +271,214 @@ describe("detail panel DOM behaviour", () => {
     const btn = panel.querySelector("button[data-action='disable']");
     expect(btn).not.toBeNull();
     expect(btn.textContent.trim()).toBe("Disable");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3. ResizeObserver / fit-mode interaction
+// ---------------------------------------------------------------------------
+
+describe("ResizeObserver / fit-mode", () => {
+  let canvas, container, result, fitTransform;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    document.body.innerHTML = "";
+
+    const n = makeNode();
+    const { root, app, graphData } = buildMinimalDom(n);
+    canvas = app.canvas;
+    canvas.style.width = "800px";
+    canvas.style.height = "600px";
+    container = root;
+    result = initInteraction(app, root, graphData, { canChange: false });
+
+    // Fire the initial 50ms fit timer; capture the transform fitToView produces
+    // in jsdom (getBoundingClientRect returns zeros → deterministic value).
+    vi.advanceTimersByTime(50);
+    fitTransform = canvas.style.transform;
+  });
+
+  afterEach(() => {
+    result.dispose();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  it("resize while in fit mode schedules a refit and executes it", () => {
+    // Mark the transform so we can detect fitToView running.
+    canvas.style.transform = "translate(100px,50px) scale(0.5)";
+
+    global.__lastRO.trigger();
+    expect(vi.getTimerCount()).toBe(1); // debounce timer queued
+
+    vi.advanceTimersByTime(60);
+    expect(canvas.style.transform).toBe(fitTransform); // fitToView ran
+  });
+
+  it("repeated resize notifications debounce into one refit", () => {
+    global.__lastRO.trigger(); // t=0: queue timer
+    vi.advanceTimersByTime(20);
+    global.__lastRO.trigger(); // t=20: cancel + requeue
+    vi.advanceTimersByTime(20);
+    global.__lastRO.trigger(); // t=40: cancel + requeue
+
+    expect(vi.getTimerCount()).toBe(1); // still just one pending timer
+
+    vi.advanceTimersByTime(60); // fire the debounced timer
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("wheel zoom immediately cancels the queued refit", () => {
+    global.__lastRO.trigger(); // queue refit
+    expect(vi.getTimerCount()).toBe(1);
+
+    container.dispatchEvent(new WheelEvent("wheel", { deltaY: 10, bubbles: true }));
+    expect(vi.getTimerCount()).toBe(0); // leaveFitMode() cleared it
+
+    // The wheel transform is not the fit value; fitToView must not have run.
+    vi.advanceTimersByTime(60);
+    expect(canvas.style.transform).not.toBe(fitTransform);
+  });
+
+  it("actual pointer movement cancels the queued refit", () => {
+    global.__lastRO.trigger(); // queue refit
+    expect(vi.getTimerCount()).toBe(1);
+
+    container.dispatchEvent(new MouseEvent("mousedown", { clientX: 0, clientY: 0, bubbles: true }));
+    window.dispatchEvent(new MouseEvent("mousemove", { clientX: 30, clientY: 0 }));
+    expect(vi.getTimerCount()).toBe(0); // leaveFitMode() cleared it
+
+    vi.advanceTimersByTime(60);
+    expect(canvas.style.transform).not.toBe(fitTransform);
+  });
+
+  it("background mousedown without movement preserves fit mode", () => {
+    canvas.style.transform = "translate(100px,50px) scale(0.5)";
+
+    // Mousedown on container background (not a module node).
+    container.dispatchEvent(new MouseEvent("mousedown", { clientX: 0, clientY: 0, bubbles: true }));
+    // No mousemove → leaveFitMode() never called → isFitMode still true.
+
+    global.__lastRO.trigger();
+    expect(vi.getTimerCount()).toBe(1);
+
+    vi.advanceTimersByTime(60);
+    expect(canvas.style.transform).toBe(fitTransform); // fitToView ran
+  });
+
+  it("fitToView restores fit mode and enables future refits", () => {
+    // Leave fit mode via pan.
+    container.dispatchEvent(new MouseEvent("mousedown", { clientX: 0, clientY: 0, bubbles: true }));
+    window.dispatchEvent(new MouseEvent("mousemove", { clientX: 20, clientY: 0 }));
+    window.dispatchEvent(new MouseEvent("mouseup", {}));
+
+    // Resize must not schedule a refit (not in fit mode).
+    global.__lastRO.trigger();
+    expect(vi.getTimerCount()).toBe(0);
+
+    // Re-enter fit mode.
+    result.fitToView();
+
+    // Now resize must schedule a refit.
+    global.__lastRO.trigger();
+    expect(vi.getTimerCount()).toBe(1);
+    vi.advanceTimersByTime(60);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("dispose cancels any pending refit timer", () => {
+    global.__lastRO.trigger(); // queue refit
+    expect(vi.getTimerCount()).toBe(1);
+
+    result.dispose();
+    expect(vi.getTimerCount()).toBe(0); // cleared synchronously
+
+    vi.advanceTimersByTime(60); // nothing fires — no error
+  });
+
+  it("dispose disconnects the ResizeObserver", () => {
+    expect(global.__lastRO.disconnected).toBe(false);
+    result.dispose();
+    expect(global.__lastRO.disconnected).toBe(true);
+  });
+
+  it("observer callback after disposal has no effect", () => {
+    result.dispose(); // sets disposed = true and disconnects
+
+    // trigger() bypasses disconnected to simulate a queued-before-disconnect
+    // race; the production disposed flag must prevent any scheduling.
+    global.__lastRO.trigger();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4. Initial fit timer cancellation (interaction before the 50 ms timer fires)
+// ---------------------------------------------------------------------------
+
+describe("initial fit timer cancellation", () => {
+  let canvas, container, result;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    document.body.innerHTML = "";
+
+    const n = makeNode();
+    const { root, app, graphData } = buildMinimalDom(n);
+    canvas = app.canvas;
+    canvas.style.width = "800px";
+    canvas.style.height = "600px";
+    container = root;
+    result = initInteraction(app, root, graphData, { canChange: false });
+    // The initial 50 ms fit timer is pending but has NOT yet fired.
+  });
+
+  afterEach(() => {
+    result.dispose();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  it("immediate wheel zoom cancels the initial fit", () => {
+    expect(vi.getTimerCount()).toBe(1); // initTimer pending
+
+    container.dispatchEvent(new WheelEvent("wheel", { deltaY: 10, bubbles: true }));
+
+    expect(vi.getTimerCount()).toBe(0); // leaveFitMode() cleared initTimer
+    vi.advanceTimersByTime(100);
+    // wheel set scale=0.9, pan unchanged; fitToView never ran
+    expect(canvas.style.transform).toBe("translate(0px,0px) scale(0.9)");
+  });
+
+  it("immediate pointer movement cancels the initial fit", () => {
+    expect(vi.getTimerCount()).toBe(1);
+
+    container.dispatchEvent(new MouseEvent("mousedown", { clientX: 0, clientY: 0, bubbles: true }));
+    window.dispatchEvent(new MouseEvent("mousemove", { clientX: 30, clientY: 0 }));
+
+    expect(vi.getTimerCount()).toBe(0); // leaveFitMode() cleared initTimer
+    vi.advanceTimersByTime(100);
+    // pan moved panX to 30, scale unchanged at 1; fitToView never ran
+    expect(canvas.style.transform).toBe("translate(30px,0px) scale(1)");
+  });
+
+  it("background mousedown without movement still allows the initial fit", () => {
+    container.dispatchEvent(new MouseEvent("mousedown", { clientX: 0, clientY: 0, bubbles: true }));
+    // No mousemove → leaveFitMode() not called → initTimer still pending.
+    expect(vi.getTimerCount()).toBe(1);
+
+    vi.advanceTimersByTime(50); // fire initTimer → fitToView runs
+    expect(canvas.style.transform).not.toBe(""); // fitToView set the transform
+  });
+
+  it("disposal before 50ms prevents the initial fit", () => {
+    expect(vi.getTimerCount()).toBe(1);
+
+    result.dispose(); // sets disposed=true, clears initTimer
+    expect(vi.getTimerCount()).toBe(0);
+
+    vi.advanceTimersByTime(100);
+    expect(canvas.style.transform).toBe(""); // fitToView never ran
   });
 });

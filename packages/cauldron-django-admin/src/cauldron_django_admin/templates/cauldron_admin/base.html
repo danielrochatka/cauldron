@@ -39,7 +39,7 @@
             </div>
             <div class="cui-page-actions">{% block page_actions %}{% endblock %}</div>
           </div>
-          <div class="cui-content">{% block content %}{% endblock %}</div>
+          <div class="cui-content {% block content_width_class %}{% endblock %}">{% block content %}{% endblock %}</div>
         </div>
       </main>
     </div>

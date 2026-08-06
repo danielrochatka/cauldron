@@ -52,6 +52,21 @@ export function initInteraction(app, container, graphData, {
   }
 
   // Pan & zoom
+  // isFitMode: true while the viewport is in the "fit to view" state (no manual
+  // pan/zoom since last fitToView call). ResizeObserver uses this to refit when
+  // the container grows (e.g. window resize after browser zoom change).
+  let isFitMode = true;
+  let resizeTimer = null;
+  let initTimer = null;
+
+  function leaveFitMode() {
+    isFitMode = false;
+    clearTimeout(initTimer);
+    initTimer = null;
+    clearTimeout(resizeTimer);
+    resizeTimer = null;
+  }
+
   let isPanning = false, panStart = null, panOrigin = null;
   container.addEventListener("mousedown", (e) => {
     if (e.target.closest(".module-node")) return;
@@ -62,6 +77,7 @@ export function initInteraction(app, container, graphData, {
   }, { signal });
   window.addEventListener("mousemove", (e) => {
     if (!isPanning) return;
+    leaveFitMode();
     panX = panOrigin.x + e.clientX - panStart.x;
     panY = panOrigin.y + e.clientY - panStart.y;
     applyTransform();
@@ -72,6 +88,7 @@ export function initInteraction(app, container, graphData, {
   }, { signal });
   container.addEventListener("wheel", (e) => {
     e.preventDefault();
+    leaveFitMode();
     const factor = e.deltaY < 0 ? 1.1 : 0.9;
     scale = Math.max(0.2, Math.min(3, scale * factor));
     applyTransform();
@@ -84,6 +101,7 @@ export function initInteraction(app, container, graphData, {
   // Fit to view
   document.getElementById("btn-fit")?.addEventListener("click", fitToView, { signal });
   function fitToView() {
+    isFitMode = true;
     const cr = container.getBoundingClientRect();
     const cw = parseFloat(canvas.style.width) || 800;
     const ch = parseFloat(canvas.style.height) || 600;
@@ -92,7 +110,23 @@ export function initInteraction(app, container, graphData, {
     panY = 20;
     applyTransform();
   }
-  setTimeout(fitToView, 50);
+  initTimer = setTimeout(() => {
+    initTimer = null;
+    if (!disposed && isFitMode) fitToView();
+  }, 50);
+
+  // ResizeObserver: refit when the container grows (fluid layout, browser zoom).
+  // Only refits if the user has not manually panned or zoomed since the last fit.
+  let disposed = false;
+  const ro = new ResizeObserver(() => {
+    if (disposed || !isFitMode) return;
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      resizeTimer = null;
+      if (isFitMode) fitToView();
+    }, 60);
+  });
+  ro.observe(container);
 
   // Reset view
   document.getElementById("btn-reset-layout")?.addEventListener("click", () => {
@@ -378,6 +412,12 @@ export function initInteraction(app, container, graphData, {
 
   return {
     dispose() {
+      disposed = true;
+      clearTimeout(initTimer);
+      initTimer = null;
+      clearTimeout(resizeTimer);
+      resizeTimer = null;
+      ro.disconnect();
       hideDetailPanel();
       document.getElementById("confirm-modal")?.classList.remove("is-open");
       ac.abort();

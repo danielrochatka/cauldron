@@ -29,16 +29,48 @@
   overflow-y: auto;
   padding: var(--cui-space-4) 0;
 }
+
+/* ── Main content area: fluid, no fixed ceiling ──────────────────────────── */
 .cui-main {
   flex: 1;
   min-width: 0;
-  overflow-x: hidden;
+  /* Oversized children are reachable via local container scrolling rather
+     than being clipped at the page level. */
 }
 .cui-main__inner {
-  max-width: var(--cui-content-max-width);
-  margin: 0 auto;
-  padding: var(--cui-space-6) var(--cui-space-4);
+  width: 100%;
+  max-width: none;
+  min-width: 0;
+  margin: 0;
+  padding: var(--cui-space-6) var(--cui-content-gutter);
+  box-sizing: border-box;
 }
+.cui-content {
+  width: 100%;
+  min-width: 0;
+}
+
+/* ── Width-mode modifiers ────────────────────────────────────────────────── */
+/* Apply to .cui-content or to any inner layout container. */
+
+/* fluid (default): uses all available main width */
+.cui-content--fluid {
+  max-width: none;
+}
+
+/* readable: comfortable reading width, centered */
+.cui-content--readable {
+  max-width: var(--cui-readable-width);
+  margin-inline: auto;
+}
+
+/* narrow: tight single-column forms / wizards */
+.cui-content--narrow {
+  max-width: var(--cui-narrow-width);
+  margin-inline: auto;
+}
+
+/* ── Page header ─────────────────────────────────────────────────────────── */
 .cui-page-header {
   display: flex;
   align-items: flex-start;
@@ -54,7 +86,8 @@
   margin: 0;
 }
 .cui-page-actions { display: flex; gap: var(--cui-space-2); flex-wrap: wrap; }
-.cui-content { }
+
+/* ── Footer ──────────────────────────────────────────────────────────────── */
 .cui-footer {
   padding: var(--cui-space-4);
   text-align: center;
@@ -63,8 +96,22 @@
   color: var(--cui-color-text-muted);
   background: var(--cui-color-surface);
 }
+
+/* ── Dashboard grid ──────────────────────────────────────────────────────── */
+/* auto-fit collapses empty tracks so cards fill available row space; min()
+   prevents overflow at narrow viewports. Four+ columns appear at 1920px+. */
 .cui-dashboard-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
   gap: var(--cui-space-6);
 }
+
+/* ── Form layout helpers ─────────────────────────────────────────────────── */
+/* Constrain form internals without restricting the page shell. */
+.cui-form-layout--readable { max-width: var(--cui-readable-width); }
+.cui-form-layout--wide     { max-width: none; }
+
+/* ── Field width modifiers ───────────────────────────────────────────────── */
+.cui-field--short  { max-width: 16rem; }
+.cui-field--medium { max-width: 30rem; }
+.cui-field--full   { max-width: none; width: 100%; }

@@ -10,6 +10,7 @@ import { buildStateRows, buildActionHtml, pendingWarning, escHtml, escapeAttr } 
 
 /**
  * focusedSlug   – present when already in focused mode (the selected root slug)
+ * focusedMeta   – metadata from buildFocusedSubgraph (requiresList, usedByList, counts)
  * fullGraphData – the original full-graph data (used for re-focus on node click)
  * onEnterFocus  – async callback(slug) to enter focused mode
  * onExitFocus   – async callback() to exit back to full graph
@@ -17,6 +18,7 @@ import { buildStateRows, buildActionHtml, pendingWarning, escHtml, escapeAttr } 
 export function initInteraction(app, container, graphData, {
   canChange,
   focusedSlug = null,
+  focusedMeta = null,
   fullGraphData = null,
   onEnterFocus = null,
   onExitFocus = null,
@@ -299,6 +301,32 @@ export function initInteraction(app, container, graphData, {
     if (!panel) return;
     panel.removeAttribute("aria-hidden");
     panel.classList.add("is-open");
+
+    // In focused mode for the selected root, show requires/used-by chip lists.
+    // In full-graph mode, show ancestor/descendant counts.
+    let relationshipHtml;
+    if (focusedSlug && slug === focusedSlug && focusedMeta) {
+      const reqChips = focusedMeta.requiresList.length
+        ? focusedMeta.requiresList.map(({ slug: s, name }) =>
+            `<button class="detail-chip" data-slug="${escapeAttr(s)}" type="button">${escHtml(name)}</button>`
+          ).join("")
+        : "<span class=\"detail-chip-empty\">None</span>";
+      const ubChips = focusedMeta.usedByList.length
+        ? focusedMeta.usedByList.map(({ slug: s, name }) =>
+            `<button class="detail-chip" data-slug="${escapeAttr(s)}" type="button">${escHtml(name)}</button>`
+          ).join("")
+        : "<span class=\"detail-chip-empty\">None</span>";
+      relationshipHtml = `
+        <dt>Requires (${focusedMeta.requiresCount})</dt>
+        <dd><div class="detail-chip-list">${reqChips}</div></dd>
+        <dt>Used by (${focusedMeta.usedByCount})</dt>
+        <dd><div class="detail-chip-list">${ubChips}</div></dd>`;
+    } else {
+      relationshipHtml = `
+        <dt>Ancestors</dt><dd>${anc.size} direct / transitive</dd>
+        <dt>Descendants</dt><dd>${desc.size} direct / transitive</dd>`;
+    }
+
     panel.innerHTML = `
       <div class="detail-header">
         <div class="detail-icon">${n.icon_svg || ""}</div>
@@ -317,13 +345,16 @@ export function initInteraction(app, container, graphData, {
           <dt>Version</dt><dd>${escHtml(n.version || "—")}</dd>
           <dt>Group</dt><dd>${escHtml(n.group || "—")}</dd>
           <dt>Source</dt><dd>${escHtml(n.source || "—")}</dd>
-          <dt>Ancestors</dt><dd>${anc.size} direct / transitive</dd>
-          <dt>Descendants</dt><dd>${desc.size} direct / transitive</dd>
+          ${relationshipHtml}
         </dl>
         ${n.errors?.length ? `<div class="detail-errors"><strong>Errors:</strong><ul>${n.errors.map((e) => `<li>${escHtml(e.message || JSON.stringify(e))}</li>`).join("")}</ul></div>` : ""}
         ${canChange ? renderActions(n) : ""}
       </div>`;
     document.getElementById("detail-close-btn")?.addEventListener("click", hideDetailPanel);
+    // Wire chip clicks to re-focus on that module
+    panel.querySelectorAll(".detail-chip[data-slug]").forEach((btn) => {
+      btn.addEventListener("click", () => onEnterFocus?.(btn.dataset.slug));
+    });
   }
 
   function renderActions(n) {

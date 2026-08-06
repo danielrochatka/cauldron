@@ -184,10 +184,11 @@ async function renderFocused(root, graphData, slug, canChange, layoutCache, grap
   });
 
   // Re-init interaction with the focused graph and pass controller callbacks
-  // so clicking any node (dep or parent) re-focuses around it.
+  // so clicking any node (requires or used-by) re-focuses around it.
   interactionRef.current = initInteraction(app, root, focusedGraphData, {
     canChange,
     focusedSlug: slug,
+    focusedMeta: focused.metadata,
     fullGraphData: graphData,
     onEnterFocus: controller?.enterFocus.bind(controller),
     onExitFocus: controller?.exitFocus.bind(controller),
@@ -285,9 +286,8 @@ function updateFocusedToolbar(meta) {
   if (stats) {
     stats.innerHTML = `
       <span class="focused-stat"><strong>${escapeHtml(meta.selected)}</strong></span>
-      <span class="focused-stat">${meta.dependencyCount} dep${meta.dependencyCount !== 1 ? "s" : ""}</span>
-      <span class="focused-stat">${meta.parentCount} parent${meta.parentCount !== 1 ? "s" : ""}</span>
-      <span class="focused-stat">depth ${meta.maxDepth}</span>
+      <span class="focused-stat">${meta.requiresCount} requires</span>
+      <span class="focused-stat">${meta.usedByCount} used by</span>
     `;
   }
   document.getElementById("tree-toolbar")?.style?.setProperty("display", "none");

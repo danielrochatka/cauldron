@@ -1,4 +1,9 @@
-"""Tests for ModuleGraph.focused_subgraph and FocusedModuleGraph."""
+"""Tests for ModuleGraph.focused_subgraph and FocusedModuleGraph.
+
+New model (requires/used-by):
+  - requires  : direct requirements of selected (ONE HOP forward only)
+  - used_by   : full transitive reverse closure (all modules that depend on selected)
+"""
 import pytest
 from unittest.mock import MagicMock
 
@@ -66,18 +71,18 @@ def test_selected_node_included():
 
 
 # --------------------------------------------------------------------------- #
-# Transitive dependencies included                                             #
+# Requires: direct (one hop) only                                              #
 # --------------------------------------------------------------------------- #
 
-def test_direct_dependency_included():
+def test_direct_requirement_included():
     g = _build([_entry("a", requires=("b",)), _entry("b")])
     f = g.focused_subgraph("a")
     assert "b" in f.nodes
-    assert f.roles["b"] == "dependency"
+    assert f.roles["b"] == "requires"
 
 
-def test_transitive_dependency_included():
-    # a → b → c
+def test_transitive_requirement_excluded():
+    # a → b → c; only b is direct requires, c is absent
     g = _build([
         _entry("a", requires=("b",)),
         _entry("b", requires=("c",)),
@@ -85,22 +90,8 @@ def test_transitive_dependency_included():
     ])
     f = g.focused_subgraph("a")
     assert "b" in f.nodes
-    assert "c" in f.nodes
-    assert f.roles["b"] == "dependency"
-    assert f.roles["c"] == "dependency"
-
-
-def test_shared_dependency_appears_once():
-    # a → b → d, a → c → d
-    g = _build([
-        _entry("a", requires=("b", "c")),
-        _entry("b", requires=("d",)),
-        _entry("c", requires=("d",)),
-        _entry("d"),
-    ])
-    f = g.focused_subgraph("a")
-    assert list(f.nodes.keys()).count("d") == 1
-    assert f.roles["d"] == "dependency"
+    assert f.roles["b"] == "requires"
+    assert "c" not in f.nodes
 
 
 def test_unrelated_sibling_excluded():
@@ -110,12 +101,23 @@ def test_unrelated_sibling_excluded():
     assert "c" not in f.nodes
 
 
+def test_multiple_direct_requirements_included():
+    g = _build([
+        _entry("sel", requires=("r1", "r2")),
+        _entry("r1"),
+        _entry("r2"),
+    ])
+    f = g.focused_subgraph("sel")
+    assert f.roles["r1"] == "requires"
+    assert f.roles["r2"] == "requires"
+
+
 # --------------------------------------------------------------------------- #
-# Parent context                                                               #
+# Used-by: full transitive reverse closure                                     #
 # --------------------------------------------------------------------------- #
 
-def test_direct_parent_included_as_context():
-    # parent → selected → dep
+def test_direct_consumer_included_as_used_by():
+    # parent → sel → dep
     g = _build([
         _entry("parent", requires=("sel",)),
         _entry("sel", requires=("dep",)),
@@ -123,22 +125,25 @@ def test_direct_parent_included_as_context():
     ])
     f = g.focused_subgraph("sel")
     assert "parent" in f.nodes
-    assert f.roles["parent"] == "parent_context"
+    assert f.roles["parent"] == "used_by"
 
 
-def test_parent_of_parent_excluded():
-    # grandparent → parent → sel
+def test_grandparent_included_as_used_by():
+    # grandparent → parent → sel (transitive consumer — now INCLUDED)
     g = _build([
         _entry("grandparent", requires=("parent",)),
         _entry("parent", requires=("sel",)),
         _entry("sel"),
     ])
     f = g.focused_subgraph("sel")
-    assert "grandparent" not in f.nodes
+    assert "grandparent" in f.nodes
+    assert f.roles["grandparent"] == "used_by"
+    assert "parent" in f.nodes
+    assert f.roles["parent"] == "used_by"
 
 
-def test_parent_unrelated_dep_excluded():
-    # parent → sel; parent → unrelated
+def test_consumer_unrelated_dep_excluded():
+    # parent → sel; parent → unrelated (unrelated is NOT in used-by closure)
     g = _build([
         _entry("parent", requires=("sel", "unrelated")),
         _entry("sel"),
@@ -148,102 +153,71 @@ def test_parent_unrelated_dep_excluded():
     assert "unrelated" not in f.nodes
 
 
-def test_include_direct_parents_false_excludes_parents():
+def test_include_used_by_false_excludes_consumers():
     g = _build([
         _entry("parent", requires=("sel",)),
         _entry("sel"),
     ])
-    f = g.focused_subgraph("sel", include_direct_parents=False)
+    f = g.focused_subgraph("sel", include_used_by=False)
     assert "parent" not in f.nodes
 
 
-# --------------------------------------------------------------------------- #
-# Parent-context edges                                                         #
-# --------------------------------------------------------------------------- #
-
-def test_parent_context_edges_generated():
-    g = _build([
-        _entry("parent", requires=("sel",)),
-        _entry("sel"),
-    ])
-    f = g.focused_subgraph("sel")
-    pc_edges = [e for e in f.edges if e.kind == "parent_context"]
-    assert len(pc_edges) == 1
-    edge = pc_edges[0]
-    assert edge.source == "sel"
-    assert edge.target == "parent"
-    assert edge.status == "resolved"
-
-
-def test_parent_context_edges_serialized_with_direction_label():
-    g = _build([
-        _entry("parent", requires=("sel",)),
-        _entry("sel"),
-    ])
-    d = g.focused_subgraph("sel").to_api_dict()
-    pc_edges = [e for e in d["edges"] if e["kind"] == "parent_context"]
-    assert len(pc_edges) == 1
-    assert pc_edges[0]["direction_label"] == "used by"
-
-
-def test_optional_parent_included_as_context():
-    # parent has an optional dependency on sel — still counts as a parent context
+def test_optional_consumer_included_as_used_by():
+    # parent has an optional dependency on sel — still counts as a used-by consumer
     g = _build([
         _entry("parent", optional=("sel",)),
         _entry("sel"),
     ])
     f = g.focused_subgraph("sel")
     assert "parent" in f.nodes
-    assert f.roles["parent"] == "parent_context"
+    assert f.roles["parent"] == "used_by"
 
 
-def test_parent_context_edge_carries_relationship_kind():
+# --------------------------------------------------------------------------- #
+# Requires edges                                                               #
+# --------------------------------------------------------------------------- #
+
+def test_requires_edges_generated():
     g = _build([
-        _entry("req.parent", requires=("sel",)),
-        _entry("opt.parent", optional=("sel",)),
+        _entry("sel", requires=("req",)),
+        _entry("req"),
+    ])
+    f = g.focused_subgraph("sel")
+    req_edges = [e for e in f.edges if e.kind == "requires"]
+    assert len(req_edges) == 1
+    edge = req_edges[0]
+    assert edge.source == "sel"
+    assert edge.target == "req"
+    assert edge.status == "resolved"
+
+
+def test_requires_edge_carries_relationship_kind():
+    g = _build([
+        _entry("sel", requires=("req.parent",)),
+        _entry("sel2", optional=("opt.req",)),
+        _entry("req.parent"),
+        _entry("opt.req"),
+    ])
+    f_req = g.focused_subgraph("sel")
+    req_edges = {e.target: e for e in f_req.edges if e.kind == "requires"}
+    assert req_edges["req.parent"].relationship_kind == "required"
+
+    f_opt = g.focused_subgraph("sel2")
+    opt_edges = {e.target: e for e in f_opt.edges if e.kind == "requires"}
+    assert opt_edges["opt.req"].relationship_kind == "optional"
+
+
+def test_used_by_edges_preserved():
+    # parent → sel; the original edge (parent → sel) should appear as used_by
+    g = _build([
+        _entry("parent", requires=("sel",)),
         _entry("sel"),
     ])
     f = g.focused_subgraph("sel")
-    pc_edges = {e.target: e for e in f.edges if e.kind == "parent_context"}
-    assert pc_edges["req.parent"].relationship_kind == "required"
-    assert pc_edges["opt.parent"].relationship_kind == "optional"
-
-
-def test_parent_context_relationship_kind_in_serialization():
-    g = _build([
-        _entry("req.parent", requires=("sel",)),
-        _entry("sel"),
-    ])
-    d = g.focused_subgraph("sel").to_api_dict()
-    pc_edges = [e for e in d["edges"] if e["kind"] == "parent_context"]
-    assert len(pc_edges) == 1
-    assert pc_edges[0]["relationship_kind"] == "required"
-
-
-def test_metadata_includes_missing_count():
-    g = _build([_entry("a", requires=("x", "y"))])
-    d = g.focused_subgraph("a").to_api_dict()
-    assert d["metadata"]["missing_count"] == 2
-
-
-# --------------------------------------------------------------------------- #
-# Dependency edges preserved                                                   #
-# --------------------------------------------------------------------------- #
-
-def test_dependency_edges_preserved():
-    g = _build([
-        _entry("a", requires=("b",)),
-        _entry("b", requires=("c",)),
-        _entry("c"),
-    ])
-    f = g.focused_subgraph("a")
-    dep_edges = [e for e in f.edges if e.kind != "parent_context"]
-    sources = {e.source for e in dep_edges}
-    targets = {e.target for e in dep_edges}
-    assert "a" in sources
-    assert "b" in sources
-    assert "b" in targets
-    assert "c" in targets
+    ub_edges = [e for e in f.edges if e.kind == "used_by"]
+    assert len(ub_edges) >= 1
+    # Original direction: source=parent, target=sel
+    assert any(e.source == "parent" and e.target == "sel" for e in ub_edges)
 
 
 # --------------------------------------------------------------------------- #
@@ -262,7 +236,7 @@ def test_cycles_terminate_safely():
 
 
 # --------------------------------------------------------------------------- #
-# Missing targets                                                              #
+# Missing targets (direct requirement to unregistered slug)                   #
 # --------------------------------------------------------------------------- #
 
 def test_missing_target_does_not_raise():
@@ -273,6 +247,12 @@ def test_missing_target_does_not_raise():
     # x is unregistered — tracked as a missing terminal, not in nodes
     assert "x" not in f.nodes
     assert "x" in f.missing_targets
+
+
+def test_metadata_includes_missing_count():
+    g = _build([_entry("a", requires=("x", "y"))])
+    d = g.focused_subgraph("a").to_api_dict()
+    assert d["metadata"]["missing_count"] == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -288,8 +268,8 @@ def test_focus_roles_in_serialized_nodes():
     d = g.focused_subgraph("sel").to_api_dict()
     role_map = {n["slug"]: n["focus_role"] for n in d["nodes"]}
     assert role_map["sel"] == "selected"
-    assert role_map["dep"] == "dependency"
-    assert role_map["parent"] == "parent_context"
+    assert role_map["dep"] == "requires"
+    assert role_map["parent"] == "used_by"
 
 
 # --------------------------------------------------------------------------- #
@@ -307,31 +287,32 @@ def test_metadata_counts():
     d = g.focused_subgraph("sel").to_api_dict()
     meta = d["metadata"]
     assert meta["selected_slug"] == "sel"
-    assert meta["dependency_count"] == 2
-    assert meta["parent_count"] == 2
-    assert meta["max_depth"] >= 1
+    assert meta["requires_count"] == 2
+    assert meta["used_by_count"] == 2
 
 
-def test_max_depth_chain():
-    # sel → d1 → d2 → d3
+def test_metadata_lists_content():
     g = _build([
-        _entry("sel", requires=("d1",)),
-        _entry("d1", requires=("d2",)),
-        _entry("d2", requires=("d3",)),
-        _entry("d3"),
+        _entry("consumer", requires=("sel",)),
+        _entry("sel", requires=("dep",)),
+        _entry("dep"),
     ])
     d = g.focused_subgraph("sel").to_api_dict()
-    assert d["metadata"]["max_depth"] == 3
+    meta = d["metadata"]
+    req_slugs = [item["slug"] for item in meta["requires_list"]]
+    ub_slugs = [item["slug"] for item in meta["used_by_list"]]
+    assert "dep" in req_slugs
+    assert "consumer" in ub_slugs
 
 
-def test_leaf_module_no_deps_no_parents():
+def test_leaf_module_no_deps_no_consumers():
     g = _build([_entry("leaf"), _entry("other")])
     f = g.focused_subgraph("leaf")
     assert list(f.nodes.keys()) == ["leaf"]
     assert f.roles == {"leaf": "selected"}
     d = f.to_api_dict()
-    assert d["metadata"]["dependency_count"] == 0
-    assert d["metadata"]["parent_count"] == 0
+    assert d["metadata"]["requires_count"] == 0
+    assert d["metadata"]["used_by_count"] == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -370,11 +351,14 @@ def test_focused_serialization_is_deterministic():
 
 
 # --------------------------------------------------------------------------- #
-# 100-module scaling test                                                      #
+# 100-module scaling test (requires/used-by model)                            #
 # --------------------------------------------------------------------------- #
 
 def test_scaling_100_modules():
-    """Focused subgraph on a large graph includes only the correct subset."""
+    """Focused subgraph on a large graph includes only the correct subset.
+
+    New model: only direct requires (one hop forward); full used-by closure.
+    """
     import time
     # Build a 100-module chain: m0 → m1 → ... → m49; m50..m99 are unrelated
     entries = []
@@ -384,7 +368,7 @@ def test_scaling_100_modules():
     for i in range(50, 100):
         entries.append(_entry(f"m{i}"))  # disconnected
 
-    # parent of m10 (for parent context)
+    # parent of m10 (for used-by context)
     entries.append(_entry("parent.of.m10", requires=("m10",)))
 
     g = _build(entries)
@@ -393,27 +377,33 @@ def test_scaling_100_modules():
     f = g.focused_subgraph("m10")
     elapsed = time.monotonic() - t0
 
-    # m10 + deps (m11..m49) = 40 dependency nodes
-    dep_slugs = {f"m{i}" for i in range(11, 50)}
+    # m10 is selected
     assert f.roles["m10"] == "selected"
-    for s in dep_slugs:
-        assert s in f.nodes, f"{s} missing from focused nodes"
-        assert f.roles[s] == "dependency"
 
-    # Parent included
+    # Only m11 is a direct requirement (one hop)
+    assert "m11" in f.nodes
+    assert f.roles["m11"] == "requires"
+
+    # Transitive deps (m12..m49) are ABSENT in the new model
+    for i in range(12, 50):
+        assert f"m{i}" not in f.nodes, f"m{i} (transitive dep) should be absent"
+
+    # m9 is a direct consumer → used_by
+    assert "m9" in f.nodes
+    assert f.roles["m9"] == "used_by"
+
+    # Transitive consumers m0..m8 are INCLUDED (full used-by closure)
+    for i in range(0, 9):
+        assert f"m{i}" in f.nodes, f"m{i} (transitive consumer) should be present"
+        assert f.roles[f"m{i}"] == "used_by"
+
+    # parent.of.m10 is a direct consumer → used_by
     assert "parent.of.m10" in f.nodes
-    assert f.roles["parent.of.m10"] == "parent_context"
+    assert f.roles["parent.of.m10"] == "used_by"
 
     # Unrelated nodes absent
     for i in range(50, 100):
         assert f"m{i}" not in f.nodes, f"m{i} should be absent"
-
-    # m9 is the direct parent of m10 → included as parent_context
-    assert "m9" in f.nodes
-    assert f.roles["m9"] == "parent_context"
-    # Ancestors further up the chain (m0..m8) are excluded
-    for i in range(0, 9):
-        assert f"m{i}" not in f.nodes, f"m{i} (ancestor) should be excluded"
 
     # Full graph unchanged
     assert len(g.nodes) == 101
@@ -435,7 +425,7 @@ def test_missing_target_serialized_as_synthetic_node():
     synthetic = next(n for n in d["nodes"] if n["slug"] == "x.missing")
     assert synthetic["state"] == "missing"
     assert synthetic["title"] == "Missing: x.missing"
-    assert synthetic["focus_role"] == "dependency"
+    assert synthetic["focus_role"] == "requires"
     assert synthetic["enabled"] is False
     assert synthetic["active"] is False
     assert synthetic.get("is_synthetic") is True

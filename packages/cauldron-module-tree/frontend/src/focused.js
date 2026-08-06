@@ -7,35 +7,40 @@
  *
  * Inclusion rules
  * ---------------
- * - selected      : the chosen slug
- * - dependency    : full transitive closure (all edge kinds: required,
- *                   capability, optional)
- * - parent_context: ALL direct incoming dependency relationships to the
- *                   selected module (required, capability, and optional)
+ * - selected  : the chosen slug
+ * - requires  : direct requirements of selected (one hop forward only, all kinds)
+ * - used_by   : full transitive reverse closure (all modules that depend on selected)
  *
  * Missing targets
  * ---------------
- * If a dependency edge points to a slug that is not registered, a synthetic
- * terminal node is added so the relationship remains visible in the focused
- * view.  Synthetic nodes have state "missing" and are never recursed into.
+ * If a direct requirement edge points to a slug that is not registered, a
+ * synthetic terminal node is added.  Synthetic nodes have state "missing" and
+ * are not recursed into.
  *
- * Parent-context edges
- * --------------------
- * Each parent_context edge carries the original relationship_kind
- * ("required", "optional", "capability") so the renderer can preserve
- * line-style semantics.  The semantic direction is selected → parent ("used
- * by"), but a reversed layout edge (parent → selected) is included in
- * layoutEdges so ELK positions parents above the selected node.
+ * Requires edges
+ * --------------
+ * The semantic direction is selected → requirement ("requires"), but reversed
+ * layout edges (requirement → selected) are included in layoutEdges so ELK
+ * positions requirements ABOVE the selected node.  The renderer calls
+ * buildReversedElkPath for kind "requires" to flip the geometry.
+ *
+ * Used-by edges
+ * -------------
+ * The semantic direction is consumer → selected (a consumer depends on selected).
+ * Both layout and display use the REVERSED direction (dependency → consumer)
+ * so ELK places consumers BELOW selected and arrows flow downward.
+ * The renderer calls buildElkPath (no reversal needed).
  *
  * Returns
  * -------
  * {
  *   nodes          – focused node list with added focus_role
- *   layoutEdges    – edges for ELK (dep edges + reversed parent_context_layout)
- *   displayEdges   – all edges for rendering (dep edges + parent_context)
- *   roles          – { [slug]: "selected"|"dependency"|"parent_context" }
- *   missingTargets – Set of slugs that were synthesised as missing terminals
- *   metadata       – { selected, dependencyCount, parentCount, missingCount, maxDepth }
+ *   layoutEdges    – edges for ELK (reversed requires_layout + reversed used_by)
+ *   displayEdges   – all edges for rendering (semantic requires + reversed used_by)
+ *   roles          – { [slug]: "selected"|"requires"|"used_by" }
+ *   missingTargets – Set of slugs synthesised as missing terminals
+ *   metadata       – { selected, requiresCount, usedByCount, missingCount,
+ *                      requiresList, usedByList }
  * }
  */
 export function buildFocusedSubgraph(data, slug) {
@@ -44,61 +49,57 @@ export function buildFocusedSubgraph(data, slug) {
     throw new Error(`Module not found: ${slug}`);
   }
 
-  // Build adjacency from full graph edges — all edge kinds
-  const fwdAll = {};   // slug → [target slugs]
+  // Build reverse adjacency from full graph edges — all edge kinds
   const revAll = {};   // slug → [{ source, kind }]  (all incoming)
   for (const e of data.edges) {
-    (fwdAll[e.source] ||= []).push(e.target);
     (revAll[e.target] ||= []).push({ source: e.source, kind: e.kind });
   }
 
-  // BFS forward to collect full transitive dependency closure.
-  // Real nodes enter the queue; missing-target stubs are noted but not recursed.
-  const depClosure = new Set();
+  // Direct requires: one-hop forward from selected, deduplicating by target
+  const requiresInfo = new Map(); // target → first edge kind
   const missingTargets = new Set();
-  const visited = new Set([slug]);
-  const queue = [slug];
-  while (queue.length) {
-    const current = queue.shift();
-    for (const neighbor of fwdAll[current] || []) {
-      if (!visited.has(neighbor)) {
-        visited.add(neighbor);
-        if (nodeMap[neighbor]) {
-          depClosure.add(neighbor);
-          queue.push(neighbor);
-        } else if (neighbor !== slug) {
-          // Missing dependency: synthetic terminal node, no recursion
-          missingTargets.add(neighbor);
-        }
+  for (const e of data.edges) {
+    if (e.source !== slug || e.target === slug) continue;
+    if (nodeMap[e.target]) {
+      if (!requiresInfo.has(e.target)) requiresInfo.set(e.target, e.kind);
+    } else {
+      missingTargets.add(e.target);
+    }
+  }
+  const requiresSlugs = new Set(requiresInfo.keys());
+
+  // Used-by closure: full transitive reverse BFS from selected (all edge kinds)
+  const usedByClosure = new Set();
+  const ubVisited = new Set([slug]);
+  const ubQueue = [slug];
+  while (ubQueue.length) {
+    const current = ubQueue.shift();
+    for (const { source: consumer } of revAll[current] || []) {
+      if (!ubVisited.has(consumer) && nodeMap[consumer]) {
+        ubVisited.add(consumer);
+        usedByClosure.add(consumer);
+        ubQueue.push(consumer);
       }
     }
   }
 
-  // Direct parents: ALL modules with any incoming edge to the selected module.
-  // Store the original relationship kind for visual semantics.
-  const parentInfo = new Map(); // slug → relationship kind
-  for (const { source: parent, kind } of revAll[slug] || []) {
-    if (nodeMap[parent] && !depClosure.has(parent) && parent !== slug) {
-      if (!parentInfo.has(parent)) parentInfo.set(parent, kind);
-    }
-  }
-  const parentSlugs = new Set(parentInfo.keys());
+  // Requires takes priority over used_by (resolves mutual-dependency cycles)
+  for (const req of requiresSlugs) usedByClosure.delete(req);
 
   // Roles
   const roles = { [slug]: "selected" };
-  for (const dep of depClosure) roles[dep] = "dependency";
-  for (const miss of missingTargets) roles[miss] = "dependency";
-  for (const p of parentSlugs) roles[p] = "parent_context";
+  for (const req of requiresSlugs) roles[req] = "requires";
+  for (const m of missingTargets) roles[m] = "requires";
+  for (const ub of usedByClosure) roles[ub] = "used_by";
 
-  const depOnlySlugs = new Set([slug, ...depClosure]);
-  const focusedSlugs = new Set([slug, ...depClosure, ...parentSlugs]);
+  const focusedSlugs = new Set([slug, ...requiresSlugs, ...usedByClosure]);
 
   // Focused real nodes with focus_role attached
   const realNodes = data.nodes
     .filter((n) => focusedSlugs.has(n.slug))
     .map((n) => ({ ...n, focus_role: roles[n.slug] }));
 
-  // Synthetic terminal nodes for missing targets
+  // Synthetic terminal nodes for missing requires targets
   const syntheticNodes = [...missingTargets].sort().map((target) => ({
     slug: target,
     title: `Missing: ${target}`,
@@ -113,61 +114,86 @@ export function buildFocusedSubgraph(data, slug) {
     configured_enabled: false,
     pending_restart: false,
     errors: [],
-    focus_role: "dependency",
+    focus_role: "requires",
     isSynthetic: true,
   }));
 
   const nodes = [...realNodes, ...syntheticNodes];
 
-  // Dependency edges — within dep-only set OR pointing to a missing target
-  const depEdges = data.edges.filter(
-    (e) =>
-      depOnlySlugs.has(e.source) &&
-      (depOnlySlugs.has(e.target) || missingTargets.has(e.target)),
-  );
+  // Requires layout edges: REVERSED (req → slug) so ELK positions requirements above selected.
+  // Requires display edges: semantic direction (slug → req), renderer reverses ELK geometry.
+  // Both arrays must be in the same order so indices align.
+  const sortedReqSlugs = [...requiresSlugs].sort();
+  const sortedMissing = [...missingTargets].sort();
 
-  // Parent-context display edges (selected → parent, semantic "used by")
-  const parentContextEdges = [...parentSlugs].sort().map((parent) => ({
-    source: slug,
-    target: parent,
-    kind: "parent_context",
-    relationship_kind: parentInfo.get(parent),
-    direction_label: "used by",
-    capability: null,
-    status: "resolved",
+  const requiresLayoutEdges = [
+    ...sortedReqSlugs.map((req) => ({
+      source: req,
+      target: slug,
+      kind: "requires_layout",
+      capability: null,
+      status: "resolved",
+    })),
+    ...sortedMissing.map((m) => ({
+      source: m,
+      target: slug,
+      kind: "requires_layout",
+      capability: null,
+      status: "resolved",
+    })),
+  ];
+
+  const requiresDisplayEdges = [
+    ...sortedReqSlugs.map((req) => ({
+      source: slug,
+      target: req,
+      kind: "requires",
+      relationship_kind: requiresInfo.get(req),
+      capability: null,
+      status: "resolved",
+    })),
+    ...sortedMissing.map((m) => ({
+      source: slug,
+      target: m,
+      kind: "requires",
+      capability: null,
+      status: "resolved",
+    })),
+  ];
+
+  // Used-by edges: reversed original edges within the used-by closure.
+  // Original: consumer → dependency; Reversed: dependency → consumer
+  // The same reversed edges are used for both layout and display so ELK
+  // places consumers below selected without needing path reversal in the renderer.
+  const usedBySet = new Set([slug, ...usedByClosure]);
+  const usedByEdges = data.edges
+    .filter((e) => usedByClosure.has(e.source) && usedBySet.has(e.target))
+    .map((e) => ({
+      source: e.target,  // reversed: dependency becomes source
+      target: e.source,  // reversed: consumer becomes target
+      kind: "used_by",
+      capability: e.capability,
+      status: e.status,
+    }));
+
+  // layoutEdges and displayEdges MUST share the same indices (critical for renderer
+  // ELK geometry lookup via edge_${idx}).
+  // requires section (indices 0..N-1): layout[i] ≠ display[i] in direction;
+  //   renderer calls buildReversedElkPath for "requires" display edges.
+  // used_by section (indices N..): layout[i] === display[i];
+  //   renderer calls buildElkPath directly.
+  const layoutEdges = [...requiresLayoutEdges, ...usedByEdges];
+  const displayEdges = [...requiresDisplayEdges, ...usedByEdges];
+
+  // Module name lists for the detail panel
+  const requiresList = sortedReqSlugs.map((req) => ({
+    slug: req,
+    name: nodeMap[req]?.title || req,
   }));
-
-  // Parent-context layout edges for ELK: REVERSED (parent → selected)
-  // so ELK's layered DOWN algorithm places parents above the selected node.
-  const parentLayoutEdges = [...parentSlugs].sort().map((parent) => ({
-    source: parent,
-    target: slug,
-    kind: "parent_context_layout",
-    capability: null,
-    status: "resolved",
+  const usedByList = [...usedByClosure].sort().map((ub) => ({
+    slug: ub,
+    name: nodeMap[ub]?.title || ub,
   }));
-
-  // layoutEdges: dep edges + reversed parent layout edges
-  // displayEdges: dep edges + semantic parent_context edges
-  // Both arrays share the same indices for dep edges (0..n-1) and parent edges
-  // (n..n+k), which is critical for the renderer to look up ELK routing by index.
-  const layoutEdges = [...depEdges, ...parentLayoutEdges];
-  const displayEdges = [...depEdges, ...parentContextEdges];
-
-  // Max dependency depth via BFS from selected
-  let maxDepth = 0;
-  const depVisited = new Set([slug]);
-  const depQueue = [[slug, 0]];
-  while (depQueue.length) {
-    const [current, depth] = depQueue.shift();
-    if (depth > maxDepth) maxDepth = depth;
-    for (const neighbor of fwdAll[current] || []) {
-      if (depClosure.has(neighbor) && !depVisited.has(neighbor)) {
-        depVisited.add(neighbor);
-        depQueue.push([neighbor, depth + 1]);
-      }
-    }
-  }
 
   return {
     nodes,
@@ -177,10 +203,11 @@ export function buildFocusedSubgraph(data, slug) {
     missingTargets,
     metadata: {
       selected: slug,
-      dependencyCount: depClosure.size,
-      parentCount: parentSlugs.size,
+      requiresCount: requiresSlugs.size + missingTargets.size,
+      usedByCount: usedByClosure.size,
+      requiresList,
+      usedByList,
       missingCount: missingTargets.size,
-      maxDepth,
     },
   };
 }

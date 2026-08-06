@@ -106,6 +106,33 @@ class FocusedModuleGraph:
                 "errors": list(node.errors),
                 "focus_role": self.roles.get(slug, "dependency"),
             })
+        # Synthetic terminal nodes for unregistered dependency targets —
+        # serialized in sorted order so output is deterministic.
+        for missing_slug in sorted(self.missing_targets):
+            nodes_list.append({
+                "slug": missing_slug,
+                "title": f"Missing: {missing_slug}",
+                "summary": "",
+                "version": "",
+                "state": "missing",
+                "enabled": False,
+                "active": False,
+                "configured_enabled": False,
+                "pending_restart": False,
+                "runtime_enabled": False,
+                "requires_restart": False,
+                "icon_svg": None,
+                "visual_color": "#9ca3af",
+                "group": "",
+                "display_order": 0,
+                "documentation_url": "",
+                "source_type": None,
+                "source": "",
+                "provides": [],
+                "errors": [],
+                "focus_role": "dependency",
+                "is_synthetic": True,
+            })
 
         edges_list = []
         for e in self.edges:

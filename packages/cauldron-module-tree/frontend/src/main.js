@@ -52,6 +52,10 @@ async function init() {
     return;
   }
 
+  // Populate group filter once from immutable full graph data.
+  // interaction.js only binds the change listener; it never appends options.
+  populateGroupFilter(graphData.nodes);
+
   // Monotonically increasing token; stale ELK results check against this.
   let renderToken = 0;
   const layoutCache = makeFocusedLayoutCache();
@@ -325,6 +329,18 @@ function announceMode(message) {
 // --------------------------------------------------------------------------- //
 // Misc helpers                                                                 //
 // --------------------------------------------------------------------------- //
+
+function populateGroupFilter(nodes) {
+  const gf = document.getElementById("group-filter");
+  if (!gf || gf.dataset.populated) return;
+  gf.dataset.populated = "1";
+  const groups = [...new Set(nodes.map((n) => n.group).filter(Boolean))].sort();
+  for (const g of groups) {
+    const opt = document.createElement("option");
+    opt.value = g; opt.textContent = g;
+    gf.appendChild(opt);
+  }
+}
 
 function showLoading(root, message) {
   root.innerHTML = `<div class="tree-loading" role="status">

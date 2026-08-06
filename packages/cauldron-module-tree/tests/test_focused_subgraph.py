@@ -420,3 +420,44 @@ def test_scaling_100_modules():
 
     # Layout completes within reasonable time (pure Python BFS)
     assert elapsed < 1.0, f"focused_subgraph took {elapsed:.3f}s"
+
+
+# --------------------------------------------------------------------------- #
+# Missing-target serialization (synthetic node in API output)                  #
+# --------------------------------------------------------------------------- #
+
+def test_missing_target_serialized_as_synthetic_node():
+    """to_api_dict() must include a synthetic node entry for each missing target."""
+    g = _build([_entry("a", requires=("x.missing",))])
+    d = g.focused_subgraph("a").to_api_dict()
+    slugs = [n["slug"] for n in d["nodes"]]
+    assert "x.missing" in slugs
+    synthetic = next(n for n in d["nodes"] if n["slug"] == "x.missing")
+    assert synthetic["state"] == "missing"
+    assert synthetic["title"] == "Missing: x.missing"
+    assert synthetic["focus_role"] == "dependency"
+    assert synthetic["enabled"] is False
+    assert synthetic["active"] is False
+    assert synthetic.get("is_synthetic") is True
+
+
+def test_missing_edges_reference_included_node():
+    """Serialized edges targeting missing slugs must have a matching node."""
+    g = _build([_entry("a", requires=("x.missing",))])
+    d = g.focused_subgraph("a").to_api_dict()
+    node_slugs = {n["slug"] for n in d["nodes"]}
+    for edge in d["edges"]:
+        assert edge["target"] in node_slugs, (
+            f"Edge targets {edge['target']!r} which is not in serialized nodes"
+        )
+
+
+def test_missing_serialization_deterministic():
+    """Repeated calls with missing targets produce identical output."""
+    g = _build([_entry("a", requires=("z.missing", "y.missing"))])
+    d1 = g.focused_subgraph("a").to_api_dict()
+    d2 = g.focused_subgraph("a").to_api_dict()
+    assert d1 == d2
+    # Synthetic nodes appear in sorted slug order
+    synthetic = [n for n in d1["nodes"] if n.get("is_synthetic")]
+    assert [n["slug"] for n in synthetic] == ["y.missing", "z.missing"]

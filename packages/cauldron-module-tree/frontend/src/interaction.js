@@ -214,20 +214,9 @@ export function initInteraction(app, container, graphData, {
   const searchInput = document.getElementById("tree-search");
   searchInput?.addEventListener("input", applyFilters, { signal });
 
-  // State / group filters
+  // State / group filters — group options are populated once by main.js
   document.getElementById("state-filter")?.addEventListener("change", applyFilters, { signal });
   document.getElementById("group-filter")?.addEventListener("change", applyFilters, { signal });
-
-  // Populate group filter
-  const groups = [...new Set(graphData.nodes.map((n) => n.group).filter(Boolean))].sort();
-  const gf = document.getElementById("group-filter");
-  if (gf) {
-    for (const g of groups) {
-      const opt = document.createElement("option");
-      opt.value = g; opt.textContent = g;
-      gf.appendChild(opt);
-    }
-  }
 
   function applyFilters() {
     const q = (searchInput?.value || "").toLowerCase();

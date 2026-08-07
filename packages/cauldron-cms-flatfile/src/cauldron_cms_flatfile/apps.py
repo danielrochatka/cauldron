@@ -60,6 +60,6 @@ def _register_provider() -> None:
 
     repo = FlatFileRepository(cms_cfg)
     try:
-        registry.register(PROVIDER_NAME, repo)
+        registry.register(PROVIDER_NAME, repo, owning_module="cauldron.cms.flatfile")
     except RegistrationError:
         pass

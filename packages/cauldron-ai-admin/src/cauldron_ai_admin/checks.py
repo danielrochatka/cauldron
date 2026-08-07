@@ -825,15 +825,13 @@ def check_global_prompt_version_valid(app_configs, **kwargs):
 
 @checks.register(checks.Tags.compatibility)
 def check_manifest_ai_tools_registered(app_configs, **kwargs):
-    """admin_ai.E022/E023: manifest declarations must match runtime registry state.
+    """admin_ai.E022-E025: manifest declarations must match runtime registry state.
 
-    For each active Cauldron module that declares ``ai_tools`` in its manifest,
-    every listed tool slug must be present in the AdminAIToolRegistry.
-    Similarly, every ``prompt_templates`` entry must be in the
-    AIPromptTemplateRegistry.
-
-    These are programming errors — a module declared ownership of an artifact
-    and never registered it during ``AppConfig.ready()``.
+    For each active Cauldron module:
+    - E022: ``ai_tools`` entry not present in AdminAIToolRegistry.
+    - E024: ``ai_tools`` entry registered but owned by a different module.
+    - E023: ``prompt_templates`` entry not present in AIPromptTemplateRegistry.
+    - E025: ``prompt_templates`` entry registered but owned by a different module.
     """
     messages: list = []
     try:
@@ -846,15 +844,16 @@ def check_manifest_ai_tools_registered(app_configs, **kwargs):
     if not module_registry.is_ready:
         return []
 
-    registered_tool_names = {d.name for d in get_tool_registry().all_definitions()}
-    registered_template_names = {
-        t.tool_name for t in get_prompt_template_registry().all_tool_templates()
+    registered_tools = {d.name: d for d in get_tool_registry().all_definitions()}
+    registered_templates = {
+        t.tool_name: t for t in get_prompt_template_registry().all_tool_templates()
     }
 
     for module in module_registry.all_active():
         manifest = module.manifest
         for tool_slug in manifest.ai_tools:
-            if tool_slug not in registered_tool_names:
+            defn = registered_tools.get(tool_slug)
+            if defn is None:
                 messages.append(checks.Error(
                     f"Module {manifest.slug!r} declares AI tool {tool_slug!r} "
                     "in its manifest but the tool is not registered in "
@@ -866,8 +865,21 @@ def check_manifest_ai_tools_registered(app_configs, **kwargs):
                     obj=manifest.slug,
                     id="admin_ai.E022",
                 ))
+            elif defn.owning_module != manifest.slug:
+                messages.append(checks.Error(
+                    f"Module {manifest.slug!r} declares AI tool {tool_slug!r} "
+                    f"but the registered tool is owned by {defn.owning_module!r}.",
+                    hint=(
+                        f"Set owning_module={manifest.slug!r} when registering "
+                        f"{tool_slug!r}, or remove the declaration from "
+                        f"{manifest.slug!r}'s manifest."
+                    ),
+                    obj=manifest.slug,
+                    id="admin_ai.E024",
+                ))
         for tmpl_slug in manifest.prompt_templates:
-            if tmpl_slug not in registered_template_names:
+            tmpl = registered_templates.get(tmpl_slug)
+            if tmpl is None:
                 messages.append(checks.Error(
                     f"Module {manifest.slug!r} declares prompt template "
                     f"{tmpl_slug!r} in its manifest but the template is not "
@@ -878,6 +890,19 @@ def check_manifest_ai_tools_registered(app_configs, **kwargs):
                     ),
                     obj=manifest.slug,
                     id="admin_ai.E023",
+                ))
+            elif tmpl.owning_module != manifest.slug:
+                messages.append(checks.Error(
+                    f"Module {manifest.slug!r} declares prompt template "
+                    f"{tmpl_slug!r} but the registered template is owned by "
+                    f"{tmpl.owning_module!r}.",
+                    hint=(
+                        f"Set owning_module={manifest.slug!r} when registering "
+                        f"{tmpl_slug!r}, or remove the declaration from "
+                        f"{manifest.slug!r}'s manifest."
+                    ),
+                    obj=manifest.slug,
+                    id="admin_ai.E025",
                 ))
 
     return messages

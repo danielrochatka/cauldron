@@ -282,3 +282,89 @@ def check_navigation_urls(app_configs, **kwargs):
             # itself; do not double-report here.
             continue
     return messages_list
+
+
+@checks.register(checks.Tags.compatibility)
+def check_manifest_navigation_registered(app_configs, **kwargs):
+    """cauldron.admin.E309-E312: manifest nav declarations must match NavigationRegistry.
+
+    For each active Cauldron module that declares navigation entries:
+    - E309: Section declared in manifest but not registered.
+    - E310: Item declared in manifest but not registered.
+    - E311: Section registered but owned by a different module.
+    - E312: Item registered but owned by a different module.
+    """
+    messages_list: list = []
+    try:
+        from cauldron.modules.registry import registry as module_registry
+    except Exception:
+        return []
+
+    if not module_registry.is_ready:
+        return []
+
+    from .navigation import get_navigation_registry
+    nav_registry = get_navigation_registry()
+
+    with nav_registry._lock:
+        registered_sections = dict(nav_registry._sections)
+        registered_items = dict(nav_registry._items)
+
+    for module in module_registry.all_active():
+        manifest = module.manifest
+        for nav in manifest.navigation:
+            is_section = not nav.section
+            if is_section:
+                registered = registered_sections.get(nav.key)
+                if registered is None:
+                    messages_list.append(checks.Error(
+                        f"Module {manifest.slug!r} declares navigation section "
+                        f"{nav.key!r} but it is not registered in NavigationRegistry.",
+                        hint=(
+                            f"Ensure {manifest.slug!r} registers {nav.key!r} "
+                            "as an AdminNavigationSection in AppConfig.ready()."
+                        ),
+                        obj=manifest.slug,
+                        id="cauldron.admin.E309",
+                    ))
+                elif registered.owning_module and registered.owning_module != manifest.slug:
+                    messages_list.append(checks.Error(
+                        f"Module {manifest.slug!r} declares navigation section "
+                        f"{nav.key!r} but it is registered with "
+                        f"owning_module={registered.owning_module!r}.",
+                        hint=(
+                            f"Only the registering module should declare the section "
+                            f"in its manifest. Check {manifest.slug!r} and "
+                            f"{registered.owning_module!r}."
+                        ),
+                        obj=manifest.slug,
+                        id="cauldron.admin.E311",
+                    ))
+            else:
+                registered = registered_items.get(nav.key)
+                if registered is None:
+                    messages_list.append(checks.Error(
+                        f"Module {manifest.slug!r} declares navigation item "
+                        f"{nav.key!r} but it is not registered in NavigationRegistry.",
+                        hint=(
+                            f"Ensure {manifest.slug!r} registers {nav.key!r} "
+                            "as an AdminNavigationItem in AppConfig.ready()."
+                        ),
+                        obj=manifest.slug,
+                        id="cauldron.admin.E310",
+                    ))
+                elif registered.owning_module and registered.owning_module != manifest.slug:
+                    messages_list.append(checks.Error(
+                        f"Module {manifest.slug!r} declares navigation item "
+                        f"{nav.key!r} but it is registered with "
+                        f"owning_module={registered.owning_module!r}.",
+                        hint=(
+                            f"Only the registering module should declare the item "
+                            f"in its manifest. Check {manifest.slug!r} and "
+                            f"{registered.owning_module!r}."
+                        ),
+                        obj=manifest.slug,
+                        id="cauldron.admin.E312",
+                    ))
+
+    return messages_list

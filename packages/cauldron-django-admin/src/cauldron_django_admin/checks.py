@@ -327,15 +327,18 @@ def check_manifest_navigation_registered(app_configs, **kwargs):
                         obj=manifest.slug,
                         id="cauldron.admin.E309",
                     ))
-                elif registered.owning_module and registered.owning_module != manifest.slug:
+                elif registered.owning_module != manifest.slug:
+                    owner_desc = (
+                        f"owning_module={registered.owning_module!r}"
+                        if registered.owning_module
+                        else "no owning_module"
+                    )
                     messages_list.append(checks.Error(
                         f"Module {manifest.slug!r} declares navigation section "
-                        f"{nav.key!r} but it is registered with "
-                        f"owning_module={registered.owning_module!r}.",
+                        f"{nav.key!r} but the runtime registration has {owner_desc}.",
                         hint=(
-                            f"Only the registering module should declare the section "
-                            f"in its manifest. Check {manifest.slug!r} and "
-                            f"{registered.owning_module!r}."
+                            f"Register {nav.key!r} with owning_module={manifest.slug!r} "
+                            "in AppConfig.ready()."
                         ),
                         obj=manifest.slug,
                         id="cauldron.admin.E311",
@@ -353,15 +356,18 @@ def check_manifest_navigation_registered(app_configs, **kwargs):
                         obj=manifest.slug,
                         id="cauldron.admin.E310",
                     ))
-                elif registered.owning_module and registered.owning_module != manifest.slug:
+                elif registered.owning_module != manifest.slug:
+                    owner_desc = (
+                        f"owning_module={registered.owning_module!r}"
+                        if registered.owning_module
+                        else "no owning_module"
+                    )
                     messages_list.append(checks.Error(
                         f"Module {manifest.slug!r} declares navigation item "
-                        f"{nav.key!r} but it is registered with "
-                        f"owning_module={registered.owning_module!r}.",
+                        f"{nav.key!r} but the runtime registration has {owner_desc}.",
                         hint=(
-                            f"Only the registering module should declare the item "
-                            f"in its manifest. Check {manifest.slug!r} and "
-                            f"{registered.owning_module!r}."
+                            f"Register {nav.key!r} with owning_module={manifest.slug!r} "
+                            "in AppConfig.ready()."
                         ),
                         obj=manifest.slug,
                         id="cauldron.admin.E312",

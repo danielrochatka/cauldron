@@ -143,7 +143,7 @@ class TestManifestNavigationCheck:
         messages = check_manifest_navigation_registered(None)
         assert not any(msg.id == "cauldron.admin.E310" for msg in messages)
 
-    # --- E311: wrong section owner ---
+    # --- E311: wrong or absent section owner ---
 
     def test_e311_when_section_owned_by_different_module(self, fresh_nav_registry):
         fresh_nav_registry.register_section(AdminNavigationSection(
@@ -159,7 +159,22 @@ class TestManifestNavigationCheck:
         assert len(e311) == 1
         assert "some.other.module" in e311[0].msg
 
-    # --- E312: wrong item owner ---
+    def test_e311_when_section_has_no_owner(self, fresh_nav_registry):
+        """owning_module='' in the runtime registration must also produce E311."""
+        fresh_nav_registry.register_section(AdminNavigationSection(
+            key="mod.a",
+            label="Mod A",
+            order=10,
+            owning_module="",
+        ))
+        m = _make_module("mod.a", navigation=[_section_decl("mod.a")])
+        _inject_and_activate([m])
+        messages = check_manifest_navigation_registered(None)
+        e311 = [msg for msg in messages if msg.id == "cauldron.admin.E311"]
+        assert len(e311) == 1
+        assert "no owning_module" in e311[0].msg
+
+    # --- E312: wrong or absent item owner ---
 
     def test_e312_when_item_owned_by_different_module(self, fresh_nav_registry):
         fresh_nav_registry.register_section(AdminNavigationSection(
@@ -180,6 +195,27 @@ class TestManifestNavigationCheck:
         e312 = [msg for msg in messages if msg.id == "cauldron.admin.E312"]
         assert len(e312) == 1
         assert "some.other.module" in e312[0].msg
+
+    def test_e312_when_item_has_no_owner(self, fresh_nav_registry):
+        """owning_module='' in the runtime registration must also produce E312."""
+        fresh_nav_registry.register_section(AdminNavigationSection(
+            key="system", label="System", order=0, owning_module="mod.a",
+        ))
+        fresh_nav_registry.register_item(AdminNavigationItem(
+            key="mod.a.dashboard",
+            label="Dashboard",
+            url_name="cauldron:dashboard",
+            section="system",
+            order=0,
+            permission="",
+            owning_module="",
+        ))
+        m = _make_module("mod.a", navigation=[_item_decl("mod.a.dashboard")])
+        _inject_and_activate([m])
+        messages = check_manifest_navigation_registered(None)
+        e312 = [msg for msg in messages if msg.id == "cauldron.admin.E312"]
+        assert len(e312) == 1
+        assert "no owning_module" in e312[0].msg
 
     # --- disabled module ignored ---
 

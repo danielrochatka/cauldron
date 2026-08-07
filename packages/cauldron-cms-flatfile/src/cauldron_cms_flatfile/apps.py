@@ -1,6 +1,8 @@
 """Django AppConfig for cauldron_cms_flatfile."""
 from django.apps import AppConfig
 
+_OWNING_MODULE = "cauldron.cms.flatfile"
+
 
 class CauldronCmsFlatfileConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
@@ -17,7 +19,9 @@ def _register_provider() -> None:
 
     Reads CAULDRON_MODULES["cauldron.cms.flatfile"] for site_root. No-op when
     the module is absent or site_root is not configured (Django checks emit I600).
-    Idempotent: safe to call on repeated ready() invocations.
+    Idempotent for repeated ready() calls when the provider is already owned by
+    cauldron.cms.flatfile. Raises RegistrationError if PROVIDER_NAME is already
+    occupied by a different or unknown owner.
     """
     from pathlib import Path
 
@@ -30,10 +34,10 @@ def _register_provider() -> None:
     from .repository import PROVIDER_NAME, FlatFileRepository
 
     modules = getattr(settings, "CAULDRON_MODULES", None) or {}
-    if "cauldron.cms.flatfile" not in modules:
+    if _OWNING_MODULE not in modules:
         return
 
-    cfg = modules["cauldron.cms.flatfile"] or {}
+    cfg = modules[_OWNING_MODULE] or {}
     site_root = cfg.get("site_root")
     if not site_root:
         return
@@ -41,11 +45,22 @@ def _register_provider() -> None:
     site_root_path = Path(site_root)
     if not site_root_path.is_absolute():
         raise ImproperlyConfigured(
-            "cauldron.cms.flatfile.site_root must be an absolute path."
+            f"{_OWNING_MODULE}.site_root must be an absolute path."
         )
 
-    if registry.get(PROVIDER_NAME) is not None:
-        return
+    existing = registry.get(PROVIDER_NAME)
+    if existing is not None:
+        existing_owner = registry.get_owning_module(PROVIDER_NAME)
+        if existing_owner == _OWNING_MODULE:
+            return  # idempotent: already registered by us
+        owner_desc = f"owned by {existing_owner!r}" if existing_owner else "has no owning module"
+        raise RegistrationError(
+            provider_name=PROVIDER_NAME,
+            message=(
+                f"Cannot register content provider {PROVIDER_NAME!r} for "
+                f"{_OWNING_MODULE!r}: a provider already exists that {owner_desc}."
+            ),
+        )
 
     try:
         cms_cfg = FlatFileCMSConfig(
@@ -55,11 +70,7 @@ def _register_provider() -> None:
         )
     except ValueError as exc:
         raise ImproperlyConfigured(
-            f"cauldron.cms.flatfile misconfiguration: {exc}"
+            f"{_OWNING_MODULE} misconfiguration: {exc}"
         ) from exc
 
-    repo = FlatFileRepository(cms_cfg)
-    try:
-        registry.register(PROVIDER_NAME, repo, owning_module="cauldron.cms.flatfile")
-    except RegistrationError:
-        pass
+    registry.register(PROVIDER_NAME, FlatFileRepository(cms_cfg), owning_module=_OWNING_MODULE)

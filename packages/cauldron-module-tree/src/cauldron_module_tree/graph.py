@@ -598,7 +598,7 @@ class ModuleGraph:
                 "restart_required": restart_required,
                 "pending_restart_count": sum(1 for n in self._nodes.values() if n.pending_restart),
                 "nodes_count": len(self._nodes),
-                "edges_count": len(self._edges),
+                "edges_count": len(edges_list),
                 "cycles": cycle_list,
                 "components_count": len(components),
             },
@@ -819,6 +819,9 @@ def build_graph(
             opt_kind: str = opt.get("kind", "module")
 
             if opt_kind == "capability":
+                # Optional capability edges use kind="optional" so they are treated
+                # as optional integrations, not required dependencies.  The capability
+                # name is still preserved in the `capability` field for display.
                 cap_slug = opt_slug
                 if cap_slug in selected_providers:
                     provider_slug = selected_providers[cap_slug]
@@ -826,7 +829,7 @@ def build_graph(
                     graph_edges.append(ModuleGraphEdge(
                         source=source_slug,
                         target=provider_slug,
-                        kind="capability",
+                        kind="optional",
                         capability=cap_slug,
                         status=status,
                     ))
@@ -837,7 +840,7 @@ def build_graph(
                         graph_edges.append(ModuleGraphEdge(
                             source=source_slug,
                             target=provider_slug,
-                            kind="capability",
+                            kind="optional",
                             capability=cap_slug,
                             status=status,
                         ))
@@ -845,7 +848,7 @@ def build_graph(
                         graph_edges.append(ModuleGraphEdge(
                             source=source_slug,
                             target=cap_slug,
-                            kind="capability",
+                            kind="optional",
                             capability=cap_slug,
                             status="missing",
                         ))

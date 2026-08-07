@@ -540,3 +540,49 @@ def test_transitive_reduction_stable_output():
     r1 = g.to_api_dict()
     r2 = g.to_api_dict()
     assert r1["edges"] == r2["edges"]
+
+
+def test_optional_capability_not_included_in_transitive_reduction():
+    """Optional capability edges must not be treated as required targets.
+
+    If A optionally uses capability provider B, directly requires C, and B
+    requires C, the reduction must NOT drop A→C.  B is an optional integration,
+    not a required ancestor.
+    """
+    from cauldron_module_tree.graph import build_graph
+
+    entries = [
+        _entry(
+            "a",
+            requires=[{"slug": "c", "kind": "module"}],
+            optional=[{"slug": "my.cap", "kind": "capability"}],
+        ),
+        _entry("b", provides=["my.cap"], requires=[{"slug": "c", "kind": "module"}]),
+        _entry("c"),
+    ]
+    g = build_graph(_make_registry(entries, capabilities={"my.cap": ["b"]}))
+    result = g.to_api_dict()
+
+    # A→C must be present — it is a genuine required dep
+    req_edges = [(e["source"], e["target"]) for e in result["edges"] if e["kind"] == "required"]
+    assert ("a", "c") in req_edges, "A→C must survive; B is optional, not a required bridge"
+
+    # Optional cap edge A→B must appear as optional, not capability
+    opt_edges = [(e["source"], e["target"]) for e in result["edges"] if e["kind"] == "optional"]
+    assert ("a", "b") in opt_edges, "Optional capability edge A→B must be kind='optional'"
+
+
+def test_edges_count_metadata_matches_serialized_edges():
+    """metadata.edges_count must equal the length of the emitted edges array."""
+    from cauldron_module_tree.graph import build_graph
+    entries = [
+        _entry("a", requires=[{"slug": "b", "kind": "module"}, {"slug": "c", "kind": "module"}]),
+        _entry("b", requires=[{"slug": "c", "kind": "module"}]),
+        _entry("c"),
+    ]
+    g = build_graph(_make_registry(entries))
+    result = g.to_api_dict()
+    assert result["metadata"]["edges_count"] == len(result["edges"]), (
+        f"edges_count {result['metadata']['edges_count']} != "
+        f"len(edges) {len(result['edges'])}"
+    )

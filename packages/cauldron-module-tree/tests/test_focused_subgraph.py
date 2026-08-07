@@ -194,17 +194,25 @@ def test_requires_edges_generated():
 def test_requires_edge_carries_relationship_kind():
     g = _build([
         _entry("sel", requires=("req.parent",)),
-        _entry("sel2", optional=("opt.req",)),
         _entry("req.parent"),
-        _entry("opt.req"),
     ])
     f_req = g.focused_subgraph("sel")
     req_edges = {e.target: e for e in f_req.edges if e.kind == "requires"}
     assert req_edges["req.parent"].relationship_kind == "required"
 
+
+def test_optional_dep_excluded_from_focused_requires():
+    # sel2 has only an optional dep on opt.req — must NOT appear in focused requires.
+    g = _build([
+        _entry("sel2", optional=("opt.req",)),
+        _entry("opt.req"),
+    ])
     f_opt = g.focused_subgraph("sel2")
-    opt_edges = {e.target: e for e in f_opt.edges if e.kind == "requires"}
-    assert opt_edges["opt.req"].relationship_kind == "optional"
+    assert "opt.req" not in f_opt.roles, (
+        "Optional dep must not appear under requires in focused subgraph"
+    )
+    opt_req_edges = [e for e in f_opt.edges if e.kind == "requires" and e.target == "opt.req"]
+    assert not opt_req_edges, "No requires edge must be emitted for an optional dep"
 
 
 def test_used_by_edges_preserved():
@@ -508,3 +516,94 @@ def test_missing_serialization_deterministic():
     # Synthetic nodes appear in sorted slug order
     synthetic = [n for n in d1["nodes"] if n.get("is_synthetic")]
     assert [n["slug"] for n in synthetic] == ["y.missing", "z.missing"]
+
+
+# --------------------------------------------------------------------------- #
+# Transitive reduction in focused subgraph                                    #
+# --------------------------------------------------------------------------- #
+
+def test_transitive_reduction_removes_redundant_ancestor():
+    # sel → b, sel → c, b → c  =>  only b in focused requires (c is redundant)
+    g = _build([
+        _entry("sel", requires=("b", "c")),
+        _entry("b", requires=("c",)),
+        _entry("c"),
+    ])
+    f = g.focused_subgraph("sel")
+    assert f.roles["b"] == "requires"
+    assert "c" not in f.roles, "c is covered transitively by b — must not appear as requires"
+
+
+def test_transitive_reduction_preserves_independent_peers():
+    # sel → b, sel → c, no edge b → c  =>  both b and c kept
+    g = _build([
+        _entry("sel", requires=("b", "c")),
+        _entry("b"),
+        _entry("c"),
+    ])
+    f = g.focused_subgraph("sel")
+    assert f.roles["b"] == "requires"
+    assert f.roles["c"] == "requires"
+
+
+def test_transitive_reduction_longer_chain():
+    # sel → b, sel → c, sel → d, b → c, c → d  =>  only b in requires
+    g = _build([
+        _entry("sel", requires=("b", "c", "d")),
+        _entry("b", requires=("c",)),
+        _entry("c", requires=("d",)),
+        _entry("d"),
+    ])
+    f = g.focused_subgraph("sel")
+    assert f.roles["b"] == "requires"
+    assert "c" not in f.roles
+    assert "d" not in f.roles
+
+
+def test_transitive_reduction_skipped_on_cycles():
+    # sel → b, b → sel (cycle): reduction must not crash or erroneously remove b
+    g = _build([
+        _entry("sel", requires=("b",)),
+        _entry("b", requires=("sel",)),
+    ])
+    f = g.focused_subgraph("sel")
+    assert f.roles["b"] == "requires"
+
+
+def test_transitive_reduction_metadata_counts_match_reduced_set():
+    # sel → b, sel → c, b → c: after reduction only b; requires_count == 1
+    g = _build([
+        _entry("sel", requires=("b", "c")),
+        _entry("b", requires=("c",)),
+        _entry("c"),
+    ])
+    d = g.focused_subgraph("sel").to_api_dict()
+    meta = d["metadata"]
+    assert meta["requires_count"] == 1
+    req_slugs = [item["slug"] for item in meta["requires_list"]]
+    assert "b" in req_slugs
+    assert "c" not in req_slugs
+
+
+def test_transitive_reduction_used_by_unaffected():
+    # sel → b, sel → c, b → c; consumer → sel
+    # used_by must still include consumer (transitive reduction only affects requires)
+    g = _build([
+        _entry("sel", requires=("b", "c")),
+        _entry("b", requires=("c",)),
+        _entry("c"),
+        _entry("consumer", requires=("sel",)),
+    ])
+    f = g.focused_subgraph("sel")
+    assert f.roles["consumer"] == "used_by"
+
+
+def test_optional_dep_present_in_used_by_not_requires():
+    # A module optionally depends on sel: it appears in used_by (not requires of sel)
+    g = _build([
+        _entry("sel"),
+        _entry("opt.user", optional=("sel",)),
+    ])
+    f = g.focused_subgraph("sel")
+    assert f.roles.get("opt.user") == "used_by"
+    assert "opt.user" not in [r for r, role in f.roles.items() if role == "requires"]

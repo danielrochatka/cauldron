@@ -229,12 +229,26 @@ describe("buildFocusedSubgraph — requires edges", () => {
 
   it("requires edge carries relationship_kind from original edge", () => {
     const data = makeData(
-      [makeNode("sel"), makeNode("opt-req")],
-      [makeEdge("sel", "opt-req", "optional")],
+      [makeNode("sel"), makeNode("dep")],
+      [makeEdge("sel", "dep", "required")],
     );
     const result = buildFocusedSubgraph(data, "sel");
-    const reqEdge = result.displayEdges.find((e) => e.kind === "requires");
-    expect(reqEdge.relationship_kind).toBe("optional");
+    const reqEdge = result.displayEdges.find((e) => e.kind === "requires" && e.target === "dep");
+    expect(reqEdge).toBeTruthy();
+    expect(reqEdge.relationship_kind).toBe("required");
+  });
+
+  it("optional edge NOT included in focused requires", () => {
+    const data = makeData(
+      [makeNode("sel"), makeNode("opt-dep")],
+      [makeEdge("sel", "opt-dep", "optional")],
+    );
+    const result = buildFocusedSubgraph(data, "sel");
+    expect(result.roles["opt-dep"]).toBeUndefined();
+    const reqEdge = result.displayEdges.find(
+      (e) => e.kind === "requires" && e.target === "opt-dep",
+    );
+    expect(reqEdge).toBeUndefined();
   });
 
   it("requires edge preserves capability and status from original edge", () => {
@@ -524,5 +538,41 @@ describe("buildFocusedSubgraph — 100-module scaling (requires/used-by)", () =>
 
     // Full graph data unchanged
     expect(nodes.length).toBe(101);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// Optional edge behaviour                                                      //
+// --------------------------------------------------------------------------- //
+
+describe("buildFocusedSubgraph — optional edge semantics", () => {
+  it("optional dep of selected is excluded from focused requires section", () => {
+    const data = makeData(
+      [makeNode("sel"), makeNode("opt")],
+      [makeEdge("sel", "opt", "optional")],
+    );
+    const result = buildFocusedSubgraph(data, "sel");
+    expect(result.roles["opt"]).toBeUndefined();
+    expect(result.nodes.some((n) => n.slug === "opt")).toBe(false);
+  });
+
+  it("required dep of selected still included when optional dep exists too", () => {
+    const data = makeData(
+      [makeNode("sel"), makeNode("req"), makeNode("opt")],
+      [makeEdge("sel", "req", "required"), makeEdge("sel", "opt", "optional")],
+    );
+    const result = buildFocusedSubgraph(data, "sel");
+    expect(result.roles["req"]).toBe("requires");
+    expect(result.roles["opt"]).toBeUndefined();
+  });
+
+  it("module that optionally depends on selected appears as used_by", () => {
+    // consumer optionally uses sel — sel is still impacted if consumer loads
+    const data = makeData(
+      [makeNode("consumer"), makeNode("sel")],
+      [makeEdge("consumer", "sel", "optional")],
+    );
+    const result = buildFocusedSubgraph(data, "sel");
+    expect(result.roles["consumer"]).toBe("used_by");
   });
 });

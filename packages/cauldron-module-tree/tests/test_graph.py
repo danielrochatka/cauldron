@@ -426,3 +426,163 @@ def test_absent_overlay_falls_back_to_enabled():
     node = result["nodes"][0]
     assert node["configured_enabled"] == node["enabled"]
     assert node["pending_restart"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Transitive reduction in full graph API output                                #
+# --------------------------------------------------------------------------- #
+
+def test_full_graph_transitive_reduction_removes_redundant_edge():
+    """A→B, B→C, A→C: canonical output must omit A→C (redundant via B)."""
+    from cauldron_module_tree.graph import build_graph
+    entries = [
+        _entry("a", requires=[{"slug": "b", "kind": "module"}, {"slug": "c", "kind": "module"}]),
+        _entry("b", requires=[{"slug": "c", "kind": "module"}]),
+        _entry("c"),
+    ]
+    g = build_graph(_make_registry(entries))
+    result = g.to_api_dict()
+    req_edges = [(e["source"], e["target"]) for e in result["edges"] if e["kind"] == "required"]
+    assert ("a", "b") in req_edges
+    assert ("b", "c") in req_edges
+    assert ("a", "c") not in req_edges, "A→C is redundant (A→B→C) and must be omitted"
+
+
+def test_full_graph_optional_edges_not_reduced():
+    """Optional edges are always included regardless of transitive coverage."""
+    from cauldron_module_tree.graph import build_graph
+    entries = [
+        _entry("a",
+               requires=[{"slug": "b", "kind": "module"}],
+               optional=[{"slug": "c", "kind": "module"}]),
+        _entry("b", requires=[{"slug": "c", "kind": "module"}]),
+        _entry("c"),
+    ]
+    g = build_graph(_make_registry(entries))
+    result = g.to_api_dict()
+    opt_edges = [(e["source"], e["target"]) for e in result["edges"] if e["kind"] == "optional"]
+    assert ("a", "c") in opt_edges, "Optional A→C must remain in output"
+
+
+def test_full_graph_transitive_reduction_parents_children():
+    """parents/children fields in node output reflect the reduced graph."""
+    from cauldron_module_tree.graph import build_graph
+    entries = [
+        _entry("a", requires=[{"slug": "b", "kind": "module"}, {"slug": "c", "kind": "module"}]),
+        _entry("b", requires=[{"slug": "c", "kind": "module"}]),
+        _entry("c"),
+    ]
+    g = build_graph(_make_registry(entries))
+    result = g.to_api_dict()
+    nodes = {n["slug"]: n for n in result["nodes"]}
+    # a's children: only b (c is redundant)
+    assert nodes["a"]["children"] == ["b"]
+    # c's parents: only b (a→c is removed)
+    assert nodes["c"]["parents"] == ["b"]
+
+
+def test_full_graph_no_duplicate_edges_same_target():
+    """When capability + required both target the same module, only one edge appears."""
+    from cauldron_module_tree.graph import build_graph
+
+    def _cap_entry(slug, *, module_requires=(), cap_requires=(), provides=(), **kwargs):
+        from cauldron.modules import ModuleManifest
+        manifest = ModuleManifest(slug=slug, label=slug)
+        defaults = {
+            "slug": slug,
+            "label": manifest.label,
+            "version": "1.0.0",
+            "state": "ready",
+            "enabled": True,
+            "active": True,
+            "load_index": 0,
+            "source_type": "package",
+            "source": "test-pkg",
+            "manifest": manifest.to_dict(),
+            "provides": list(provides),
+            "requires": (
+                [{"slug": r, "kind": "module"} for r in module_requires] +
+                [{"slug": c, "kind": "capability"} for c in cap_requires]
+            ),
+            "optional": [],
+            "selected_providers": {},
+            "deps": [],
+            "django_apps": [],
+            "errors": [],
+            "requires_restart": False,
+            "cauldron_version_ok": True,
+            "installed_cauldron_version": "0.1.0",
+        }
+        defaults.update(kwargs)
+        return defaults
+
+    entries = [
+        _cap_entry("a", module_requires=["b"], cap_requires=["my.cap"]),
+        _cap_entry("b", provides=["my.cap"]),
+    ]
+    g = build_graph(_make_registry(entries, capabilities={"my.cap": ["b"]}))
+    result = g.to_api_dict()
+    edges_to_b = [e for e in result["edges"]
+                  if e["source"] == "a" and e["target"] == "b"
+                  and e["kind"] in ("required", "capability")]
+    assert len(edges_to_b) == 1, f"Expected 1 edge a→b, got {len(edges_to_b)}: {edges_to_b}"
+
+
+def test_transitive_reduction_stable_output():
+    """Repeated calls produce identical edge output (deterministic)."""
+    from cauldron_module_tree.graph import build_graph
+    entries = [
+        _entry("a", requires=[{"slug": "b", "kind": "module"}, {"slug": "c", "kind": "module"}]),
+        _entry("b", requires=[{"slug": "c", "kind": "module"}]),
+        _entry("c"),
+    ]
+    g = build_graph(_make_registry(entries))
+    r1 = g.to_api_dict()
+    r2 = g.to_api_dict()
+    assert r1["edges"] == r2["edges"]
+
+
+def test_optional_capability_not_included_in_transitive_reduction():
+    """Optional capability edges must not be treated as required targets.
+
+    If A optionally uses capability provider B, directly requires C, and B
+    requires C, the reduction must NOT drop A→C.  B is an optional integration,
+    not a required ancestor.
+    """
+    from cauldron_module_tree.graph import build_graph
+
+    entries = [
+        _entry(
+            "a",
+            requires=[{"slug": "c", "kind": "module"}],
+            optional=[{"slug": "my.cap", "kind": "capability"}],
+        ),
+        _entry("b", provides=["my.cap"], requires=[{"slug": "c", "kind": "module"}]),
+        _entry("c"),
+    ]
+    g = build_graph(_make_registry(entries, capabilities={"my.cap": ["b"]}))
+    result = g.to_api_dict()
+
+    # A→C must be present — it is a genuine required dep
+    req_edges = [(e["source"], e["target"]) for e in result["edges"] if e["kind"] == "required"]
+    assert ("a", "c") in req_edges, "A→C must survive; B is optional, not a required bridge"
+
+    # Optional cap edge A→B must appear as optional, not capability
+    opt_edges = [(e["source"], e["target"]) for e in result["edges"] if e["kind"] == "optional"]
+    assert ("a", "b") in opt_edges, "Optional capability edge A→B must be kind='optional'"
+
+
+def test_edges_count_metadata_matches_serialized_edges():
+    """metadata.edges_count must equal the length of the emitted edges array."""
+    from cauldron_module_tree.graph import build_graph
+    entries = [
+        _entry("a", requires=[{"slug": "b", "kind": "module"}, {"slug": "c", "kind": "module"}]),
+        _entry("b", requires=[{"slug": "c", "kind": "module"}]),
+        _entry("c"),
+    ]
+    g = build_graph(_make_registry(entries))
+    result = g.to_api_dict()
+    assert result["metadata"]["edges_count"] == len(result["edges"]), (
+        f"edges_count {result['metadata']['edges_count']} != "
+        f"len(edges) {len(result['edges'])}"
+    )

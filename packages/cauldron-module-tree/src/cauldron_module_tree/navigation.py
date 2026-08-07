@@ -16,6 +16,7 @@ def _register() -> None:
         permission="cauldron_module_tree.view_module_tree",
         url_prefix="/cauldron/module-tree/",
         description="Interactive module dependency graph",
+        owning_module="cauldron.module.tree",
     ))
 
 

@@ -182,6 +182,7 @@ def _project_to_navigation(spec: ModuleSettingsSpec) -> None:
         description=spec.description,
         kind="settings",
         show_on_dashboard=False,
+        owning_module=spec.module_slug,
     ))
 
 

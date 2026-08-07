@@ -25,6 +25,7 @@ class CauldronAdminContentConfig(AppConfig):
             key="content",
             label="Content",
             order=200,
+            owning_module="cauldron.admin.content",
         ))
         registry.register_item(AdminNavigationItem(
             key="cauldron.admin.content.browser",
@@ -35,6 +36,7 @@ class CauldronAdminContentConfig(AppConfig):
             permission="cauldron_content_operations.view_published_content",
             url_prefix="/cauldron/content/",
             description="Browse published and draft content",
+            owning_module="cauldron.admin.content",
         ))
         registry.register_item(AdminNavigationItem(
             key="cauldron.admin.content.homepage",
@@ -46,6 +48,7 @@ class CauldronAdminContentConfig(AppConfig):
             url_prefix="/cauldron/content/homepage/",
             url_prefix_exact=True,
             description="Edit the Homepage singleton",
+            owning_module="cauldron.admin.content",
         ))
         registry.register_item(AdminNavigationItem(
             key="cauldron.admin.content.page-create",
@@ -57,6 +60,7 @@ class CauldronAdminContentConfig(AppConfig):
             url_prefix="/cauldron/content/pages/new/",
             url_prefix_exact=True,
             description="Create a new page proposal",
+            owning_module="cauldron.admin.content",
         ))
         registry.register_item(AdminNavigationItem(
             key="cauldron.admin.content.change-requests",
@@ -67,6 +71,7 @@ class CauldronAdminContentConfig(AppConfig):
             permission="cauldron_content_operations.view_content_change_requests",
             url_prefix="/cauldron/content/change-requests/",
             description="Review content change requests",
+            owning_module="cauldron.admin.content",
         ))
         registry.register_item(AdminNavigationItem(
             key="cauldron.admin.content.audit",
@@ -77,4 +82,5 @@ class CauldronAdminContentConfig(AppConfig):
             permission="cauldron_content_operations.view_content_audit",
             url_prefix="/cauldron/content/audit/",
             description="View content audit history",
+            owning_module="cauldron.admin.content",
         ))

@@ -19,7 +19,7 @@ class CauldronSiteAstroConfig(AppConfig):
 def _register_public_url_provider() -> None:
     from cauldron_content.site import register_public_url_provider
     from cauldron_site_astro.public_url import AstroPublicUrlProvider
-    register_public_url_provider(AstroPublicUrlProvider())
+    register_public_url_provider(AstroPublicUrlProvider(), owning_module="cauldron.site.astro")
 
 
 def _register_site_tools() -> None:

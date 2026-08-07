@@ -55,3 +55,21 @@ def test_reset_clears():
     reg.register("p", _StubRepo())
     reg.reset()
     assert reg.names() == []
+
+
+def test_same_instance_reregistration_is_idempotent():
+    """Re-registering the exact same instance under the same name is a no-op."""
+    reg = RepositoryRegistry()
+    r = _StubRepo()
+    reg.register("p", r)
+    reg.register("p", r)  # must not raise
+    assert reg.get("p") is r
+    assert reg.names() == ["p"]
+
+
+def test_different_instance_same_name_raises():
+    """Re-registering a different instance under the same name still raises."""
+    reg = RepositoryRegistry()
+    reg.register("p", _StubRepo())
+    with pytest.raises(RegistrationError, match="already registered"):
+        reg.register("p", _StubRepo())

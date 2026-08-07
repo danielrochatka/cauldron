@@ -824,6 +824,66 @@ def check_global_prompt_version_valid(app_configs, **kwargs):
 
 
 @checks.register(checks.Tags.compatibility)
+def check_manifest_ai_tools_registered(app_configs, **kwargs):
+    """admin_ai.E022/E023: manifest declarations must match runtime registry state.
+
+    For each active Cauldron module that declares ``ai_tools`` in its manifest,
+    every listed tool slug must be present in the AdminAIToolRegistry.
+    Similarly, every ``prompt_templates`` entry must be in the
+    AIPromptTemplateRegistry.
+
+    These are programming errors — a module declared ownership of an artifact
+    and never registered it during ``AppConfig.ready()``.
+    """
+    messages: list = []
+    try:
+        from cauldron.modules.registry import registry as module_registry
+        from .tools import get_tool_registry
+        from cauldron_ai.prompt_templates import get_prompt_template_registry
+    except Exception:
+        return []
+
+    if not module_registry.is_ready:
+        return []
+
+    registered_tool_names = {d.name for d in get_tool_registry().all_definitions()}
+    registered_template_names = {
+        t.tool_name for t in get_prompt_template_registry().all_tool_templates()
+    }
+
+    for module in module_registry.all_active():
+        manifest = module.manifest
+        for tool_slug in manifest.ai_tools:
+            if tool_slug not in registered_tool_names:
+                messages.append(checks.Error(
+                    f"Module {manifest.slug!r} declares AI tool {tool_slug!r} "
+                    "in its manifest but the tool is not registered in "
+                    "AdminAIToolRegistry.",
+                    hint=(
+                        f"Ensure {manifest.slug!r} registers "
+                        f"{tool_slug!r} via register_tool() in AppConfig.ready()."
+                    ),
+                    obj=manifest.slug,
+                    id="admin_ai.E022",
+                ))
+        for tmpl_slug in manifest.prompt_templates:
+            if tmpl_slug not in registered_template_names:
+                messages.append(checks.Error(
+                    f"Module {manifest.slug!r} declares prompt template "
+                    f"{tmpl_slug!r} in its manifest but the template is not "
+                    "registered in AIPromptTemplateRegistry.",
+                    hint=(
+                        f"Ensure {manifest.slug!r} registers "
+                        f"{tmpl_slug!r} via register_tool_template() in AppConfig.ready()."
+                    ),
+                    obj=manifest.slug,
+                    id="admin_ai.E023",
+                ))
+
+    return messages
+
+
+@checks.register(checks.Tags.compatibility)
 def check_registered_tool_contracts(app_configs, **kwargs):
     """admin_ai.E009: a registered tool has a contract violation.
 

@@ -621,3 +621,5 @@ class TestScopedDiscoveryChecks:
         messages = django_checks.run_checks()
         e023 = [m for m in messages if m.id == "cauldron.E023"]
         assert e023 == []
+
+

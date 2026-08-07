@@ -56,6 +56,9 @@ class AdminNavigationItem:
     # When False the item is excluded from dashboard card generation even if
     # the user has the required permission.  Settings items default to False.
     show_on_dashboard: bool = True
+    # Cauldron module slug that owns this item (e.g. "cauldron.django.admin").
+    # Used for conflict diagnostics and registration integrity checks.
+    owning_module: str = ""
 
 
 @dataclass(frozen=True)
@@ -63,6 +66,8 @@ class AdminNavigationSection:
     key: str
     label: str
     order: int
+    # Cauldron module slug that owns this section (e.g. "cauldron.django.admin").
+    owning_module: str = ""
 
 
 @dataclass(frozen=True)
@@ -97,9 +102,13 @@ class NavigationRegistry:
                     # Exact re-registration is idempotent (e.g. Django
                     # autoreload re-executing AppConfig.ready()).
                     return
+                owner_hint = (
+                    f" (owned by {existing.owning_module!r})"
+                    if existing.owning_module else ""
+                )
                 raise ValueError(
-                    f"Navigation section {section.key!r} is already registered "
-                    "with different attributes."
+                    f"Navigation section {section.key!r} is already registered"
+                    f"{owner_hint} with different attributes."
                 )
             self._sections[section.key] = section
 
@@ -125,9 +134,13 @@ class NavigationRegistry:
                 if existing == item:
                     # Exact re-registration is idempotent.
                     return
+                owner_hint = (
+                    f" (owned by {existing.owning_module!r})"
+                    if existing.owning_module else ""
+                )
                 raise ValueError(
-                    f"Navigation item {item.key!r} is already registered "
-                    "with different attributes."
+                    f"Navigation item {item.key!r} is already registered"
+                    f"{owner_hint} with different attributes."
                 )
             self._items[item.key] = item
 

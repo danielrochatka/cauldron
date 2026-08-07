@@ -21,6 +21,8 @@ class RepositoryRegistry:
 
     def register(self, provider_name: str, repository: ContentRepository) -> None:
         if provider_name in self._repositories:
+            if self._repositories[provider_name] is repository:
+                return  # idempotent re-registration (same instance)
             raise RegistrationError(
                 provider_name=provider_name,
                 message=f"Provider {provider_name!r} is already registered.",

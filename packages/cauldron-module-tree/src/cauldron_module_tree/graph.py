@@ -271,6 +271,32 @@ class ModuleGraph:
                 result.add(dependent)
         return frozenset(result)
 
+    def _reduced_required_targets(self, slug: str) -> set[str]:
+        """Direct required targets of slug that survive transitive reduction.
+
+        A target T is removed when another direct required target D already
+        transitively requires T, making the direct slug → T edge redundant.
+
+        Skips reduction entirely when the required graph contains cycles to avoid
+        false removals caused by cyclic reachability.
+        """
+        direct: set[str] = {
+            e.target
+            for e in self._edges
+            if e.source == slug
+            and e.kind in ("required", "capability")
+            and e.target in self._nodes
+        }
+        if len(direct) <= 1:
+            return set(direct)
+        if self.cycles():
+            return set(direct)
+        ancestors_of: dict[str, frozenset[str]] = {t: self.ancestors(t) for t in direct}
+        return {
+            t for t in direct
+            if not any(t in ancestors_of[d] for d in direct if d != t)
+        }
+
     def connected_components(self) -> list[frozenset[str]]:
         """Union-find over all edge kinds.  Returns list of component slug sets."""
         parent: dict[str, str] = {s: s for s in self._nodes}
@@ -359,12 +385,14 @@ class ModuleGraph:
         if slug not in self._nodes:
             raise ValueError(f"Module {slug!r} not found in graph")
 
-        # Direct requires: one-hop forward from slug, all edge kinds.
-        # Store the first complete edge per target so capability and status are preserved.
+        # Direct required/capability edges only — optional edges never appear in the
+        # "requires" section of the focused graph; they are separate integrations.
         requires_edge_map: dict[str, ModuleGraphEdge] = {}  # target → first edge
         missing_targets: set[str] = set()
         for edge in self._edges:
             if edge.source != slug or edge.target == slug:
+                continue
+            if edge.kind not in ("required", "capability"):
                 continue
             target = edge.target
             if target in self._nodes:
@@ -372,6 +400,13 @@ class ModuleGraph:
                     requires_edge_map[target] = edge
             else:
                 missing_targets.add(target)
+
+        # Apply transitive reduction: remove targets already covered by another
+        # direct required target's transitive closure.
+        reduced_targets = self._reduced_required_targets(slug)
+        requires_edge_map = {
+            t: e for t, e in requires_edge_map.items() if t in reduced_targets
+        }
         requires_slugs: set[str] = set(requires_edge_map.keys())
 
         # Used-by closure: full transitive reverse BFS from slug (all edge kinds).
@@ -481,13 +516,25 @@ class ModuleGraph:
         components = self.connected_components()
         generated_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-        # Build nodes list preserving parents/children for backward compat
-        # We need to recompute parents/children from edge data
+        # Build reduced required adjacency — one edge per (source, target) pair,
+        # keeping only targets that survive transitive reduction.
+        reduced_targets: dict[str, set[str]] = {
+            s: self._reduced_required_targets(s) for s in self._nodes
+        }
         parents_map: dict[str, list[str]] = {s: [] for s in self._nodes}
         children_map: dict[str, list[str]] = {s: [] for s in self._nodes}
+        seen_required_pair: set[tuple[str, str]] = set()
         for edge in self._edges:
             src, tgt = edge.source, edge.target
             if edge.kind in ("required", "capability"):
+                if tgt not in self._nodes:
+                    continue  # missing targets not in parents/children
+                if tgt not in reduced_targets.get(src, set()):
+                    continue  # redundant ancestor — skip
+                pair = (src, tgt)
+                if pair in seen_required_pair:
+                    continue  # deduplicate capability + required to same target
+                seen_required_pair.add(pair)
                 if src in children_map:
                     children_map[src].append(tgt)
                 if tgt in parents_map:
@@ -520,16 +567,26 @@ class ModuleGraph:
                 "children": sorted(set(children_map.get(slug, []))),
             })
 
-        edges_list = [
-            {
+        # Emit reduced required/capability edges (one per source→target pair,
+        # only if the target survives transitive reduction) plus all optional edges.
+        edges_list = []
+        seen_edge_pair: set[tuple[str, str]] = set()
+        for e in self._edges:
+            if e.kind in ("required", "capability"):
+                tgt = e.target
+                if tgt in self._nodes and tgt not in reduced_targets.get(e.source, set()):
+                    continue  # transitively covered — omit from canonical output
+                pair = (e.source, tgt)
+                if pair in seen_edge_pair:
+                    continue  # deduplicate multiple edges to same target
+                seen_edge_pair.add(pair)
+            edges_list.append({
                 "source": e.source,
                 "target": e.target,
                 "kind": e.kind,
                 "capability": e.capability,
                 "status": e.status,
-            }
-            for e in self._edges
-        ]
+            })
 
         restart_required = any(n.pending_restart for n in self._nodes.values())
 

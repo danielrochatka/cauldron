@@ -61,6 +61,7 @@ export function buildFocusedSubgraph(data, slug) {
   const missingTargets = new Set();
   for (const e of data.edges) {
     if (e.source !== slug || e.target === slug) continue;
+    if (e.kind === "optional") continue;  // optional integrations are not shown under Requires
     if (nodeMap[e.target]) {
       if (!requiresEdgeMap.has(e.target)) requiresEdgeMap.set(e.target, e);
     } else {

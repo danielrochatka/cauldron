@@ -824,6 +824,91 @@ def check_global_prompt_version_valid(app_configs, **kwargs):
 
 
 @checks.register(checks.Tags.compatibility)
+def check_manifest_ai_tools_registered(app_configs, **kwargs):
+    """admin_ai.E022-E025: manifest declarations must match runtime registry state.
+
+    For each active Cauldron module:
+    - E022: ``ai_tools`` entry not present in AdminAIToolRegistry.
+    - E024: ``ai_tools`` entry registered but owned by a different module.
+    - E023: ``prompt_templates`` entry not present in AIPromptTemplateRegistry.
+    - E025: ``prompt_templates`` entry registered but owned by a different module.
+    """
+    messages: list = []
+    try:
+        from cauldron.modules.registry import registry as module_registry
+        from .tools import get_tool_registry
+        from cauldron_ai.prompt_templates import get_prompt_template_registry
+    except Exception:
+        return []
+
+    if not module_registry.is_ready:
+        return []
+
+    registered_tools = {d.name: d for d in get_tool_registry().all_definitions()}
+    registered_templates = {
+        t.tool_name: t for t in get_prompt_template_registry().all_tool_templates()
+    }
+
+    for module in module_registry.all_active():
+        manifest = module.manifest
+        for tool_slug in manifest.ai_tools:
+            defn = registered_tools.get(tool_slug)
+            if defn is None:
+                messages.append(checks.Error(
+                    f"Module {manifest.slug!r} declares AI tool {tool_slug!r} "
+                    "in its manifest but the tool is not registered in "
+                    "AdminAIToolRegistry.",
+                    hint=(
+                        f"Ensure {manifest.slug!r} registers "
+                        f"{tool_slug!r} via register_tool() in AppConfig.ready()."
+                    ),
+                    obj=manifest.slug,
+                    id="admin_ai.E022",
+                ))
+            elif defn.owning_module != manifest.slug:
+                messages.append(checks.Error(
+                    f"Module {manifest.slug!r} declares AI tool {tool_slug!r} "
+                    f"but the registered tool is owned by {defn.owning_module!r}.",
+                    hint=(
+                        f"Set owning_module={manifest.slug!r} when registering "
+                        f"{tool_slug!r}, or remove the declaration from "
+                        f"{manifest.slug!r}'s manifest."
+                    ),
+                    obj=manifest.slug,
+                    id="admin_ai.E024",
+                ))
+        for tmpl_slug in manifest.prompt_templates:
+            tmpl = registered_templates.get(tmpl_slug)
+            if tmpl is None:
+                messages.append(checks.Error(
+                    f"Module {manifest.slug!r} declares prompt template "
+                    f"{tmpl_slug!r} in its manifest but the template is not "
+                    "registered in AIPromptTemplateRegistry.",
+                    hint=(
+                        f"Ensure {manifest.slug!r} registers "
+                        f"{tmpl_slug!r} via register_tool_template() in AppConfig.ready()."
+                    ),
+                    obj=manifest.slug,
+                    id="admin_ai.E023",
+                ))
+            elif tmpl.owning_module != manifest.slug:
+                messages.append(checks.Error(
+                    f"Module {manifest.slug!r} declares prompt template "
+                    f"{tmpl_slug!r} but the registered template is owned by "
+                    f"{tmpl.owning_module!r}.",
+                    hint=(
+                        f"Set owning_module={manifest.slug!r} when registering "
+                        f"{tmpl_slug!r}, or remove the declaration from "
+                        f"{manifest.slug!r}'s manifest."
+                    ),
+                    obj=manifest.slug,
+                    id="admin_ai.E025",
+                ))
+
+    return messages
+
+
+@checks.register(checks.Tags.compatibility)
 def check_registered_tool_contracts(app_configs, **kwargs):
     """admin_ai.E009: a registered tool has a contract violation.
 

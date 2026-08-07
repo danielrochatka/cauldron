@@ -28,6 +28,7 @@ class CauldronDjangoAdminConfig(AppConfig):
             key="overview",
             label="Overview",
             order=10,
+            owning_module="cauldron.django.admin",
         ))
         registry.register_item(AdminNavigationItem(
             key="cauldron.dashboard",
@@ -40,11 +41,13 @@ class CauldronDjangoAdminConfig(AppConfig):
             # Dashboard shares its prefix with every nested cauldron page;
             # match exactly so it does not remain active on Modules etc.
             url_prefix_exact=True,
+            owning_module="cauldron.django.admin",
         ))
         registry.register_section(AdminNavigationSection(
             key="system",
             label="System",
             order=900,
+            owning_module="cauldron.django.admin",
         ))
         registry.register_item(AdminNavigationItem(
             key="cauldron.modules",
@@ -55,4 +58,5 @@ class CauldronDjangoAdminConfig(AppConfig):
             permission="",
             url_prefix="/cauldron/modules/",
             description="Active Cauldron modules and capabilities",
+            owning_module="cauldron.django.admin",
         ))

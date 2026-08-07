@@ -7,9 +7,9 @@ from pathlib import Path
 import pytest
 from django.test import override_settings
 
-from cauldron_content.registry import registry
-from cauldron_cms_flatfile.apps import _register_provider
-from cauldron_cms_flatfile.repository import FlatFileRepository
+from cauldron_content.registry import RegistrationError, registry
+from cauldron_cms_flatfile.apps import _OWNING_MODULE, _register_provider
+from cauldron_cms_flatfile.repository import PROVIDER_NAME, FlatFileRepository
 
 
 @pytest.fixture(autouse=True)
@@ -183,3 +183,68 @@ class TestFreshInstallWorkflow:
             repo2 = registry.get("flatfile")
             items = repo2.list_items("pages")
             assert any(item.id == "page-about" for item in items)
+
+
+class TestRegistrationOwnership:
+    """Ownership semantics of _register_provider()."""
+
+    _SETTINGS = {
+        "cauldron.content": {},
+        "cauldron.cms.flatfile": {"site_root": "/tmp/site"},
+    }
+
+    def test_first_registration_stores_correct_owner(self, tmp_path):
+        with override_settings(CAULDRON_MODULES={
+            "cauldron.content": {},
+            "cauldron.cms.flatfile": {"site_root": str(tmp_path)},
+        }):
+            _register_provider()
+            assert registry.get_owning_module(PROVIDER_NAME) == _OWNING_MODULE
+
+    def test_repeated_call_with_own_provider_is_idempotent(self, tmp_path):
+        with override_settings(CAULDRON_MODULES={
+            "cauldron.content": {},
+            "cauldron.cms.flatfile": {"site_root": str(tmp_path)},
+        }):
+            _register_provider()
+            first = registry.get(PROVIDER_NAME)
+            _register_provider()  # must not raise
+            assert registry.get(PROVIDER_NAME) is first
+
+    def test_existing_provider_owned_by_another_module_raises(self, tmp_path):
+        other_repo = FlatFileRepository.__new__(FlatFileRepository)
+        registry.register(PROVIDER_NAME, other_repo, owning_module="some.other.module")
+        with override_settings(CAULDRON_MODULES={
+            "cauldron.content": {},
+            "cauldron.cms.flatfile": {"site_root": str(tmp_path)},
+        }):
+            with pytest.raises(RegistrationError) as exc_info:
+                _register_provider()
+        assert PROVIDER_NAME in str(exc_info.value)
+        assert "some.other.module" in str(exc_info.value)
+        assert _OWNING_MODULE in str(exc_info.value)
+
+    def test_existing_provider_with_empty_owner_raises(self, tmp_path):
+        other_repo = FlatFileRepository.__new__(FlatFileRepository)
+        registry.register(PROVIDER_NAME, other_repo, owning_module="")
+        with override_settings(CAULDRON_MODULES={
+            "cauldron.content": {},
+            "cauldron.cms.flatfile": {"site_root": str(tmp_path)},
+        }):
+            with pytest.raises(RegistrationError) as exc_info:
+                _register_provider()
+        assert "no owning module" in str(exc_info.value)
+
+    def test_conflict_diagnostic_names_provider_and_owners(self, tmp_path):
+        other_repo = FlatFileRepository.__new__(FlatFileRepository)
+        registry.register(PROVIDER_NAME, other_repo, owning_module="rival.module")
+        with override_settings(CAULDRON_MODULES={
+            "cauldron.content": {},
+            "cauldron.cms.flatfile": {"site_root": str(tmp_path)},
+        }):
+            with pytest.raises(RegistrationError) as exc_info:
+                _register_provider()
+        msg = str(exc_info.value)
+        assert PROVIDER_NAME in msg
+        assert "rival.module" in msg
+        assert _OWNING_MODULE in msg

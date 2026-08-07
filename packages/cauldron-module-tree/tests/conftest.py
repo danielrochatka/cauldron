@@ -84,6 +84,7 @@ def pytest_configure(config):
                     key="system",
                     label="System",
                     order=900,
+                    owning_module="cauldron.django.admin",
                 ))
             except ValueError:
                 # Already registered — idempotent re-run.

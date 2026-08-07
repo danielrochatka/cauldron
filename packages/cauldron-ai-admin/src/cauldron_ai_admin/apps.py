@@ -36,6 +36,7 @@ class CauldronAIAdminConfig(AppConfig):
             key="ai",
             label="Admin AI",
             order=500,
+            owning_module="cauldron.ai.admin",
         ))
         registry.register_item(AdminNavigationItem(
             key="cauldron.ai.admin.page",
@@ -46,6 +47,7 @@ class CauldronAIAdminConfig(AppConfig):
             permission="cauldron_ai_admin.use_admin_ai",
             url_prefix="/cauldron/admin/ai/",
             description="Interact with the Admin AI assistant",
+            owning_module="cauldron.ai.admin",
         ))
         registry.register_item(AdminNavigationItem(
             key="cauldron.ai.admin.runs",
@@ -56,6 +58,7 @@ class CauldronAIAdminConfig(AppConfig):
             permission="cauldron_ai_admin.view_admin_ai_runs",
             url_prefix="/cauldron/admin/ai/runs/",
             description="View Admin AI run history",
+            owning_module="cauldron.ai.admin",
         ))
         registry.register_item(AdminNavigationItem(
             key="cauldron.ui.styles",
@@ -66,6 +69,7 @@ class CauldronAIAdminConfig(AppConfig):
             permission="cauldron_ai_admin.view_ui_styles",
             url_prefix="/cauldron/ui/style-changes/",
             description="Review AI-proposed CSS changes",
+            owning_module="cauldron.ai.admin",
         ))
         # Settings spec — projects as kind="settings" at the end of the ai section.
         try:

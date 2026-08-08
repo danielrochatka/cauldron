@@ -1,0 +1,100 @@
+{% extends "cauldron_admin/base.html" %}
+{% block page_title %}Review Change Set{% endblock %}
+
+{% block page_actions %}
+<a href="{% url 'cauldron_admin_content:content-browser' %}" class="cui-button cui-button--secondary">Back to Content</a>
+{% endblock %}
+
+{% block content %}
+
+<div class="cui-card">
+  <h2 class="cui-card__heading">Change set</h2>
+  <dl class="cui-dl">
+    <dt>ID</dt><dd><code>{{ change_set_id|escape }}</code></dd>
+    <dt>Status</dt><dd>{% include "cauldron_admin/includes/status_badge.html" with status=status %}</dd>
+    {% if created_at %}<dt>Created</dt><dd>{{ created_at|escape }}</dd>{% endif %}
+  </dl>
+</div>
+
+{% if content_request_ids %}
+<div class="cui-card">
+  <h2 class="cui-card__heading">Included change requests</h2>
+  <ul class="cui-list">
+    {% for req_id in content_request_ids %}
+    <li><code>{{ req_id|escape }}</code></li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+{% if status == "draft_ready" %}
+  {% if preview_url %}
+  <div class="cui-card">
+    <h2 class="cui-card__heading">Preview</h2>
+    <p>Review the proposed changes before publishing.</p>
+    <p><a href="{{ preview_url|escape }}" class="cui-button" target="_blank" rel="noopener">Open preview</a></p>
+  </div>
+  {% endif %}
+
+  {% if can_publish %}
+  <div class="cui-card">
+    <h2 class="cui-card__heading">Publish</h2>
+    <p>Publish this change set to make the changes live.</p>
+    <form method="post" action="{% url 'cauldron_admin_content:change-set-review' change_set_id=change_set_id %}">
+      {% csrf_token %}
+      <input type="hidden" name="action" value="publish">
+      <button type="submit" class="cui-button cui-button--primary">Publish</button>
+    </form>
+  </div>
+  {% else %}
+  <div class="cui-alert cui-alert--info" role="note">
+    You do not have permission to publish this change set.
+  </div>
+  {% endif %}
+
+{% elif status == "preview_failed" %}
+<div class="cui-alert cui-alert--error" role="alert">
+  <strong>Preview build failed.</strong>
+  {% if error_message %}<p>{{ error_message|escape }}</p>{% endif %}
+</div>
+
+{% elif status == "publish_failed" %}
+<div class="cui-alert cui-alert--error" role="alert">
+  <strong>Publish failed.</strong>
+  {% if error_message %}<p>{{ error_message|escape }}</p>{% endif %}
+  {% if requires_reconciliation %}
+  <p><strong>Manual reconciliation is required.</strong> One or more applied
+  content changes could not be verified as restored to their pre-publish state.
+  Do not retry this change set — investigate the compensation report below
+  and reconcile the affected requests before creating a new publish.</p>
+  {% elif compensated %}
+  <p>All applied content changes were compensated and their canonical state
+  was restored. The underlying change requests are now terminally
+  <code>rolled_back</code>; create new change requests to retry the intended
+  publish.</p>
+  {% endif %}
+</div>
+{% if can_publish and retryable %}
+<div class="cui-card">
+  <h2 class="cui-card__heading">Retry</h2>
+  <p>Filesystem state has been restored; you may retry the publish.</p>
+  <form method="post" action="{% url 'cauldron_admin_content:change-set-review' change_set_id=change_set_id %}">
+    {% csrf_token %}
+    <input type="hidden" name="action" value="publish">
+    <button type="submit" class="cui-button cui-button--primary">Retry Publish</button>
+  </form>
+</div>
+{% endif %}
+
+{% elif status == "published" %}
+<div class="cui-alert cui-alert--success" role="status">
+  <strong>Change set was published.</strong>
+</div>
+
+{% elif status == "publishing" %}
+<div class="cui-alert cui-alert--info" role="status">
+  <strong>Publishing in progress.</strong>
+</div>
+{% endif %}
+
+{% endblock %}

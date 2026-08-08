@@ -1,5 +1,15 @@
 """Django AppConfig for cauldron_site_astro."""
+import threading
+
 from django.apps import AppConfig
+
+
+# Thread-local flag used by SiteChangeSetService.publish() to suppress the
+# canonical_content_changed signal-driven rebuild during a controlled publish
+# (that publish already performs its own scoped build and promotion — an
+# additional signal-triggered build would race with it and rebuild the full
+# site including drafts that were not part of this change set).
+_suppress_rebuild = threading.local()
 
 
 class CauldronSiteAstroConfig(AppConfig):
@@ -51,6 +61,18 @@ def _connect_signals() -> None:
 def _handle_content_changed(sender, change_type, change_id, provider_name, changed_by, **kwargs):
     import logging
     logger = logging.getLogger(__name__)
+    # If a SiteChangeSet publish is currently active on this thread, skip the
+    # signal-driven rebuild — that publish already builds and promotes the site
+    # atomically as part of its own 7-step workflow, so a concurrent rebuild
+    # would race with it and re-include unrelated draft content.
+    if getattr(_suppress_rebuild, "active", False):
+        logger.debug(
+            "cauldron.site.astro: suppressed signal-driven rebuild after %s of %s "
+            "(inside SiteChangeSet publish)",
+            change_type,
+            change_id,
+        )
+        return
     try:
         from cauldron_site_astro.dispatcher import get_dispatcher
         get_dispatcher().dispatch()

@@ -951,6 +951,42 @@ def test_build_preview_extra_items_win_deduplication(tmp_path: Path):
     assert captured_manifest["pages"][0]["title"] == "New Home Draft"
 
 
+def test_build_preview_excluded_item_ids_removes_from_baseline(tmp_path: Path):
+    """Pages in excluded_item_ids must not appear in the controlled build.
+
+    Regression test for delete operations: a page that exists in the published
+    baseline must be omitted from the preview when its item_id is listed in
+    excluded_item_ids (i.e., a delete operation targets it).
+    """
+    published_page = _make_item("page-about", "about", data={"title": "About"})
+    published_home = _make_item("homepage", "homepage", data={"title": "Home"})
+    config = _make_config(tmp_path)
+    router = _make_router([published_page, published_home])
+    svc = SiteBuildService(config, router)
+    preview_out = tmp_path / "preview"
+
+    captured_manifest: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        manifest_path = kwargs["env"]["CAULDRON_MANIFEST"]
+        preview_out.mkdir(parents=True, exist_ok=True)
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            captured_manifest.update(json.load(f))
+        return _ok_proc()
+
+    with patch("subprocess.run", side_effect=fake_run):
+        result = svc.build_preview(
+            output_dir=preview_out,
+            # "page-about" is the deleted item; homepage remains in baseline.
+            excluded_item_ids=["page-about"],
+        )
+
+    assert result.ok is True
+    ids_in_build = {p["id"] for p in captured_manifest["pages"]}
+    assert "page-about" not in ids_in_build, "Deleted page must not appear in the controlled build"
+    assert "homepage" in ids_in_build, "Non-deleted page must still appear"
+
+
 # ---------------------------------------------------------------------------
 # migrate_output_root management command
 # ---------------------------------------------------------------------------

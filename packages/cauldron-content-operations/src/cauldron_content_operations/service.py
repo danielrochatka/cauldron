@@ -22,6 +22,7 @@ from .results import (
     ChangeRequestDetail,
     ChangeRequestResult,
     ChangeSetPreview,
+    CompensationResult,
     ContentItemResult,
     OperationError,
     OperationPreview,
@@ -2413,6 +2414,220 @@ class ContentOperationService:
                 lifecycle_state=LifecycleState.RECONCILIATION_REQUIRED.value,
             )
         return ChangeRequestResult(ok=False, error=OperationError(rollback_error_code, rollback_error), request_id=request_id, lifecycle_state=LifecycleState.ROLLBACK_FAILED.value)
+
+    def compensate_for_publication_failure(
+        self,
+        request_id: str,
+        *,
+        user: Any,
+        expected_version: int = 0,
+        correlation_id: str = "",
+    ) -> CompensationResult:
+        """Internal compensation: unwind an in-progress coordinated publish.
+
+        This is not a user-invoked rollback. It is called by
+        :class:`SiteChangeSetService.publish` when one apply in a multi-request
+        publish has already succeeded and a subsequent apply fails. The
+        publisher only holds ``apply_content_changes`` — requiring the unrelated
+        ``rollback_content_changes`` permission here would leave real half-
+        published state stranded.
+
+        Design constraints
+        ------------------
+        * Uses the trusted SQL rollback artifact evidence recorded by the
+          preceding ``apply_change_request`` call.
+        * Uses the same :class:`ReversibleMutationAdapter` code path that
+          ``rollback_change_request`` uses — no filesystem mutation happens
+          outside the adapter.
+        * Enforces ``apply_content_changes`` (the same permission the
+          publisher used to apply). Does NOT require
+          ``rollback_content_changes``.
+        * Returns a :class:`CompensationResult` with ``verified`` reflecting
+          the adapter's verify_rolled_back_state outcome so the coordinator
+          can decide whether to restore prior FS state or require manual
+          reconciliation.
+        """
+        _check_permission(user, "apply_content_changes")
+        version_err = _require_positive_version(expected_version)
+        if version_err is not None:
+            # Reuse the error but wrap it as a CompensationResult so the caller
+            # gets consistent structured output.
+            err = version_err.error
+            return CompensationResult(
+                ok=False,
+                verified=False,
+                request_id=request_id,
+                lifecycle_state="",
+                error_code=err.code if err else "conflict.version_required",
+                error_message=err.message if err else "expected_version required",
+            )
+
+        # Idempotent short-circuit for already-rolled-back requests.
+        try:
+            cr_check = ContentChangeRequest.objects.get(request_id=request_id)
+        except ContentChangeRequest.DoesNotExist:
+            return CompensationResult(
+                ok=False,
+                verified=False,
+                request_id=request_id,
+                error_code="not_found",
+                error_message=f"Not found: {request_id!r}",
+            )
+        if cr_check.current_state == LifecycleState.ROLLED_BACK:
+            return CompensationResult(
+                ok=True,
+                verified=True,
+                request_id=request_id,
+                lifecycle_state=LifecycleState.ROLLED_BACK.value,
+                request_version=cr_check.request_version,
+            )
+
+        # Reuse rollback_change_request's underlying flow, bypassing its
+        # permission check by calling _rollback_locked directly after the same
+        # preflight (adapter compatibility, artifact digest, has_rollback_artifact,
+        # lock acquisition). This keeps the compensation path aligned with the
+        # canonical rollback path — same audit trail, same reconciliation
+        # semantics — while enforcing only apply_content_changes.
+        cid = correlation_id or str(uuid.uuid4())
+        provider_name = cr_check.provider_name
+        adapter = get_adapter(provider_name)
+        if not _adapter_fully_supports_rollback(adapter):
+            return CompensationResult(
+                ok=False,
+                verified=False,
+                request_id=request_id,
+                lifecycle_state=cr_check.lifecycle_state,
+                error_code="rollback.not_supported",
+                error_message=(
+                    f"Provider {provider_name!r} does not support rollback."
+                ),
+            )
+        if not _is_valid_sha256_hex(cr_check.rollback_artifact_digest or ""):
+            return CompensationResult(
+                ok=False,
+                verified=False,
+                request_id=request_id,
+                lifecycle_state=cr_check.lifecycle_state,
+                error_code="rollback.evidence_unavailable",
+                error_message="No trusted SQL rollback artifact digest for this request.",
+            )
+        _entry_count_meta = (cr_check.metadata or {}).get("rollback_artifact_entry_count")
+        if (
+            not isinstance(_entry_count_meta, int)
+            or isinstance(_entry_count_meta, bool)
+            or _entry_count_meta <= 0
+        ):
+            return CompensationResult(
+                ok=False,
+                verified=False,
+                request_id=request_id,
+                lifecycle_state=cr_check.lifecycle_state,
+                error_code="rollback.evidence_unavailable",
+                error_message="No trusted SQL rollback entry count for this request.",
+            )
+        if not adapter.has_rollback_artifact(cr_check.workspace_changeset_id):
+            return CompensationResult(
+                ok=False,
+                verified=False,
+                request_id=request_id,
+                lifecycle_state=cr_check.lifecycle_state,
+                error_code="rollback.no_artifact",
+                error_message="No rollback artifact found for this change request.",
+            )
+
+        locks_dir = self._resolved_locks_dir()
+        if locks_dir is None:
+            return CompensationResult(
+                ok=False,
+                verified=False,
+                request_id=request_id,
+                lifecycle_state=cr_check.lifecycle_state,
+                error_code="workspace.unavailable",
+                error_message=(
+                    "Workspace locks directory is unavailable; cannot compensate safely."
+                ),
+            )
+        timeout = float(self._config.lock_timeout)
+
+        try:
+            request_lock_ctx = request_lock(request_id, locks_dir, timeout=timeout)
+            request_lock_ctx.__enter__()
+        except TimeoutError:
+            return CompensationResult(
+                ok=False,
+                verified=False,
+                request_id=request_id,
+                lifecycle_state=cr_check.lifecycle_state,
+                error_code="operations.busy",
+                error_message="Another rollback is in progress for this request; try again.",
+            )
+        except Exception as exc:
+            return CompensationResult(
+                ok=False,
+                verified=False,
+                request_id=request_id,
+                lifecycle_state=cr_check.lifecycle_state,
+                error_code="operations.busy",
+                error_message=f"Could not acquire request lock: {type(exc).__name__}",
+            )
+        try:
+            try:
+                provider_lock_ctx = provider_lock(provider_name, locks_dir, timeout=timeout)
+                provider_lock_ctx.__enter__()
+            except TimeoutError:
+                return CompensationResult(
+                    ok=False,
+                    verified=False,
+                    request_id=request_id,
+                    lifecycle_state=cr_check.lifecycle_state,
+                    error_code="operations.busy",
+                    error_message=(
+                        "Another rollback is in progress for this provider; try again."
+                    ),
+                )
+            except Exception as exc:
+                return CompensationResult(
+                    ok=False,
+                    verified=False,
+                    request_id=request_id,
+                    lifecycle_state=cr_check.lifecycle_state,
+                    error_code="operations.busy",
+                    error_message=f"Could not acquire provider lock: {type(exc).__name__}",
+                )
+            try:
+                rb_result = self._rollback_locked(
+                    request_id=request_id,
+                    user=user,
+                    expected_version=expected_version,
+                    provider_name=provider_name,
+                    adapter=adapter,
+                    force=False,
+                    correlation_id=cid,
+                )
+            finally:
+                provider_lock_ctx.__exit__(None, None, None)
+        finally:
+            request_lock_ctx.__exit__(None, None, None)
+
+        # Translate ChangeRequestResult into a CompensationResult that reports
+        # verified=True only when the rollback fully succeeded (ROLLED_BACK
+        # lifecycle state). Any other terminal state is unverified —
+        # RECONCILIATION_REQUIRED and ROLLBACK_FAILED both mean the coordinator
+        # cannot claim clean restoration.
+        verified = bool(
+            rb_result.ok
+            and rb_result.lifecycle_state == LifecycleState.ROLLED_BACK.value
+        )
+        err = rb_result.error
+        return CompensationResult(
+            ok=verified,
+            verified=verified,
+            request_id=request_id,
+            lifecycle_state=rb_result.lifecycle_state,
+            request_version=rb_result.request_version,
+            error_code=(err.code if err else ""),
+            error_message=(err.message if err else ""),
+        )
 
     def get_audit_history(
         self,

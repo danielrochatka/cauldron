@@ -15,6 +15,14 @@ dependencies = [
     "django>=4.2",
 ]
 
+[project.optional-dependencies]
+site = [
+    "cauldron-site-astro>=0.1.0",
+]
+test = [
+    "cauldron-site-astro>=0.1.0",
+]
+
 [project.entry-points."cauldron.modules"]
 "cauldron.admin.content" = "cauldron_admin_content.module:module"
 

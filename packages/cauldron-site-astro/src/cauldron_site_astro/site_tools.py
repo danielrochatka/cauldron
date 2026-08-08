@@ -592,207 +592,95 @@ def _handle_prepare_change_set(
     description="",
     **kwargs,
 ):
-    from pathlib import Path
-
-    from django.utils import timezone
-
+    """Thin adapter — validates tool-specific args and delegates to the service."""
     try:
         from cauldron_ai_admin.tools import AdminAIToolResult
     except ImportError:
         return None
-    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_site_astro.publication_service import get_publication_service
 
-    # ---- Validate inputs ---------------------------------------------------
-    if not isinstance(content_request_ids, list) or not content_request_ids:
-        return AdminAIToolResult(
-            tool_name="site.prepare_change_set",
-            success=False,
-            message="content_request_ids must be a non-empty list of strings.",
-        )
-    content_request_ids = [str(x) for x in content_request_ids]
-
-    # ---- Load build config -------------------------------------------------
-    try:
-        svc = get_build_service()
-        cfg = svc._config
-    except Exception as exc:
-        return AdminAIToolResult(
-            tool_name="site.prepare_change_set",
-            success=False,
-            message=f"Could not load site build config: {_safe_exc(exc)}",
-        )
-
-    if not cfg.previews_root:
-        return AdminAIToolResult(
-            tool_name="site.prepare_change_set",
-            success=False,
-            message="previews_root is not configured; cannot build preview.",
-        )
-
-    # ---- Auto-load staged theme CSS if not explicitly supplied ------------
-    if not theme_css and cfg.theme_root:
-        try:
-            from cauldron_site_astro.theme import SiteThemeService
-            theme_css = SiteThemeService(cfg.theme_root).get_staged_css() or ""
-        except Exception:
-            pass
-
-    # ---- Create the SiteChangeSet in 'preparing' state --------------------
-    # _extract_draft_items returns (item_ids, extra_items):
-    # - item_ids: used for scoping (include existing router drafts with these ids)
-    # - extra_items: the proposed item content extracted directly from workspace
-    #   changesets, injected into the preview so new pages (not yet in the
-    #   flatfile store) and edited pages (override router version with proposed
-    #   content) appear exactly as the operator reviewed them.
-    affected_item_ids, draft_extra_items = _extract_draft_items(content_request_ids)
-    cs = SiteChangeSet.objects.create(
-        status=SiteChangeSet.PREPARING,
-        content_request_ids=content_request_ids,
-        staged_theme_css=theme_css or "",
-        originating_run_id=_coerce_run_id(getattr(context, "run_id", None)),
-        creator=getattr(context, "actor", None),
-        affected_item_ids=affected_item_ids,
+    result = get_publication_service().prepare(
+        actor=getattr(context, "actor", None),
+        content_request_ids=content_request_ids if isinstance(content_request_ids, list) else [],
+        originating_run_id=getattr(context, "run_id", None),
+        description=description,
+        staged_theme_css=theme_css,
     )
 
-    # ---- Build the scoped preview -----------------------------------------
-    output_dir = Path(cfg.previews_root) / str(cs.id)
-    try:
-        result = svc.build_preview(
-            output_dir=output_dir,
-            item_ids_to_include=affected_item_ids or None,
-            extra_items=draft_extra_items or None,
-            theme_css=theme_css or "",
-        )
-    except Exception as exc:
-        cs.status = SiteChangeSet.PREVIEW_FAILED
-        cs.save(update_fields=["status", "updated_at"])
-        return AdminAIToolResult(
-            tool_name="site.prepare_change_set",
-            success=False,
-            data={"change_set_id": str(cs.id)},
-            message=f"Preview build raised an exception: {_safe_exc(exc)}",
-        )
-
     if not result.ok:
-        cs.status = SiteChangeSet.PREVIEW_FAILED
-        cs.preview_dir = str(cs.id)
-        cs.save(update_fields=["status", "preview_dir", "updated_at"])
+        data: dict = {}
+        if result.change_set_id:
+            data["change_set_id"] = result.change_set_id
+        if result.build_log_tail:
+            data["build_log"] = result.build_log_tail
         return AdminAIToolResult(
             tool_name="site.prepare_change_set",
             success=False,
-            data={
-                "change_set_id": str(cs.id),
-                "build_log": (result.build_log or "")[-_MAX_BUILD_LOG_TAIL:],
-            },
-            message=f"Preview build failed: {_safe_exc(Exception(result.error or ''))}",
+            data=data or None,
+            message=result.message,
         )
-
-    cs.status = SiteChangeSet.DRAFT_READY
-    cs.preview_dir = str(cs.id)  # relative path beneath previews_root
-    cs.draft_ready_at = timezone.now()
-    cs.save(update_fields=[
-        "status", "preview_dir", "draft_ready_at", "updated_at",
-    ])
 
     return AdminAIToolResult(
         tool_name="site.prepare_change_set",
         success=True,
         data={
-            "change_set_id": str(cs.id),
+            "change_set_id": result.change_set_id,
             "pages_built": result.pages_built,
-            "preview_url": cs.get_preview_url(),
+            "preview_url": result.preview_url,
             "description": description,
         },
         message=(
-            f"Change set {cs.id} is draft_ready ({result.pages_built} page(s)). "
-            f"Review at the returned preview_url, then call "
-            f"site.publish(change_set_id={str(cs.id)!r}, confirm=true) to go live."
+            f"Change set {result.change_set_id} is draft_ready "
+            f"({result.pages_built} page(s)). Review at the returned preview_url, "
+            f"then call site.publish(change_set_id={result.change_set_id!r}, "
+            f"confirm=true) to go live."
         ),
     )
 
 
 def _handle_inspect_preview(context, *, change_set_id, **kwargs):
-    from pathlib import Path
-
+    """Thin adapter — delegates to :class:`SiteChangeSetService`."""
     try:
         from cauldron_ai_admin.tools import AdminAIToolResult
     except ImportError:
         return None
-    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_site_astro.publication_service import get_publication_service
 
-    try:
-        cs = SiteChangeSet.objects.get(id=change_set_id)
-    except (SiteChangeSet.DoesNotExist, ValueError):
+    result = get_publication_service().inspect(change_set_id)
+
+    if not result.ok:
         return AdminAIToolResult(
             tool_name="site.inspect_preview",
             success=False,
-            message=f"Change set {change_set_id!r} not found.",
+            message=result.message,
         )
-
-    try:
-        svc = get_build_service()
-        cfg = svc._config
-    except Exception as exc:
-        return AdminAIToolResult(
-            tool_name="site.inspect_preview",
-            success=False,
-            message=f"Could not load site build config: {_safe_exc(exc)}",
-        )
-
-    pages_built = 0
-    if cfg.previews_root and cs.preview_dir:
-        preview_dir = Path(cfg.previews_root) / cs.preview_dir
-        if preview_dir.exists() and preview_dir.is_dir():
-            pages_built = sum(1 for _ in preview_dir.rglob("*.html"))
 
     return AdminAIToolResult(
         tool_name="site.inspect_preview",
         success=True,
         data={
-            "change_set_id": str(cs.id),
-            "status": cs.status,
-            "pages_built": pages_built,
-            "preview_url": cs.get_preview_url(),
-            "created_at": cs.created_at.isoformat() if cs.created_at else "",
+            "change_set_id": result.change_set_id,
+            "status": result.status,
+            "pages_built": result.pages_built,
+            "preview_url": result.preview_url,
+            "created_at": result.created_at,
         },
     )
 
 
 def _handle_publish(context, *, change_set_id, confirm, **kwargs):
-    """Publish a draft-ready SiteChangeSet to the live site.
+    """Thin adapter — delegates to :class:`SiteChangeSetService`.
 
-    Execution order and rollback guarantees
-    ----------------------------------------
-    1. Validate all content requests (read-only pre-flight).
-    2. Build via build_preview with draft items — no DB or FS mutations yet.
-    3. Snapshot current active CSS (in memory).
-    4. Promote output to live output_root — keeping the previous output as a
-       rollback snapshot (promote_output_with_backup).
-    5. Promote staged CSS to active.css.
-       On failure: restore output from snapshot → PUBLISH_FAILED.
-    6. Apply content requests inside a single transaction.atomic() block.
-       On failure: transaction rolls back; restore output from snapshot;
-       restore active.css from in-memory snapshot → PUBLISH_FAILED.
-    7. Discard output snapshot (commit).  Mark PUBLISHED.
-
-    This ordering ensures:
-    - A build failure leaves the content store unchanged (step 2 first).
-    - A CSS failure leaves content unchanged and the previous output live.
-    - A DB failure leaves the previous output and previous CSS live;
-      the transaction rollback guarantees no partial content applies.
-    - PUBLISH_FAILED change sets may be retried (all FS state is restored).
+    Validates the ``confirm`` guard, then hands the change-set publish to the
+    domain service. The service reproduces the original 7-step atomic
+    transaction (validate → build → snapshot output → promote output →
+    promote CSS → apply content in transaction.atomic() → discard snapshot).
     """
-    import shutil
-    import tempfile
-
-    from django.db import transaction
-    from django.utils import timezone
-
     try:
         from cauldron_ai_admin.tools import AdminAIToolResult
     except ImportError:
         return None
-    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_site_astro.publication_service import get_publication_service
 
     if not confirm:
         return AdminAIToolResult(
@@ -801,289 +689,40 @@ def _handle_publish(context, *, change_set_id, confirm, **kwargs):
             message="Publish not confirmed. Set confirm=true to proceed.",
         )
 
-    try:
-        cs = SiteChangeSet.objects.get(id=change_set_id)
-    except (SiteChangeSet.DoesNotExist, ValueError):
+    result = get_publication_service().publish(
+        actor=getattr(context, "actor", None),
+        change_set_id=change_set_id,
+    )
+
+    if not result.ok:
+        data: dict = {}
+        if result.change_set_id:
+            data["change_set_id"] = result.change_set_id
+        if result.status:
+            data["status"] = result.status
+        if result.build_log_tail:
+            data["build_log"] = result.build_log_tail
         return AdminAIToolResult(
             tool_name="site.publish",
             success=False,
-            message=f"Change set {change_set_id!r} not found.",
+            data=data or None,
+            message=result.message,
         )
 
-    # Allow retry from publish_failed: all FS state is restored on each failure.
-    if cs.status not in (SiteChangeSet.DRAFT_READY, SiteChangeSet.PUBLISH_FAILED):
-        return AdminAIToolResult(
-            tool_name="site.publish",
-            success=False,
-            data={"change_set_id": str(cs.id), "status": cs.status},
-            message=(
-                f"Change set is in status {cs.status!r}; "
-                f"only draft_ready or publish_failed change sets can be published."
-            ),
-        )
-
-    try:
-        svc = get_build_service()
-        cfg = svc._config
-    except Exception as exc:
-        return AdminAIToolResult(
-            tool_name="site.publish",
-            success=False,
-            message=f"Could not load site build config: {_safe_exc(exc)}",
-        )
-
-    cs.status = SiteChangeSet.PUBLISHING
-    cs.save(update_fields=["status", "updated_at"])
-
-    # ---- Step 1: Validate all content requests (read-only pre-flight) ------
-    content_service = _get_content_operation_service()
-    validated: dict = {}
-
-    for req_id in cs.content_request_ids or ():
-        if content_service is None:
-            cs.status = SiteChangeSet.PUBLISH_FAILED
-            cs.publish_build_result = {
-                "error": "content-operations service unavailable",
-                "applied": [],
-            }
-            cs.save(update_fields=["status", "publish_build_result", "updated_at"])
-            return AdminAIToolResult(
-                tool_name="site.publish",
-                success=False,
-                data={"change_set_id": str(cs.id)},
-                message="Content operations service is unavailable; cannot apply changes.",
-            )
-
-        try:
-            v = content_service.validate_change_request(req_id, user=context.actor)
-        except Exception as exc:
-            cs.status = SiteChangeSet.PUBLISH_FAILED
-            cs.publish_build_result = {
-                "error": f"validate raised: {_safe_exc(exc)}",
-                "applied": [],
-                "failed_request_id": req_id,
-            }
-            cs.save(update_fields=["status", "publish_build_result", "updated_at"])
-            return AdminAIToolResult(
-                tool_name="site.publish",
-                success=False,
-                data={"change_set_id": str(cs.id)},
-                message=f"Validation of {req_id!r} raised: {_safe_exc(exc)}",
-            )
-
-        if not getattr(v, "ok", False):
-            err = getattr(v, "error", None)
-            err_msg = getattr(err, "message", "validation failed")
-            cs.status = SiteChangeSet.PUBLISH_FAILED
-            cs.publish_build_result = {
-                "error": f"validate failed for {req_id}: {err_msg[:_MAX_EXC_MSG]}",
-                "applied": [],
-                "failed_request_id": req_id,
-            }
-            cs.save(update_fields=["status", "publish_build_result", "updated_at"])
-            return AdminAIToolResult(
-                tool_name="site.publish",
-                success=False,
-                data={"change_set_id": str(cs.id)},
-                message=f"Validation of {req_id!r} failed: {err_msg[:_MAX_EXC_MSG]}",
-            )
-
-        validated[req_id] = v
-
-    # ---- Step 2: Build (no DB or FS mutations) -----------------------------
-    # Extract proposed item content from workspace changesets so that new pages
-    # (not yet in the flatfile store) appear in the build with the exact content
-    # the operator reviewed.  The content requests are applied in Step 6 AFTER
-    # the build, so without extra_items those pages would be absent from the
-    # published output.
-    _, publish_extra_items = _extract_draft_items(cs.content_request_ids or [])
-
-    tmp_build_dir = tempfile.mkdtemp(prefix="cauldron_pub_")
-    output_snapshot: "Path | None" = None  # set after promote_output_with_backup
-
-    try:
-        try:
-            result = svc.build_preview(
-                output_dir=tmp_build_dir,
-                item_ids_to_include=cs.affected_item_ids or None,
-                extra_items=publish_extra_items or None,
-                theme_css=cs.staged_theme_css or "",
-            )
-        except Exception as exc:
-            cs.status = SiteChangeSet.PUBLISH_FAILED
-            cs.publish_build_result = {
-                "error": f"build raised: {_safe_exc(exc)}",
-                "applied": [],
-            }
-            cs.save(update_fields=["status", "publish_build_result", "updated_at"])
-            return AdminAIToolResult(
-                tool_name="site.publish",
-                success=False,
-                data={"change_set_id": str(cs.id)},
-                message=f"Publish build raised an exception: {_safe_exc(exc)}",
-            )
-
-        if not result.ok:
-            cs.status = SiteChangeSet.PUBLISH_FAILED
-            cs.publish_build_result = {
-                "error": (result.error or "")[:_MAX_EXC_MSG],
-                "applied": [],
-                "build_log_tail": (result.build_log or "")[-_MAX_BUILD_LOG_TAIL:],
-            }
-            cs.save(update_fields=["status", "publish_build_result", "updated_at"])
-            return AdminAIToolResult(
-                tool_name="site.publish",
-                success=False,
-                data={
-                    "change_set_id": str(cs.id),
-                    "build_log": (result.build_log or "")[-_MAX_BUILD_LOG_TAIL:],
-                },
-                message=f"Publish build failed: {(result.error or '')[:_MAX_EXC_MSG]}",
-            )
-
-        # ---- Step 3: Snapshot current active CSS (before any FS mutation) --
-        theme_svc = None
-        prev_active_css = ""
-        if cs.staged_theme_css and cfg.theme_root:
-            try:
-                from cauldron_site_astro.theme import SiteThemeService
-                theme_svc = SiteThemeService(cfg.theme_root)
-                prev_active_css = theme_svc.get_active_css()
-            except Exception:
-                pass  # Non-fatal; snapshot is "" if unavailable
-
-        # ---- Step 4: Promote output with rollback snapshot -----------------
-        try:
-            output_snapshot = svc.promote_output_with_backup(tmp_build_dir)
-        except Exception as exc:
-            # No DB changes, no CSS changes; FS unchanged (promotion failed before swap).
-            cs.status = SiteChangeSet.PUBLISH_FAILED
-            cs.publish_build_result = {
-                "error": f"output promotion failed: {_safe_exc(exc)}",
-                "applied": [],
-            }
-            cs.save(update_fields=["status", "publish_build_result", "updated_at"])
-            return AdminAIToolResult(
-                tool_name="site.publish",
-                success=False,
-                data={"change_set_id": str(cs.id)},
-                message=f"Output promotion failed: {_safe_exc(exc)}",
-            )
-
-        # ---- Step 5: Promote CSS -------------------------------------------
-        if theme_svc is not None:
-            try:
-                theme_svc.stage_css(cs.staged_theme_css)
-                theme_svc.promote_staged()
-            except Exception as exc:
-                # CSS failed. Restore output. No DB changes.
-                try:
-                    svc.restore_output(output_snapshot)
-                    output_snapshot = None
-                except Exception:
-                    pass
-                cs.status = SiteChangeSet.PUBLISH_FAILED
-                cs.publish_build_result = {
-                    "error": f"theme promotion failed: {_safe_exc(exc)}",
-                    "applied": [],
-                }
-                cs.save(update_fields=["status", "publish_build_result", "updated_at"])
-                return AdminAIToolResult(
-                    tool_name="site.publish",
-                    success=False,
-                    data={"change_set_id": str(cs.id)},
-                    message=f"Theme promotion failed: {_safe_exc(exc)}",
-                )
-
-        # ---- Step 6: Apply content requests inside a single transaction ----
-        # All-or-nothing: any failure raises out of the atomic block, causing
-        # an automatic rollback. No partial content state is ever committed.
-        applied_ids: list[str] = []
-        _apply_err: str = ""
-
-        try:
-            with transaction.atomic():
-                for req_id in cs.content_request_ids or ():
-                    v = validated[req_id]
-                    try:
-                        a = content_service.apply_change_request(
-                            req_id,
-                            user=context.actor,
-                            expected_version=getattr(v, "request_version", 0),
-                        )
-                    except Exception as exc:
-                        _apply_err = f"apply raised for {req_id!r}: {_safe_exc(exc)}"
-                        raise  # Propagates out of atomic(); triggers rollback
-                    if not getattr(a, "ok", False):
-                        err = getattr(a, "error", None)
-                        err_msg = getattr(err, "message", "apply failed")[:_MAX_EXC_MSG]
-                        _apply_err = f"apply failed for {req_id!r}: {err_msg}"
-                        raise RuntimeError(_apply_err)  # Triggers rollback
-                    applied_ids.append(req_id)
-        except Exception:
-            # Transaction rolled back: no content changes committed.
-            # Restore output and CSS to their pre-publish state.
-            try:
-                svc.restore_output(output_snapshot)
-                output_snapshot = None
-            except Exception:
-                pass
-            if theme_svc is not None:
-                try:
-                    theme_svc.set_active_css(prev_active_css)
-                except Exception:
-                    pass
-            cs.status = SiteChangeSet.PUBLISH_FAILED
-            cs.publish_build_result = {
-                # applied_ids here are NOT committed (transaction rolled back)
-                "error": _apply_err or "DB apply transaction failed",
-                "applied": [],
-            }
-            cs.save(update_fields=["status", "publish_build_result", "updated_at"])
-            return AdminAIToolResult(
-                tool_name="site.publish",
-                success=False,
-                data={"change_set_id": str(cs.id)},
-                message=_apply_err or "Content apply transaction failed; all changes rolled back.",
-            )
-
-        # ---- Step 7: Commit — discard snapshot and mark PUBLISHED ----------
-        svc.discard_output_backup(output_snapshot)
-        output_snapshot = None
-
-        cs.status = SiteChangeSet.PUBLISHED
-        cs.published_at = timezone.now()
-        cs.publish_build_result = {
-            "applied": applied_ids,
+    return AdminAIToolResult(
+        tool_name="site.publish",
+        success=True,
+        data={
+            "change_set_id": result.change_set_id,
+            "published": True,
             "pages_built": result.pages_built,
-        }
-        cs.save(update_fields=[
-            "status", "published_at", "publish_build_result", "updated_at",
-        ])
-
-        return AdminAIToolResult(
-            tool_name="site.publish",
-            success=True,
-            data={
-                "change_set_id": str(cs.id),
-                "published": True,
-                "pages_built": result.pages_built,
-                "live_url": "/",
-            },
-            message=(
-                f"Change set {cs.id} published successfully "
-                f"({result.pages_built} page(s))."
-            ),
-        )
-
-    finally:
-        shutil.rmtree(tmp_build_dir, ignore_errors=True)
-        # Safety net: clean up backup if an unexpected exception bypassed normal paths
-        if output_snapshot is not None:
-            try:
-                svc.discard_output_backup(output_snapshot)
-            except Exception:
-                pass
+            "live_url": result.live_url or "/",
+        },
+        message=(
+            f"Change set {result.change_set_id} published successfully "
+            f"({result.pages_built} page(s))."
+        ),
+    )
 
 
 def _handle_verify_root(context, **kwargs):

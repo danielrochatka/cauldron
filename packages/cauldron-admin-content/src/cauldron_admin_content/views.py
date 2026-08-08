@@ -128,6 +128,79 @@ def _redirect_after_publish(request: HttpRequest, request_id: str) -> HttpRespon
     return _redirect_after_proposal(request, request_id)
 
 
+def _get_publication_service():
+    """Return :class:`SiteChangeSetService`, or ``None`` if Site Astro is absent.
+
+    Admin content is optional-dependent on cauldron-site-astro: when it is
+    installed we route human publish through the unified SiteChangeSet
+    workflow (scoped preview + atomic publish, shared with the AI path);
+    when it is missing we fall back to inline validate+apply so admin-content
+    remains functional in content-only deployments.
+    """
+    try:
+        from cauldron_site_astro.publication_service import get_publication_service
+    except ImportError:
+        return None
+    try:
+        return get_publication_service()
+    except Exception:
+        return None
+
+
+def _redirect_to_change_set_review(change_set_id: str) -> HttpResponseRedirect:
+    return HttpResponseRedirect(
+        reverse(
+            "cauldron_admin_content:change-set-review",
+            kwargs={"change_set_id": change_set_id},
+        )
+    )
+
+
+def _try_route_publish_via_site_change_set(
+    request: HttpRequest,
+    request_id: str,
+) -> HttpResponseRedirect | None:
+    """Create a SiteChangeSet + preview and redirect to the review page.
+
+    Returns ``None`` when Site Astro is unavailable so the caller falls back
+    to the direct validate+apply path. Returns a redirect on both success
+    (to the review page) and preview-build failure (also to the review page
+    so the operator can see the failure state and retry).
+    """
+    pub_service = _get_publication_service()
+    if pub_service is None:
+        return None
+
+    try:
+        prep = pub_service.prepare(
+            actor=request.user,
+            content_request_ids=[request_id],
+            description="",
+        )
+    except Exception as exc:
+        messages.error(request, html.escape(str(exc)[:400]))
+        return None
+
+    if not prep.ok and not prep.change_set_id:
+        # No change set was even created — surface the error and fall back.
+        messages.error(request, html.escape(prep.message[:400]))
+        return None
+
+    # Whether the preview built or failed, redirect to the review page so
+    # the operator sees the durable state and can retry or abandon.
+    if not prep.ok:
+        messages.warning(
+            request,
+            html.escape(f"Preview build failed: {prep.message[:300]}"),
+        )
+    else:
+        messages.success(
+            request,
+            "Draft ready — review the preview and publish when ready.",
+        )
+    return _redirect_to_change_set_review(prep.change_set_id)
+
+
 def _handle_publish_flow(
     request: HttpRequest,
     service,
@@ -138,12 +211,18 @@ def _handle_publish_flow(
     approval_message="Page submitted for review.",
     published_message="Page published successfully.",
 ):
-    """Shared publish flow: validate → (if no approval needed) apply.
+    """Shared publish flow.
 
-    ``on_form_error(issues, fresh_submission_token)`` is called with structured
-    validation issue dicts and a new submission token when validation fails.
-    The fresh token prevents idempotency.payload_mismatch on the next retry
-    because the previous proposal was already created under the old key.
+    When Site Astro is available and approval is not required, the publish is
+    routed through :class:`SiteChangeSetService` — the same service the AI
+    workflow uses — so both human and AI publish get scoped preview builds
+    and atomic content+asset promotion.
+
+    When approval IS required, the change request goes through the normal
+    review queue (same as before).
+
+    When Site Astro is NOT installed, we fall back to the previous inline
+    validate+apply behaviour so content-only deployments keep working.
     """
     from cauldron_content_operations.config import get_operations_config
     cfg = get_operations_config()
@@ -168,6 +247,14 @@ def _handle_publish_flow(
         messages.success(request, approval_message)
         return _redirect_after_proposal(request, request_id)
 
+    # Preferred path: route through the shared SiteChangeSet workflow when
+    # Site Astro is installed. Both human and AI publishes then flow through
+    # the same scoped-preview + atomic-publish service.
+    redirected = _try_route_publish_via_site_change_set(request, request_id)
+    if redirected is not None:
+        return redirected
+
+    # Fallback: no Site Astro — apply inline (legacy content-only behaviour).
     try:
         apply_result = service.apply_change_request(
             request_id, user=request.user, expected_version=validate_result.request_version,
@@ -1299,3 +1386,125 @@ class AuditDetailView(View):
                 {"label": event_id[:8] + "…", "url": ""},
             ],
         })
+
+
+# ---------------------------------------------------------------------------
+# SiteChangeSet review + publish (only active when cauldron.site.astro is installed)
+# ---------------------------------------------------------------------------
+
+
+@method_decorator([
+    login_required,
+    permission_required(
+        "cauldron_content_operations.view_content_change_requests",
+        raise_exception=True,
+    ),
+], name="dispatch")
+class ChangeSetReviewView(View):
+    """Review a :class:`SiteChangeSet` preview and publish it.
+
+    GET renders the review page (preview link, status, build errors).
+    POST with action=publish triggers the atomic publish via the shared
+    :class:`SiteChangeSetService`. All state transitions are durable so
+    a preview_failed or publish_failed change set can be retried.
+    """
+
+    template_name = "cauldron_admin_content/change_set_review.html"
+
+    def _breadcrumbs(self, change_set_id: str):
+        return [
+            {"label": "Content", "url": reverse("cauldron_admin_content:content-browser")},
+            {"label": f"Change set {change_set_id[:8]}…", "url": ""},
+        ]
+
+    def _can_publish_site_change_set(self, request: HttpRequest) -> bool:
+        return request.user.has_perm(
+            "cauldron_content_operations.apply_content_changes"
+        )
+
+    def _render(
+        self,
+        request: HttpRequest,
+        *,
+        change_set_id: str,
+        status: str = "",
+        preview_url: str = "",
+        created_at: str = "",
+        content_request_ids=None,
+        error_message: str = "",
+    ):
+        return render(request, self.template_name, {
+            "change_set_id": change_set_id,
+            "status": status,
+            "preview_url": preview_url,
+            "created_at": created_at,
+            "content_request_ids": content_request_ids or [],
+            "error_message": error_message,
+            "can_publish": self._can_publish_site_change_set(request),
+            "breadcrumbs": self._breadcrumbs(change_set_id),
+        })
+
+    def _inspect(self, change_set_id: str):
+        pub_service = _get_publication_service()
+        if pub_service is None:
+            return None
+        try:
+            return pub_service.inspect(change_set_id)
+        except Exception:
+            return None
+
+    def get(self, request: HttpRequest, change_set_id: str):
+        inspect_result = self._inspect(change_set_id)
+        if inspect_result is None or not inspect_result.ok:
+            raise Http404
+        return self._render(
+            request,
+            change_set_id=inspect_result.change_set_id,
+            status=inspect_result.status,
+            preview_url=inspect_result.preview_url,
+            created_at=inspect_result.created_at,
+            content_request_ids=inspect_result.content_request_ids,
+            error_message=(inspect_result.publish_build_result or {}).get("error", ""),
+        )
+
+    def post(self, request: HttpRequest, change_set_id: str):
+        action = request.POST.get("action", "")
+        review_url = reverse(
+            "cauldron_admin_content:change-set-review",
+            kwargs={"change_set_id": change_set_id},
+        )
+
+        if action != "publish":
+            return HttpResponseRedirect(review_url)
+
+        if not self._can_publish_site_change_set(request):
+            messages.error(request, "You do not have permission to publish content.")
+            return HttpResponseRedirect(review_url)
+
+        pub_service = _get_publication_service()
+        if pub_service is None:
+            messages.error(
+                request,
+                "Site publication service is not available.",
+            )
+            return HttpResponseRedirect(review_url)
+
+        try:
+            pub_result = pub_service.publish(
+                actor=request.user,
+                change_set_id=change_set_id,
+            )
+        except Exception as exc:
+            messages.error(request, html.escape(str(exc)[:400]))
+            return HttpResponseRedirect(review_url)
+
+        if pub_result.ok:
+            messages.success(request, "Change set published successfully.")
+            if request.user.has_perm("cauldron_content_operations.view_published_content"):
+                return HttpResponseRedirect(
+                    reverse("cauldron_admin_content:content-browser")
+                )
+            return HttpResponseRedirect(review_url)
+
+        messages.error(request, html.escape(pub_result.message[:400]))
+        return HttpResponseRedirect(review_url)

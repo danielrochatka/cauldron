@@ -245,7 +245,7 @@ def test_prepare_change_set_requires_content_request_ids(tmp_path: Path):
     config = _make_config(tmp_path, previews_root=str(previews_root))
     svc = _make_mock_svc(config)
 
-    with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+    with patch("cauldron_site_astro.publication_service.get_build_service", return_value=svc):
         result = handle_prepare_change_set(_ctx(), content_request_ids=[])
 
     assert result.success is False
@@ -258,7 +258,7 @@ def test_prepare_change_set_no_previews_root_returns_error(tmp_path: Path):
     config = _make_config(tmp_path, previews_root="")
     svc = _make_mock_svc(config)
 
-    with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+    with patch("cauldron_site_astro.publication_service.get_build_service", return_value=svc):
         result = handle_prepare_change_set(
             _ctx(), content_request_ids=["req-1"],
         )
@@ -276,7 +276,7 @@ def test_prepare_change_set_success_persists_draft_ready(tmp_path: Path):
     build_result = _make_build_result(ok=True, pages_built=2)
     svc = _make_mock_svc(config, pages_result=build_result)
 
-    with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+    with patch("cauldron_site_astro.publication_service.get_build_service", return_value=svc):
         result = handle_prepare_change_set(
             _ctx(),
             content_request_ids=["req-a", "req-b"],
@@ -305,7 +305,7 @@ def test_prepare_change_set_preview_failed_persists_status(tmp_path: Path):
     build_result = _make_build_result(ok=False, error="Build crashed", build_log="error log")
     svc = _make_mock_svc(config, pages_result=build_result)
 
-    with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+    with patch("cauldron_site_astro.publication_service.get_build_service", return_value=svc):
         result = handle_prepare_change_set(
             _ctx(), content_request_ids=["req-x"],
         )
@@ -332,7 +332,7 @@ def test_prepare_change_set_forwards_theme_css_to_build(tmp_path: Path):
 
     svc.build_preview.side_effect = capture_preview
 
-    with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+    with patch("cauldron_site_astro.publication_service.get_build_service", return_value=svc):
         result = handle_prepare_change_set(
             _ctx(),
             content_request_ids=["req-1"],
@@ -379,7 +379,7 @@ def test_inspect_preview_success(tmp_path: Path):
     config = _make_config(tmp_path, previews_root=str(previews_root))
     svc = _make_mock_svc(config)
 
-    with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+    with patch("cauldron_site_astro.publication_service.get_build_service", return_value=svc):
         result = handle_inspect_preview(_ctx(), change_set_id=str(cs.id))
 
     assert result.success is True
@@ -429,7 +429,7 @@ def test_publish_success_with_no_content_requests(tmp_path: Path):
     build_result = _make_build_result(ok=True, pages_built=3, output_dir=str(tmp_path / "output"))
     svc = _make_mock_svc(config, pages_result=build_result)
 
-    with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+    with patch("cauldron_site_astro.publication_service.get_build_service", return_value=svc):
         result = handle_publish(_ctx(), change_set_id=str(cs.id), confirm=True)
 
     assert result.success is True
@@ -458,7 +458,7 @@ def test_publish_promotes_staged_theme_only_after_successful_build(tmp_path: Pat
     build_result = _make_build_result(ok=True, pages_built=1)
     svc = _make_mock_svc(config, pages_result=build_result)
 
-    with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+    with patch("cauldron_site_astro.publication_service.get_build_service", return_value=svc):
         result = handle_publish(_ctx(), change_set_id=str(cs.id), confirm=True)
 
     assert result.success is True
@@ -487,7 +487,7 @@ def test_publish_build_failure_leaves_active_css_untouched(tmp_path: Path):
     build_result = _make_build_result(ok=False, error="Astro failed", build_log="err")
     svc = _make_mock_svc(config, pages_result=build_result)
 
-    with patch("cauldron_site_astro.site_tools.get_build_service", return_value=svc):
+    with patch("cauldron_site_astro.publication_service.get_build_service", return_value=svc):
         result = handle_publish(_ctx(), change_set_id=str(cs.id), confirm=True)
 
     assert result.success is False
@@ -504,7 +504,7 @@ def test_publish_get_build_service_error():
 
     cs = SiteChangeSet.objects.create(status=SiteChangeSet.DRAFT_READY)
     with patch(
-        "cauldron_site_astro.site_tools.get_build_service",
+        "cauldron_site_astro.publication_service.get_build_service",
         side_effect=Exception("config missing"),
     ):
         result = handle_publish(_ctx(), change_set_id=str(cs.id), confirm=True)
@@ -981,3 +981,111 @@ def test_propose_homepage_all_seo_fields_passed():
     assert data.get("social_title") == "Social T"
     assert data.get("social_description") == "Social D"
     assert data.get("social_image") == "/img/social.jpg"
+
+
+# ---------------------------------------------------------------------------
+# Thin-adapter delegation to SiteChangeSetService
+# ---------------------------------------------------------------------------
+
+
+def test_handle_prepare_change_set_delegates_to_service(tmp_path: Path):
+    """The AI handler must call SiteChangeSetService.prepare, not reimplement logic."""
+    from cauldron_site_astro.site_tools import _handle_prepare_change_set as handle_prepare
+    from cauldron_site_astro.publication_service import PrepareResult
+
+    fake_result = PrepareResult(
+        ok=True,
+        change_set_id="cs-xyz",
+        status="draft_ready",
+        pages_built=2,
+        preview_url="/preview/cs-xyz/",
+        message="ok",
+    )
+    fake_service = MagicMock()
+    fake_service.prepare.return_value = fake_result
+
+    with patch(
+        "cauldron_site_astro.publication_service.get_publication_service",
+        return_value=fake_service,
+    ):
+        result = handle_prepare(
+            _ctx(),
+            content_request_ids=["req-a"],
+            theme_css="body { color: red; }",
+            description="Test",
+        )
+
+    assert result.success is True
+    fake_service.prepare.assert_called_once()
+    call_kwargs = fake_service.prepare.call_args.kwargs
+    assert call_kwargs["content_request_ids"] == ["req-a"]
+    assert call_kwargs["staged_theme_css"] == "body { color: red; }"
+    assert call_kwargs["description"] == "Test"
+
+
+def test_handle_inspect_preview_delegates_to_service():
+    from cauldron_site_astro.site_tools import _handle_inspect_preview as handle_inspect
+    from cauldron_site_astro.publication_service import InspectResult
+
+    fake_result = InspectResult(
+        ok=True,
+        change_set_id="cs-abc",
+        status="draft_ready",
+        pages_built=3,
+        preview_url="/preview/cs-abc/",
+        created_at="2024-01-01T00:00:00",
+    )
+    fake_service = MagicMock()
+    fake_service.inspect.return_value = fake_result
+
+    with patch(
+        "cauldron_site_astro.publication_service.get_publication_service",
+        return_value=fake_service,
+    ):
+        result = handle_inspect(_ctx(), change_set_id="cs-abc")
+
+    assert result.success is True
+    fake_service.inspect.assert_called_once_with("cs-abc")
+    assert result.data["pages_built"] == 3
+
+
+def test_handle_publish_delegates_to_service():
+    from cauldron_site_astro.site_tools import _handle_publish as handle_publish
+    from cauldron_site_astro.publication_service import PublishResult
+
+    fake_result = PublishResult(
+        ok=True,
+        change_set_id="cs-pub",
+        status="published",
+        pages_built=5,
+        live_url="/",
+        applied_request_ids=["r1", "r2"],
+        message="ok",
+    )
+    fake_service = MagicMock()
+    fake_service.publish.return_value = fake_result
+
+    with patch(
+        "cauldron_site_astro.publication_service.get_publication_service",
+        return_value=fake_service,
+    ):
+        result = handle_publish(_ctx(), change_set_id="cs-pub", confirm=True)
+
+    assert result.success is True
+    fake_service.publish.assert_called_once()
+    assert result.data["published"] is True
+    assert result.data["live_url"] == "/"
+
+
+def test_handle_publish_confirm_false_does_not_call_service():
+    from cauldron_site_astro.site_tools import _handle_publish as handle_publish
+
+    fake_service = MagicMock()
+    with patch(
+        "cauldron_site_astro.publication_service.get_publication_service",
+        return_value=fake_service,
+    ):
+        result = handle_publish(_ctx(), change_set_id="cs-x", confirm=False)
+
+    assert result.success is False
+    fake_service.publish.assert_not_called()

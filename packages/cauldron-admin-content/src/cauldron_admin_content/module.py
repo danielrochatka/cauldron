@@ -27,6 +27,13 @@ _manifest = ModuleManifest(
         ModuleRequirement(slug="cauldron.content.operations", kind="module"),
         ModuleRequirement(slug="cauldron.workspace.flatfile", kind="module"),
     ),
+    optional=(
+        # When Site Astro is installed, human publish flows route through the
+        # shared SiteChangeSetService for scoped preview + atomic publish.
+        # When it is absent, the human views fall back to inline validate+apply
+        # so admin-content remains functional in content-only deployments.
+        ModuleRequirement(slug="cauldron.site.astro", kind="module"),
+    ),
     provides=(
         "admin.content",
         "admin.content.changerequests",

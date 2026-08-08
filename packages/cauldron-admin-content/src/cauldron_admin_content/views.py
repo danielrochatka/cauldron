@@ -128,17 +128,19 @@ def _redirect_after_publish(request: HttpRequest, request_id: str) -> HttpRespon
     return _redirect_after_proposal(request, request_id)
 
 
+# Sentinel used by ``_try_route_publish_via_site_change_set`` to unambiguously
+# signal "Site Astro is genuinely absent (ImportError)" — the ONLY case where
+# the caller should fall back to direct validate+apply. Any other outcome
+# (redirect, error, failure) means Site Astro is installed and its result is
+# authoritative; falling back would mask a real failure.
+_SITE_ASTRO_ABSENT = object()
+
+
 def _get_publication_service():
     """Return :class:`SiteChangeSetService`, or ``None`` if Site Astro is absent.
 
-    Admin content is optional-dependent on cauldron-site-astro: when it is
-    installed we route human publish through the unified SiteChangeSet
-    workflow (scoped preview + atomic publish, shared with the AI path);
-    when it is missing we fall back to inline validate+apply so admin-content
-    remains functional in content-only deployments.
-
     Only ``ImportError`` is caught here — any other exception means Site Astro
-    *is* installed but broken, and the caller should propagate the error rather
+    *is* installed but broken, and the caller must propagate the error rather
     than silently falling back to direct apply.
     """
     try:
@@ -160,17 +162,39 @@ def _redirect_to_change_set_review(change_set_id: str) -> HttpResponseRedirect:
 def _try_route_publish_via_site_change_set(
     request: HttpRequest,
     request_id: str,
-) -> HttpResponseRedirect | None:
+):
     """Create a SiteChangeSet + preview and redirect to the review page.
 
-    Returns ``None`` when Site Astro is unavailable so the caller falls back
-    to the direct validate+apply path. Returns a redirect on both success
-    (to the review page) and preview-build failure (also to the review page
-    so the operator can see the failure state and retry).
+    Return values (Correction 1 — no more ambiguous ``None`` for all
+    failures):
+
+    * ``_SITE_ASTRO_ABSENT`` — Site Astro is genuinely not installed
+      (``ImportError``). Caller may safely fall back to direct
+      validate+apply. This is the ONLY sentinel value that means fall
+      through.
+    * ``HttpResponseRedirect`` — Site Astro is present. Either it succeeded
+      and prepared a durable SiteChangeSet (redirect to review) or the
+      publication service produced a durable failure state (redirect to
+      review or to a caller-supplied error redirect). Callers MUST honour
+      the redirect and MUST NOT fall through to direct apply — doing so
+      would silently mask a broken Site Astro installation.
+
+    A resolved publication service that raises during ``prepare()`` or
+    returns a failure without any change_set_id triggers an operator-visible
+    error redirect (back to the change-request detail page) rather than a
+    silent fall-through.
     """
     pub_service = _get_publication_service()
     if pub_service is None:
-        return None
+        # Genuine ImportError from _get_publication_service — Site Astro is
+        # not installed. This is the ONLY case where falling through to
+        # inline apply is safe.
+        return _SITE_ASTRO_ABSENT
+
+    # Where to send the operator when there is no durable change_set_id to
+    # inspect — the source change request's detail page (or content browser
+    # if they lack permission for that).
+    error_redirect = _redirect_after_proposal(request, request_id)
 
     try:
         prep = pub_service.prepare(
@@ -179,16 +203,25 @@ def _try_route_publish_via_site_change_set(
             description="",
         )
     except Exception as exc:
-        messages.error(request, html.escape(str(exc)[:400]))
-        return None
+        # Site Astro is installed but prepare() blew up. Surface the error
+        # and return a redirect — do NOT fall through to inline apply,
+        # which would mask the broken publication service.
+        messages.error(
+            request,
+            html.escape(f"Publication service error: {str(exc)[:300]}"),
+        )
+        return error_redirect
 
     if not prep.ok and not prep.change_set_id:
-        # No change set was even created — surface the error and fall back.
+        # Configuration failure (or integrity failure) before the
+        # SiteChangeSet was created. Surface the error and stop; DO NOT
+        # fall through to inline apply.
         messages.error(request, html.escape(prep.message[:400]))
-        return None
+        return error_redirect
 
-    # Whether the preview built or failed, redirect to the review page so
-    # the operator sees the durable state and can retry or abandon.
+    # From here we have a durable SiteChangeSet id — always redirect to the
+    # review page so the operator can see the state (draft_ready or
+    # preview_failed) and retry/abandon.
     if not prep.ok:
         messages.warning(
             request,
@@ -251,9 +284,13 @@ def _handle_publish_flow(
     # Preferred path: route through the shared SiteChangeSet workflow when
     # Site Astro is installed. Both human and AI publishes then flow through
     # the same scoped-preview + atomic-publish service.
-    redirected = _try_route_publish_via_site_change_set(request, request_id)
-    if redirected is not None:
-        return redirected
+    # Correction 1: only the ``_SITE_ASTRO_ABSENT`` sentinel means fall
+    # through. Any other returned response — success or failure — must be
+    # honoured, so a broken publication service surfaces its error instead
+    # of silently apply-ing content directly.
+    routed = _try_route_publish_via_site_change_set(request, request_id)
+    if routed is not _SITE_ASTRO_ABSENT:
+        return routed
 
     # Fallback: no Site Astro — apply inline (legacy content-only behaviour).
     try:
@@ -1318,9 +1355,10 @@ class ChangeRequestDetailView(View):
         elif action == "apply":
             # Route through SiteChangeSet when Site Astro is installed so the
             # APPROVED → publish path also gets a scoped preview + atomic publish.
-            redirected = _try_route_publish_via_site_change_set(request, request_id)
-            if redirected is not None:
-                return redirected
+            # Correction 1: fall through ONLY on the absent sentinel.
+            routed = _try_route_publish_via_site_change_set(request, request_id)
+            if routed is not _SITE_ASTRO_ABSENT:
+                return routed
             result = service.apply_change_request(request_id, user=request.user, expected_version=expected_version)
 
         if result.ok:
@@ -1420,6 +1458,9 @@ class ChangeSetReviewView(View):
         created_at: str = "",
         content_request_ids=None,
         error_message: str = "",
+        retryable: bool = True,
+        compensated: bool = False,
+        requires_reconciliation: bool = False,
     ):
         return render(request, self.template_name, {
             "change_set_id": change_set_id,
@@ -1430,6 +1471,9 @@ class ChangeSetReviewView(View):
             "error_message": error_message,
             "can_publish": self._can_publish_site_change_set(request),
             "breadcrumbs": self._breadcrumbs(change_set_id),
+            "retryable": retryable,
+            "compensated": compensated,
+            "requires_reconciliation": requires_reconciliation,
         })
 
     def _inspect(self, change_set_id: str):
@@ -1445,6 +1489,7 @@ class ChangeSetReviewView(View):
         inspect_result = self._inspect(change_set_id)
         if inspect_result is None or not inspect_result.ok:
             raise Http404
+        pbr = inspect_result.publish_build_result or {}
         return self._render(
             request,
             change_set_id=inspect_result.change_set_id,
@@ -1452,7 +1497,10 @@ class ChangeSetReviewView(View):
             preview_url=inspect_result.preview_url,
             created_at=inspect_result.created_at,
             content_request_ids=inspect_result.content_request_ids,
-            error_message=(inspect_result.publish_build_result or {}).get("error", ""),
+            error_message=pbr.get("error", ""),
+            retryable=bool(getattr(inspect_result, "retryable", True)),
+            compensated=bool(pbr.get("compensated", False)),
+            requires_reconciliation=bool(pbr.get("requires_reconciliation", False)),
         )
 
     def post(self, request: HttpRequest, change_set_id: str):

@@ -62,11 +62,22 @@
 <div class="cui-alert cui-alert--error" role="alert">
   <strong>Publish failed.</strong>
   {% if error_message %}<p>{{ error_message|escape }}</p>{% endif %}
+  {% if requires_reconciliation %}
+  <p><strong>Manual reconciliation is required.</strong> One or more applied
+  content changes could not be verified as restored to their pre-publish state.
+  Do not retry this change set — investigate the compensation report below
+  and reconcile the affected requests before creating a new publish.</p>
+  {% elif compensated %}
+  <p>All applied content changes were compensated and their canonical state
+  was restored. The underlying change requests are now terminally
+  <code>rolled_back</code>; create new change requests to retry the intended
+  publish.</p>
+  {% endif %}
 </div>
-{% if can_publish %}
+{% if can_publish and retryable %}
 <div class="cui-card">
   <h2 class="cui-card__heading">Retry</h2>
-  <p>All filesystem state has been restored; you may retry the publish.</p>
+  <p>Filesystem state has been restored; you may retry the publish.</p>
   <form method="post" action="{% url 'cauldron_admin_content:change-set-review' change_set_id=change_set_id %}">
     {% csrf_token %}
     <input type="hidden" name="action" value="publish">

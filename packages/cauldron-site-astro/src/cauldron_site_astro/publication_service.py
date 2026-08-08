@@ -48,6 +48,43 @@ _PERM_PUBLISH = "cauldron_content_operations.apply_content_changes"
 
 
 # ---------------------------------------------------------------------------
+# Lifecycle allowlist (Correction 4)
+# ---------------------------------------------------------------------------
+#
+# The publish() integrity check uses an explicit allowlist of lifecycle states
+# rather than relying on "not terminal" heuristics. Any state not present here
+# — including unknown or future values — is refused. This prevents partial
+# publishes from being kicked off against a request in an ambiguous or
+# transitional state (applying/rolling_back/reconciliation_required).
+#
+# States that can transition into apply *without* approval:
+#   * proposed   — validate + apply chain will move it forward
+#   * validated  — apply directly; no re-validation needed
+#   * apply_failed — retry: apply_change_request supports APPLY_FAILED → APPLYING
+#
+# When require_approval is True the ONLY eligible state is:
+#   * approved
+#
+# All other states — applying, rolling_back, rolled_back, applied,
+# reconciliation_required, rejected, rollback_failed, or any unknown value —
+# fail closed with an explicit diagnostic. See ``lifecycle.py`` for the
+# canonical state definitions; we import LifecycleState rather than
+# duplicating the string literals.
+
+
+def _publishable_states(require_approval: bool) -> "frozenset[str]":
+    """Return the allowlisted lifecycle states for the publish path."""
+    from cauldron_content_operations.lifecycle import LifecycleState
+    if require_approval:
+        return frozenset({LifecycleState.APPROVED.value})
+    return frozenset({
+        LifecycleState.PROPOSED.value,
+        LifecycleState.VALIDATED.value,
+        LifecycleState.APPLY_FAILED.value,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Result dataclasses
 # ---------------------------------------------------------------------------
 
@@ -78,6 +115,11 @@ class InspectResult:
     message: str = ""
     publish_build_result: dict = field(default_factory=dict)
     content_request_ids: list = field(default_factory=list)
+    # True when the caller may reasonably retry publishing the same change
+    # set. False when compensation succeeded (change requests are now
+    # terminally rolled back) or compensation failed (reconciliation
+    # required). Derived from ``publish_build_result`` on inspect().
+    retryable: bool = True
 
 
 @dataclass
@@ -234,6 +276,168 @@ def _extract_draft_items(
 
 
 # ---------------------------------------------------------------------------
+# Integrity check (Correction 2)
+# ---------------------------------------------------------------------------
+
+
+def _check_request_integrity(
+    content_request_ids: list[str],
+    *,
+    require_approval: bool,
+) -> "tuple[bool, str]":
+    """Verify every requested change request is eligible for preview/publish.
+
+    Runs BEFORE any SiteChangeSet or preview build so a broken/missing request
+    cannot silently disappear from the preview. Reuses ContentOperationService's
+    read contracts — this function does NOT re-implement the validation engine;
+    it only asserts that the requested requests exist, are in an allowlisted
+    lifecycle state, and — when approval is required — have been approved.
+
+    Returns ``(ok, message)``. On success ``message`` is empty. On failure
+    ``message`` contains a bounded operator-facing diagnostic and no
+    SiteChangeSet should be created.
+
+    Fails CLOSED when the ContentChangeRequest model cannot be imported: the
+    module has ``cauldron.content.operations`` in its declared dependencies,
+    so the model must be available in every deployment. Silently skipping
+    integrity checks was the pre-correction behaviour that let requested
+    changes disappear from previews.
+    """
+    if not content_request_ids:
+        # Callers must supply a non-empty list; this is a safety net.
+        return False, "content_request_ids must be a non-empty list of strings."
+
+    try:
+        from cauldron_content_operations.models import ContentChangeRequest
+    except ImportError as exc:
+        return False, (
+            f"cauldron.content.operations is required for publish integrity checks: "
+            f"{_safe_exc(exc)}"
+        )
+
+    allowed = _publishable_states(require_approval)
+
+    for req_id in content_request_ids:
+        try:
+            cr = ContentChangeRequest.objects.get(request_id=req_id)
+        except ContentChangeRequest.DoesNotExist:
+            return False, f"Content request {req_id!r} not found."
+        # Any other DB/config failure means the environment is broken; do NOT
+        # silently continue — that reintroduces the pre-correction bug.
+        state = cr.lifecycle_state
+        if state not in allowed:
+            if require_approval:
+                return False, (
+                    f"Content request {req_id!r} must be approved before "
+                    f"publishing (current state: {state!r})."
+                )
+            return False, (
+                f"Content request {req_id!r} is in state {state!r}; only "
+                f"{sorted(allowed)!r} are eligible for publish."
+            )
+
+    # Cross-check: the persisted operations must load. Skipping missing
+    # workspace payloads was another silent-failure mode.
+    service = _get_content_operation_service()
+    workspace = getattr(service, "_workspace", None) if service is not None else None
+    for req_id in content_request_ids:
+        try:
+            cr = ContentChangeRequest.objects.get(request_id=req_id)
+        except ContentChangeRequest.DoesNotExist:
+            # Already handled above; belt-and-braces.
+            return False, f"Content request {req_id!r} not found."
+        ws_id = getattr(cr, "workspace_changeset_id", "") or ""
+        raw_ops = getattr(cr, "operations", None)
+        has_raw_ops = isinstance(raw_ops, list) and len(raw_ops) > 0
+        if workspace is not None and ws_id:
+            try:
+                changeset = workspace.load_changeset(ws_id)
+            except Exception as exc:
+                # If we do not have inline operations to fall back to, fail
+                # closed — otherwise the preview would silently omit this
+                # request.
+                if not has_raw_ops:
+                    return False, (
+                        f"Could not load workspace changeset for {req_id!r}: "
+                        f"{_safe_exc(exc)}"
+                    )
+                changeset = None
+            if changeset is not None and not list(
+                getattr(changeset, "operations", ()) or ()
+            ) and not has_raw_ops:
+                return False, (
+                    f"Content request {req_id!r} has no operations to publish."
+                )
+        elif not has_raw_ops:
+            # No workspace and no inline operations: nothing to publish.
+            return False, (
+                f"Content request {req_id!r} has no operations to publish."
+            )
+
+    return True, ""
+
+
+# ---------------------------------------------------------------------------
+# Publish-time CR loader (Correction 4 — extracted for testability)
+# ---------------------------------------------------------------------------
+
+
+def _fetch_eligible_change_requests(
+    content_request_ids: list[str],
+    allowed_states: "frozenset[str]",
+    require_approval: bool,
+) -> "tuple[dict, dict | None]":
+    """Load ContentChangeRequests and verify their lifecycle states.
+
+    Returns ``(loaded_crs, error_context)`` where *error_context* is ``None``
+    on success. On failure *loaded_crs* is empty and *error_context* is a dict
+    with ``"publish_build_result"`` (ready for ``cs.publish_build_result``) and
+    ``"message"`` (ready for ``PublishResult.message``).
+
+    Extracted from ``publish()`` so tests can patch this single function
+    without needing real ContentChangeRequest rows for publish-flow tests that
+    are exercising other concerns (CSS handoff, signal suppression, etc.).
+    """
+    from cauldron_content_operations.models import ContentChangeRequest
+
+    loaded: dict = {}
+    for req_id in content_request_ids:
+        try:
+            cr = ContentChangeRequest.objects.get(request_id=req_id)
+        except ContentChangeRequest.DoesNotExist:
+            return {}, {
+                "publish_build_result": {
+                    "error": f"content request {req_id!r} not found",
+                    "applied": [],
+                    "failed_request_id": req_id,
+                },
+                "message": f"Content request {req_id!r} not found.",
+            }
+        state = cr.lifecycle_state
+        if state not in allowed_states:
+            if require_approval:
+                msg = (
+                    f"Content request {req_id!r} must be approved before "
+                    f"publishing (current state: {state!r})."
+                )
+            else:
+                msg = (
+                    f"Content request {req_id!r} is in state {state!r}; "
+                    f"only {sorted(allowed_states)!r} are eligible for publish."
+                )
+            return {}, {
+                "publish_build_result": {
+                    "error": msg,
+                    "applied": [],
+                    "failed_request_id": req_id,
+                },
+                "message": msg,
+            }
+        loaded[req_id] = cr
+    return loaded, None
+
+
+# ---------------------------------------------------------------------------
 # Signal suppression flag (set by publish() around the content-apply step)
 # ---------------------------------------------------------------------------
 
@@ -273,6 +477,11 @@ class SiteChangeSetService:
         preview URL is returned. On build failure it transitions to
         ``PREVIEW_FAILED``; the change set is still returned so the caller
         can surface the error state to the operator.
+
+        Correction 2: integrity of every requested ContentChangeRequest is
+        verified BEFORE any SiteChangeSet row is created. A missing,
+        terminal, or otherwise ineligible request causes prepare() to fail
+        without side effects — no SiteChangeSet, no build_preview call.
         """
         if not isinstance(content_request_ids, list) or not content_request_ids:
             return PrepareResult(
@@ -295,6 +504,22 @@ class SiteChangeSetService:
                 ok=False,
                 message="previews_root is not configured; cannot build preview.",
             )
+
+        # Correction 2: integrity gate — reject BEFORE creating a SiteChangeSet.
+        try:
+            from cauldron_content_operations.config import (
+                get_operations_config as _get_ops_cfg,
+            )
+            _ops_cfg = _get_ops_cfg()
+            require_approval = bool(getattr(_ops_cfg, "require_approval", False))
+        except Exception:
+            require_approval = False
+
+        integrity_ok, integrity_msg = _check_request_integrity(
+            content_request_ids, require_approval=require_approval,
+        )
+        if not integrity_ok:
+            return PrepareResult(ok=False, message=integrity_msg)
 
         # Auto-load staged theme CSS if not explicitly supplied.
         theme_css = staged_theme_css or ""
@@ -389,6 +614,21 @@ class SiteChangeSetService:
             if preview_dir.exists() and preview_dir.is_dir():
                 pages_built = sum(1 for _ in preview_dir.rglob("*.html"))
 
+        publish_build_result = cs.publish_build_result or {}
+
+        # Correction 3: derive retryability from publish_build_result. A change
+        # set is not retryable when compensation succeeded (change requests are
+        # now terminally rolled_back), nor when reconciliation is required.
+        retryable = True
+        if cs.status == SiteChangeSet.PUBLISH_FAILED:
+            if publish_build_result.get("requires_reconciliation"):
+                retryable = False
+            elif publish_build_result.get("compensated"):
+                # Successful compensation moved every applied CR to rolled_back,
+                # which is terminal. The operator must create new change
+                # requests; the same SiteChangeSet cannot be retried.
+                retryable = False
+
         return InspectResult(
             ok=True,
             change_set_id=str(cs.id),
@@ -396,8 +636,9 @@ class SiteChangeSetService:
             pages_built=pages_built,
             preview_url=cs.get_preview_url(),
             created_at=cs.created_at.isoformat() if cs.created_at else "",
-            publish_build_result=cs.publish_build_result or {},
+            publish_build_result=publish_build_result,
             content_request_ids=list(cs.content_request_ids or []),
+            retryable=retryable,
         )
 
     # -- publish ------------------------------------------------------------
@@ -472,88 +713,62 @@ class SiteChangeSetService:
 
         content_service = _get_content_operation_service()
 
-        # ---- Step A: Prepare integrity check (#8) -------------------------
-        # Verify all request IDs exist and are in a publishable lifecycle state
-        # before spending time on the build step.
-        _TERMINAL = frozenset({"applied", "rejected", "rolled_back"})
-
+        # ---- Step A: Prepare integrity check (Correction 4) --------------
+        # Use the explicit lifecycle allowlist rather than "not terminal".
+        # Fail CLOSED when the ContentChangeRequest model cannot be loaded —
+        # cauldron.site.astro already requires cauldron.content.operations, so
+        # a missing model means the deployment is broken and we must not
+        # silently proceed.
         try:
             from cauldron_content_operations.models import ContentChangeRequest
-            _cr_import_ok = True
-        except ImportError:
-            _cr_import_ok = False
+        except ImportError as exc:
+            cs.status = SiteChangeSet.PUBLISH_FAILED
+            cs.publish_build_result = {
+                "error": f"content-operations models unavailable: {_safe_exc(exc)}",
+                "applied": [],
+            }
+            cs.save(update_fields=["status", "publish_build_result", "updated_at"])
+            return PublishResult(
+                ok=False,
+                change_set_id=str(cs.id),
+                status=cs.status,
+                message=(
+                    "cauldron.content.operations is required for publish; "
+                    "cannot load ContentChangeRequest."
+                ),
+            )
 
         try:
-            from cauldron_content_operations.config import get_operations_config as _get_ops_cfg
+            from cauldron_content_operations.config import (
+                get_operations_config as _get_ops_cfg,
+            )
             _ops_cfg = _get_ops_cfg()
-            require_approval = getattr(_ops_cfg, "require_approval", False)
+            require_approval = bool(getattr(_ops_cfg, "require_approval", False))
         except Exception:
             require_approval = False
 
-        # Map req_id → current ContentChangeRequest for lifecycle checks.
-        _loaded_crs: dict[str, Any] = {}
-        for req_id in cs.content_request_ids or ():
-            if not _cr_import_ok:
-                break
-            try:
-                cr = ContentChangeRequest.objects.get(request_id=req_id)
-            except ContentChangeRequest.DoesNotExist:
-                cs.status = SiteChangeSet.PUBLISH_FAILED
-                cs.publish_build_result = {
-                    "error": f"content request {req_id!r} not found",
-                    "applied": [],
-                    "failed_request_id": req_id,
-                }
-                cs.save(update_fields=["status", "publish_build_result", "updated_at"])
-                return PublishResult(
-                    ok=False,
-                    change_set_id=str(cs.id),
-                    status=cs.status,
-                    message=f"Content request {req_id!r} not found.",
-                )
-            except Exception:
-                # DB table unavailable (e.g., content_operations not in INSTALLED_APPS
-                # in this environment); skip integrity check for this request.
-                # Validation step will catch the issue if the service is available.
-                continue
-            state = cr.lifecycle_state
-            if state in _TERMINAL:
-                cs.status = SiteChangeSet.PUBLISH_FAILED
-                cs.publish_build_result = {
-                    "error": f"request {req_id!r} is in terminal state {state!r}",
-                    "applied": [],
-                    "failed_request_id": req_id,
-                }
-                cs.save(update_fields=["status", "publish_build_result", "updated_at"])
-                return PublishResult(
-                    ok=False,
-                    change_set_id=str(cs.id),
-                    status=cs.status,
-                    message=f"Content request {req_id!r} is in terminal state {state!r}; cannot publish.",
-                )
-            if require_approval and state != "approved":
-                cs.status = SiteChangeSet.PUBLISH_FAILED
-                cs.publish_build_result = {
-                    "error": f"request {req_id!r} requires approval but is in state {state!r}",
-                    "applied": [],
-                    "failed_request_id": req_id,
-                }
-                cs.save(update_fields=["status", "publish_build_result", "updated_at"])
-                return PublishResult(
-                    ok=False,
-                    change_set_id=str(cs.id),
-                    status=cs.status,
-                    message=(
-                        f"Content request {req_id!r} must be approved before publishing "
-                        f"(current state: {state!r})."
-                    ),
-                )
-            _loaded_crs[req_id] = cr
+        allowed_states = _publishable_states(require_approval)
 
-        # ---- Step 1: Validate content requests (#4) ----------------------
-        # Skip validate for requests already in validated/approved state —
-        # re-validating would fail the lifecycle state machine. Use the
-        # current request_version for optimistic locking.
+        # Map req_id → current ContentChangeRequest for lifecycle/version checks.
+        _loaded_crs, _cr_error = _fetch_eligible_change_requests(
+            list(cs.content_request_ids or []), allowed_states, require_approval,
+        )
+        if _cr_error is not None:
+            cs.status = SiteChangeSet.PUBLISH_FAILED
+            cs.publish_build_result = _cr_error["publish_build_result"]
+            cs.save(update_fields=["status", "publish_build_result", "updated_at"])
+            return PublishResult(
+                ok=False,
+                change_set_id=str(cs.id),
+                status=cs.status,
+                message=_cr_error["message"],
+            )
+
+        # ---- Step 1: Validate content requests ---------------------------
+        # Use the current request_version for optimistic locking. Skip validate
+        # for VALIDATED/APPROVED states — re-validating would be rejected by
+        # the state machine.
+        from cauldron_content_operations.lifecycle import LifecycleState as _LS
         validated: dict = {}
 
         for req_id in cs.content_request_ids or ():
@@ -575,7 +790,7 @@ class SiteChangeSetService:
             current_state = cr.lifecycle_state if cr is not None else ""
             current_version = cr.request_version if cr is not None else 0
 
-            if current_state in ("validated", "approved"):
+            if current_state in (_LS.VALIDATED.value, _LS.APPROVED.value):
                 # Already validated; skip to avoid a lifecycle state machine error.
                 from types import SimpleNamespace as _NS
                 validated[req_id] = _NS(ok=True, request_version=current_version)
@@ -716,19 +931,21 @@ class SiteChangeSetService:
                         message=f"Theme promotion failed: {_safe_exc(exc)}",
                     )
 
-            # ---- Step 6: Apply content requests (#6 — no outer SQL wrapper)
+            # ---- Step 6: Apply content requests (Correction 3) -----------
             # Each apply_change_request call is internally atomic. We track
-            # which requests succeed so we can attempt compensation via
-            # rollback_change_request (using the ReversibleMutationAdapter
-            # internally) if a later request fails. SQL transaction.atomic()
-            # alone cannot roll back filesystem mutations made by flat-file
-            # providers, so per-request compensation is required.
+            # every apply so that if a later request fails we can compensate
+            # via ContentOperationService.compensate_for_publication_failure —
+            # a narrow internal path that uses the same ReversibleMutationAdapter
+            # rollback as rollback_change_request but does NOT require the
+            # publisher to hold rollback_content_changes (which is unrelated to
+            # apply_content_changes).
             #
             # Signal-suppression flag is set here so canonical_content_changed
             # fired by apply_change_request does NOT trigger a redundant rebuild.
             applied_ids: list[str] = []
             applied_versions: dict[str, int] = {}
             _apply_err: str = ""
+            _failed_request_id: str = ""
 
             suppress = _suppress_flag()
             suppress.active = True
@@ -743,50 +960,108 @@ class SiteChangeSetService:
                         )
                     except Exception as exc:
                         _apply_err = f"apply raised for {req_id!r}: {_safe_exc(exc)}"
+                        _failed_request_id = req_id
                         break
                     if not getattr(a, "ok", False):
                         err = getattr(a, "error", None)
                         err_msg = getattr(err, "message", "apply failed")[:_MAX_EXC_MSG]
                         _apply_err = f"apply failed for {req_id!r}: {err_msg}"
+                        _failed_request_id = req_id
                         break
                     applied_ids.append(req_id)
                     applied_versions[req_id] = getattr(a, "request_version", 0)
 
                 if _apply_err:
-                    # Compensate: attempt to roll back already-applied requests in
-                    # reverse order. This triggers the ReversibleMutationAdapter
-                    # internally so filesystem mutations are also undone.
+                    # Correction 3: honest compensation using the new narrow
+                    # internal path. We track every compensation result and
+                    # only claim clean restoration when every compensation
+                    # verified the pre-application state was restored.
+                    compensations: list[dict] = []
+                    all_verified = True
                     for prev_req_id in reversed(applied_ids):
                         try:
-                            content_service.rollback_change_request(
+                            comp = content_service.compensate_for_publication_failure(
                                 prev_req_id,
                                 user=actor,
-                                force=False,
                                 expected_version=applied_versions.get(prev_req_id, 0),
                             )
-                        except Exception:
-                            pass  # Best-effort; FS backup below handles Astro output.
-                    try:
-                        svc.restore_output(output_snapshot)
-                        output_snapshot = None
-                    except Exception:
-                        pass
-                    if theme_svc is not None:
+                        except Exception as exc:
+                            # Method absent on older service versions or
+                            # unexpected runtime error — treat as un-verified.
+                            comp = None
+                            comp_err = _safe_exc(exc)
+                            all_verified = False
+                            compensations.append({
+                                "request_id": prev_req_id,
+                                "ok": False,
+                                "verified": False,
+                                "error_code": "compensation.exception",
+                                "error_message": comp_err,
+                            })
+                            continue
+                        entry = {
+                            "request_id": prev_req_id,
+                            "ok": bool(getattr(comp, "ok", False)),
+                            "verified": bool(getattr(comp, "verified", False)),
+                            "lifecycle_state": getattr(comp, "lifecycle_state", "") or "",
+                            "error_code": getattr(comp, "error_code", "") or "",
+                            "error_message": (
+                                getattr(comp, "error_message", "") or ""
+                            )[:_MAX_EXC_MSG],
+                        }
+                        compensations.append(entry)
+                        if not entry["verified"]:
+                            all_verified = False
+
+                    requires_reconciliation = not all_verified
+
+                    # Only restore Astro output + CSS when we can prove the
+                    # canonical content was also restored. Otherwise the UI
+                    # would misleadingly show pre-publish content while the
+                    # filesystem still carries applied changes.
+                    if all_verified:
                         try:
-                            theme_svc.set_active_css(prev_active_css)
+                            svc.restore_output(output_snapshot)
+                            output_snapshot = None
                         except Exception:
                             pass
+                        if theme_svc is not None:
+                            try:
+                                theme_svc.set_active_css(prev_active_css)
+                            except Exception:
+                                pass
+                    else:
+                        # Do NOT restore FS state — canonical content is in an
+                        # uncertain partially-applied condition. Keep the new
+                        # output so reconciliation operators can see the state
+                        # that matches what's on-disk in flat files.
+                        pass
+
                     cs.status = SiteChangeSet.PUBLISH_FAILED
                     cs.publish_build_result = {
                         "error": _apply_err,
                         "applied": [],
+                        "failed_request_id": _failed_request_id,
+                        "compensated": all_verified,
+                        "requires_reconciliation": requires_reconciliation,
+                        "compensations": compensations,
                     }
                     cs.save(update_fields=["status", "publish_build_result", "updated_at"])
+                    if requires_reconciliation:
+                        message = (
+                            f"{_apply_err}; compensation could not verify "
+                            f"restoration — manual reconciliation required."
+                        )
+                    else:
+                        message = (
+                            f"{_apply_err}; all applied content requests were "
+                            f"compensated and canonical state restored."
+                        )
                     return PublishResult(
                         ok=False,
                         change_set_id=str(cs.id),
                         status=cs.status,
-                        message=_apply_err,
+                        message=message,
                     )
             finally:
                 suppress.active = False

@@ -199,7 +199,7 @@ def _review_url(cs_id):
 def test_review_get_shows_page(client):
     from django.test import override_settings
 
-    user = _make_user("cs_review_user", ["view_content_change_requests"])
+    user = _make_user("cs_review_user", ["view_content_change_requests", "apply_content_changes"])
     cs_id = str(uuid.uuid4())
     pub_service_mock = MagicMock()
     pub_service_mock.inspect.return_value = _make_inspect_result(cs_id)
@@ -221,7 +221,7 @@ def test_review_get_shows_page(client):
 def test_review_get_returns_404_when_site_astro_missing(client):
     from django.test import override_settings
 
-    user = _make_user("cs_no_astro", ["view_content_change_requests"])
+    user = _make_user("cs_no_astro", ["view_content_change_requests", "apply_content_changes"])
     cs_id = str(uuid.uuid4())
 
     client.force_login(user)
@@ -263,7 +263,7 @@ def test_review_publish_requires_post_not_get(client):
 def test_review_post_publish_requires_apply_permission(client):
     from django.test import override_settings
 
-    # User has view_content_change_requests (to pass dispatch) but NOT apply.
+    # User lacks apply_content_changes — dispatch rejects with 403.
     user = _make_user("cs_no_apply", ["view_content_change_requests"])
     cs_id = str(uuid.uuid4())
 
@@ -277,8 +277,8 @@ def test_review_post_publish_requires_apply_permission(client):
         with override_settings(ROOT_URLCONF="tests.urls"):
             response = client.post(_review_url(cs_id), data={"action": "publish"})
 
-    # Redirect back to the review page with an error message; publish not called.
-    assert response.status_code == 302
+    # Dispatch decorator enforces apply_content_changes; without it → 403.
+    assert response.status_code == 403
     pub_service_mock.publish.assert_not_called()
 
 

@@ -136,15 +136,16 @@ def _get_publication_service():
     workflow (scoped preview + atomic publish, shared with the AI path);
     when it is missing we fall back to inline validate+apply so admin-content
     remains functional in content-only deployments.
+
+    Only ``ImportError`` is caught here — any other exception means Site Astro
+    *is* installed but broken, and the caller should propagate the error rather
+    than silently falling back to direct apply.
     """
     try:
         from cauldron_site_astro.publication_service import get_publication_service
     except ImportError:
         return None
-    try:
-        return get_publication_service()
-    except Exception:
-        return None
+    return get_publication_service()
 
 
 def _redirect_to_change_set_review(change_set_id: str) -> HttpResponseRedirect:
@@ -1283,38 +1284,20 @@ class ChangeRequestDetailView(View):
             if not _can_publish(request, cfg.require_approval):
                 messages.error(request, "You do not have permission to perform this action.")
                 return HttpResponseRedirect(detail_url)
-            try:
-                validate_result = service.validate_change_request(
-                    request_id, user=request.user, expected_version=expected_version,
-                )
-            except Exception as exc:
-                messages.error(request, html.escape(str(exc)[:400]))
-                return HttpResponseRedirect(detail_url)
-            if not validate_result.ok:
-                issues = validate_result.meta.get("validation_issues", [])
-                error_msg = validate_result.error.message if validate_result.error else "Validation failed."
-                messages.error(request, html.escape(error_msg[:400]))
+
+            def _form_error(issues, fresh_token):
                 cr.refresh_from_db()
-                audit_events = list(ContentAuditEvent.objects.filter(change_request=cr).order_by("sequence"))
+                ae = list(ContentAuditEvent.objects.filter(change_request=cr).order_by("sequence"))
                 return render(request, self.template_name, self._build_context(
-                    request, cr, audit_events, validation_issues=issues,
+                    request, cr, ae, validation_issues=issues,
                 ))
-            if cfg.require_approval:
-                messages.success(request, "Change request submitted for review.")
-                return HttpResponseRedirect(detail_url)
-            try:
-                apply_result = service.apply_change_request(
-                    request_id, user=request.user, expected_version=validate_result.request_version,
-                )
-            except Exception as exc:
-                messages.error(request, html.escape(str(exc)[:400]))
-                return HttpResponseRedirect(detail_url)
-            if apply_result.ok:
-                messages.success(request, "Change request published successfully.")
-            else:
-                error_msg = apply_result.error.message if apply_result.error else "An unknown error occurred."
-                messages.error(request, html.escape(error_msg[:400]))
-            return HttpResponseRedirect(detail_url)
+
+            return _handle_publish_flow(
+                request, service, request_id, expected_version,
+                on_form_error=_form_error,
+                approval_message="Change request submitted for review.",
+                published_message="Change request published successfully.",
+            )
 
         if action not in _ACTION_PERMISSIONS:
             messages.error(request, "Unknown action.")
@@ -1333,6 +1316,11 @@ class ChangeRequestDetailView(View):
             reason = request.POST.get("rejection_reason", "").strip()[:500]
             result = service.reject_change_request(request_id, user=request.user, reason=reason, expected_version=expected_version)
         elif action == "apply":
+            # Route through SiteChangeSet when Site Astro is installed so the
+            # APPROVED → publish path also gets a scoped preview + atomic publish.
+            redirected = _try_route_publish_via_site_change_set(request, request_id)
+            if redirected is not None:
+                return redirected
             result = service.apply_change_request(request_id, user=request.user, expected_version=expected_version)
 
         if result.ok:
@@ -1396,7 +1384,7 @@ class AuditDetailView(View):
 @method_decorator([
     login_required,
     permission_required(
-        "cauldron_content_operations.view_content_change_requests",
+        "cauldron_content_operations.apply_content_changes",
         raise_exception=True,
     ),
 ], name="dispatch")

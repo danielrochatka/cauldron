@@ -422,6 +422,7 @@ class SiteBuildService:
         output_dir: "str | Path",
         extra_items: "list | None" = None,
         item_ids_to_include: "list[str] | None" = None,
+        excluded_item_ids: "list[str] | None" = None,
         theme_css: str = "",
     ) -> BuildResult:
         """Build a preview scoped to a specific set of drafts + a proposed theme.
@@ -433,6 +434,10 @@ class SiteBuildService:
         Drafts NOT listed here are excluded, so an in-flight preview cannot
         accidentally surface unrelated authoring work. ``None`` means "no
         drafts" — the preview shows only the published baseline.
+
+        ``excluded_item_ids`` — item ids to remove from the preview even if
+        they appear in the published baseline. Used to represent delete
+        operations so a deleted page does not appear in the controlled build.
 
         ``extra_items`` are duck-typed content items appended after the
         include-filter has run; they always win over router items with the
@@ -520,6 +525,11 @@ class SiteBuildService:
             for item in all_items:
                 if item.id in include_ids:
                     pages_by_id[item.id] = _page_entry(item)
+
+        # Remove items that have been deleted in the change requests so they
+        # do not appear in the controlled build even when present in the baseline.
+        for _excl_id in (excluded_item_ids or ()):
+            pages_by_id.pop(_excl_id, None)
 
         # extra_items always win last (test hook / direct payload injection)
         for item in (extra_items or []):

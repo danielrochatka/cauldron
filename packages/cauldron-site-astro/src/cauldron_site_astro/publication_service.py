@@ -128,28 +128,37 @@ def _get_content_operation_service():
 
 def _extract_draft_items(
     content_request_ids: list[str],
-) -> "tuple[list[str], list]":
-    """Return (item_ids, extra_items) for the given change requests.
+) -> "tuple[list[str], list, list[str]]":
+    """Return (item_ids, extra_items, deleted_item_ids) for the given change requests.
+
+    ``item_ids`` — all affected item ids (includes deletes, for tracking).
+    ``extra_items`` — synthetic draft items for create/update ops to inject
+    into the controlled build as if they are already applied.
+    ``deleted_item_ids`` — item ids for delete operations; callers pass these
+    as ``excluded_item_ids`` to ``build_preview`` so the published baseline
+    version of a deleted page is omitted from the controlled build.
 
     Mirrors the extraction logic used by the original site_tools handlers so
     the preview and publish builds see the same draft content the operator
     reviewed. See site_tools._extract_draft_items for the full contract.
     """
     if not content_request_ids:
-        return [], []
+        return [], [], []
 
     try:
         from cauldron_content_operations.models import ContentChangeRequest
     except Exception:
-        return [], []
+        return [], [], []
 
     service = _get_content_operation_service()
     workspace = getattr(service, "_workspace", None) if service is not None else None
 
     item_ids: list[str] = []
     extra_items: list = []
+    deleted_item_ids: list[str] = []
     seen_item_ids: set[str] = set()
     seen_inject_ids: set[str] = set()
+    seen_deleted_ids: set[str] = set()
 
     for req_id in content_request_ids:
         try:
@@ -190,6 +199,9 @@ def _extract_draft_items(
                 item_ids.append(op_item_id)
 
             if op_kind == "delete":
+                if op_item_id and op_item_id not in seen_deleted_ids:
+                    seen_deleted_ids.add(op_item_id)
+                    deleted_item_ids.append(op_item_id)
                 continue
 
             if not op_slug:
@@ -218,7 +230,7 @@ def _extract_draft_items(
             except Exception:
                 pass
 
-    return item_ids, extra_items
+    return item_ids, extra_items, deleted_item_ids
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +305,7 @@ class SiteChangeSetService:
             except Exception:
                 pass
 
-        affected_item_ids, draft_extra_items = _extract_draft_items(content_request_ids)
+        affected_item_ids, draft_extra_items, draft_deleted_ids = _extract_draft_items(content_request_ids)
         cs = SiteChangeSet.objects.create(
             status=SiteChangeSet.PREPARING,
             content_request_ids=content_request_ids,
@@ -309,6 +321,7 @@ class SiteChangeSetService:
                 output_dir=output_dir,
                 item_ids_to_include=affected_item_ids or None,
                 extra_items=draft_extra_items or None,
+                excluded_item_ids=draft_deleted_ids or None,
                 theme_css=theme_css or "",
             )
         except Exception as exc:
@@ -390,11 +403,7 @@ class SiteChangeSetService:
     # -- publish ------------------------------------------------------------
 
     def publish(self, actor: Any, change_set_id: str) -> PublishResult:
-        """Publish a draft-ready :class:`SiteChangeSet` to the live site.
-
-        Reproduces the 7-step atomic transaction from the original
-        ``_handle_publish`` in ``site_tools.py`` verbatim.
-        """
+        """Publish a draft-ready :class:`SiteChangeSet` to the live site."""
         # Permission gate — same permission the AI handler required.
         if not getattr(actor, "has_perm", lambda _p: False)(_PERM_PUBLISH):
             return PublishResult(
@@ -405,56 +414,146 @@ class SiteChangeSetService:
                 ),
             )
 
-        try:
-            cs = SiteChangeSet.objects.get(id=change_set_id)
-        except (SiteChangeSet.DoesNotExist, ValueError):
-            return PublishResult(
-                ok=False,
-                change_set_id=str(change_set_id),
-                message=f"Change set {change_set_id!r} not found.",
-            )
+        # Lock the row to prevent concurrent PUBLISHING transitions (#7).
+        # The transaction commits (releasing the lock) before the slow
+        # build + FS steps so we do not hold a DB lock for the entire publish.
+        with transaction.atomic():
+            try:
+                cs = SiteChangeSet.objects.select_for_update().get(id=change_set_id)
+            except (SiteChangeSet.DoesNotExist, ValueError):
+                return PublishResult(
+                    ok=False,
+                    change_set_id=str(change_set_id),
+                    message=f"Change set {change_set_id!r} not found.",
+                )
 
-        # Idempotent: re-publishing an already-published change set is a no-op.
-        if cs.status == SiteChangeSet.PUBLISHED:
-            return PublishResult(
-                ok=True,
-                change_set_id=str(cs.id),
-                status=cs.status,
-                pages_built=(cs.publish_build_result or {}).get("pages_built", 0),
-                live_url="/",
-                applied_request_ids=list(
-                    (cs.publish_build_result or {}).get("applied", []) or []
-                ),
-                message=f"Change set {cs.id} was already published.",
-            )
+            # Idempotent: re-publishing an already-published change set is a no-op.
+            if cs.status == SiteChangeSet.PUBLISHED:
+                return PublishResult(
+                    ok=True,
+                    change_set_id=str(cs.id),
+                    status=cs.status,
+                    pages_built=(cs.publish_build_result or {}).get("pages_built", 0),
+                    live_url="/",
+                    applied_request_ids=list(
+                        (cs.publish_build_result or {}).get("applied", []) or []
+                    ),
+                    message=f"Change set {cs.id} was already published.",
+                )
 
-        # Allow retry from publish_failed: all FS state is restored on each failure.
-        if cs.status not in (SiteChangeSet.DRAFT_READY, SiteChangeSet.PUBLISH_FAILED):
-            return PublishResult(
-                ok=False,
-                change_set_id=str(cs.id),
-                status=cs.status,
-                message=(
-                    f"Change set is in status {cs.status!r}; "
-                    f"only draft_ready or publish_failed change sets can be published."
-                ),
-            )
+            # Allow retry from publish_failed: all FS state is restored on each failure.
+            if cs.status not in (SiteChangeSet.DRAFT_READY, SiteChangeSet.PUBLISH_FAILED):
+                return PublishResult(
+                    ok=False,
+                    change_set_id=str(cs.id),
+                    status=cs.status,
+                    message=(
+                        f"Change set is in status {cs.status!r}; "
+                        f"only draft_ready or publish_failed change sets can be published."
+                    ),
+                )
+
+            cs.status = SiteChangeSet.PUBLISHING
+            cs.save(update_fields=["status", "updated_at"])
+        # Lock released; cs.status == PUBLISHING is now committed.
 
         try:
             svc = get_build_service()
             cfg = svc._config
         except Exception as exc:
+            cs.status = SiteChangeSet.PUBLISH_FAILED
+            cs.publish_build_result = {"error": f"build config unavailable: {_safe_exc(exc)}", "applied": []}
+            cs.save(update_fields=["status", "publish_build_result", "updated_at"])
             return PublishResult(
                 ok=False,
                 change_set_id=str(cs.id),
                 message=f"Could not load site build config: {_safe_exc(exc)}",
             )
 
-        cs.status = SiteChangeSet.PUBLISHING
-        cs.save(update_fields=["status", "updated_at"])
-
-        # ---- Step 1: Validate all content requests ------------------------
         content_service = _get_content_operation_service()
+
+        # ---- Step A: Prepare integrity check (#8) -------------------------
+        # Verify all request IDs exist and are in a publishable lifecycle state
+        # before spending time on the build step.
+        _TERMINAL = frozenset({"applied", "rejected", "rolled_back"})
+
+        try:
+            from cauldron_content_operations.models import ContentChangeRequest
+            _cr_import_ok = True
+        except ImportError:
+            _cr_import_ok = False
+
+        try:
+            from cauldron_content_operations.config import get_operations_config as _get_ops_cfg
+            _ops_cfg = _get_ops_cfg()
+            require_approval = getattr(_ops_cfg, "require_approval", False)
+        except Exception:
+            require_approval = False
+
+        # Map req_id → current ContentChangeRequest for lifecycle checks.
+        _loaded_crs: dict[str, Any] = {}
+        for req_id in cs.content_request_ids or ():
+            if not _cr_import_ok:
+                break
+            try:
+                cr = ContentChangeRequest.objects.get(request_id=req_id)
+            except ContentChangeRequest.DoesNotExist:
+                cs.status = SiteChangeSet.PUBLISH_FAILED
+                cs.publish_build_result = {
+                    "error": f"content request {req_id!r} not found",
+                    "applied": [],
+                    "failed_request_id": req_id,
+                }
+                cs.save(update_fields=["status", "publish_build_result", "updated_at"])
+                return PublishResult(
+                    ok=False,
+                    change_set_id=str(cs.id),
+                    status=cs.status,
+                    message=f"Content request {req_id!r} not found.",
+                )
+            except Exception:
+                # DB table unavailable (e.g., content_operations not in INSTALLED_APPS
+                # in this environment); skip integrity check for this request.
+                # Validation step will catch the issue if the service is available.
+                continue
+            state = cr.lifecycle_state
+            if state in _TERMINAL:
+                cs.status = SiteChangeSet.PUBLISH_FAILED
+                cs.publish_build_result = {
+                    "error": f"request {req_id!r} is in terminal state {state!r}",
+                    "applied": [],
+                    "failed_request_id": req_id,
+                }
+                cs.save(update_fields=["status", "publish_build_result", "updated_at"])
+                return PublishResult(
+                    ok=False,
+                    change_set_id=str(cs.id),
+                    status=cs.status,
+                    message=f"Content request {req_id!r} is in terminal state {state!r}; cannot publish.",
+                )
+            if require_approval and state != "approved":
+                cs.status = SiteChangeSet.PUBLISH_FAILED
+                cs.publish_build_result = {
+                    "error": f"request {req_id!r} requires approval but is in state {state!r}",
+                    "applied": [],
+                    "failed_request_id": req_id,
+                }
+                cs.save(update_fields=["status", "publish_build_result", "updated_at"])
+                return PublishResult(
+                    ok=False,
+                    change_set_id=str(cs.id),
+                    status=cs.status,
+                    message=(
+                        f"Content request {req_id!r} must be approved before publishing "
+                        f"(current state: {state!r})."
+                    ),
+                )
+            _loaded_crs[req_id] = cr
+
+        # ---- Step 1: Validate content requests (#4) ----------------------
+        # Skip validate for requests already in validated/approved state —
+        # re-validating would fail the lifecycle state machine. Use the
+        # current request_version for optimistic locking.
         validated: dict = {}
 
         for req_id in cs.content_request_ids or ():
@@ -472,8 +571,20 @@ class SiteChangeSetService:
                     message="Content operations service is unavailable; cannot apply changes.",
                 )
 
+            cr = _loaded_crs.get(req_id)
+            current_state = cr.lifecycle_state if cr is not None else ""
+            current_version = cr.request_version if cr is not None else 0
+
+            if current_state in ("validated", "approved"):
+                # Already validated; skip to avoid a lifecycle state machine error.
+                from types import SimpleNamespace as _NS
+                validated[req_id] = _NS(ok=True, request_version=current_version)
+                continue
+
             try:
-                v = content_service.validate_change_request(req_id, user=actor)
+                v = content_service.validate_change_request(
+                    req_id, user=actor, expected_version=current_version,
+                )
             except Exception as exc:
                 cs.status = SiteChangeSet.PUBLISH_FAILED
                 cs.publish_build_result = {
@@ -509,7 +620,7 @@ class SiteChangeSetService:
             validated[req_id] = v
 
         # ---- Step 2: Build ------------------------------------------------
-        _, publish_extra_items = _extract_draft_items(cs.content_request_ids or [])
+        _, publish_extra_items, publish_deleted_ids = _extract_draft_items(cs.content_request_ids or [])
 
         tmp_build_dir = tempfile.mkdtemp(prefix="cauldron_pub_")
         output_snapshot: "Path | None" = None
@@ -520,6 +631,7 @@ class SiteChangeSetService:
                     output_dir=tmp_build_dir,
                     item_ids_to_include=cs.affected_item_ids or None,
                     extra_items=publish_extra_items or None,
+                    excluded_item_ids=publish_deleted_ids or None,
                     theme_css=cs.staged_theme_css or "",
                 )
             except Exception as exc:
@@ -604,36 +716,56 @@ class SiteChangeSetService:
                         message=f"Theme promotion failed: {_safe_exc(exc)}",
                     )
 
-            # ---- Step 6: Apply content requests inside a single transaction
+            # ---- Step 6: Apply content requests (#6 — no outer SQL wrapper)
+            # Each apply_change_request call is internally atomic. We track
+            # which requests succeed so we can attempt compensation via
+            # rollback_change_request (using the ReversibleMutationAdapter
+            # internally) if a later request fails. SQL transaction.atomic()
+            # alone cannot roll back filesystem mutations made by flat-file
+            # providers, so per-request compensation is required.
+            #
             # Signal-suppression flag is set here so canonical_content_changed
-            # signal fired by apply_change_request does NOT trigger a redundant
-            # rebuild — this publish already manages its own build.
+            # fired by apply_change_request does NOT trigger a redundant rebuild.
             applied_ids: list[str] = []
+            applied_versions: dict[str, int] = {}
             _apply_err: str = ""
 
             suppress = _suppress_flag()
             suppress.active = True
             try:
-                try:
-                    with transaction.atomic():
-                        for req_id in cs.content_request_ids or ():
-                            v = validated[req_id]
-                            try:
-                                a = content_service.apply_change_request(
-                                    req_id,
-                                    user=actor,
-                                    expected_version=getattr(v, "request_version", 0),
-                                )
-                            except Exception as exc:
-                                _apply_err = f"apply raised for {req_id!r}: {_safe_exc(exc)}"
-                                raise
-                            if not getattr(a, "ok", False):
-                                err = getattr(a, "error", None)
-                                err_msg = getattr(err, "message", "apply failed")[:_MAX_EXC_MSG]
-                                _apply_err = f"apply failed for {req_id!r}: {err_msg}"
-                                raise RuntimeError(_apply_err)
-                            applied_ids.append(req_id)
-                except Exception:
+                for req_id in cs.content_request_ids or ():
+                    v = validated[req_id]
+                    try:
+                        a = content_service.apply_change_request(
+                            req_id,
+                            user=actor,
+                            expected_version=getattr(v, "request_version", 0),
+                        )
+                    except Exception as exc:
+                        _apply_err = f"apply raised for {req_id!r}: {_safe_exc(exc)}"
+                        break
+                    if not getattr(a, "ok", False):
+                        err = getattr(a, "error", None)
+                        err_msg = getattr(err, "message", "apply failed")[:_MAX_EXC_MSG]
+                        _apply_err = f"apply failed for {req_id!r}: {err_msg}"
+                        break
+                    applied_ids.append(req_id)
+                    applied_versions[req_id] = getattr(a, "request_version", 0)
+
+                if _apply_err:
+                    # Compensate: attempt to roll back already-applied requests in
+                    # reverse order. This triggers the ReversibleMutationAdapter
+                    # internally so filesystem mutations are also undone.
+                    for prev_req_id in reversed(applied_ids):
+                        try:
+                            content_service.rollback_change_request(
+                                prev_req_id,
+                                user=actor,
+                                force=False,
+                                expected_version=applied_versions.get(prev_req_id, 0),
+                            )
+                        except Exception:
+                            pass  # Best-effort; FS backup below handles Astro output.
                     try:
                         svc.restore_output(output_snapshot)
                         output_snapshot = None
@@ -646,7 +778,7 @@ class SiteChangeSetService:
                             pass
                     cs.status = SiteChangeSet.PUBLISH_FAILED
                     cs.publish_build_result = {
-                        "error": _apply_err or "DB apply transaction failed",
+                        "error": _apply_err,
                         "applied": [],
                     }
                     cs.save(update_fields=["status", "publish_build_result", "updated_at"])
@@ -654,7 +786,7 @@ class SiteChangeSetService:
                         ok=False,
                         change_set_id=str(cs.id),
                         status=cs.status,
-                        message=_apply_err or "Content apply transaction failed; all changes rolled back.",
+                        message=_apply_err,
                     )
             finally:
                 suppress.active = False

@@ -876,7 +876,7 @@ def test_prepare_change_set_passes_extra_items_to_build_preview(tmp_path):
 
     with patch(
         "cauldron_site_astro.publication_service._extract_draft_items",
-        return_value=(["new-timmy-page"], [fake_item]),
+        return_value=(["new-timmy-page"], [fake_item], []),
     ):
         with patch("cauldron_site_astro.publication_service.get_build_service", return_value=svc):
             result = handle_prepare_change_set(

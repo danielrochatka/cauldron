@@ -23,6 +23,16 @@ class CauldronSiteAstroConfig(AppConfig):
         _connect_signals()
         _register_site_tool_prompts()
         _register_public_url_provider()
+        _register_site_tools()
+
+
+def _register_site_tools() -> None:
+    try:
+        from cauldron_ai_admin.tools import get_tool_registry
+        from cauldron_site_astro.site_tools import register
+        register(get_tool_registry())
+    except ImportError:
+        pass  # cauldron-ai-admin not installed
 
 
 def _register_public_url_provider() -> None:

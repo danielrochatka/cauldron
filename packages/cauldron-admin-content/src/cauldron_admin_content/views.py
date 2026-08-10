@@ -409,6 +409,35 @@ class ContentBrowserView(View):
             except Exception as exc:
                 error = html.escape(str(exc)[:200])
 
+        # Collect item IDs that have non-terminal ContentChangeRequests so the
+        # template can show a "Pending changes" indicator for published items
+        # that have a proposed revision in flight. Uses the existing workspace
+        # on the ContentOperationService — no new persistence.
+        pending_item_ids: set[str] = set()
+        if collection == PAGE_COLLECTION:
+            try:
+                from cauldron_content_operations.models import ContentChangeRequest
+                _non_terminal = ["proposed", "validated", "apply_failed"]
+                active_crs = ContentChangeRequest.objects.filter(
+                    lifecycle_state__in=_non_terminal
+                )
+                ws = getattr(service, "_workspace", None)
+                if ws is not None:
+                    for cr in active_crs:
+                        ws_id = getattr(cr, "workspace_changeset_id", "") or ""
+                        if not ws_id:
+                            continue
+                        try:
+                            changeset = ws.load_changeset(ws_id)
+                            for op in getattr(changeset, "operations", []) or []:
+                                iid = str(getattr(op, "item_id", "") or "")
+                                if iid:
+                                    pending_item_ids.add(iid)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
         return render(request, self.template_name, {
             "collections": collections,
             "selected_collection": collection,
@@ -419,6 +448,8 @@ class ContentBrowserView(View):
             "is_pages_collection": collection == PAGE_COLLECTION,
             "page_collection": PAGE_COLLECTION,
             "page_schema": _PAGE_SCHEMA,
+            "pending_item_ids": pending_item_ids,
+            "site_astro_installed": _site_astro_installed(),
             "error": error,
         })
 

@@ -40,12 +40,16 @@ def test_connect_signals_safe_without_content_operations(monkeypatch):
 
 
 def test_site_astro_manifest_ai_deps_are_optional():
-    """Manifest must not hard-require AI or consumer modules.
+    """Manifest must not hard-require AI modules, and must not reference admin.content.
 
-    cauldron.ai.admin and cauldron.admin.content are *consumers* of site.astro's
-    publish service; they declare the optional dep on site.astro (not vice versa)
-    to avoid circular dependency in the module graph.  cauldron.ai remains an
-    optional dep of site.astro (prompt template registration).
+    Dependency direction:
+      site.astro → (optional) cauldron.ai.admin   (tool registration, prompt templates)
+      site.astro → (optional) cauldron.ai          (prompt templates only)
+      cauldron.admin.content uses importlib for site.astro — NO manifest edge back.
+
+    cauldron.admin.content must never appear in site.astro's requires or optional;
+    that edge would complete the cycle admin.content → site.astro → ai.admin → admin.content.
+    cauldron.ai.admin is correctly optional (site_tools.py imports AdminAIToolDefinition etc.).
     """
     from cauldron_site_astro.module import module
     manifest = module.manifest
@@ -53,16 +57,22 @@ def test_site_astro_manifest_ai_deps_are_optional():
     required_slugs = {r.slug for r in manifest.requires}
     optional_slugs = {r.slug for r in manifest.optional}
 
-    consumer_slugs = {"cauldron.ai.admin", "cauldron.admin.content"}
-    for slug in consumer_slugs:
-        assert slug not in required_slugs, (
-            f"{slug} must not be in requires — site.astro is its provider, not consumer"
-        )
-        assert slug not in optional_slugs, (
-            f"{slug} must not be in optional — that would create a circular module dependency; "
-            f"the dep flows the other way: {slug} → cauldron.site.astro"
-        )
+    # admin.content must NOT appear — it would create a 3-node cycle.
+    assert "cauldron.admin.content" not in required_slugs, (
+        "cauldron.admin.content must not be in requires — that creates a circular dependency"
+    )
+    assert "cauldron.admin.content" not in optional_slugs, (
+        "cauldron.admin.content must not be in optional — that creates a circular dependency; "
+        "admin.content accesses site.astro via importlib with no manifest edge"
+    )
 
+    # AI deps must be optional, not required.
+    assert "cauldron.ai.admin" not in required_slugs, (
+        "cauldron.ai.admin must not be hard-required by site.astro"
+    )
+    assert "cauldron.ai.admin" in optional_slugs, (
+        "cauldron.ai.admin must be optional — site_tools.py uses AdminAIToolDefinition etc."
+    )
     assert "cauldron.ai" not in required_slugs
     assert "cauldron.ai" in optional_slugs
 

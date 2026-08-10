@@ -40,24 +40,31 @@ def test_connect_signals_safe_without_content_operations(monkeypatch):
 
 
 def test_site_astro_manifest_ai_deps_are_optional():
-    """Manifest must declare AI, Admin AI, and Admin Content as optional, not required."""
+    """Manifest must not hard-require AI or consumer modules.
+
+    cauldron.ai.admin and cauldron.admin.content are *consumers* of site.astro's
+    publish service; they declare the optional dep on site.astro (not vice versa)
+    to avoid circular dependency in the module graph.  cauldron.ai remains an
+    optional dep of site.astro (prompt template registration).
+    """
     from cauldron_site_astro.module import module
     manifest = module.manifest
 
     required_slugs = {r.slug for r in manifest.requires}
     optional_slugs = {r.slug for r in manifest.optional}
 
-    ai_slugs = {"cauldron.ai", "cauldron.ai.admin", "cauldron.admin.content"}
-    for slug in ai_slugs:
+    consumer_slugs = {"cauldron.ai.admin", "cauldron.admin.content"}
+    for slug in consumer_slugs:
         assert slug not in required_slugs, (
-            f"{slug} must not be in requires — it is an optional integration"
+            f"{slug} must not be in requires — site.astro is its provider, not consumer"
+        )
+        assert slug not in optional_slugs, (
+            f"{slug} must not be in optional — that would create a circular module dependency; "
+            f"the dep flows the other way: {slug} → cauldron.site.astro"
         )
 
-    # All three should be optional (not required)
-    for slug in ai_slugs:
-        assert slug in optional_slugs, (
-            f"{slug} should be in optional integrations"
-        )
+    assert "cauldron.ai" not in required_slugs
+    assert "cauldron.ai" in optional_slugs
 
 
 def test_site_astro_manifest_core_requires():

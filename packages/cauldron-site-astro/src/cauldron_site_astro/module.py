@@ -22,8 +22,6 @@ _manifest = ModuleManifest(
         ModuleRequirement(slug="cauldron.content.operations", kind="module"),
     ),
     optional=(
-        ModuleRequirement(slug="cauldron.ai.admin"),
-        ModuleRequirement(slug="cauldron.admin.content"),
         ModuleRequirement(slug="cauldron.ai", kind="module"),
     ),
     provides=("site.public", "site.build"),
@@ -34,6 +32,7 @@ _manifest = ModuleManifest(
         "cauldron_site_astro.public_url",
         "cauldron_site_astro.site_tools",
         "cauldron_site_astro.urls",
+        "cauldron_site_astro.publication_service",
     ),
     capability_implementations=(
         # Concrete SitePublicUrlProvider — external callers use

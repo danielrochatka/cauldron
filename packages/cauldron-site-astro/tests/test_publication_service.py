@@ -1128,3 +1128,190 @@ def test_prepare_passes_deleted_ids_as_excluded_to_build(tmp_path, bypass_db_int
     # build_preview must have been called with excluded_item_ids=["item-1"].
     call_kwargs = svc.build_preview.call_args.kwargs
     assert call_kwargs.get("excluded_item_ids") == ["item-1"]
+
+
+# ---------------------------------------------------------------------------
+# _extract_draft_items projection fix: draft-status ops → excluded_item_ids
+# ---------------------------------------------------------------------------
+
+
+def _fake_cr_and_service(ws_id, ops):
+    """Return (fake_cr, fake_service) for workspace-based _extract_draft_items tests."""
+    from types import SimpleNamespace
+    fake_changeset = SimpleNamespace(operations=ops)
+    fake_workspace = MagicMock()
+    fake_workspace.load_changeset.return_value = fake_changeset
+    fake_cr = SimpleNamespace(workspace_changeset_id=ws_id)
+    fake_service = MagicMock()
+    fake_service._workspace = fake_workspace
+    return fake_cr, fake_service
+
+
+def _op(kind, item_id, slug, status=None):
+    """Build a SimpleNamespace operation with an optional data.status."""
+    from types import SimpleNamespace
+    data = {}
+    if status is not None:
+        data["status"] = status
+    return SimpleNamespace(
+        kind=kind,
+        item_id=item_id,
+        slug=slug,
+        collection="pages",
+        schema="page",
+        body="# content",
+        data=data,
+    )
+
+
+def test_extract_draft_items_published_op_goes_to_extra_items():
+    """Create/update ops with status=published must appear in extra_items."""
+    from cauldron_site_astro.publication_service import _extract_draft_items
+    from cauldron_content.contracts import ContentStatus
+
+    fake_cr, fake_service = _fake_cr_and_service("ws-pub", [
+        _op("create", "page-xyz", "my-page", status="published"),
+    ])
+
+    with patch("cauldron_site_astro.publication_service._get_content_operation_service", return_value=fake_service), \
+         patch("cauldron_content_operations.models.ContentChangeRequest.objects.get", return_value=fake_cr):
+        ids, extras, deleted = _extract_draft_items(["req-xdi-pub"])
+
+    assert "page-xyz" in ids
+    assert len(extras) == 1
+    assert extras[0].id == "page-xyz"
+    assert extras[0].status == ContentStatus.PUBLISHED
+    assert deleted == []
+
+
+def test_extract_draft_items_draft_op_goes_to_excluded():
+    """Create/update ops with status=draft must be excluded from preview (like deletes)."""
+    from cauldron_site_astro.publication_service import _extract_draft_items
+
+    fake_cr, fake_service = _fake_cr_and_service("ws-draft", [
+        _op("update", "live-page", "live-page", status="draft"),
+    ])
+
+    with patch("cauldron_site_astro.publication_service._get_content_operation_service", return_value=fake_service), \
+         patch("cauldron_content_operations.models.ContentChangeRequest.objects.get", return_value=fake_cr):
+        ids, extras, deleted = _extract_draft_items(["req-xdi-draft"])
+
+    assert "live-page" in ids
+    assert extras == []
+    assert "live-page" in deleted
+
+
+def test_extract_draft_items_delete_op_goes_to_excluded():
+    """Delete ops must always appear in deleted_item_ids, not extra_items."""
+    from cauldron_site_astro.publication_service import _extract_draft_items
+
+    fake_cr, fake_service = _fake_cr_and_service("ws-del2", [
+        _op("delete", "gone-page", "gone"),
+    ])
+
+    with patch("cauldron_site_astro.publication_service._get_content_operation_service", return_value=fake_service), \
+         patch("cauldron_content_operations.models.ContentChangeRequest.objects.get", return_value=fake_cr):
+        ids, extras, deleted = _extract_draft_items(["req-xdi-del"])
+
+    assert "gone-page" in ids
+    assert extras == []
+    assert "gone-page" in deleted
+
+
+def test_extract_draft_items_mixed_ops():
+    """Mixed ops: published → extra_items, draft → excluded, delete → excluded."""
+    from cauldron_site_astro.publication_service import _extract_draft_items
+    from cauldron_content.contracts import ContentStatus
+
+    fake_cr, fake_service = _fake_cr_and_service("ws-mix", [
+        _op("create", "new-page", "new", status="published"),
+        _op("update", "unpub-page", "unpub", status="draft"),
+        _op("delete", "del-page", "del"),
+    ])
+
+    with patch("cauldron_site_astro.publication_service._get_content_operation_service", return_value=fake_service), \
+         patch("cauldron_content_operations.models.ContentChangeRequest.objects.get", return_value=fake_cr):
+        ids, extras, deleted = _extract_draft_items(["req-xdi-mix"])
+
+    assert set(ids) == {"new-page", "unpub-page", "del-page"}
+    assert len(extras) == 1
+    assert extras[0].id == "new-page"
+    assert extras[0].status == ContentStatus.PUBLISHED
+    assert set(deleted) == {"unpub-page", "del-page"}
+
+
+# ---------------------------------------------------------------------------
+# SiteChangeSetService.find_reusable_change_set
+# ---------------------------------------------------------------------------
+
+
+def test_find_reusable_change_set_returns_draft_ready_id():
+    """find_reusable_change_set returns the ID of a DRAFT_READY change set."""
+    from cauldron_site_astro.publication_service import SiteChangeSetService
+    from cauldron_site_astro.models import SiteChangeSet
+
+    req_id = "find-cs-1"
+    cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        content_request_ids=[req_id],
+    )
+
+    result = SiteChangeSetService().find_reusable_change_set(req_id)
+    assert result == str(cs.id)
+
+
+def test_find_reusable_change_set_returns_publish_failed_id():
+    """find_reusable_change_set returns the ID of a PUBLISH_FAILED change set."""
+    from cauldron_site_astro.publication_service import SiteChangeSetService
+    from cauldron_site_astro.models import SiteChangeSet
+
+    req_id = "find-cs-2"
+    cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.PUBLISH_FAILED,
+        content_request_ids=[req_id],
+    )
+
+    result = SiteChangeSetService().find_reusable_change_set(req_id)
+    assert result == str(cs.id)
+
+
+def test_find_reusable_change_set_ignores_published_change_set():
+    """A PUBLISHED change set is not reusable."""
+    from cauldron_site_astro.publication_service import SiteChangeSetService
+    from cauldron_site_astro.models import SiteChangeSet
+
+    req_id = "find-cs-3"
+    SiteChangeSet.objects.create(
+        status=SiteChangeSet.PUBLISHED,
+        content_request_ids=[req_id],
+    )
+
+    result = SiteChangeSetService().find_reusable_change_set(req_id)
+    assert result is None
+
+
+def test_find_reusable_change_set_returns_none_when_not_found():
+    """Returns None when no matching change set exists."""
+    from cauldron_site_astro.publication_service import SiteChangeSetService
+
+    result = SiteChangeSetService().find_reusable_change_set("no-such-request")
+    assert result is None
+
+
+def test_find_reusable_change_set_returns_newest_first():
+    """Returns the most recently created reusable change set."""
+    from cauldron_site_astro.publication_service import SiteChangeSetService
+    from cauldron_site_astro.models import SiteChangeSet
+
+    req_id = "find-cs-order"
+    older = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        content_request_ids=[req_id],
+    )
+    newer = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        content_request_ids=[req_id],
+    )
+
+    result = SiteChangeSetService().find_reusable_change_set(req_id)
+    assert result == str(newer.id)

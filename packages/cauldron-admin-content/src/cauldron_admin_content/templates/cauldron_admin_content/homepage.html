@@ -102,13 +102,15 @@
     <h2 class="cui-card__heading">Workflow</h2>
     <div class="cui-form">
       <div class="cui-alert cui-alert--info" role="note">
-        <strong>Save Draft</strong> saves a draft for later.
-        {% if not require_approval %}
-        <strong>Publish</strong> validates and applies it immediately.
-        {% else %}
+        <strong>Save Draft</strong> saves a proposed change for later.
+        {% if require_approval %}
         <strong>Submit for Review</strong> validates and queues it for approval.
+        {% elif site_astro_installed %}
+        <strong>Review &amp; Preview</strong> validates and opens the site preview workflow.
+        {% else %}
+        <strong>Publish</strong> validates and applies it immediately.
         {% endif %}
-        No file is written until the request is applied.
+        No file is written until the change is published.
       </div>
       {% include "cauldron_admin/includes/form_field.html" with field=form.change_description %}
     </div>
@@ -130,8 +132,11 @@
   <div class="cui-form-actions">
     {% if can_publish %}
     <button type="submit" name="action" value="publish" class="cui-button">
-      {% if require_approval %}Submit for Review{% else %}Publish{% endif %}
+      {% if require_approval %}Submit for Review{% elif site_astro_installed %}Review &amp; Preview{% else %}Publish{% endif %}
     </button>
+    {% if item and item.status == "published" %}
+    <button type="submit" name="action" value="unpublish" class="cui-button cui-button--secondary">Unpublish</button>
+    {% endif %}
     {% endif %}
     <button type="submit" name="action" value="save_draft" class="cui-button cui-button--secondary">Save Draft</button>
   </div>

@@ -321,9 +321,26 @@ class TestPublishEdit:
         op = mock_service.create_change_request.call_args[1]["operations"][0]
         assert op["status"] == "published"
 
-    def test_save_draft_edit_of_published_produces_draft(self, client):
+    def test_save_draft_edit_of_published_keeps_published_status(self, client):
+        """Save Draft on a published page proposes a pending revision, not a downgrade."""
         user = _make_user("pe_sd1", ["propose_content_changes", "view_published_content"])
         item = _make_item(status="published")
+        edit_token = _make_edit_token(item.id)
+        mock_result = _make_result(ok=True)
+        mock_service = MagicMock()
+        mock_service.get_item.return_value = item
+        mock_service.create_change_request.return_value = mock_result
+
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+            _post_edit(client, user, item.id, edit_token, action="save_draft")
+
+        op = mock_service.create_change_request.call_args[1]["operations"][0]
+        assert op["status"] == "published"
+
+    def test_save_draft_edit_of_draft_produces_draft_status(self, client):
+        """Save Draft on a draft page keeps status=draft."""
+        user = _make_user("pe_sd2", ["propose_content_changes", "view_published_content"])
+        item = _make_item(status="draft")
         edit_token = _make_edit_token(item.id)
         mock_result = _make_result(ok=True)
         mock_service = MagicMock()
@@ -682,3 +699,218 @@ class TestPageDetailPublishButton:
         assert response.status_code == 200
         content = response.content.decode()
         assert 'name="action" value="publish"' not in content
+
+
+# ---------------------------------------------------------------------------
+# TestUnpublishPage
+# ---------------------------------------------------------------------------
+
+class TestUnpublishPage:
+    def _post_detail_action(self, client, user, item_id, action):
+        from django.test import override_settings
+        client.force_login(user)
+        with override_settings(ROOT_URLCONF="tests.urls"):
+            return client.post(
+                f"/cauldron-admin/content/pages/{item_id}/",
+                data={"action": action},
+            )
+
+    def test_unpublish_creates_draft_status_operation(self, client):
+        """Unpublish action produces an update operation with status=draft."""
+        user = _make_user("up_pub1", [
+            "view_published_content",
+            "propose_content_changes",
+            "validate_content_changes",
+            "apply_content_changes",
+        ])
+        item = _make_item(status="published")
+        req_id = str(uuid.uuid4())
+        mock_service = MagicMock()
+        mock_service.get_item.return_value = item
+        mock_service.create_change_request.return_value = _make_result(ok=True, request_id=req_id, request_version=1)
+        mock_service.validate_change_request.return_value = _make_validate_result(ok=True, request_id=req_id, request_version=2)
+        mock_service.apply_change_request.return_value = _make_apply_result(ok=True)
+
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_service), \
+             patch("cauldron_admin_content.views._get_publication_service", return_value=None):
+            response = self._post_detail_action(client, user, item.id, "unpublish")
+
+        assert response.status_code == 302
+        assert mock_service.create_change_request.call_count == 1
+        op = mock_service.create_change_request.call_args[1]["operations"][0]
+        assert op["kind"] == "update"
+        assert op["status"] == "draft"
+
+    def test_unpublish_on_draft_page_redirects_without_cr(self, client):
+        """Unpublish action on a draft page redirects with info message."""
+        user = _make_user("up_draft1", [
+            "view_published_content",
+            "view_draft_content",
+            "propose_content_changes",
+            "validate_content_changes",
+            "apply_content_changes",
+        ])
+        item = _make_item(status="draft")
+        mock_service = MagicMock()
+        mock_service.get_item.return_value = item
+
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+            response = self._post_detail_action(client, user, item.id, "unpublish")
+
+        assert response.status_code == 302
+        mock_service.create_change_request.assert_not_called()
+
+    def test_unpublish_requires_can_publish_permission(self, client):
+        """Unpublish requires the same permissions as publish."""
+        user = _make_user("up_noperm1", ["view_published_content", "view_draft_content"])
+        item = _make_item(status="published")
+        mock_service = MagicMock()
+        mock_service.get_item.return_value = item
+
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+            response = self._post_detail_action(client, user, item.id, "unpublish")
+
+        assert response.status_code == 302
+        mock_service.create_change_request.assert_not_called()
+
+    def test_unpublish_button_shown_for_published_page(self, client):
+        """Page detail shows an Unpublish button for published items."""
+        from django.test import override_settings
+        user = _make_user("up_btn1", [
+            "view_published_content",
+            "propose_content_changes",
+            "validate_content_changes",
+            "apply_content_changes",
+        ])
+        item = _make_item(status="published")
+        mock_service = MagicMock()
+        mock_service.get_item.return_value = item
+
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+            client.force_login(user)
+            with override_settings(ROOT_URLCONF="tests.urls"):
+                response = client.get(f"/cauldron-admin/content/pages/{item.id}/")
+
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert 'value="unpublish"' in content
+
+    def test_no_unpublish_button_for_draft_page(self, client):
+        """Page detail does not show an Unpublish button for draft items."""
+        from django.test import override_settings
+        user = _make_user("up_btn2", [
+            "view_published_content",
+            "view_draft_content",
+            "propose_content_changes",
+            "validate_content_changes",
+            "apply_content_changes",
+        ])
+        item = _make_item(status="draft")
+        mock_service = MagicMock()
+        mock_service.get_item.return_value = item
+
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+            client.force_login(user)
+            with override_settings(ROOT_URLCONF="tests.urls"):
+                response = client.get(f"/cauldron-admin/content/pages/{item.id}/")
+
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert 'value="unpublish"' not in content
+
+
+# ---------------------------------------------------------------------------
+# TestReuseSiteChangeSet
+# ---------------------------------------------------------------------------
+
+class TestReuseSiteChangeSet:
+    """Verify that _try_route_publish_via_site_change_set reuses existing change sets."""
+
+    def _post_cr_publish(self, client, user, request_id, version=1):
+        from django.test import override_settings
+        client.force_login(user)
+        with override_settings(ROOT_URLCONF="tests.urls"):
+            return client.post(
+                f"/cauldron-admin/content/change-requests/{request_id}/",
+                data={"action": "publish", "expected_version": version},
+            )
+
+    def test_reuses_existing_draft_ready_change_set(self, client):
+        """When a DRAFT_READY change set exists for the request, redirect to it."""
+        from django.test import override_settings
+        from cauldron_content_operations.models import ContentChangeRequest
+        user = _make_user("reuse_cs1", [
+            "view_published_content",
+            "view_content_change_requests",
+            "propose_content_changes",
+            "validate_content_changes",
+            "apply_content_changes",
+        ])
+        req_id = str(uuid.uuid4())
+        ContentChangeRequest.objects.create(
+            request_id=req_id,
+            lifecycle_state="proposed",
+            request_version=1,
+            provider_name="",
+            workspace_changeset_id="",
+        )
+
+        existing_cs_id = str(uuid.uuid4())
+        mock_pub_service = MagicMock()
+        mock_pub_service.find_reusable_change_set.return_value = existing_cs_id
+
+        mock_service = MagicMock()
+        mock_service.validate_change_request.return_value = _make_validate_result(
+            ok=True, request_id=req_id, request_version=2,
+        )
+
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_service), \
+             patch("cauldron_admin_content.views._get_publication_service", return_value=mock_pub_service):
+            with override_settings(ROOT_URLCONF="tests.urls"):
+                response = self._post_cr_publish(client, user, req_id)
+
+        assert response.status_code == 302
+        assert existing_cs_id in response["Location"]
+        mock_pub_service.prepare.assert_not_called()
+
+    def test_calls_prepare_when_no_reusable_change_set(self, client):
+        """When no reusable change set exists, prepare() is called to create one."""
+        from django.test import override_settings
+        from cauldron_content_operations.models import ContentChangeRequest
+        user = _make_user("reuse_cs2", [
+            "view_published_content",
+            "view_content_change_requests",
+            "propose_content_changes",
+            "validate_content_changes",
+            "apply_content_changes",
+        ])
+        req_id = str(uuid.uuid4())
+        ContentChangeRequest.objects.create(
+            request_id=req_id,
+            lifecycle_state="proposed",
+            request_version=1,
+            provider_name="",
+            workspace_changeset_id="",
+        )
+
+        new_cs_id = str(uuid.uuid4())
+        mock_pub_service = MagicMock()
+        mock_pub_service.find_reusable_change_set.return_value = None
+        prepare_result = MagicMock()
+        prepare_result.ok = True
+        prepare_result.change_set_id = new_cs_id
+        prepare_result.message = ""
+        mock_pub_service.prepare.return_value = prepare_result
+
+        mock_service = MagicMock()
+        mock_service.validate_change_request.return_value = _make_validate_result(
+            ok=True, request_id=req_id, request_version=2,
+        )
+
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_service), \
+             patch("cauldron_admin_content.views._get_publication_service", return_value=mock_pub_service):
+            with override_settings(ROOT_URLCONF="tests.urls"):
+                response = self._post_cr_publish(client, user, req_id)
+
+        assert response.status_code == 302
+        mock_pub_service.prepare.assert_called_once()

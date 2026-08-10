@@ -128,6 +128,16 @@ def _redirect_after_publish(request: HttpRequest, request_id: str) -> HttpRespon
     return _redirect_after_proposal(request, request_id)
 
 
+def _site_astro_installed() -> bool:
+    """Return True when cauldron_site_astro is importable."""
+    import importlib
+    try:
+        importlib.import_module("cauldron_site_astro")
+        return True
+    except ImportError:
+        return False
+
+
 # Sentinel used by ``_try_route_publish_via_site_change_set`` to unambiguously
 # signal "Site Astro is genuinely absent (ImportError)" — the ONLY case where
 # the caller should fall back to direct validate+apply. Any other outcome
@@ -197,6 +207,20 @@ def _try_route_publish_via_site_change_set(
     # inspect — the source change request's detail page (or content browser
     # if they lack permission for that).
     error_redirect = _redirect_after_proposal(request, request_id)
+
+    # Reuse an existing DRAFT_READY or PUBLISH_FAILED change set rather than
+    # creating a redundant new one. The operator reviews the same preview they
+    # already built rather than triggering a duplicate build.
+    try:
+        existing_id = pub_service.find_reusable_change_set(request_id)
+    except Exception:
+        existing_id = None
+    if existing_id:
+        messages.info(
+            request,
+            "Resuming existing preview — review and publish when ready.",
+        )
+        return _redirect_to_change_set_review(existing_id)
 
     try:
         prep = pub_service.prepare(
@@ -618,6 +642,7 @@ class PageDetailView(View):
             "can_edit": can_edit,
             "can_publish": _can_publish(request, cfg.require_approval),
             "require_approval": cfg.require_approval,
+            "site_astro_installed": _site_astro_installed(),
             "breadcrumbs": [
                 {"label": "Content", "url": reverse("cauldron_admin_content:content-browser")},
                 {"label": title, "url": ""},
@@ -625,14 +650,14 @@ class PageDetailView(View):
         })
 
     def post(self, request: HttpRequest, item_id: str) -> Any:
-        """Publish an existing draft page directly from the detail view."""
+        """Publish a draft page or unpublish a published page from the detail view."""
         from cauldron_content.pages import PAGE_COLLECTION, build_page_operation
         from cauldron_content_operations.config import get_operations_config
         from django.core.exceptions import ImproperlyConfigured
 
         detail_url = reverse("cauldron_admin_content:page-detail", kwargs={"item_id": item_id})
         action = request.POST.get("action", "")
-        if action != "publish":
+        if action not in ("publish", "unpublish"):
             return HttpResponseRedirect(detail_url)
 
         cfg = get_operations_config()
@@ -656,16 +681,25 @@ class PageDetailView(View):
         if item.schema not in (_PAGE_SCHEMA, ""):
             raise Http404
 
-        if item.status == "published":
-            messages.info(request, "This page is already published.")
-            return HttpResponseRedirect(detail_url)
+        if action == "publish":
+            if item.status == "published":
+                messages.info(request, "This page is already published.")
+                return HttpResponseRedirect(detail_url)
+            target_status = "published"
+            cr_description = f"Publish draft: {item.data.get('title', item.id)}"
+        else:  # unpublish
+            if item.status != "published":
+                messages.info(request, "This page is not currently published.")
+                return HttpResponseRedirect(detail_url)
+            target_status = "draft"
+            cr_description = f"Unpublish: {item.data.get('title', item.id)}"
 
         data = item.data
         operation = build_page_operation(
             kind="update",
             item_id=item.id,
             slug=item.slug,
-            status="published",
+            status=target_status,
             title=data.get("title", ""),
             body=item.body,
             expected_hash=item.hash,
@@ -688,7 +722,7 @@ class PageDetailView(View):
                 user=request.user,
                 operations=[operation],
                 provider_name="",
-                description=f"Publish draft: {data.get('title', item.id)}",
+                description=cr_description,
             )
         except Exception as exc:
             messages.error(request, html.escape(str(exc)[:400]))
@@ -754,6 +788,7 @@ class PageEditView(View):
             "form_title": f"Edit: {title}",
             "require_approval": cfg.require_approval,
             "can_publish": _can_publish(request, cfg.require_approval),
+            "site_astro_installed": _site_astro_installed(),
             "validation_issues": validation_issues or [],
             "breadcrumbs": [
                 {"label": "Content", "url": reverse("cauldron_admin_content:content-browser")},
@@ -840,7 +875,14 @@ class PageEditView(View):
         if not form.is_valid():
             return self._render_form(request, form, item, edit_token, submission_token)
 
-        status = "published" if action == "publish" else "draft"
+        if action == "publish":
+            status = "published"
+        elif item.status == "published":
+            # Save Draft on a published page proposes a pending revision that
+            # keeps it published — not a downgrade to draft.
+            status = "published"
+        else:
+            status = "draft"
 
         operation = build_page_operation(
             kind="update",
@@ -946,6 +988,7 @@ class HomepageView(View):
             "can_publish": _can_publish(request, cfg.require_approval),
             "require_approval": cfg.require_approval,
             "can_propose": can_propose,
+            "site_astro_installed": _site_astro_installed(),
             "validation_issues": validation_issues or [],
             "breadcrumbs": [
                 {"label": "Content", "url": reverse("cauldron_admin_content:content-browser")},
@@ -1022,6 +1065,55 @@ class HomepageView(View):
         item, service = self._load_homepage(request)
         if service is None:
             return HttpResponseRedirect(homepage_url)
+
+        # Handle unpublish before the create/update split.
+        if action == "unpublish":
+            from cauldron_content_operations.config import get_operations_config
+            cfg = get_operations_config()
+            if not _can_publish(request, cfg.require_approval):
+                messages.error(request, "You do not have permission to publish content.")
+                return HttpResponseRedirect(homepage_url)
+            if item is None or item.status != "published":
+                messages.info(request, "The homepage is not currently published.")
+                return HttpResponseRedirect(homepage_url)
+            data = item.data
+            operation = build_homepage_operation(
+                kind="update",
+                status="draft",
+                title=data.get("title", ""),
+                body=item.body,
+                expected_hash=item.hash,
+                navigation_title=data.get("navigation_title", ""),
+                summary=data.get("summary", ""),
+                seo_title=data.get("seo_title", ""),
+                meta_description=data.get("meta_description", ""),
+                canonical_url=data.get("canonical_url", ""),
+                robots_index=bool(data.get("robots_index", True)),
+                robots_follow=bool(data.get("robots_follow", True)),
+                social_title=data.get("social_title", ""),
+                social_description=data.get("social_description", ""),
+                social_image=data.get("social_image", ""),
+            )
+            try:
+                result = service.create_change_request(
+                    user=request.user,
+                    operations=[operation],
+                    provider_name="",
+                    description="Unpublish homepage",
+                )
+            except Exception as exc:
+                messages.error(request, html.escape(str(exc)[:400]))
+                return HttpResponseRedirect(homepage_url)
+            if not result.ok:
+                error_msg = result.error.message if result.error else "An unknown error occurred."
+                messages.error(request, html.escape(error_msg[:400]))
+                return HttpResponseRedirect(homepage_url)
+            return _handle_publish_flow(
+                request, service, result.request_id, result.request_version,
+                on_form_error=lambda issues, fresh_token: HttpResponseRedirect(homepage_url),
+                approval_message="Homepage unpublish submitted for review.",
+                published_message="Homepage queued for unpublishing.",
+            )
 
         status = "published" if action == "publish" else "draft"
 
@@ -1269,6 +1361,7 @@ class ChangeRequestDetailView(View):
             "valid_actions": valid_actions,
             "is_terminal": state in _TERMINAL_STATES,
             "require_approval": cfg.require_approval,
+            "site_astro_installed": _site_astro_installed(),
             "can_validate": request.user.has_perm(_ACTION_PERMISSIONS["validate"]),
             "can_approve": request.user.has_perm(_ACTION_PERMISSIONS["approve"]),
             "can_reject": request.user.has_perm(_ACTION_PERMISSIONS["reject"]),

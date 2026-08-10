@@ -74,7 +74,7 @@
     <input type="hidden" name="action" value="publish">
     <input type="hidden" name="expected_version" value="{{ cr.request_version }}">
     <button type="submit" class="cui-button cui-button--primary">
-      {% if require_approval %}Submit for Review{% else %}Publish{% endif %}
+      {% if require_approval %}Submit for Review{% elif site_astro_installed %}Review &amp; Preview{% else %}Publish{% endif %}
     </button>
   </form>
   {% endif %}

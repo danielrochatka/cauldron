@@ -17,10 +17,15 @@ dependencies = [
 ai = [
     "cauldron-ai>=0.1.0",
     "cauldron-ai-admin>=0.1.0",
-    "cauldron-admin-content>=0.1.0",
 ]
 test = [
     "cauldron-ai-admin>=0.1.0",
+    # test_integration_flatfile.py wires a real ContentOperationService
+    # backed by real FlatFile infrastructure. These are TEST-ONLY: nothing
+    # in the site-astro runtime imports from cauldron_cms_flatfile or
+    # cauldron_workspace_flatfile.
+    "cauldron-cms-flatfile>=0.1.0",
+    "cauldron-workspace-flatfile>=0.1.0",
 ]
 
 [project.entry-points."cauldron.modules"]

@@ -17,6 +17,9 @@ class CauldronAIAdminConfig(AppConfig):
         # Register the global operating prompt and per-tool prompt templates.
         from . import builtin_tool_prompts
         builtin_tool_prompts.register_builtin_tool_prompts()
+        # Pull site.astro tools into the shared registry when site.astro is installed.
+        # ai.admin is the consumer of site.astro's tools (correct dependency direction).
+        _register_site_astro_tools()
         # Register navigation items with the admin shell.
         self._register_navigation()
 
@@ -86,3 +89,13 @@ class CauldronAIAdminConfig(AppConfig):
             ))
         except ImportError:
             pass
+
+
+def _register_site_astro_tools() -> None:
+    import importlib
+    try:
+        from cauldron_ai_admin.tools import get_tool_registry
+        site_tools = importlib.import_module("cauldron_site_astro.site_tools")
+        site_tools.register(get_tool_registry())
+    except ImportError:
+        pass  # cauldron-site-astro not installed

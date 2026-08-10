@@ -751,7 +751,8 @@ def test_post_apply_calls_service(client):
     mock_svc = _make_service()
 
     with override_settings(ROOT_URLCONF="tests.urls"):
-        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc), \
+             patch("cauldron_admin_content.views._get_publication_service", return_value=None):
             resp = client.post(url, {"action": "apply", "expected_version": "3"})
 
     assert resp.status_code == 302
@@ -784,7 +785,8 @@ def test_post_apply_from_apply_failed_calls_service(client):
     mock_svc = _make_service()
 
     with override_settings(ROOT_URLCONF="tests.urls"):
-        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc), \
+             patch("cauldron_admin_content.views._get_publication_service", return_value=None):
             resp = client.post(url, {"action": "apply", "expected_version": "4"})
 
     assert resp.status_code == 302
@@ -803,7 +805,8 @@ def test_post_apply_from_validated_calls_service_when_approval_not_required(clie
 
     no_approval = {"cauldron.content.operations": {"require_approval": False, "max_operations_per_change_set": 100}}
     with override_settings(ROOT_URLCONF="tests.urls", CAULDRON_MODULES=no_approval):
-        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc), \
+             patch("cauldron_admin_content.views._get_publication_service", return_value=None):
             resp = client.post(url, {"action": "apply", "expected_version": "2"})
 
     assert resp.status_code == 302
@@ -879,7 +882,8 @@ def test_post_apply_success_message_says_applied(client):
     mock_svc = _make_service()
 
     with override_settings(ROOT_URLCONF="tests.urls"):
-        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc), \
+             patch("cauldron_admin_content.views._get_publication_service", return_value=None):
             resp = client.post(url, {"action": "apply", "expected_version": "3"}, follow=True)
 
     assert "applied successfully" in resp.content.decode()
@@ -995,7 +999,8 @@ def test_publish_action_validates_and_applies_when_approval_not_required(client)
     )
 
     with override_settings(ROOT_URLCONF="tests.urls"):
-        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_svc), \
+             patch("cauldron_admin_content.views._get_publication_service", return_value=None):
             resp = client.post(url, data={"action": "publish", "expected_version": "1"})
 
     assert resp.status_code == 302

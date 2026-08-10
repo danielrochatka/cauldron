@@ -25,4 +25,11 @@ urlpatterns = [
     path("content/change-requests/<str:request_id>/", views.ChangeRequestDetailView.as_view(), name="change-request-detail"),
     path("content/audit/", views.AuditListView.as_view(), name="audit-list"),
     path("content/audit/<str:event_id>/", views.AuditDetailView.as_view(), name="audit-detail"),
+
+    # Site change-set review (only used when cauldron.site.astro is installed)
+    path(
+        "content/change-sets/<str:change_set_id>/",
+        views.ChangeSetReviewView.as_view(),
+        name="change-set-review",
+    ),
 ]

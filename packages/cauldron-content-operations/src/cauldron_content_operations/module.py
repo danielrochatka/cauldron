@@ -37,6 +37,7 @@ _manifest = ModuleManifest(
     namespaces=("cauldron_content_operations",),
     public_api=(
         "cauldron_content_operations.service",
+        "cauldron_content_operations.service_factory",
         "cauldron_content_operations.config",
         "cauldron_content_operations.lifecycle",
         "cauldron_content_operations.models",

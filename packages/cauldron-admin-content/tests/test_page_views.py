@@ -876,7 +876,8 @@ def test_publish_action_validates_and_applies_when_approval_not_required(client)
     )
 
     # require_approval=False is the default in conftest
-    with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+    with patch("cauldron_admin_content.views._get_service", return_value=mock_service), \
+         patch("cauldron_admin_content.views._get_publication_service", return_value=None):
         response = _post_create_with_action(client, user, action="publish")
 
     assert response.status_code == 302
@@ -1039,7 +1040,8 @@ def test_edit_publish_action_validates_and_applies(client):
         ok=True, request_id=req_id, lifecycle_state="applied", request_version=3,
     )
 
-    with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+    with patch("cauldron_admin_content.views._get_service", return_value=mock_service), \
+         patch("cauldron_admin_content.views._get_publication_service", return_value=None):
         response = _post_edit_with_action(client, user, item.id, edit_token, action="publish")
 
     assert response.status_code == 302

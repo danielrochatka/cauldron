@@ -243,7 +243,8 @@ class TestPublishCreate:
         mock_service.validate_change_request.return_value = _make_validate_result(ok=True, request_id=req_id, request_version=2)
         mock_service.apply_change_request.return_value = _make_apply_result(ok=True)
 
-        with patch("cauldron_admin_content.views._get_service", return_value=mock_service):
+        with patch("cauldron_admin_content.views._get_service", return_value=mock_service), \
+             patch("cauldron_admin_content.views._get_publication_service", return_value=None):
             response = _post_create(client, user, action="publish")
 
         assert response.status_code == 302

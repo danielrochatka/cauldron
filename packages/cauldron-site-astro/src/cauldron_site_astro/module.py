@@ -22,6 +22,7 @@ _manifest = ModuleManifest(
         ModuleRequirement(slug="cauldron.content.operations", kind="module"),
     ),
     optional=(
+        ModuleRequirement(slug="cauldron.ai.admin", kind="module"),
         ModuleRequirement(slug="cauldron.ai", kind="module"),
     ),
     provides=("site.public", "site.build"),

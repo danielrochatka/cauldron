@@ -27,6 +27,7 @@ _manifest = ModuleManifest(
         ModuleRequirement(slug="cauldron.content.operations", kind="module"),
         ModuleRequirement(slug="cauldron.workspace.flatfile", kind="module"),
     ),
+    optional=(),
     provides=(
         "admin.content",
         "admin.content.changerequests",

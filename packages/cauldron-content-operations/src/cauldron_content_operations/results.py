@@ -42,6 +42,43 @@ class ChangeRequestResult:
 
 
 @dataclass(frozen=True)
+class CompensationResult:
+    """Returned by internal compensation for a failed coordinated publish.
+
+    ``ok`` — canonical rollback mutation completed on the provider side
+    (SQL and provider markers written).
+    ``verified`` — provider verification confirmed the pre-application state
+    was restored on-disk. False when ``ok`` is False, or when the adapter
+    reported anything other than ``verified``.
+    ``lifecycle_state`` — the request's terminal lifecycle state after
+    compensation (``rolled_back``, ``reconciliation_required``, or
+    ``rollback_failed``).
+    ``error_code`` and ``error_message`` — bounded diagnostic strings
+    populated when compensation fails or verification does not confirm
+    restoration. Empty on a fully successful compensation.
+    """
+
+    ok: bool
+    verified: bool
+    request_id: str = ""
+    lifecycle_state: str = ""
+    request_version: int = 0
+    error_code: str = ""
+    error_message: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "verified": self.verified,
+            "request_id": self.request_id,
+            "lifecycle_state": self.lifecycle_state,
+            "request_version": self.request_version,
+            "error_code": self.error_code,
+            "error_message": self.error_message,
+        }
+
+
+@dataclass(frozen=True)
 class ContentItemResult:
     id: str
     collection: str

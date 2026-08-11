@@ -838,6 +838,9 @@ class UIStyleChangeDetailView(View):
             "can_approve": request.user.has_perm(
                 "cauldron_ai_admin.approve_ui_style_changes"
             ),
+            "can_publish": request.user.has_perm(
+                "cauldron_content_operations.apply_content_changes"
+            ),
             "can_view_audit": can_view_audit,
             "current_content": current_content,
             "current_label": current_label,
@@ -866,16 +869,23 @@ class UIStyleChangeDetailView(View):
                 service.reject(proposal, reviewed_by=request.user)
                 messages.success(request, "Proposal rejected.")
             elif action == "apply" and proposal.status == "approved":
-                try:
-                    service.apply(proposal, applied_by=request.user)
-                    messages.success(request, "Style change applied successfully.")
-                except HashConflictError:
+                if proposal.scope == "pages":
                     messages.error(
                         request,
-                        "Conflict: the target file was modified. Proposal marked as conflicted.",
+                        "Pages-scope proposals must be published via the "
+                        "Review & Preview workflow, not direct apply.",
                     )
-                except OverrideStoreError:
-                    messages.error(request, "Failed to apply style change. See audit for details.")
+                else:
+                    try:
+                        service.apply(proposal, applied_by=request.user)
+                        messages.success(request, "Style change applied successfully.")
+                    except HashConflictError:
+                        messages.error(
+                            request,
+                            "Conflict: the target file was modified. Proposal marked as conflicted.",
+                        )
+                    except OverrideStoreError:
+                        messages.error(request, "Failed to apply style change. See audit for details.")
         except ValueError as exc:
             messages.error(request, str(exc))
         return redirect("cauldron_ai_admin:style-detail", request_id=request_id)

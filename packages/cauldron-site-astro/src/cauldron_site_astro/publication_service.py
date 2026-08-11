@@ -520,8 +520,13 @@ class SiteChangeSetService:
         *,
         originating_run_id: str | None = None,
         description: str = "",
-        staged_theme_css: str = "",
+        staged_theme_css: str | None = None,
         style_request_id: str = "",
+        style_scope: str = "",
+        style_target: str = "",
+        style_proposed_content: str = "",
+        style_base_hash: str = "",
+        style_base_exists: bool = False,
     ) -> PrepareResult:
         """Create a :class:`SiteChangeSet` and build a scoped preview.
 
@@ -585,38 +590,61 @@ class SiteChangeSetService:
             if not integrity_ok:
                 return PrepareResult(ok=False, message=integrity_msg)
 
-        # Determine effective theme CSS.  Priority (highest to lowest):
-        #   1. Explicitly passed staged_theme_css.
-        #   2. Composed pages CSS from the registered PagesStyleProvider
-        #      (cauldron-django-admin's UIOverrideStore).  This ensures that
-        #      content-only publishes carry forward existing pages overrides
-        #      and that style-only changesets carry the proposed overlay.
-        #   3. Any staged.css already written under theme_root.
-        theme_css = staged_theme_css or ""
-        if not theme_css:
-            try:
-                from cauldron_content.pages_style import get_pages_style_provider
-                _provider = get_pages_style_provider()
-                if _provider is not None:
-                    theme_css = _provider.get_composed_css() or ""
-            except Exception:
-                pass
-        if not theme_css and cfg.theme_root:
-            try:
-                from cauldron_site_astro.theme import SiteThemeService
-                theme_css = SiteThemeService(cfg.theme_root).get_staged_css() or ""
-            except Exception:
-                pass
+        # Determine effective theme CSS.
+        #
+        # Semantics stored in SiteChangeSet.staged_theme_css:
+        #   None  — inherited / re-resolve from PagesStyleProvider at publish time
+        #   ""    — explicitly empty (no theme change)
+        #   "..." — explicit CSS
+        #
+        # Priority for prepare (preview):
+        #   1. Explicit staged_theme_css arg (not None) — caller intent wins.
+        #   2. staged.css already written under theme_root — explicit operator intent.
+        #   3. PagesStyleProvider composed CSS (preview only; not stored as explicit).
+        #
+        # Content-only changesets store None so publish() re-resolves from the
+        # provider at publication time, avoiding a stale-snapshot race.
+        if staged_theme_css is not None:
+            explicit_css: str | None = staged_theme_css
+            preview_css: str = staged_theme_css
+        else:
+            explicit_css = None  # re-resolve at publish time
+            preview_css = ""
+            if cfg.theme_root:
+                try:
+                    from cauldron_site_astro.theme import SiteThemeService
+                    _staged = SiteThemeService(cfg.theme_root).get_staged_css() or ""
+                    if _staged:
+                        explicit_css = _staged
+                        preview_css = _staged
+                except Exception:
+                    pass
+            if explicit_css is None:
+                try:
+                    from cauldron_content.pages_style import get_pages_style_provider
+                    _provider = get_pages_style_provider()
+                    if _provider is not None:
+                        preview_css = _provider.get_composed_css(
+                            proposed_target=style_target or None,
+                            proposed_content=style_proposed_content or None,
+                        ) or ""
+                except Exception:
+                    pass
 
         affected_item_ids, draft_extra_items, draft_deleted_ids = _extract_draft_items(content_request_ids)
         cs = SiteChangeSet.objects.create(
             status=SiteChangeSet.PREPARING,
             content_request_ids=content_request_ids,
-            staged_theme_css=theme_css or "",
+            staged_theme_css=explicit_css,
             originating_run_id=_coerce_run_id(originating_run_id),
             creator=actor if getattr(actor, "pk", None) is not None else None,
             affected_item_ids=affected_item_ids,
             style_request_id=style_request_id or "",
+            style_scope=style_scope or "",
+            style_target=style_target or "",
+            style_proposed_content=style_proposed_content or "",
+            style_base_hash=style_base_hash or "",
+            style_base_exists=style_base_exists,
         )
 
         output_dir = Path(cfg.previews_root) / str(cs.id)
@@ -626,7 +654,7 @@ class SiteChangeSetService:
                 item_ids_to_include=affected_item_ids or None,
                 extra_items=draft_extra_items or None,
                 excluded_item_ids=draft_deleted_ids or None,
-                theme_css=theme_css or "",
+                theme_css=preview_css,
             )
         except Exception as exc:
             cs.status = SiteChangeSet.PREVIEW_FAILED
@@ -952,6 +980,20 @@ class SiteChangeSetService:
         # ---- Step 2: Build ------------------------------------------------
         _, publish_extra_items, publish_deleted_ids = _extract_draft_items(cs.content_request_ids or [])
 
+        # Resolve effective CSS for this publish.
+        # staged_theme_css=None means "inherited" — re-resolve from provider now.
+        if cs.staged_theme_css is None:
+            publish_css = ""
+            try:
+                from cauldron_content.pages_style import get_pages_style_provider
+                _pub_provider = get_pages_style_provider()
+                if _pub_provider is not None:
+                    publish_css = _pub_provider.get_composed_css() or ""
+            except Exception:
+                pass
+        else:
+            publish_css = cs.staged_theme_css
+
         tmp_build_dir = tempfile.mkdtemp(prefix="cauldron_pub_")
         output_snapshot: "Path | None" = None
         # Item 4: when output restoration fails during compensation we must
@@ -966,7 +1008,7 @@ class SiteChangeSetService:
                     item_ids_to_include=cs.affected_item_ids or None,
                     extra_items=publish_extra_items or None,
                     excluded_item_ids=publish_deleted_ids or None,
-                    theme_css=cs.staged_theme_css or "",
+                    theme_css=publish_css,
                 )
             except Exception as exc:
                 cs.status = SiteChangeSet.PUBLISH_FAILED
@@ -998,10 +1040,107 @@ class SiteChangeSetService:
                     build_log_tail=(result.build_log or "")[-_MAX_BUILD_LOG_TAIL:],
                 )
 
+            # ---- Step 2.5: Commit pages CSS source BEFORE live mutation ----
+            # Must happen before any output or theme promotion so that a
+            # conflict is detected while the site is still in its prior state.
+            style_pre_image: "str | None" = None
+            style_committed_hash: str = ""
+            style_source_committed: bool = False
+
+            if cs.style_request_id and cs.style_target:
+                try:
+                    from cauldron_content.pages_style import (
+                        get_pages_style_provider,
+                        StyleConflictError,
+                    )
+                except ImportError as exc:
+                    cs.status = SiteChangeSet.PUBLISH_FAILED
+                    cs.publish_build_result = {
+                        "error": f"pages_style import failed: {_safe_exc(exc)}",
+                        "applied": [],
+                    }
+                    cs.save(update_fields=["status", "publish_build_result", "updated_at"])
+                    return PublishResult(
+                        ok=False,
+                        change_set_id=str(cs.id),
+                        status=cs.status,
+                        message=f"pages_style import failed: {_safe_exc(exc)}",
+                    )
+
+                _style_provider = get_pages_style_provider()
+                if _style_provider is None:
+                    cs.status = SiteChangeSet.PUBLISH_FAILED
+                    cs.publish_build_result = {
+                        "error": "PagesStyleProvider not registered; cannot commit style source",
+                        "applied": [],
+                    }
+                    cs.save(update_fields=["status", "publish_build_result", "updated_at"])
+                    return PublishResult(
+                        ok=False,
+                        change_set_id=str(cs.id),
+                        status=cs.status,
+                        message="PagesStyleProvider not registered; cannot commit style source.",
+                    )
+
+                try:
+                    style_pre_image = _style_provider.read_style_source(cs.style_target)
+                    style_committed_hash = _style_provider.commit_style(
+                        target=cs.style_target,
+                        content=cs.style_proposed_content,
+                        expected_hash=cs.style_base_hash,
+                        base_exists=cs.style_base_exists,
+                    )
+                    style_source_committed = True
+                except StyleConflictError as exc:
+                    cs.status = SiteChangeSet.PUBLISH_FAILED
+                    cs.publish_build_result = {
+                        "error": f"style source conflict: {_safe_exc(exc)}",
+                        "applied": [],
+                        "style_conflict": True,
+                    }
+                    cs.save(update_fields=["status", "publish_build_result", "updated_at"])
+                    return PublishResult(
+                        ok=False,
+                        change_set_id=str(cs.id),
+                        status=cs.status,
+                        message=f"Style source conflict: {_safe_exc(exc)}",
+                    )
+                except Exception as exc:
+                    cs.status = SiteChangeSet.PUBLISH_FAILED
+                    cs.publish_build_result = {
+                        "error": f"style source commit failed: {_safe_exc(exc)}",
+                        "applied": [],
+                    }
+                    cs.save(update_fields=["status", "publish_build_result", "updated_at"])
+                    return PublishResult(
+                        ok=False,
+                        change_set_id=str(cs.id),
+                        status=cs.status,
+                        message=f"Style source commit failed: {_safe_exc(exc)}",
+                    )
+
+            def _rollback_style() -> "tuple[bool, str]":
+                """Attempt to undo the Step 2.5 style source write."""
+                if not style_source_committed:
+                    return True, ""
+                try:
+                    from cauldron_content.pages_style import get_pages_style_provider
+                    _p = get_pages_style_provider()
+                    if _p is None:
+                        return False, "provider disappeared after commit"
+                    ok = _p.rollback_style_commit(
+                        target=cs.style_target,
+                        old_content=style_pre_image,
+                        committed_hash=style_committed_hash,
+                    )
+                    return ok, "" if ok else "style source rollback failed (hash conflict)"
+                except Exception as exc:
+                    return False, _safe_exc(exc)
+
             # ---- Step 3: Snapshot current active CSS ---------------------
             theme_svc = None
             prev_active_css = ""
-            if cs.staged_theme_css and cfg.theme_root:
+            if publish_css and cfg.theme_root:
                 try:
                     from cauldron_site_astro.theme import SiteThemeService
                     theme_svc = SiteThemeService(cfg.theme_root)
@@ -1013,11 +1152,17 @@ class SiteChangeSetService:
             try:
                 output_snapshot = svc.promote_output_with_backup(tmp_build_dir)
             except Exception as exc:
-                cs.status = SiteChangeSet.PUBLISH_FAILED
-                cs.publish_build_result = {
+                _style_rb_ok, _style_rb_err = _rollback_style()
+                _result_meta: dict = {
                     "error": f"output promotion failed: {_safe_exc(exc)}",
                     "applied": [],
                 }
+                if not _style_rb_ok:
+                    _result_meta["style_source_rollback_failed"] = True
+                    _result_meta["style_source_rollback_error"] = _style_rb_err
+                    _result_meta["requires_reconciliation"] = True
+                cs.status = SiteChangeSet.PUBLISH_FAILED
+                cs.publish_build_result = _result_meta
                 cs.save(update_fields=["status", "publish_build_result", "updated_at"])
                 return PublishResult(
                     ok=False,
@@ -1029,7 +1174,7 @@ class SiteChangeSetService:
             # ---- Step 5: Promote CSS -------------------------------------
             if theme_svc is not None:
                 try:
-                    theme_svc.stage_css(cs.staged_theme_css)
+                    theme_svc.stage_css(publish_css)
                     theme_svc.promote_staged()
                 except Exception as exc:
                     # Apply the same restoration discipline as Step 6: track
@@ -1070,8 +1215,12 @@ class SiteChangeSetService:
                     except Exception as css_exc:
                         _step5_css_restore_err = _safe_exc(css_exc)
 
+                    _step5_style_rb_ok, _step5_style_rb_err = _rollback_style()
+
                     _step5_requires_reconciliation = (
-                        not _step5_output_restored or not _step5_css_restored
+                        not _step5_output_restored
+                        or not _step5_css_restored
+                        or not _step5_style_rb_ok
                     )
 
                     result_meta: dict = {
@@ -1085,6 +1234,9 @@ class SiteChangeSetService:
                     if not _step5_css_restored:
                         result_meta["css_restored"] = False
                         result_meta["css_restore_error"] = _step5_css_restore_err
+                    if not _step5_style_rb_ok:
+                        result_meta["style_source_rollback_failed"] = True
+                        result_meta["style_source_rollback_error"] = _step5_style_rb_err
 
                     cs.status = SiteChangeSet.PUBLISH_FAILED
                     cs.publish_build_result = result_meta
@@ -1210,12 +1362,12 @@ class SiteChangeSetService:
                         (not all_verified) or _failed_was_mutated
                     )
 
-                    # Item 4: track output and theme restoration independently.
-                    # Restoration is safe when the canonical state is confirmed
-                    # clean — either because nothing was applied AND the failed
-                    # request was not mutated (APPLY_FAILED or an exception
-                    # before mutation), or because all prior applies were
-                    # verified-compensated AND the failed request was not
+                    # Item 4: track output, theme, and style source restoration
+                    # independently. Restoration is safe when the canonical state
+                    # is confirmed clean — either because nothing was applied AND
+                    # the failed request was not mutated (APPLY_FAILED or an
+                    # exception before mutation), or because all prior applies
+                    # were verified-compensated AND the failed request was not
                     # mutated.
                     _output_restored = False
                     _theme_restored = False
@@ -1226,6 +1378,16 @@ class SiteChangeSetService:
                         (not _failed_was_mutated)
                         and (not applied_ids or all_verified)
                     )
+
+                    # Always attempt style source rollback when canonical is
+                    # clean; skip (leave committed) when canonical is unclean
+                    # so reconciliation operators see a consistent on-disk state.
+                    _style_rb_ok6: bool = True
+                    _style_rb_err6: str = ""
+                    if _canonical_clean:
+                        _style_rb_ok6, _style_rb_err6 = _rollback_style()
+                        if not _style_rb_ok6:
+                            requires_reconciliation = True
 
                     if _canonical_clean:
                         # Canonical content is confirmed restored. Now restore
@@ -1270,6 +1432,7 @@ class SiteChangeSetService:
                         and all_verified
                         and _output_restored
                         and _theme_restored
+                        and _style_rb_ok6
                         and not _failed_was_mutated
                     )
 
@@ -1285,6 +1448,9 @@ class SiteChangeSetService:
                         restoration_info["theme_restored"] = _theme_restored
                         if _theme_restore_err:
                             restoration_info["theme_restore_error"] = _theme_restore_err
+                    if not _style_rb_ok6:
+                        restoration_info["style_source_rollback_failed"] = True
+                        restoration_info["style_source_rollback_error"] = _style_rb_err6
                     if _failed_was_mutated:
                         restoration_info["failed_request_lifecycle"] = _failed_lifecycle
 
@@ -1337,6 +1503,9 @@ class SiteChangeSetService:
             ])
 
             # Notify subscribers (e.g. style-request lifecycle handler).
+            # style_committed_hash carries the hash returned by Step 2.5 so
+            # the handler can do a DB-only mark_style_applied() without any
+            # further filesystem writes.
             try:
                 from cauldron_site_astro.signals import site_changeset_published
                 site_changeset_published.send(
@@ -1344,6 +1513,7 @@ class SiteChangeSetService:
                     changeset_id=str(cs.id),
                     staged_theme_css=cs.staged_theme_css or "",
                     style_request_id=cs.style_request_id or "",
+                    style_committed_hash=style_committed_hash,
                 )
             except Exception:
                 logger.exception(

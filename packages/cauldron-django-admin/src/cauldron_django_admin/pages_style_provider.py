@@ -64,6 +64,14 @@ class UIOverrideStorePagesProvider:
 
         return "\n".join(p for p in parts if p)
 
+    def read_style_source(self, target: str) -> str | None:
+        try:
+            return _get_store().read_file("pages", target)
+        except FileNotFoundError:
+            return None
+        except Exception:
+            return None
+
     def commit_style(
         self,
         *,
@@ -72,10 +80,37 @@ class UIOverrideStorePagesProvider:
         expected_hash: str,
         base_exists: bool,
     ) -> str:
-        from cauldron_django_admin.override_store import ABSENT
+        from cauldron_django_admin.override_store import ABSENT, HashConflictError
         store = _get_store()
         expected = expected_hash if base_exists else ABSENT
-        return store.write_file_atomic("pages", target, content, expected_hash=expected)
+        try:
+            return store.write_file_atomic("pages", target, content, expected_hash=expected)
+        except HashConflictError as exc:
+            try:
+                from cauldron_content.pages_style import StyleConflictError
+            except ImportError:
+                raise exc
+            raise StyleConflictError(str(exc)) from exc
+
+    def rollback_style_commit(
+        self,
+        *,
+        target: str,
+        old_content: str | None,
+        committed_hash: str,
+    ) -> bool:
+        from cauldron_django_admin.override_store import ABSENT, HashConflictError
+        store = _get_store()
+        try:
+            if old_content is None:
+                store.delete_file_atomic("pages", target, expected_hash=committed_hash)
+            else:
+                store.write_file_atomic(
+                    "pages", target, old_content, expected_hash=committed_hash
+                )
+            return True
+        except (HashConflictError, FileNotFoundError, Exception):
+            return False
 
     def list_targets(self) -> list[str]:
         try:

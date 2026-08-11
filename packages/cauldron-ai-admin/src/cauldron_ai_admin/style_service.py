@@ -274,6 +274,11 @@ class UIStyleChangeService:
     def apply(self, proposal: UIStyleChangeRequest, applied_by) -> UIStyleChangeRequest:
         """Apply an approved proposal to the filesystem.
 
+        pages-scope proposals must go through the Astro changeset workflow
+        (Review & Preview → SiteChangeSet.publish()).  Direct apply is refused
+        so the atomic pre-promotion CSS source write in publish() Step 2.5 is
+        never bypassed.
+
         Four-transition protocol that keeps the database and the filesystem in
         agreement even under commit-time failures and concurrent apply attempts:
 
@@ -292,6 +297,12 @@ class UIStyleChangeService:
            transition to ``approved`` (rollback succeeded) or ``conflicted``
            (rollback failed).
         """
+        if proposal.scope == "pages":
+            raise ValueError(
+                "pages-scope proposals must be published via the Astro changeset "
+                "workflow (Review & Preview → publish). Direct apply is not allowed."
+            )
+
         from cauldron_django_admin.override_store import (
             HashConflictError, OverrideStoreError, ABSENT,
         )
@@ -542,25 +553,17 @@ class UIStyleChangeService:
         self,
         request_id: str,
         changeset_id: str = "",
+        committed_hash: str = "",
         applied_by=None,
     ) -> None:
-        """Mark an approved pages-scope style request as applied.
+        """Mark an approved pages-scope style request as applied (DB-only).
 
         Called by the site-astro post-publication signal handler after a
-        SiteChangeSet publishes successfully.  Writes the proposed CSS to
-        UIOverrideStore (keeping the per-file source current for future
-        compositions) then transitions the request to ``applied``.
-
-        Hash conflict during the UIOverrideStore write marks the request as
-        ``conflicted`` — the Astro publication has already succeeded so the
-        live site is correct, but future compositions will notice the mismatch.
-        This is rare: it means a separate pages-style apply wrote a newer
-        version of the same file between proposal creation and publication.
+        SiteChangeSet publishes successfully.  The pages CSS source was already
+        written atomically in publish() Step 2.5 (before any live output/theme
+        promotion), so this method only performs the DB lifecycle transition.
+        No UIOverrideStore write happens here.
         """
-        from cauldron_django_admin.override_store import (
-            HashConflictError, OverrideStoreError, ABSENT,
-        )
-
         with transaction.atomic():
             try:
                 locked = UIStyleChangeRequest.objects.select_for_update().get(
@@ -576,68 +579,20 @@ class UIStyleChangeService:
                 # Already applied, conflicted, rejected, etc.  No-op.
                 return
 
-            scope = locked.scope
-            target_path = locked.target_path
-            proposed_content = locked.proposed_content
-            base_exists = locked.base_exists
-            base_hash = locked.base_hash
-
-        # Write the proposed file to UIOverrideStore outside any transaction
-        # (filesystem write must not be inside a DB transaction).
-        store = _get_override_store()
-        expected = base_hash if base_exists else ABSENT
-        try:
-            new_hash = store.write_file_atomic(
-                scope, target_path, proposed_content, expected_hash=expected,
-            )
-        except (HashConflictError, OverrideStoreError) as exc:
-            logger.warning(
-                "mark_style_applied: UIOverrideStore write failed for %s/%s "
-                "(request %s): %s — marking conflicted",
-                scope, target_path, request_id, exc,
-            )
-            with transaction.atomic():
-                locked2 = UIStyleChangeRequest.objects.select_for_update().get(
-                    request_id=request_id,
-                )
-                if locked2.status == "approved":
-                    locked2.status = "conflicted"
-                    locked2.error_code = "STORE_CONFLICT_POST_PUBLISH"
-                    locked2.error_summary = (
-                        "Astro publication succeeded but UIOverrideStore write failed "
-                        "due to a concurrent modification. Live site is correct; "
-                        "future compositions may use stale individual file."
-                    )
-                    locked2.save(update_fields=["status", "error_code", "error_summary"])
-                    UIStyleAuditEvent.objects.create(
-                        change_request=locked2,
-                        sequence=_next_sequence_locked(locked2),
-                        event_type="conflict",
-                        actor=applied_by,
-                        detail={"error": "post_publish_store_conflict"},
-                    )
-            return
-
-        # Commit applied status.
-        with transaction.atomic():
-            locked2 = UIStyleChangeRequest.objects.select_for_update().get(
-                request_id=request_id,
-            )
-            if locked2.status != "approved":
-                return
-            locked2.status = "applied"
-            locked2.apply_lease = ""
-            locked2.applied_at = timezone.now()
-            locked2.proposed_hash = new_hash
-            locked2.save(update_fields=[
+            locked.status = "applied"
+            locked.apply_lease = ""
+            locked.applied_at = timezone.now()
+            if committed_hash:
+                locked.proposed_hash = committed_hash
+            locked.save(update_fields=[
                 "status", "apply_lease", "applied_at", "proposed_hash",
             ])
             UIStyleAuditEvent.objects.create(
-                change_request=locked2,
-                sequence=_next_sequence_locked(locked2),
+                change_request=locked,
+                sequence=_next_sequence_locked(locked),
                 event_type="applied",
                 actor=applied_by,
-                detail={"new_hash": new_hash, "via_changeset": changeset_id},
+                detail={"new_hash": committed_hash, "via_changeset": changeset_id},
             )
 
 

@@ -109,25 +109,21 @@ class PreviewServeView(View):
 class StylePublicationPrepareView(View):
     """Create a SiteChangeSet preview for an approved pages-scope style proposal.
 
-    Requires both propose and apply permissions so that the operator who
-    initiates the preview already holds the rights needed to publish.  The
-    actual Publish action is still gated by :data:`_PERM_PUBLISH` on the
-    change-set review page.
+    Requires the publish permission so that the operator who initiates the
+    preview already holds the rights needed to publish.
 
-    POST or GET ``request_id`` → creates a SiteChangeSet with the composed
-    pages CSS (current overrides + proposed target overlaid) → redirects to
-    the change-set review page.  The action is idempotent in the sense that
-    creating a new SiteChangeSet leaves previous ones intact and the style
-    request can only become ``applied`` after a successful Publish.
+    GET: read-only redirect — if the proposal already has a reusable
+    SiteChangeSet (DRAFT_READY or PUBLISH_FAILED), redirect to the review
+    page; otherwise redirect back to the style-detail page.  GET never
+    creates a SiteChangeSet.
+
+    POST: check for a reusable SiteChangeSet first (same redirect); if none
+    exists, create one with all style commit metadata and redirect to review.
+    The CSS source write (UIOverrideStore) is deferred to publish() Step 2.5
+    so the atomic pre-promotion lock happens there, not here.
     """
 
     def get(self, request, request_id: str):
-        return self._prepare(request, request_id)
-
-    def post(self, request, request_id: str):
-        return self._prepare(request, request_id)
-
-    def _prepare(self, request, request_id: str):
         try:
             from cauldron_ai_admin.models import UIStyleChangeRequest
         except ImportError:
@@ -143,28 +139,49 @@ class StylePublicationPrepareView(View):
             messages.error(request, f"Style proposal must be approved before preview (status: {proposal.status}).")
             return redirect(reverse("cauldron_ai_admin:style-detail", args=[request_id]))
 
-        from cauldron_content.pages_style import get_pages_style_provider
-        provider = get_pages_style_provider()
-        if provider is None:
-            messages.error(request, "Pages style provider is not configured; cannot build preview.")
+        review_url = self._reusable_review_url(proposal)
+        if review_url:
+            return redirect(review_url)
+
+        return redirect(reverse("cauldron_ai_admin:style-detail", args=[request_id]))
+
+    def post(self, request, request_id: str):
+        try:
+            from cauldron_ai_admin.models import UIStyleChangeRequest
+        except ImportError:
+            raise Http404("cauldron-ai-admin is not installed.")
+
+        proposal = get_object_or_404(UIStyleChangeRequest, request_id=request_id)
+
+        if proposal.scope != "pages":
+            messages.error(request, "Only pages-scope style proposals use the Astro publication flow.")
             return redirect(reverse("cauldron_ai_admin:style-detail", args=[request_id]))
 
-        composed_css = provider.get_composed_css(
-            proposed_target=proposal.target_path,
-            proposed_content=proposal.proposed_content,
-        )
+        if proposal.status != "approved":
+            messages.error(request, f"Style proposal must be approved before preview (status: {proposal.status}).")
+            return redirect(reverse("cauldron_ai_admin:style-detail", args=[request_id]))
+
+        review_url = self._reusable_review_url(proposal)
+        if review_url:
+            return redirect(review_url)
 
         from cauldron_site_astro.publication_service import get_publication_service
         svc = get_publication_service()
         result = svc.prepare(
             actor=request.user,
             content_request_ids=[],
-            staged_theme_css=composed_css,
+            staged_theme_css=None,
             style_request_id=str(proposal.request_id),
+            style_scope=proposal.scope,
+            style_target=proposal.target_path,
+            style_proposed_content=proposal.proposed_content,
+            style_base_hash=proposal.base_hash or "",
+            style_base_exists=bool(proposal.base_exists),
         )
 
-        proposal.site_changeset_id = result.change_set_id
-        proposal.save(update_fields=["site_changeset_id"])
+        if result.change_set_id:
+            proposal.site_changeset_id = result.change_set_id
+            proposal.save(update_fields=["site_changeset_id"])
 
         if not result.ok:
             messages.error(request, f"Preview build failed: {result.message}")
@@ -173,3 +190,18 @@ class StylePublicationPrepareView(View):
         return redirect(
             reverse("cauldron_admin_content:change-set-review", args=[result.change_set_id])
         )
+
+    @staticmethod
+    def _reusable_review_url(proposal) -> str | None:
+        """Return a redirect URL if proposal.site_changeset_id points to a reusable CS."""
+        cs_id = getattr(proposal, "site_changeset_id", None)
+        if not cs_id:
+            return None
+        try:
+            from cauldron_site_astro.models import SiteChangeSet
+            cs = SiteChangeSet.objects.get(id=cs_id)
+            if cs.status in (SiteChangeSet.DRAFT_READY, SiteChangeSet.PUBLISH_FAILED):
+                return reverse("cauldron_admin_content:change-set-review", args=[str(cs.id)])
+        except Exception:
+            pass
+        return None

@@ -595,7 +595,7 @@ def _handle_prepare_change_set(
         content_request_ids=content_request_ids if isinstance(content_request_ids, list) else [],
         originating_run_id=getattr(context, "run_id", None),
         description=description,
-        staged_theme_css=theme_css,
+        staged_theme_css=theme_css or None,
     )
 
     if not result.ok:

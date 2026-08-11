@@ -2,13 +2,12 @@
 
 This module holds a single optional provider slot.  Callers must not import
 from the concrete provider package (cauldron-django-admin) — they use the
-accessor here instead.
+accessors here instead.
 
 ``cauldron-django-admin`` registers a ``PagesStyleProvider`` during its
 ``AppConfig.ready()``.  ``cauldron-site-astro`` reads the provider during
-``SiteChangeSetService.prepare()`` so that content-only publishes always carry
-the current composed pages CSS, and style proposals flow through the full
-controlled-publication lifecycle.
+``SiteChangeSetService.publish()`` so that style commits happen atomically
+before any live output/theme promotion.
 
 If no provider is registered (e.g. the override store module is absent), all
 accessors return safe no-op results so site-astro degrades gracefully.
@@ -16,6 +15,15 @@ accessors return safe no-op results so site-astro degrades gracefully.
 from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
+
+
+class StyleConflictError(Exception):
+    """Raised by PagesStyleProvider when a hash conflict is detected.
+
+    Concrete implementations translate backend-specific conflict errors (e.g.
+    ``HashConflictError`` from UIOverrideStore) to this type so callers do not
+    need to import from ``cauldron-django-admin``.
+    """
 
 
 @runtime_checkable
@@ -39,6 +47,14 @@ class PagesStyleProvider(Protocol):
         """
         ...
 
+    def read_style_source(self, target: str) -> str | None:
+        """Read the current content of a pages CSS source file.
+
+        Returns ``None`` when the file does not exist.  Used to capture a
+        pre-image for rollback before committing a style change.
+        """
+        ...
+
     def commit_style(
         self,
         *,
@@ -47,14 +63,34 @@ class PagesStyleProvider(Protocol):
         expected_hash: str,
         base_exists: bool,
     ) -> str:
-        """Write a proposed CSS file to the store.
+        """Write a proposed CSS file to the store atomically.
 
         Uses optimistic locking via *expected_hash* so concurrent modifications
         fail rather than silently overwriting.  Returns the new hash of the
         written content.
 
-        Raises ``HashConflictError`` (from ``cauldron_django_admin.override_store``)
-        if *expected_hash* does not match the current on-disk state.
+        Raises :exc:`StyleConflictError` if *expected_hash* does not match the
+        current on-disk state.  Concrete implementations must translate any
+        backend-specific conflict errors to this type.
+        """
+        ...
+
+    def rollback_style_commit(
+        self,
+        *,
+        target: str,
+        old_content: str | None,
+        committed_hash: str,
+    ) -> bool:
+        """Attempt to undo a previous :meth:`commit_style` call.
+
+        *old_content* is the content that existed before the commit (``None``
+        means the file was newly created).  *committed_hash* is the hash
+        returned by the prior :meth:`commit_style` call and is used as the
+        optimistic lock value for the rollback write.
+
+        Returns ``True`` if the rollback succeeded, ``False`` if it failed
+        (callers should set reconciliation evidence in the latter case).
         """
         ...
 

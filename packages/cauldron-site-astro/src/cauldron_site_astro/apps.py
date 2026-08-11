@@ -68,14 +68,17 @@ def _connect_style_publication_handler() -> None:
         pass
 
 
-def _handle_changeset_published(sender, changeset_id, staged_theme_css, style_request_id, **kwargs):
+def _handle_changeset_published(
+    sender, changeset_id, staged_theme_css, style_request_id,
+    style_committed_hash="", **kwargs
+):
     """Mark a pages-scope style request applied after its changeset publishes.
 
-    Writes the proposed CSS to UIOverrideStore (so future style compositions
-    read the correct individual file) then transitions the style request to
-    ``applied``.  Failures are logged but never re-raised — the Astro
-    publication has already succeeded and must not be rolled back by a
-    post-publish hook error.
+    The pages CSS source was already written atomically in publish() Step 2.5.
+    This handler only does the DB lifecycle transition via mark_style_applied()
+    — no more filesystem writes here.  Failures are logged but never re-raised
+    — the Astro publication has already succeeded and must not be rolled back
+    by a post-publish hook error.
     """
     import logging
     _log = logging.getLogger(__name__)
@@ -86,6 +89,7 @@ def _handle_changeset_published(sender, changeset_id, staged_theme_css, style_re
         get_style_service().mark_style_applied(
             request_id=style_request_id,
             changeset_id=changeset_id,
+            committed_hash=style_committed_hash,
         )
     except ImportError:
         pass

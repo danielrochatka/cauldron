@@ -521,6 +521,7 @@ class SiteChangeSetService:
         originating_run_id: str | None = None,
         description: str = "",
         staged_theme_css: str = "",
+        style_request_id: str = "",
     ) -> PrepareResult:
         """Create a :class:`SiteChangeSet` and build a scoped preview.
 
@@ -533,13 +534,23 @@ class SiteChangeSetService:
         verified BEFORE any SiteChangeSet row is created. A missing,
         terminal, or otherwise ineligible request causes prepare() to fail
         without side effects — no SiteChangeSet, no build_preview call.
+
+        ``style_request_id`` — when non-empty, the SiteChangeSet represents a
+        pages-scope style proposal.  An empty ``content_request_ids`` is
+        permitted in this case (style-only changeset).  After successful
+        ``publish()``, the ``site_changeset_published`` signal carries this ID
+        so the style request can be marked applied.
         """
-        if not isinstance(content_request_ids, list) or not content_request_ids:
-            return PrepareResult(
-                ok=False,
-                message="content_request_ids must be a non-empty list of strings.",
-            )
-        content_request_ids = [str(x) for x in content_request_ids]
+        # Style-only changesets (style_request_id set, no content requests) are
+        # allowed.  Content-only changesets still require at least one ID.
+        is_style_only = bool(style_request_id) and not content_request_ids
+        if not is_style_only:
+            if not isinstance(content_request_ids, list) or not content_request_ids:
+                return PrepareResult(
+                    ok=False,
+                    message="content_request_ids must be a non-empty list of strings.",
+                )
+        content_request_ids = [str(x) for x in (content_request_ids or [])]
 
         try:
             svc = get_build_service()
@@ -556,27 +567,40 @@ class SiteChangeSetService:
                 message="previews_root is not configured; cannot build preview.",
             )
 
-        # Correction 2 / Item 5: fail closed if operations config is unavailable.
-        # Silently defaulting require_approval=False would disable the approval
-        # gate whenever the config module was broken.
-        try:
-            require_approval = _get_require_approval()
-        except Exception as exc:
-            return PrepareResult(
-                ok=False,
-                message=(
-                    f"Content operations configuration unavailable: {_safe_exc(exc)}"
-                ),
+        if content_request_ids:
+            # Correction 2 / Item 5: fail closed if operations config is unavailable.
+            try:
+                require_approval = _get_require_approval()
+            except Exception as exc:
+                return PrepareResult(
+                    ok=False,
+                    message=(
+                        f"Content operations configuration unavailable: {_safe_exc(exc)}"
+                    ),
+                )
+
+            integrity_ok, integrity_msg = _check_request_integrity(
+                content_request_ids, require_approval=require_approval,
             )
+            if not integrity_ok:
+                return PrepareResult(ok=False, message=integrity_msg)
 
-        integrity_ok, integrity_msg = _check_request_integrity(
-            content_request_ids, require_approval=require_approval,
-        )
-        if not integrity_ok:
-            return PrepareResult(ok=False, message=integrity_msg)
-
-        # Auto-load staged theme CSS if not explicitly supplied.
+        # Determine effective theme CSS.  Priority (highest to lowest):
+        #   1. Explicitly passed staged_theme_css.
+        #   2. Composed pages CSS from the registered PagesStyleProvider
+        #      (cauldron-django-admin's UIOverrideStore).  This ensures that
+        #      content-only publishes carry forward existing pages overrides
+        #      and that style-only changesets carry the proposed overlay.
+        #   3. Any staged.css already written under theme_root.
         theme_css = staged_theme_css or ""
+        if not theme_css:
+            try:
+                from cauldron_content.pages_style import get_pages_style_provider
+                _provider = get_pages_style_provider()
+                if _provider is not None:
+                    theme_css = _provider.get_composed_css() or ""
+            except Exception:
+                pass
         if not theme_css and cfg.theme_root:
             try:
                 from cauldron_site_astro.theme import SiteThemeService
@@ -592,6 +616,7 @@ class SiteChangeSetService:
             originating_run_id=_coerce_run_id(originating_run_id),
             creator=actor if getattr(actor, "pk", None) is not None else None,
             affected_item_ids=affected_item_ids,
+            style_request_id=style_request_id or "",
         )
 
         output_dir = Path(cfg.previews_root) / str(cs.id)
@@ -1310,6 +1335,22 @@ class SiteChangeSetService:
             cs.save(update_fields=[
                 "status", "published_at", "publish_build_result", "updated_at",
             ])
+
+            # Notify subscribers (e.g. style-request lifecycle handler).
+            try:
+                from cauldron_site_astro.signals import site_changeset_published
+                site_changeset_published.send(
+                    sender=SiteChangeSetService,
+                    changeset_id=str(cs.id),
+                    staged_theme_css=cs.staged_theme_css or "",
+                    style_request_id=cs.style_request_id or "",
+                )
+            except Exception:
+                logger.exception(
+                    "cauldron.site.astro: site_changeset_published signal failed "
+                    "for changeset %s; publication succeeded but handlers errored.",
+                    cs.id,
+                )
 
             return PublishResult(
                 ok=True,

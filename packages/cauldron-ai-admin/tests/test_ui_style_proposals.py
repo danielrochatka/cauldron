@@ -531,3 +531,96 @@ def test_apply_uses_persisted_base_state():
         proposal.refresh_from_db()
         assert proposal.status == "conflicted"
         assert proposal.error_code == "HASH_CONFLICT"
+
+
+# ---------------------------------------------------------------------------
+# Pages-style publication lifecycle (acceptance criteria 1, 10, 14)
+# ---------------------------------------------------------------------------
+
+_FAKE_HASH = "a" * 64  # valid 64-char hex digest satisfying uiscr_proposed_hash_format
+
+
+def test_admin_scope_apply_is_direct_not_via_changeset():
+    """For scope='admin', UIStyleChangeService.apply() writes directly to the
+    UIOverrideStore without creating a SiteChangeSet."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+
+    actor = _make_user(username="admin-scope-actor", perms=[])
+    svc = UIStyleChangeService()
+    fake_store = MagicMock()
+    fake_store.inspect_state.return_value = {"exists": False, "hash": None, "size": 0}
+    fake_store.write_file_atomic.return_value = _FAKE_HASH
+
+    with patch("cauldron_ai_admin.style_service._get_override_store", return_value=fake_store):
+        proposal = svc.create_proposal(
+            scope="admin",
+            target_path="overrides.css",
+            proposed_content=".foo { color: red; }",
+            description="Test admin override",
+        )
+        approved = svc.approve(proposal, reviewed_by=actor)
+        result = svc.apply(approved, applied_by=actor)
+
+    assert result.status == "applied"
+    fake_store.write_file_atomic.assert_called_once()
+
+
+def test_mark_style_applied_transitions_to_applied():
+    """UIStyleChangeService.mark_style_applied() transitions an approved pages
+    proposal to applied and commits the CSS to UIOverrideStore."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from cauldron_ai_admin.models import UIStyleChangeRequest
+
+    reviewer = _make_user(username="pages-reviewer", perms=[])
+    svc = UIStyleChangeService()
+    fake_store = MagicMock()
+    fake_store.inspect_state.return_value = {"exists": False, "hash": None, "size": 0}
+    fake_store.write_file_atomic.return_value = _FAKE_HASH
+
+    with patch("cauldron_ai_admin.style_service._get_override_store", return_value=fake_store):
+        proposal = svc.create_proposal(
+            scope="pages",
+            target_path="90-site.css",
+            proposed_content="nav { display: flex; }",
+            description="Pages nav proposal",
+        )
+        approved = svc.approve(proposal, reviewed_by=reviewer)
+        svc.mark_style_applied(
+            request_id=str(approved.request_id),
+            changeset_id="changeset-xyz",
+        )
+
+    fresh = UIStyleChangeRequest.objects.get(pk=approved.pk)
+    assert fresh.status == "applied"
+    fake_store.write_file_atomic.assert_called_once()
+
+
+def test_mark_style_applied_hash_conflict_marks_conflicted():
+    """If UIOverrideStore raises HashConflictError during mark_style_applied,
+    the proposal is marked conflicted rather than applied."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from cauldron_ai_admin.models import UIStyleChangeRequest
+    from cauldron_django_admin.override_store import HashConflictError
+
+    reviewer = _make_user(username="hash-conflict-reviewer", perms=[])
+    svc = UIStyleChangeService()
+    fake_store = MagicMock()
+    fake_store.inspect_state.return_value = {"exists": False, "hash": None, "size": 0}
+    fake_store.write_file_atomic.side_effect = HashConflictError("stale hash")
+
+    with patch("cauldron_ai_admin.style_service._get_override_store", return_value=fake_store):
+        proposal = svc.create_proposal(
+            scope="pages",
+            target_path="90-site.css",
+            proposed_content="nav { display: flex; }",
+            description="Stale hash test",
+        )
+        approved = svc.approve(proposal, reviewed_by=reviewer)
+        svc.mark_style_applied(
+            request_id=str(approved.request_id),
+            changeset_id="changeset-stale",
+        )
+
+    fresh = UIStyleChangeRequest.objects.get(pk=approved.pk)
+    assert fresh.status == "conflicted"
+    assert "STORE_CONFLICT_POST_PUBLISH" in fresh.error_code

@@ -24,6 +24,7 @@ class CauldronSiteAstroConfig(AppConfig):
         _register_site_tool_prompts()
         _register_public_url_provider()
         _register_site_tools()
+        _connect_style_publication_handler()
 
 
 def _register_site_tools() -> None:
@@ -56,6 +57,45 @@ def _connect_signals() -> None:
         canonical_content_changed.connect(_handle_content_changed, weak=False)
     except ImportError:
         pass
+
+
+def _connect_style_publication_handler() -> None:
+    """Connect the style-request post-publication handler (optional ai-admin integration)."""
+    try:
+        from cauldron_site_astro.signals import site_changeset_published
+        site_changeset_published.connect(_handle_changeset_published, weak=False)
+    except Exception:
+        pass
+
+
+def _handle_changeset_published(sender, changeset_id, staged_theme_css, style_request_id, **kwargs):
+    """Mark a pages-scope style request applied after its changeset publishes.
+
+    Writes the proposed CSS to UIOverrideStore (so future style compositions
+    read the correct individual file) then transitions the style request to
+    ``applied``.  Failures are logged but never re-raised — the Astro
+    publication has already succeeded and must not be rolled back by a
+    post-publish hook error.
+    """
+    import logging
+    _log = logging.getLogger(__name__)
+    if not style_request_id:
+        return
+    try:
+        from cauldron_ai_admin.style_service import get_style_service
+        get_style_service().mark_style_applied(
+            request_id=style_request_id,
+            changeset_id=changeset_id,
+        )
+    except ImportError:
+        pass
+    except Exception:
+        _log.exception(
+            "cauldron.site.astro: failed to mark style request %s applied "
+            "after changeset %s published",
+            style_request_id,
+            changeset_id,
+        )
 
 
 def _handle_content_changed(sender, change_type, change_id, provider_name, changed_by, **kwargs):

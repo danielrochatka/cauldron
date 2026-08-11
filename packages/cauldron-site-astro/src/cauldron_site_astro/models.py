@@ -46,6 +46,11 @@ class SiteChangeSet(models.Model):
     # Staged public-site theme CSS (empty means no theme change)
     staged_theme_css = models.TextField(blank=True)
 
+    # UIStyleChangeRequest.request_id associated with this changeset (pages
+    # scope only).  Empty string for content-only changesets.  Plain char field
+    # (not FK) so site-astro stays independent of cauldron-ai-admin models.
+    style_request_id = models.CharField(max_length=36, blank=True, default="", db_index=True)
+
     # Originating Admin AI run (optional — populated when created by AI)
     originating_run_id = models.UUIDField(null=True, blank=True, db_index=True)
 

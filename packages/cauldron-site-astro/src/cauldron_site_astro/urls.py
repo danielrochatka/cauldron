@@ -16,4 +16,9 @@ urlpatterns = [
         views.PreviewServeView.as_view(),
         name="preview-page",
     ),
+    path(
+        "style-prepare/<str:request_id>/",
+        views.StylePublicationPrepareView.as_view(),
+        name="style-prepare",
+    ),
 ]

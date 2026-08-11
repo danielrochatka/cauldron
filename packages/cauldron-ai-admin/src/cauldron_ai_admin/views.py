@@ -20,7 +20,6 @@ from .style_service import get_style_service
 
 logger = logging.getLogger(__name__)
 
-
 ADMIN_AI_PERMISSION = "cauldron_ai_admin.use_admin_ai"
 MANAGE_AI_SETTINGS_PERMISSION = "cauldron_ai_admin.manage_admin_ai_settings"
 

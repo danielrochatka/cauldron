@@ -8,6 +8,9 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = ["cauldron>=0.1.0", "cauldron-django-auth>=0.1.0"]
 
+[project.optional-dependencies]
+content = ["cauldron-content>=0.1.0"]
+
 [project.entry-points."cauldron.modules"]
 "cauldron.django.admin" = "cauldron_django_admin.module:module"
 

@@ -26,6 +26,7 @@ _manifest = ModuleManifest(
         "cauldron_content.site",
         "cauldron_content.hashing",
         "cauldron_content.reversible",
+        "cauldron_content.pages_style",
     ),
     settings_declarations=(
         ModuleSettingsDeclaration(

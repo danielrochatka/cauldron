@@ -10,10 +10,15 @@
   <button type="submit" name="action" value="reject" class="cui-button cui-button--danger">Reject</button>
 </form>
 {% elif proposal.status == "approved" and can_approve %}
+{% if proposal.scope == "pages" %}{% url 'cauldron_site_astro:style-prepare' proposal.request_id as pages_style_prepare_url %}{% endif %}
+{% if proposal.scope == "pages" and pages_style_prepare_url %}
+<a href="{{ pages_style_prepare_url }}" class="cui-button">Review &amp; Preview</a>
+{% else %}
 <form method="post" style="display:inline;">
   {% csrf_token %}
   <button type="submit" name="action" value="apply" class="cui-button">Apply</button>
 </form>
+{% endif %}
 {% endif %}
 {% endblock %}
 

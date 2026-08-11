@@ -4,13 +4,18 @@ from __future__ import annotations
 import mimetypes
 from pathlib import Path
 
+from django.contrib import messages
 from django.contrib.auth.decorators import login_required, permission_required
 from django.http import FileResponse, Http404, HttpResponse
+from django.shortcuts import get_object_or_404, redirect
+from django.urls import reverse
 from django.utils.decorators import method_decorator
 from django.views import View
 
 
 PREVIEW_PERMISSION = "cauldron_content_operations.view_draft_content"
+_PERM_PROPOSE = "cauldron_content_operations.propose_content_changes"
+_PERM_PUBLISH = "cauldron_content_operations.apply_content_changes"
 PREVIEW_BANNER = (
     b'<div style="position:fixed;top:0;left:0;right:0;background:#f59e0b;'
     b'color:#000;padding:6px 12px;font:bold 13px/1.4 sans-serif;'
@@ -95,3 +100,76 @@ class PreviewServeView(View):
             return HttpResponse(body, content_type=content_type)
 
         return FileResponse(open(candidate, "rb"), content_type=content_type)
+
+
+@method_decorator([
+    login_required,
+    permission_required(_PERM_PUBLISH, raise_exception=True),
+], name="dispatch")
+class StylePublicationPrepareView(View):
+    """Create a SiteChangeSet preview for an approved pages-scope style proposal.
+
+    Requires both propose and apply permissions so that the operator who
+    initiates the preview already holds the rights needed to publish.  The
+    actual Publish action is still gated by :data:`_PERM_PUBLISH` on the
+    change-set review page.
+
+    POST or GET ``request_id`` → creates a SiteChangeSet with the composed
+    pages CSS (current overrides + proposed target overlaid) → redirects to
+    the change-set review page.  The action is idempotent in the sense that
+    creating a new SiteChangeSet leaves previous ones intact and the style
+    request can only become ``applied`` after a successful Publish.
+    """
+
+    def get(self, request, request_id: str):
+        return self._prepare(request, request_id)
+
+    def post(self, request, request_id: str):
+        return self._prepare(request, request_id)
+
+    def _prepare(self, request, request_id: str):
+        try:
+            from cauldron_ai_admin.models import UIStyleChangeRequest
+        except ImportError:
+            raise Http404("cauldron-ai-admin is not installed.")
+
+        proposal = get_object_or_404(UIStyleChangeRequest, request_id=request_id)
+
+        if proposal.scope != "pages":
+            messages.error(request, "Only pages-scope style proposals use the Astro publication flow.")
+            return redirect(reverse("cauldron_ai_admin:style-detail", args=[request_id]))
+
+        if proposal.status != "approved":
+            messages.error(request, f"Style proposal must be approved before preview (status: {proposal.status}).")
+            return redirect(reverse("cauldron_ai_admin:style-detail", args=[request_id]))
+
+        from cauldron_content.pages_style import get_pages_style_provider
+        provider = get_pages_style_provider()
+        if provider is None:
+            messages.error(request, "Pages style provider is not configured; cannot build preview.")
+            return redirect(reverse("cauldron_ai_admin:style-detail", args=[request_id]))
+
+        composed_css = provider.get_composed_css(
+            proposed_target=proposal.target_path,
+            proposed_content=proposal.proposed_content,
+        )
+
+        from cauldron_site_astro.publication_service import get_publication_service
+        svc = get_publication_service()
+        result = svc.prepare(
+            actor=request.user,
+            content_request_ids=[],
+            staged_theme_css=composed_css,
+            style_request_id=str(proposal.request_id),
+        )
+
+        proposal.site_changeset_id = result.change_set_id
+        proposal.save(update_fields=["site_changeset_id"])
+
+        if not result.ok:
+            messages.error(request, f"Preview build failed: {result.message}")
+            return redirect(reverse("cauldron_ai_admin:style-detail", args=[request_id]))
+
+        return redirect(
+            reverse("cauldron_admin_content:change-set-review", args=[result.change_set_id])
+        )

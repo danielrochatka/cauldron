@@ -417,7 +417,13 @@ class ContentBrowserView(View):
         if collection == PAGE_COLLECTION:
             try:
                 from cauldron_content_operations.models import ContentChangeRequest
-                _non_terminal = ["proposed", "validated", "apply_failed"]
+                from cauldron_content_operations.lifecycle import LifecycleState as _LS
+                _non_terminal = [
+                    _LS.PROPOSED.value,
+                    _LS.VALIDATED.value,
+                    _LS.APPROVED.value,
+                    _LS.APPLY_FAILED.value,
+                ]
                 active_crs = ContentChangeRequest.objects.filter(
                     lifecycle_state__in=_non_terminal
                 )

@@ -269,15 +269,23 @@ def _extract_draft_items(
                 seen_item_ids.add(op_item_id)
                 item_ids.append(op_item_id)
 
-            # The final intended status for this operation (published or draft).
-            op_final_status = (
-                op_data.get("status", "published") if isinstance(op_data, dict) else "published"
-            )
-
             if op_kind == "delete":
                 if op_item_id and op_item_id not in seen_deleted_ids:
                     seen_deleted_ids.add(op_item_id)
                     deleted_item_ids.append(op_item_id)
+                continue
+
+            # Read op.status (top-level field set by build_page_operation()).
+            # ContentStatus is a str Enum so its members compare equal to their
+            # string values; both enum members and raw strings are accepted.
+            # Fail closed for missing or unknown status — do not default to published.
+            _raw_status = getattr(op, "status", None)
+            if _raw_status == "published":
+                op_final_status = "published"
+            elif _raw_status == "draft":
+                op_final_status = "draft"
+            else:
+                # Missing or unrecognised status — skip this op.
                 continue
 
             # Draft-status create/update ops (e.g. unpublish) are excluded from

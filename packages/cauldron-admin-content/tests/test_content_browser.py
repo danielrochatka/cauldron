@@ -444,3 +444,29 @@ def test_browser_draft_publish_button_says_publish_without_site_astro(client):
     assert resp.status_code == 200
     content = resp.content.decode()
     assert 'value="publish"' in content
+
+
+def test_pending_indicator_shown_for_approved_revision(client):
+    """An approved ContentChangeRequest is still pending application — Pending badge must appear."""
+    from django.test import override_settings
+    from cauldron_content_operations.models import ContentChangeRequest
+
+    item_id = "page-approved-pending"
+    ContentChangeRequest.objects.create(
+        request_id="cr-approved-1",
+        lifecycle_state="approved",
+        request_version=1,
+        provider_name="",
+        workspace_changeset_id="ws-approved-1",
+    )
+
+    user = _make_user("approved_viewer1", ["view_published_content", "view_draft_content"])
+    client.force_login(user)
+    svc = _make_pending_indicator_service(item_id, pending_op_item_id=item_id)
+
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        with patch("cauldron_admin_content.views._get_service", return_value=svc):
+            resp = client.get(_URL + "?collection=pages")
+
+    assert resp.status_code == 200
+    assert "Pending" in resp.content.decode()

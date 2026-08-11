@@ -1012,3 +1012,229 @@ def test_publish_signal_carries_style_committed_hash(bypass_db_integrity, tmp_pa
 
     assert result.ok, result.message
     assert received.get("hash") == "b" * 64
+
+
+# ---------------------------------------------------------------------------
+# Test 11: source rollback failure produces reconciliation evidence
+# ---------------------------------------------------------------------------
+
+def test_style_source_rollback_failure_produces_reconciliation_evidence(bypass_db_integrity, tmp_path):
+    """When output promotion fails and _rollback_style() returns False,
+    publish_build_result must contain style_source_rollback_failed=True and
+    requires_reconciliation=True so operators know manual recovery is needed."""
+    from cauldron_site_astro.publication_service import SiteChangeSetService
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_content.pages_style import register_pages_style_provider
+
+    provider = FakePagesStyleProvider()
+    provider._rollback_ok = False  # rollback will fail
+    register_pages_style_provider(provider)
+
+    cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        staged_theme_css=None,
+        content_request_ids=[],
+        style_request_id="req-rollback-fail",
+        style_target="90-site.css",
+        style_proposed_content="nav {}",
+        style_base_hash="",
+        style_base_exists=False,
+    )
+
+    mock_svc = _make_pub_service_mocks(preview_ok=True)
+    mock_svc._config.theme_root = None
+    mock_svc.promote_output_with_backup.side_effect = RuntimeError("disk full")
+
+    actor = SimpleNamespace(pk=1, has_perm=lambda p: True)
+    with (
+        patch("cauldron_site_astro.publication_service.get_build_service", return_value=mock_svc),
+        patch("cauldron_site_astro.publication_service._get_content_operation_service", return_value=None),
+        patch("cauldron_site_astro.publication_service._get_require_approval", return_value=False),
+        patch("cauldron_site_astro.publication_service._fetch_eligible_change_requests", return_value=({}, None)),
+    ):
+        svc = SiteChangeSetService()
+        result = svc.publish(actor=actor, change_set_id=str(cs.id))
+
+    assert not result.ok
+    cs.refresh_from_db()
+    assert cs.status == SiteChangeSet.PUBLISH_FAILED
+    pbr = cs.publish_build_result
+    assert pbr.get("style_source_rollback_failed") is True
+    assert pbr.get("requires_reconciliation") is True
+
+
+# ---------------------------------------------------------------------------
+# Tests 12 & 13: explicitly empty CSS previews and publishes as empty
+# (no provider fallback when staged_theme_css == "")
+# ---------------------------------------------------------------------------
+
+def test_explicit_empty_css_previews_as_empty(bypass_db_integrity, tmp_path):
+    """staged_theme_css='' (explicitly empty) means build_preview is called with
+    theme_css='' — it must NOT fall back to PagesStyleProvider composition."""
+    from cauldron_site_astro.publication_service import SiteChangeSetService
+    from cauldron_content.pages_style import register_pages_style_provider
+
+    provider = FakePagesStyleProvider({"90-site.css": "nav { display: flex; }"})
+    register_pages_style_provider(provider)
+
+    mock_svc = _make_pub_service_mocks(preview_ok=True)
+    mock_svc._config.previews_root = str(tmp_path / "previews")
+    mock_svc._config.theme_root = None
+
+    captured = {}
+
+    def capture_preview(**kwargs):
+        captured["theme_css"] = kwargs.get("theme_css", "SENTINEL")
+        from cauldron_site_astro.service import BuildResult
+        return BuildResult(ok=True, pages_built=1)
+
+    mock_svc.build_preview.side_effect = capture_preview
+
+    with patch("cauldron_site_astro.publication_service.get_build_service", return_value=mock_svc):
+        svc = SiteChangeSetService()
+        result = svc.prepare(
+            actor=SimpleNamespace(pk=None),
+            content_request_ids=["req-explicit-empty-preview"],
+            staged_theme_css="",
+        )
+
+    assert result.ok
+    # build_preview must have received "" — not provider CSS
+    assert captured["theme_css"] == ""
+    assert "nav" not in captured["theme_css"]
+
+
+def test_explicit_empty_css_publishes_as_empty(bypass_db_integrity, tmp_path):
+    """When SiteChangeSet.staged_theme_css == '', publish() must pass theme_css=''
+    to build_preview and must NOT consult PagesStyleProvider."""
+    from cauldron_site_astro.publication_service import SiteChangeSetService
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_content.pages_style import register_pages_style_provider
+
+    # Provider has content — must NOT be used when staged_theme_css is ""
+    provider = FakePagesStyleProvider({"90-site.css": "nav { color: red; }"})
+    register_pages_style_provider(provider)
+
+    cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        staged_theme_css="",  # explicitly empty, not None
+        content_request_ids=[],
+        style_request_id="",
+    )
+
+    mock_svc = _make_pub_service_mocks(preview_ok=True)
+    mock_svc._config.theme_root = None
+
+    captured = {}
+
+    def capture_build(**kwargs):
+        captured["theme_css"] = kwargs.get("theme_css", "SENTINEL")
+        from cauldron_site_astro.service import BuildResult
+        return BuildResult(ok=True, pages_built=1)
+
+    mock_svc.build_preview.side_effect = capture_build
+
+    actor = SimpleNamespace(pk=1, has_perm=lambda p: True)
+    with (
+        patch("cauldron_site_astro.publication_service.get_build_service", return_value=mock_svc),
+        patch("cauldron_site_astro.publication_service._get_content_operation_service", return_value=None),
+        patch("cauldron_site_astro.publication_service._get_require_approval", return_value=False),
+        patch("cauldron_site_astro.publication_service._fetch_eligible_change_requests", return_value=({}, None)),
+    ):
+        svc = SiteChangeSetService()
+        result = svc.publish(actor=actor, change_set_id=str(cs.id))
+
+    assert result.ok, result.message
+    # publish must have used "" — no provider fallback
+    assert captured["theme_css"] == ""
+    assert "nav" not in captured["theme_css"]
+
+
+# ---------------------------------------------------------------------------
+# Test 15: direct race scenario — CSS A at preview, CSS B at publish
+# ---------------------------------------------------------------------------
+
+def test_content_publish_uses_css_b_after_style_publish_changed_provider(bypass_db_integrity, tmp_path):
+    """Race regression: a content changeset previewed when the provider had CSS A
+    must publish with CSS B when the provider was updated between preview and publish.
+
+    Two-phase structure:
+      Phase 1 — prepare(): verify staged_theme_css=None (no snapshot stored).
+      Phase 2 — publish(): verify publish() re-resolves from provider (CSS B used).
+    The two phases use separate change sets so the publish step is not blocked
+    by content request validation (which is exercised by its own test suite).
+    """
+    from cauldron_site_astro.publication_service import SiteChangeSetService
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_content.pages_style import register_pages_style_provider
+
+    css_a = "/* CSS A — state at preview time */"
+    css_b = "/* CSS B — state after style publication */"
+
+    # Phase 1: prepare() — provider has CSS A, should store staged_theme_css=None
+    provider = FakePagesStyleProvider({"90-site.css": css_a})
+    register_pages_style_provider(provider)
+
+    mock_svc = _make_pub_service_mocks(preview_ok=True)
+    mock_svc._config.previews_root = str(tmp_path / "previews")
+    mock_svc._config.theme_root = None
+
+    preview_captured = {}
+
+    def capture_preview(**kwargs):
+        preview_captured["theme_css"] = kwargs.get("theme_css", "")
+        from cauldron_site_astro.service import BuildResult
+        return BuildResult(ok=True, pages_built=1)
+
+    mock_svc.build_preview.side_effect = capture_preview
+
+    with patch("cauldron_site_astro.publication_service.get_build_service", return_value=mock_svc):
+        svc = SiteChangeSetService()
+        result = svc.prepare(
+            actor=SimpleNamespace(pk=None),
+            content_request_ids=["content-req-race"],
+        )
+
+    assert result.ok
+    prepared_cs = SiteChangeSet.objects.get(id=result.change_set_id)
+    # staged_theme_css must be None — not a snapshot of CSS A
+    assert prepared_cs.staged_theme_css is None
+    # Preview used CSS A (current at preview time)
+    assert css_a in preview_captured.get("theme_css", "")
+
+    # Phase 2: provider updated to CSS B (simulates intervening style publication)
+    provider._files = {"90-site.css": css_b}
+
+    # Create a clean style-only changeset with staged_theme_css=None and empty
+    # content_request_ids so we can run publish() without real CR rows.
+    publish_cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        staged_theme_css=None,  # re-resolve at publish time — same as content-only
+        content_request_ids=[],
+        style_request_id="",
+    )
+
+    publish_captured = {}
+
+    def capture_publish(**kwargs):
+        publish_captured["theme_css"] = kwargs.get("theme_css", "")
+        from cauldron_site_astro.service import BuildResult
+        return BuildResult(ok=True, pages_built=1)
+
+    mock_svc.build_preview.side_effect = capture_publish
+
+    actor = SimpleNamespace(pk=1, has_perm=lambda p: True)
+    with (
+        patch("cauldron_site_astro.publication_service.get_build_service", return_value=mock_svc),
+        patch("cauldron_site_astro.publication_service._get_content_operation_service", return_value=None),
+        patch("cauldron_site_astro.publication_service._get_require_approval", return_value=False),
+        patch("cauldron_site_astro.publication_service._fetch_eligible_change_requests", return_value=({}, None)),
+    ):
+        result = svc.publish(actor=actor, change_set_id=str(publish_cs.id))
+
+    assert result.ok, result.message
+    # Publish MUST use CSS B — not the stale CSS A captured at preview time
+    assert css_b in publish_captured.get("theme_css", ""), (
+        f"Expected CSS B in publish build; got: {publish_captured.get('theme_css')!r}"
+    )
+    assert css_a not in publish_captured.get("theme_css", "")

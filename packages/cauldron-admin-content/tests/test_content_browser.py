@@ -280,3 +280,193 @@ def test_no_site_capability_hides_view_button(client):
     assert resp.status_code == 200
     content = resp.content.decode()
     assert "View" not in content
+
+
+# ---------------------------------------------------------------------------
+# Pending revision indicator: published items with active ContentChangeRequests
+# ---------------------------------------------------------------------------
+
+def _make_pending_indicator_service(item_id, *, pending_op_item_id=None):
+    """Return a mock service where _workspace yields a pending op for pending_op_item_id."""
+    from types import SimpleNamespace
+    items = [_item(item_id, "my-page", status="published")]
+    svc = _mock_service(items)
+    if pending_op_item_id is not None:
+        fake_op = SimpleNamespace(item_id=pending_op_item_id, kind="update", slug="my-page")
+        fake_changeset = SimpleNamespace(operations=[fake_op])
+        fake_workspace = MagicMock()
+        fake_workspace.load_changeset.return_value = fake_changeset
+        svc._workspace = fake_workspace
+    else:
+        svc._workspace = None
+    return svc
+
+
+def test_pending_indicator_shown_for_published_item_with_active_cr(client):
+    """A published item with a proposed ContentChangeRequest shows a Pending badge."""
+    from django.test import override_settings
+    from cauldron_content_operations.models import ContentChangeRequest
+
+    item_id = "page-with-pending"
+    cr = ContentChangeRequest.objects.create(
+        request_id="cr-pending-1",
+        lifecycle_state="proposed",
+        request_version=1,
+        provider_name="",
+        workspace_changeset_id="ws-pending-1",
+    )
+
+    user = _make_user("pending_viewer1", ["view_published_content", "view_draft_content"])
+    client.force_login(user)
+    svc = _make_pending_indicator_service(item_id, pending_op_item_id=item_id)
+
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        with patch("cauldron_admin_content.views._get_service", return_value=svc):
+            resp = client.get(_URL + "?collection=pages")
+
+    assert resp.status_code == 200
+    content = resp.content.decode()
+    assert "Pending" in content
+
+
+def test_no_pending_indicator_without_active_cr(client):
+    """A published item with no pending ContentChangeRequest shows no Pending badge."""
+    from django.test import override_settings
+
+    user = _make_user("pending_viewer2", ["view_published_content"])
+    client.force_login(user)
+    svc = _make_pending_indicator_service("page-clean", pending_op_item_id=None)
+
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        with patch("cauldron_admin_content.views._get_service", return_value=svc):
+            resp = client.get(_URL + "?collection=pages")
+
+    assert resp.status_code == 200
+    content = resp.content.decode()
+    assert "Pending" not in content
+
+
+def test_pending_indicator_only_for_matching_item(client):
+    """Pending badge appears only on the item whose ID matches the active CR operation."""
+    from django.test import override_settings
+    from cauldron_content_operations.models import ContentChangeRequest
+    from types import SimpleNamespace
+
+    cr = ContentChangeRequest.objects.create(
+        request_id="cr-pending-2",
+        lifecycle_state="validated",
+        request_version=1,
+        provider_name="",
+        workspace_changeset_id="ws-pending-2",
+    )
+
+    affected_id = "page-affected"
+    unaffected_id = "page-clean"
+
+    items_data = [
+        _item(affected_id, "affected", status="published"),
+        _item(unaffected_id, "clean", status="published"),
+    ]
+    ns_items = [SimpleNamespace(**d, to_dict=lambda d=d: d) for d in items_data]
+    svc = MagicMock()
+    svc.list_collections.return_value = [SimpleNamespace(name="pages")]
+    svc.list_items.return_value = ns_items
+
+    fake_op = SimpleNamespace(item_id=affected_id, kind="update", slug="affected")
+    fake_changeset = SimpleNamespace(operations=[fake_op])
+    fake_workspace = MagicMock()
+    fake_workspace.load_changeset.return_value = fake_changeset
+    svc._workspace = fake_workspace
+
+    user = _make_user("pending_viewer3", ["view_published_content", "view_draft_content"])
+    client.force_login(user)
+
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        with patch("cauldron_admin_content.views._get_service", return_value=svc):
+            resp = client.get(_URL + "?collection=pages")
+
+    assert resp.status_code == 200
+    content = resp.content.decode()
+    assert "Pending" in content
+    # Only one badge (for affected_id, not unaffected_id)
+    assert content.count(">Pending<") == 1
+
+
+def test_browser_draft_publish_button_says_review_when_site_astro(client):
+    """When Site Astro is installed, the draft-page Publish button reads 'Review & Preview'."""
+    from django.test import override_settings
+
+    user = _make_user("astro_browser1", [
+        "view_published_content",
+        "view_draft_content",
+        "propose_content_changes",
+        "validate_content_changes",
+        "apply_content_changes",
+    ])
+    client.force_login(user)
+
+    items = [_item("draft-page-1", "draft-page", status="draft")]
+    svc = _mock_service(items)
+    svc._workspace = None
+
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        with patch("cauldron_admin_content.views._get_service", return_value=svc), \
+             patch("cauldron_admin_content.views._site_astro_installed", return_value=True):
+            resp = client.get(_URL + "?collection=pages")
+
+    assert resp.status_code == 200
+    content = resp.content.decode()
+    assert "Review" in content and "Preview" in content
+
+
+def test_browser_draft_publish_button_says_publish_without_site_astro(client):
+    """Without Site Astro, the draft-page button reads 'Publish'."""
+    from django.test import override_settings
+
+    user = _make_user("noastro_browser1", [
+        "view_published_content",
+        "view_draft_content",
+        "propose_content_changes",
+        "validate_content_changes",
+        "apply_content_changes",
+    ])
+    client.force_login(user)
+
+    items = [_item("draft-page-2", "draft-page-2", status="draft")]
+    svc = _mock_service(items)
+    svc._workspace = None
+
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        with patch("cauldron_admin_content.views._get_service", return_value=svc), \
+             patch("cauldron_admin_content.views._site_astro_installed", return_value=False):
+            resp = client.get(_URL + "?collection=pages")
+
+    assert resp.status_code == 200
+    content = resp.content.decode()
+    assert 'value="publish"' in content
+
+
+def test_pending_indicator_shown_for_approved_revision(client):
+    """An approved ContentChangeRequest is still pending application — Pending badge must appear."""
+    from django.test import override_settings
+    from cauldron_content_operations.models import ContentChangeRequest
+
+    item_id = "page-approved-pending"
+    ContentChangeRequest.objects.create(
+        request_id="cr-approved-1",
+        lifecycle_state="approved",
+        request_version=1,
+        provider_name="",
+        workspace_changeset_id="ws-approved-1",
+    )
+
+    user = _make_user("approved_viewer1", ["view_published_content", "view_draft_content"])
+    client.force_login(user)
+    svc = _make_pending_indicator_service(item_id, pending_op_item_id=item_id)
+
+    with override_settings(ROOT_URLCONF="tests.urls"):
+        with patch("cauldron_admin_content.views._get_service", return_value=svc):
+            resp = client.get(_URL + "?collection=pages")
+
+    assert resp.status_code == 200
+    assert "Pending" in resp.content.decode()

@@ -57,7 +57,12 @@
           {% endif %}
         </td>
         <td><code>{{ item.slug|escape }}</code></td>
-        <td>{% include "cauldron_admin/includes/status_badge.html" with status=item.status %}</td>
+        <td>
+          {% include "cauldron_admin/includes/status_badge.html" with status=item.status %}
+          {% if item.id in pending_item_ids %}
+          <span class="cui-badge cui-badge--warning" title="Pending proposed revision">Pending</span>
+          {% endif %}
+        </td>
         <td>{{ item.schema|escape }}</td>
         <td><code>{{ item.hash|escape|slice:":12" }}…</code></td>
         <td>
@@ -72,7 +77,9 @@
           <form method="post" action="{% url 'cauldron_admin_content:page-detail' item.id %}" style="display:inline">
             {% csrf_token %}
             <input type="hidden" name="action" value="publish">
-            <button type="submit" class="cui-button cui-button--sm">Publish</button>
+            <button type="submit" class="cui-button cui-button--sm">
+              {% if site_astro_installed %}Review &amp; Preview{% else %}Publish{% endif %}
+            </button>
           </form>
           {% endif %}
           {% endif %}

@@ -10,16 +10,26 @@
 
 {% block content %}
 
-{% if item.status == "draft" and can_publish %}
+{% if can_publish %}
+{% if item.status == "draft" %}
 <div class="cui-action-bar" style="margin-bottom:1rem">
   <form method="post">
     {% csrf_token %}
     <input type="hidden" name="action" value="publish">
     <button type="submit" class="cui-button">
-      {% if require_approval %}Submit for Review{% else %}Publish{% endif %}
+      {% if require_approval %}Submit for Review{% elif site_astro_installed %}Review &amp; Preview{% else %}Publish{% endif %}
     </button>
   </form>
 </div>
+{% elif item.status == "published" %}
+<div class="cui-action-bar" style="margin-bottom:1rem">
+  <form method="post">
+    {% csrf_token %}
+    <input type="hidden" name="action" value="unpublish">
+    <button type="submit" class="cui-button cui-button--secondary">Unpublish</button>
+  </form>
+</div>
+{% endif %}
 {% endif %}
 
 <div class="cui-card">

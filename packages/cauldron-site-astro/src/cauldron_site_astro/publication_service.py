@@ -275,6 +275,28 @@ def _extract_draft_items(
                     deleted_item_ids.append(op_item_id)
                 continue
 
+            # Read op.status (top-level field set by build_page_operation()).
+            # ContentStatus is a str Enum so its members compare equal to their
+            # string values; both enum members and raw strings are accepted.
+            # Fail closed for missing or unknown status — do not default to published.
+            _raw_status = getattr(op, "status", None)
+            if _raw_status == "published":
+                op_final_status = "published"
+            elif _raw_status == "draft":
+                op_final_status = "draft"
+            else:
+                # Missing or unrecognised status — skip this op.
+                continue
+
+            # Draft-status create/update ops (e.g. unpublish) are excluded from
+            # the preview build just like deletes — the page must not appear in
+            # the scoped preview.
+            if op_final_status == "draft":
+                if op_item_id and op_item_id not in seen_deleted_ids:
+                    seen_deleted_ids.add(op_item_id)
+                    deleted_item_ids.append(op_item_id)
+                continue
+
             if not op_slug:
                 continue
 
@@ -290,7 +312,7 @@ def _extract_draft_items(
                     id=inject_id,
                     collection=op_collection,
                     slug=op_slug,
-                    status=ContentStatus.DRAFT,
+                    status=ContentStatus.PUBLISHED,
                     schema=op_schema,
                     data=op_data if isinstance(op_data, dict) else {},
                     body=op_body,
@@ -620,6 +642,30 @@ class SiteChangeSetService:
                 f"Change set {cs.id} is draft_ready ({result.pages_built} page(s))."
             ),
         )
+
+    # -- find_reusable_change_set -------------------------------------------
+
+    def find_reusable_change_set(self, request_id: str) -> str | None:
+        """Return the ID of an existing reusable SiteChangeSet for *request_id*.
+
+        Returns the most recent DRAFT_READY or PUBLISH_FAILED change set that
+        includes *request_id* in its content_request_ids. Uses Python-level
+        filtering (bounded scan of recent candidates) to avoid the JSONField
+        __contains limitation on SQLite.
+        Returns None on any failure or if no suitable change set exists.
+        """
+        try:
+            candidates = (
+                SiteChangeSet.objects
+                .filter(status__in=[SiteChangeSet.DRAFT_READY, SiteChangeSet.PUBLISH_FAILED])
+                .order_by("-created_at")[:50]
+            )
+            for cs in candidates:
+                if request_id in (cs.content_request_ids or []):
+                    return str(cs.id)
+            return None
+        except Exception:
+            return None
 
     # -- inspect ------------------------------------------------------------
 

@@ -1238,3 +1238,367 @@ def test_content_publish_uses_css_b_after_style_publish_changed_provider(bypass_
         f"Expected CSS B in publish build; got: {publish_captured.get('theme_css')!r}"
     )
     assert css_a not in publish_captured.get("theme_css", "")
+
+
+# ===========================================================================
+# Defect-correction regression tests (PR #88 follow-up)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Test 1: style publish build uses proposed CSS, not pre-commit provider CSS
+# Test 2: unrelated pages CSS remains composed
+# ---------------------------------------------------------------------------
+
+def test_style_publish_build_uses_post_commit_css(bypass_db_integrity, tmp_path):
+    """Regression for Defect 1: publish() must commit the style source BEFORE
+    building Astro so the build uses the post-commit effective CSS.
+
+    Store:
+      00-variables.css = var CSS
+      90-site.css = old nav CSS
+
+    Proposal:
+      90-site.css = new nav CSS
+
+    After publish:
+      - provider source contains new nav CSS (committed)
+      - build_preview theme_css contains var CSS + new nav CSS
+      - old nav CSS is absent from the build
+    """
+    from cauldron_site_astro.publication_service import SiteChangeSetService
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_content.pages_style import register_pages_style_provider
+
+    var_css = ":root { --color: blue; }"
+    old_nav = "nav { display: block; } /* OLD */"
+    new_nav = "nav { display: flex; } /* NEW */"
+
+    provider = FakePagesStyleProvider({
+        "00-variables.css": var_css,
+        "90-site.css": old_nav,
+    })
+    register_pages_style_provider(provider)
+
+    cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        staged_theme_css=None,
+        content_request_ids=[],
+        style_request_id="req-defect1-test",
+        style_target="90-site.css",
+        style_proposed_content=new_nav,
+        style_base_hash="",
+        style_base_exists=False,
+    )
+
+    mock_svc = _make_pub_service_mocks(preview_ok=True)
+    mock_svc._config.theme_root = None
+
+    build_captured = {}
+
+    def capture_build(**kwargs):
+        build_captured["theme_css"] = kwargs.get("theme_css", "")
+        from cauldron_site_astro.service import BuildResult
+        return BuildResult(ok=True, pages_built=1)
+
+    mock_svc.build_preview.side_effect = capture_build
+
+    actor = SimpleNamespace(pk=1, has_perm=lambda p: True)
+    with (
+        patch("cauldron_site_astro.publication_service.get_build_service", return_value=mock_svc),
+        patch("cauldron_site_astro.publication_service._get_content_operation_service", return_value=None),
+        patch("cauldron_site_astro.publication_service._get_require_approval", return_value=False),
+        patch("cauldron_site_astro.publication_service._fetch_eligible_change_requests", return_value=({}, None)),
+    ):
+        svc = SiteChangeSetService()
+        result = svc.publish(actor=actor, change_set_id=str(cs.id))
+
+    assert result.ok, result.message
+
+    # Test 1: build used new nav CSS (from post-commit provider)
+    assert new_nav in build_captured.get("theme_css", ""), (
+        f"Expected new nav CSS in build; got: {build_captured['theme_css']!r}"
+    )
+    assert old_nav not in build_captured.get("theme_css", "")
+
+    # Test 2: unrelated pages CSS (00-variables.css) was also composed
+    assert var_css in build_captured.get("theme_css", ""), (
+        f"Expected var CSS in build; got: {build_captured['theme_css']!r}"
+    )
+
+    # Provider source now contains the new content
+    assert provider._files.get("90-site.css") == new_nav
+
+
+# ---------------------------------------------------------------------------
+# Test 3: build failure after source commit rolls source back
+# ---------------------------------------------------------------------------
+
+def test_build_failure_after_source_commit_rolls_back(bypass_db_integrity, tmp_path):
+    """When the Astro build fails AFTER the style source was committed (Step 2.5),
+    _rollback_style() must be called to undo the source write."""
+    from cauldron_site_astro.publication_service import SiteChangeSetService
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_content.pages_style import register_pages_style_provider
+
+    provider = FakePagesStyleProvider({"90-site.css": "nav { display: block; }"})
+    register_pages_style_provider(provider)
+
+    cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        staged_theme_css=None,
+        content_request_ids=[],
+        style_request_id="req-build-fail",
+        style_target="90-site.css",
+        style_proposed_content="nav { display: flex; }",
+        style_base_hash="",
+        style_base_exists=False,
+    )
+
+    mock_svc = _make_pub_service_mocks(preview_ok=False)  # build fails
+    mock_svc._config.theme_root = None
+
+    actor = SimpleNamespace(pk=1, has_perm=lambda p: True)
+    with (
+        patch("cauldron_site_astro.publication_service.get_build_service", return_value=mock_svc),
+        patch("cauldron_site_astro.publication_service._get_content_operation_service", return_value=None),
+        patch("cauldron_site_astro.publication_service._get_require_approval", return_value=False),
+        patch("cauldron_site_astro.publication_service._fetch_eligible_change_requests", return_value=({}, None)),
+    ):
+        svc = SiteChangeSetService()
+        result = svc.publish(actor=actor, change_set_id=str(cs.id))
+
+    assert not result.ok
+    # Source was rolled back — provider is back to old content
+    assert len(provider._rollback_called) == 1
+    assert provider._rollback_called[0]["target"] == "90-site.css"
+    assert provider._files.get("90-site.css") == "nav { display: block; }"
+
+
+# ---------------------------------------------------------------------------
+# Test 4: empty style proposal previews as empty
+# ---------------------------------------------------------------------------
+
+def test_empty_style_proposal_previews_empty(bypass_db_integrity, tmp_path):
+    """An approved proposal with proposed_content='' means 'clear the target file'.
+    prepare() must pass proposed_content='' literally — not convert it to None."""
+    from cauldron_site_astro.publication_service import SiteChangeSetService
+    from cauldron_content.pages_style import register_pages_style_provider
+
+    nav_css = "nav { display: flex; }"
+    provider = FakePagesStyleProvider({"90-site.css": nav_css})
+    register_pages_style_provider(provider)
+
+    mock_svc = _make_pub_service_mocks(preview_ok=True)
+    mock_svc._config.previews_root = str(tmp_path / "previews")
+    mock_svc._config.theme_root = None
+
+    captured = {}
+
+    def capture_preview(**kwargs):
+        captured["theme_css"] = kwargs.get("theme_css", "SENTINEL")
+        from cauldron_site_astro.service import BuildResult
+        return BuildResult(ok=True, pages_built=1)
+
+    mock_svc.build_preview.side_effect = capture_preview
+
+    with patch("cauldron_site_astro.publication_service.get_build_service", return_value=mock_svc):
+        svc = SiteChangeSetService()
+        result = svc.prepare(
+            actor=SimpleNamespace(pk=None),
+            content_request_ids=[],
+            style_request_id="req-empty-proposal",
+            style_target="90-site.css",
+            style_proposed_content="",  # intentionally empty — clears the file
+        )
+
+    assert result.ok
+    # Preview must exclude the old nav CSS (proposed empty replaces it)
+    assert nav_css not in captured.get("theme_css", ""), (
+        f"Old nav CSS must be absent from preview; got: {captured['theme_css']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 5: empty style proposal publishes as empty
+# Test 6: active.css is actually cleared when effective CSS is empty
+# ---------------------------------------------------------------------------
+
+def test_empty_style_proposal_publishes_empty_and_clears_active_css(bypass_db_integrity, tmp_path):
+    """When a style proposal clears 90-site.css (proposed_content=''):
+    - publish() commits empty content to the source store
+    - provider composes empty (no files remain after clear)
+    - Astro build receives empty theme_css
+    - active.css is written as empty
+    """
+    from cauldron_site_astro.publication_service import SiteChangeSetService
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_content.pages_style import register_pages_style_provider
+    from cauldron_site_astro.theme import SiteThemeService
+
+    nav_css = "nav { display: flex; }"
+
+    # Provider has one file; the proposal will write "" to it.
+    # After commit: file content = "", get_composed_css() returns "".
+    provider = FakePagesStyleProvider({"90-site.css": nav_css})
+    register_pages_style_provider(provider)
+
+    theme_root = tmp_path / "theme"
+    theme_root.mkdir()
+    active_css_path = theme_root / "active.css"
+    active_css_path.write_text(nav_css)  # live site has nav CSS
+
+    cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        staged_theme_css=None,
+        content_request_ids=[],
+        style_request_id="req-empty-publish",
+        style_target="90-site.css",
+        style_proposed_content="",  # intentionally empty
+        style_base_hash="",
+        style_base_exists=False,
+    )
+
+    mock_svc = _make_pub_service_mocks(preview_ok=True)
+    mock_svc._config.theme_root = str(theme_root)
+
+    build_captured = {}
+
+    def capture_build(**kwargs):
+        build_captured["theme_css"] = kwargs.get("theme_css", "SENTINEL")
+        from cauldron_site_astro.service import BuildResult
+        return BuildResult(ok=True, pages_built=1)
+
+    mock_svc.build_preview.side_effect = capture_build
+
+    actor = SimpleNamespace(pk=1, has_perm=lambda p: True)
+    with (
+        patch("cauldron_site_astro.publication_service.get_build_service", return_value=mock_svc),
+        patch("cauldron_site_astro.publication_service._get_content_operation_service", return_value=None),
+        patch("cauldron_site_astro.publication_service._get_require_approval", return_value=False),
+        patch("cauldron_site_astro.publication_service._fetch_eligible_change_requests", return_value=({}, None)),
+    ):
+        svc = SiteChangeSetService()
+        result = svc.publish(actor=actor, change_set_id=str(cs.id))
+
+    assert result.ok, result.message
+
+    # Test 5: build was called with empty CSS (not old nav CSS)
+    assert build_captured.get("theme_css") == "", (
+        f"Expected empty theme_css in build; got: {build_captured.get('theme_css')!r}"
+    )
+    assert nav_css not in build_captured.get("theme_css", "")
+
+    # Test 6: active.css is actually empty (was written via stage_css + promote_staged)
+    assert active_css_path.read_text() == "", (
+        f"Expected active.css to be empty; got: {active_css_path.read_text()!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 7: style lifecycle finalization failure cannot silently return PUBLISHED
+# Test 8: successful style publish ends with PUBLISHED + UIStyleChangeRequest=applied
+# ---------------------------------------------------------------------------
+
+def test_style_lifecycle_finalization_failure_returns_publish_failed(bypass_db_integrity, tmp_path):
+    """When mark_style_applied() (called via signal) raises, publish() must NOT
+    set PUBLISHED. It must roll back FS state and return PUBLISH_FAILED."""
+    from cauldron_site_astro.publication_service import SiteChangeSetService
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_content.pages_style import register_pages_style_provider
+    from cauldron_site_astro.signals import site_changeset_published
+
+    provider = FakePagesStyleProvider()
+    register_pages_style_provider(provider)
+
+    cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        staged_theme_css=None,
+        content_request_ids=[],
+        style_request_id="req-lifecycle-fail",
+        style_target="90-site.css",
+        style_proposed_content="nav {}",
+        style_base_hash="",
+        style_base_exists=False,
+    )
+
+    mock_svc = _make_pub_service_mocks(preview_ok=True)
+    mock_svc._config.theme_root = None
+
+    def failing_handler(sender, **kwargs):
+        raise RuntimeError("DB unavailable — cannot mark applied")
+
+    site_changeset_published.connect(failing_handler)
+    try:
+        actor = SimpleNamespace(pk=1, has_perm=lambda p: True)
+        with (
+            patch("cauldron_site_astro.publication_service.get_build_service", return_value=mock_svc),
+            patch("cauldron_site_astro.publication_service._get_content_operation_service", return_value=None),
+            patch("cauldron_site_astro.publication_service._get_require_approval", return_value=False),
+            patch("cauldron_site_astro.publication_service._fetch_eligible_change_requests", return_value=({}, None)),
+        ):
+            svc = SiteChangeSetService()
+            result = svc.publish(actor=actor, change_set_id=str(cs.id))
+    finally:
+        site_changeset_published.disconnect(failing_handler)
+
+    # Must not be PUBLISHED
+    assert not result.ok
+    cs.refresh_from_db()
+    assert cs.status == SiteChangeSet.PUBLISH_FAILED
+    assert cs.publish_build_result.get("style_lifecycle_failed") is True
+    # Style source should have been rolled back
+    assert len(provider._rollback_called) == 1
+
+
+def test_successful_style_publish_ends_with_published_and_applied(bypass_db_integrity, tmp_path):
+    """Successful style publication: SiteChangeSet=PUBLISHED and the signal
+    handler is called (simulating mark_style_applied transition)."""
+    from cauldron_site_astro.publication_service import SiteChangeSetService
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_content.pages_style import register_pages_style_provider
+    from cauldron_site_astro.signals import site_changeset_published
+
+    provider = FakePagesStyleProvider()
+    register_pages_style_provider(provider)
+
+    cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        staged_theme_css=None,
+        content_request_ids=[],
+        style_request_id="req-lifecycle-success",
+        style_target="90-site.css",
+        style_proposed_content="nav { display: flex; }",
+        style_base_hash="",
+        style_base_exists=False,
+    )
+
+    mock_svc = _make_pub_service_mocks(preview_ok=True)
+    mock_svc._config.theme_root = None
+
+    handler_called = []
+
+    def success_handler(sender, style_request_id, changeset_id, **kwargs):
+        handler_called.append({"style_request_id": style_request_id, "changeset_id": changeset_id})
+
+    site_changeset_published.connect(success_handler)
+    try:
+        actor = SimpleNamespace(pk=1, has_perm=lambda p: True)
+        with (
+            patch("cauldron_site_astro.publication_service.get_build_service", return_value=mock_svc),
+            patch("cauldron_site_astro.publication_service._get_content_operation_service", return_value=None),
+            patch("cauldron_site_astro.publication_service._get_require_approval", return_value=False),
+            patch("cauldron_site_astro.publication_service._fetch_eligible_change_requests", return_value=({}, None)),
+        ):
+            svc = SiteChangeSetService()
+            result = svc.publish(actor=actor, change_set_id=str(cs.id))
+    finally:
+        site_changeset_published.disconnect(success_handler)
+
+    assert result.ok, result.message
+    cs.refresh_from_db()
+    assert cs.status == SiteChangeSet.PUBLISHED
+
+    # Signal was called before PUBLISHED was set (lifecycle coherence)
+    assert len(handler_called) == 1
+    assert handler_called[0]["style_request_id"] == "req-lifecycle-success"
+    assert handler_called[0]["changeset_id"] == str(cs.id)

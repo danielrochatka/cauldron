@@ -320,6 +320,7 @@ class AdminAIService:
         max_result_bytes: int = 65536,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         prompt_assembly_service: PromptAssemblyService | None = None,
+        semantic_memory_indexer: Any = None,
     ) -> None:
         if max_model_turns <= 0:
             raise ValueError("max_model_turns must be positive")
@@ -345,6 +346,7 @@ class AdminAIService:
         self._max_result_bytes = int(max_result_bytes)
         self._system_prompt = system_prompt
         self._prompt_assembly = prompt_assembly_service or PromptAssemblyService()
+        self._semantic_memory_indexer = semantic_memory_indexer
 
     # ------------------------------------------------------------------ public
 
@@ -1198,6 +1200,22 @@ class AdminAIService:
             error_code="",
             error_summary="",
         )
+        # Canonical persistence (AdminAIRun / query_logs) is durably committed
+        # above. Semantic-memory indexing is best-effort derived work — its
+        # failure must never roll back or invalidate the committed record.
+        if self._semantic_memory_indexer is not None:
+            try:
+                self._semantic_memory_indexer.index_completed_turn(
+                    run_id=str(run.run_id),
+                    question=run.user_request or "",
+                    answer=run.final_response or "",
+                )
+            except Exception:
+                logger.exception(
+                    "Semantic memory indexing failed for run %s; "
+                    "canonical record is intact.",
+                    run.run_id,
+                )
 
     def _finalize_error(self, run: AdminAIRun, code: str, summary: str) -> None:
         self._compare_and_finalize(

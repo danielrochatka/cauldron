@@ -35,6 +35,15 @@ def _get_override_store():
     return UIOverrideStore(Path(override_dir))
 
 
+class StyleFinalizationError(Exception):
+    """Raised by mark_style_applied() when the lifecycle transition cannot be completed.
+
+    Signals an authoritative business-logic failure (request not found, wrong
+    status, or conflicting applied-to-changeset).  Distinguished from transient
+    infrastructure errors so callers can decide whether to propagate or log.
+    """
+
+
 def _next_sequence_locked(proposal: UIStyleChangeRequest) -> int:
     """Allocate the next audit sequence for a proposal.
 
@@ -570,22 +579,32 @@ class UIStyleChangeService:
                     request_id=request_id,
                 )
             except UIStyleChangeRequest.DoesNotExist:
-                logger.warning(
-                    "mark_style_applied: UIStyleChangeRequest %s not found", request_id,
+                raise StyleFinalizationError(
+                    f"mark_style_applied: UIStyleChangeRequest {request_id!r} not found"
                 )
-                return
+
+            if locked.status == "applied":
+                if locked.site_changeset_id == changeset_id:
+                    return  # idempotent success — already correctly applied
+                raise StyleFinalizationError(
+                    f"mark_style_applied: request {request_id!r} is already applied "
+                    f"to changeset {locked.site_changeset_id!r}, not {changeset_id!r}"
+                )
 
             if locked.status != "approved":
-                # Already applied, conflicted, rejected, etc.  No-op.
-                return
+                raise StyleFinalizationError(
+                    f"mark_style_applied: UIStyleChangeRequest {request_id!r} has "
+                    f"unexpected status {locked.status!r}; expected 'approved'"
+                )
 
             locked.status = "applied"
             locked.apply_lease = ""
             locked.applied_at = timezone.now()
+            locked.site_changeset_id = changeset_id
             if committed_hash:
                 locked.proposed_hash = committed_hash
             locked.save(update_fields=[
-                "status", "apply_lease", "applied_at", "proposed_hash",
+                "status", "apply_lease", "applied_at", "proposed_hash", "site_changeset_id",
             ])
             UIStyleAuditEvent.objects.create(
                 change_request=locked,

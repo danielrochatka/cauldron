@@ -657,6 +657,116 @@ def test_mark_style_applied_conflict_is_no_longer_possible():
     assert fresh.status == "applied"
 
 
+def test_mark_style_applied_not_found_raises():
+    """mark_style_applied() raises StyleFinalizationError when the request does not exist."""
+    import uuid as _uuid
+    from cauldron_ai_admin.style_service import UIStyleChangeService, StyleFinalizationError
+
+    svc = UIStyleChangeService()
+    with pytest.raises(StyleFinalizationError, match="not found"):
+        svc.mark_style_applied(request_id=str(_uuid.uuid4()))
+
+
+def test_mark_style_applied_wrong_status_raises():
+    """mark_style_applied() raises StyleFinalizationError for non-approved, non-applied status."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService, StyleFinalizationError
+    from cauldron_ai_admin.models import UIStyleChangeRequest
+
+    svc = UIStyleChangeService()
+    fake_store = MagicMock()
+    fake_store.inspect_state.return_value = {"exists": False, "hash": None, "size": 0}
+
+    with patch("cauldron_ai_admin.style_service._get_override_store", return_value=fake_store):
+        proposal = svc.create_proposal(
+            scope="pages",
+            target_path="90-site.css",
+            proposed_content="nav {}",
+            description="Wrong status test",
+        )
+        # proposal.status == "proposed" — not approved
+
+    with pytest.raises(StyleFinalizationError, match="unexpected status"):
+        svc.mark_style_applied(request_id=str(proposal.request_id))
+
+
+def test_mark_style_applied_idempotent_same_changeset():
+    """mark_style_applied() succeeds without error when already applied to the same changeset."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from cauldron_ai_admin.models import UIStyleChangeRequest
+
+    reviewer = _make_user(username="idem-reviewer", perms=[])
+    svc = UIStyleChangeService()
+    fake_store = MagicMock()
+    fake_store.inspect_state.return_value = {"exists": False, "hash": None, "size": 0}
+
+    with patch("cauldron_ai_admin.style_service._get_override_store", return_value=fake_store):
+        proposal = svc.create_proposal(
+            scope="pages",
+            target_path="90-site.css",
+            proposed_content="h1 {}",
+            description="Idempotent test",
+        )
+        approved = svc.approve(proposal, reviewed_by=reviewer)
+        svc.mark_style_applied(request_id=str(approved.request_id), changeset_id="cs-abc")
+        # Second call with same changeset — must not raise
+        svc.mark_style_applied(request_id=str(approved.request_id), changeset_id="cs-abc")
+
+    fresh = UIStyleChangeRequest.objects.get(pk=approved.pk)
+    assert fresh.status == "applied"
+    assert fresh.site_changeset_id == "cs-abc"
+
+
+def test_mark_style_applied_conflict_different_changeset_raises():
+    """mark_style_applied() raises StyleFinalizationError when already applied to a different changeset."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService, StyleFinalizationError
+    from cauldron_ai_admin.models import UIStyleChangeRequest
+
+    reviewer = _make_user(username="conflict-cs-reviewer", perms=[])
+    svc = UIStyleChangeService()
+    fake_store = MagicMock()
+    fake_store.inspect_state.return_value = {"exists": False, "hash": None, "size": 0}
+
+    with patch("cauldron_ai_admin.style_service._get_override_store", return_value=fake_store):
+        proposal = svc.create_proposal(
+            scope="pages",
+            target_path="90-site.css",
+            proposed_content="p {}",
+            description="Conflict changeset test",
+        )
+        approved = svc.approve(proposal, reviewed_by=reviewer)
+        svc.mark_style_applied(request_id=str(approved.request_id), changeset_id="cs-first")
+
+    with pytest.raises(StyleFinalizationError, match="already applied"):
+        svc.mark_style_applied(request_id=str(approved.request_id), changeset_id="cs-second")
+
+
+def test_mark_style_applied_persists_site_changeset_id():
+    """mark_style_applied() persists the changeset_id on the proposal row."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from cauldron_ai_admin.models import UIStyleChangeRequest
+
+    reviewer = _make_user(username="cs-id-reviewer", perms=[])
+    svc = UIStyleChangeService()
+    fake_store = MagicMock()
+    fake_store.inspect_state.return_value = {"exists": False, "hash": None, "size": 0}
+
+    with patch("cauldron_ai_admin.style_service._get_override_store", return_value=fake_store):
+        proposal = svc.create_proposal(
+            scope="pages",
+            target_path="90-site.css",
+            proposed_content="footer {}",
+            description="Changeset ID persistence test",
+        )
+        approved = svc.approve(proposal, reviewed_by=reviewer)
+        svc.mark_style_applied(
+            request_id=str(approved.request_id),
+            changeset_id="cs-persist-me",
+        )
+
+    fresh = UIStyleChangeRequest.objects.get(pk=approved.pk)
+    assert fresh.site_changeset_id == "cs-persist-me"
+
+
 # ---------------------------------------------------------------------------
 # Blocker 5: apply() refuses pages-scope proposals (direct bypass closed)
 # ---------------------------------------------------------------------------

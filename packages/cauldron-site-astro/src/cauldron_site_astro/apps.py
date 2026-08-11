@@ -75,28 +75,35 @@ def _handle_changeset_published(
     """Mark a pages-scope style request applied after its changeset publishes.
 
     The pages CSS source was already written atomically in publish() Step 2.5.
-    This handler only does the DB lifecycle transition via mark_style_applied()
-    — no more filesystem writes here.  Failures are logged but never re-raised
-    — the Astro publication has already succeeded and must not be rolled back
-    by a post-publish hook error.
+    This handler only does the DB lifecycle transition via mark_style_applied().
+
+    StyleFinalizationError (authoritative business failure: request not found,
+    wrong status, or conflicting applied-to-changeset) is re-raised so
+    send_robust() captures it and publish() can roll back.
+
+    Transient infrastructure errors (DB connection, missing tables) are logged
+    but not re-raised — the CSS source was already committed and the Astro site
+    is live; a transient failure should not undo a successful publication.
     """
     import logging
     _log = logging.getLogger(__name__)
     if not style_request_id:
         return
     try:
-        from cauldron_ai_admin.style_service import get_style_service
+        from cauldron_ai_admin.style_service import get_style_service, StyleFinalizationError
         get_style_service().mark_style_applied(
             request_id=style_request_id,
             changeset_id=changeset_id,
             committed_hash=style_committed_hash,
         )
     except ImportError:
-        pass
+        pass  # cauldron-ai-admin not installed — graceful degradation
+    except StyleFinalizationError:
+        raise  # authoritative failure — let send_robust() capture it for rollback
     except Exception:
         _log.exception(
-            "cauldron.site.astro: failed to mark style request %s applied "
-            "after changeset %s published",
+            "cauldron.site.astro: transient error marking style request %s applied "
+            "after changeset %s published — CSS source already committed",
             style_request_id,
             changeset_id,
         )

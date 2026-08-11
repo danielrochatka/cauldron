@@ -1602,3 +1602,60 @@ def test_successful_style_publish_ends_with_published_and_applied(bypass_db_inte
     assert len(handler_called) == 1
     assert handler_called[0]["style_request_id"] == "req-lifecycle-success"
     assert handler_called[0]["changeset_id"] == str(cs.id)
+
+
+def test_real_handler_propagates_finalization_failure_to_publish_failed(bypass_db_integrity, tmp_path):
+    """Production-path test using the real _handle_changeset_published handler.
+
+    Patches get_style_service() so mark_style_applied() raises
+    StyleFinalizationError.  Verifies that the real handler propagates the
+    error through send_robust(), publish() sets PUBLISH_FAILED, and the style
+    source commit is rolled back.
+
+    This test does NOT connect the handler manually — it relies on the handler
+    already being connected via CauldronSiteAstroConfig.ready().
+    """
+    from cauldron_ai_admin.style_service import StyleFinalizationError
+    from cauldron_site_astro.publication_service import SiteChangeSetService
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_content.pages_style import register_pages_style_provider
+
+    provider = FakePagesStyleProvider()
+    register_pages_style_provider(provider)
+
+    cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        staged_theme_css=None,
+        content_request_ids=[],
+        style_request_id="req-real-handler-fail",
+        style_target="90-site.css",
+        style_proposed_content="body { margin: 0; }",
+        style_base_hash="",
+        style_base_exists=False,
+    )
+
+    mock_svc = _make_pub_service_mocks(preview_ok=True)
+    mock_svc._config.theme_root = None
+
+    failing_style_svc = MagicMock()
+    failing_style_svc.mark_style_applied.side_effect = StyleFinalizationError(
+        "request req-real-handler-fail not found"
+    )
+
+    actor = SimpleNamespace(pk=1, has_perm=lambda p: True)
+    with (
+        patch("cauldron_site_astro.publication_service.get_build_service", return_value=mock_svc),
+        patch("cauldron_site_astro.publication_service._get_content_operation_service", return_value=None),
+        patch("cauldron_site_astro.publication_service._get_require_approval", return_value=False),
+        patch("cauldron_site_astro.publication_service._fetch_eligible_change_requests", return_value=({}, None)),
+        patch("cauldron_ai_admin.style_service.get_style_service", return_value=failing_style_svc),
+    ):
+        svc = SiteChangeSetService()
+        result = svc.publish(actor=actor, change_set_id=str(cs.id))
+
+    assert not result.ok
+    cs.refresh_from_db()
+    assert cs.status == SiteChangeSet.PUBLISH_FAILED
+    assert cs.publish_build_result.get("style_lifecycle_failed") is True
+    # Style source committed in Step 2.5 must be rolled back
+    assert len(provider._rollback_called) == 1

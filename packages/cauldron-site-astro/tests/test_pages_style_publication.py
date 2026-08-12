@@ -355,6 +355,7 @@ def test_publish_calls_mark_style_applied_signal(bypass_db_integrity, tmp_path):
             patch("cauldron_site_astro.publication_service._get_content_operation_service", return_value=None),
             patch("cauldron_site_astro.publication_service._get_require_approval", return_value=False),
             patch("cauldron_site_astro.publication_service._fetch_eligible_change_requests", return_value=({}, None)),
+            patch("cauldron_ai_admin.style_service.get_style_service", return_value=MagicMock()),
         ):
             svc = SiteChangeSetService()
             result = svc.publish(actor=actor, change_set_id=str(cs.id))
@@ -600,24 +601,20 @@ def test_site_astro_prepare_without_ai_admin(bypass_db_integrity, tmp_path):
     assert result.ok  # no crash
 
 
-def test_site_astro_publish_signal_handler_survives_missing_ai_admin():
-    """_handle_changeset_published must silently handle ImportError when
-    cauldron-ai-admin is not installed."""
+def test_non_style_changeset_handler_graceful_without_ai_admin():
+    """_handle_changeset_published returns immediately for empty style_request_id,
+    requiring no cauldron-ai-admin import regardless of whether it is installed."""
     from cauldron_site_astro.apps import _handle_changeset_published
 
-    # Simulate cauldron_ai_admin being absent by removing it from sys.modules
-    # so the lazy import inside the handler raises ImportError.
     absent = {"cauldron_ai_admin": None, "cauldron_ai_admin.style_service": None}
     with patch.dict(sys.modules, absent):
-        try:
-            _handle_changeset_published(
-                sender=None,
-                changeset_id="cs-123",
-                staged_theme_css="body{}",
-                style_request_id="req-123",
-            )
-        except ImportError:
-            pytest.fail("_handle_changeset_published raised ImportError — must handle gracefully")
+        # Must not raise — empty style_request_id exits before any import
+        _handle_changeset_published(
+            sender=None,
+            changeset_id="cs-123",
+            staged_theme_css="body{}",
+            style_request_id="",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1004,6 +1001,7 @@ def test_publish_signal_carries_style_committed_hash(bypass_db_integrity, tmp_pa
             patch("cauldron_site_astro.publication_service._get_content_operation_service", return_value=None),
             patch("cauldron_site_astro.publication_service._get_require_approval", return_value=False),
             patch("cauldron_site_astro.publication_service._fetch_eligible_change_requests", return_value=({}, None)),
+            patch("cauldron_ai_admin.style_service.get_style_service", return_value=MagicMock()),
         ):
             svc = SiteChangeSetService()
             result = svc.publish(actor=actor, change_set_id=str(cs.id))
@@ -1308,6 +1306,7 @@ def test_style_publish_build_uses_post_commit_css(bypass_db_integrity, tmp_path)
         patch("cauldron_site_astro.publication_service._get_content_operation_service", return_value=None),
         patch("cauldron_site_astro.publication_service._get_require_approval", return_value=False),
         patch("cauldron_site_astro.publication_service._fetch_eligible_change_requests", return_value=({}, None)),
+        patch("cauldron_ai_admin.style_service.get_style_service", return_value=MagicMock()),
     ):
         svc = SiteChangeSetService()
         result = svc.publish(actor=actor, change_set_id=str(cs.id))
@@ -1476,6 +1475,7 @@ def test_empty_style_proposal_publishes_empty_and_clears_active_css(bypass_db_in
         patch("cauldron_site_astro.publication_service._get_content_operation_service", return_value=None),
         patch("cauldron_site_astro.publication_service._get_require_approval", return_value=False),
         patch("cauldron_site_astro.publication_service._fetch_eligible_change_requests", return_value=({}, None)),
+        patch("cauldron_ai_admin.style_service.get_style_service", return_value=MagicMock()),
     ):
         svc = SiteChangeSetService()
         result = svc.publish(actor=actor, change_set_id=str(cs.id))
@@ -1588,6 +1588,7 @@ def test_successful_style_publish_ends_with_published_and_applied(bypass_db_inte
             patch("cauldron_site_astro.publication_service._get_content_operation_service", return_value=None),
             patch("cauldron_site_astro.publication_service._get_require_approval", return_value=False),
             patch("cauldron_site_astro.publication_service._fetch_eligible_change_requests", return_value=({}, None)),
+            patch("cauldron_ai_admin.style_service.get_style_service", return_value=MagicMock()),
         ):
             svc = SiteChangeSetService()
             result = svc.publish(actor=actor, change_set_id=str(cs.id))
@@ -1659,3 +1660,139 @@ def test_real_handler_propagates_finalization_failure_to_publish_failed(bypass_d
     assert cs.publish_build_result.get("style_lifecycle_failed") is True
     # Style source committed in Step 2.5 must be rolled back
     assert len(provider._rollback_called) == 1
+
+
+def test_real_handler_infrastructure_error_causes_publish_failed_with_rollback(bypass_db_integrity, tmp_path):
+    """Production-path: real _handle_changeset_published, mark_style_applied()
+    raises a generic infrastructure RuntimeError.
+
+    send_robust() receives the exception; publish() returns ok=False,
+    SiteChangeSet=PUBLISH_FAILED, style source rolled back, output restored.
+    SiteChangeSet never reaches PUBLISHED.
+    """
+    from cauldron_site_astro.publication_service import SiteChangeSetService
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_content.pages_style import register_pages_style_provider
+
+    provider = FakePagesStyleProvider()
+    register_pages_style_provider(provider)
+
+    cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        staged_theme_css=None,
+        content_request_ids=[],
+        style_request_id="req-infra-fail",
+        style_target="90-site.css",
+        style_proposed_content="body { margin: 0; }",
+        style_base_hash="",
+        style_base_exists=False,
+    )
+
+    mock_svc = _make_pub_service_mocks(preview_ok=True)
+    mock_svc._config.theme_root = None
+    # Non-None snapshot so publish() attempts restore_output on failure
+    mock_svc.promote_output_with_backup.return_value = "snapshot-handle"
+
+    failing_style_svc = MagicMock()
+    failing_style_svc.mark_style_applied.side_effect = RuntimeError("DB connection lost")
+
+    actor = SimpleNamespace(pk=1, has_perm=lambda p: True)
+    with (
+        patch("cauldron_site_astro.publication_service.get_build_service", return_value=mock_svc),
+        patch("cauldron_site_astro.publication_service._get_content_operation_service", return_value=None),
+        patch("cauldron_site_astro.publication_service._get_require_approval", return_value=False),
+        patch("cauldron_site_astro.publication_service._fetch_eligible_change_requests", return_value=({}, None)),
+        patch("cauldron_ai_admin.style_service.get_style_service", return_value=failing_style_svc),
+    ):
+        svc = SiteChangeSetService()
+        result = svc.publish(actor=actor, change_set_id=str(cs.id))
+
+    assert not result.ok
+    cs.refresh_from_db()
+    assert cs.status == SiteChangeSet.PUBLISH_FAILED
+    assert cs.publish_build_result.get("style_lifecycle_failed") is True
+    # Style source committed in Step 2.5 rolled back
+    assert len(provider._rollback_called) == 1
+    # Output promoted with backup must be restored
+    mock_svc.restore_output.assert_called_once_with("snapshot-handle")
+    # SiteChangeSet never became PUBLISHED
+    assert cs.status != SiteChangeSet.PUBLISHED
+
+
+def test_real_handler_import_error_for_style_changeset_causes_publish_failed(bypass_db_integrity, tmp_path):
+    """Production-path: real handler, cauldron-ai-admin unavailable at finalization.
+
+    ImportError is converted to RuntimeError and propagates through send_robust()
+    so publish() rolls back and returns PUBLISH_FAILED.
+    """
+    from cauldron_site_astro.publication_service import SiteChangeSetService
+    from cauldron_site_astro.models import SiteChangeSet
+    from cauldron_content.pages_style import register_pages_style_provider
+
+    provider = FakePagesStyleProvider()
+    register_pages_style_provider(provider)
+
+    cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        staged_theme_css=None,
+        content_request_ids=[],
+        style_request_id="req-import-fail",
+        style_target="90-site.css",
+        style_proposed_content="h1 {}",
+        style_base_hash="",
+        style_base_exists=False,
+    )
+
+    mock_svc = _make_pub_service_mocks(preview_ok=True)
+    mock_svc._config.theme_root = None
+
+    actor = SimpleNamespace(pk=1, has_perm=lambda p: True)
+    absent = {"cauldron_ai_admin": None, "cauldron_ai_admin.style_service": None}
+    with (
+        patch("cauldron_site_astro.publication_service.get_build_service", return_value=mock_svc),
+        patch("cauldron_site_astro.publication_service._get_content_operation_service", return_value=None),
+        patch("cauldron_site_astro.publication_service._get_require_approval", return_value=False),
+        patch("cauldron_site_astro.publication_service._fetch_eligible_change_requests", return_value=({}, None)),
+        patch.dict(sys.modules, absent),
+    ):
+        svc = SiteChangeSetService()
+        result = svc.publish(actor=actor, change_set_id=str(cs.id))
+
+    assert not result.ok
+    cs.refresh_from_db()
+    assert cs.status == SiteChangeSet.PUBLISH_FAILED
+    assert cs.publish_build_result.get("style_lifecycle_failed") is True
+    assert len(provider._rollback_called) == 1
+
+
+def test_non_style_changeset_publish_unaffected_by_ai_admin_absence(bypass_db_integrity, tmp_path):
+    """Non-style SiteChangeSet publishes normally even when cauldron-ai-admin
+    is unavailable — the handler returns immediately for empty style_request_id."""
+    from cauldron_site_astro.publication_service import SiteChangeSetService
+    from cauldron_site_astro.models import SiteChangeSet
+
+    cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        staged_theme_css=None,
+        content_request_ids=[],
+        style_request_id="",
+    )
+
+    mock_svc = _make_pub_service_mocks(preview_ok=True)
+    mock_svc._config.theme_root = None
+
+    actor = SimpleNamespace(pk=1, has_perm=lambda p: True)
+    absent = {"cauldron_ai_admin": None, "cauldron_ai_admin.style_service": None}
+    with (
+        patch("cauldron_site_astro.publication_service.get_build_service", return_value=mock_svc),
+        patch("cauldron_site_astro.publication_service._get_content_operation_service", return_value=None),
+        patch("cauldron_site_astro.publication_service._get_require_approval", return_value=False),
+        patch("cauldron_site_astro.publication_service._fetch_eligible_change_requests", return_value=({}, None)),
+        patch.dict(sys.modules, absent),
+    ):
+        svc = SiteChangeSetService()
+        result = svc.publish(actor=actor, change_set_id=str(cs.id))
+
+    assert result.ok
+    cs.refresh_from_db()
+    assert cs.status == SiteChangeSet.PUBLISHED

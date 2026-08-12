@@ -35,6 +35,15 @@ def _get_override_store():
     return UIOverrideStore(Path(override_dir))
 
 
+class StyleFinalizationError(Exception):
+    """Raised by mark_style_applied() when the lifecycle transition cannot be completed.
+
+    Signals an authoritative business-logic failure (request not found, wrong
+    status, or conflicting applied-to-changeset).  Distinguished from transient
+    infrastructure errors so callers can decide whether to propagate or log.
+    """
+
+
 def _next_sequence_locked(proposal: UIStyleChangeRequest) -> int:
     """Allocate the next audit sequence for a proposal.
 
@@ -274,6 +283,11 @@ class UIStyleChangeService:
     def apply(self, proposal: UIStyleChangeRequest, applied_by) -> UIStyleChangeRequest:
         """Apply an approved proposal to the filesystem.
 
+        pages-scope proposals must go through the Astro changeset workflow
+        (Review & Preview → SiteChangeSet.publish()).  Direct apply is refused
+        so the atomic pre-promotion CSS source write in publish() Step 2.5 is
+        never bypassed.
+
         Four-transition protocol that keeps the database and the filesystem in
         agreement even under commit-time failures and concurrent apply attempts:
 
@@ -292,6 +306,12 @@ class UIStyleChangeService:
            transition to ``approved`` (rollback succeeded) or ``conflicted``
            (rollback failed).
         """
+        if proposal.scope == "pages":
+            raise ValueError(
+                "pages-scope proposals must be published via the Astro changeset "
+                "workflow (Review & Preview → publish). Direct apply is not allowed."
+            )
+
         from cauldron_django_admin.override_store import (
             HashConflictError, OverrideStoreError, ABSENT,
         )
@@ -536,6 +556,63 @@ class UIStyleChangeService:
             raise phase3_exc
 
         return UIStyleChangeRequest.objects.get(pk=proposal.pk)
+
+
+    def mark_style_applied(
+        self,
+        request_id: str,
+        changeset_id: str = "",
+        committed_hash: str = "",
+        applied_by=None,
+    ) -> None:
+        """Mark an approved pages-scope style request as applied (DB-only).
+
+        Called by the site-astro post-publication signal handler after a
+        SiteChangeSet publishes successfully.  The pages CSS source was already
+        written atomically in publish() Step 2.5 (before any live output/theme
+        promotion), so this method only performs the DB lifecycle transition.
+        No UIOverrideStore write happens here.
+        """
+        with transaction.atomic():
+            try:
+                locked = UIStyleChangeRequest.objects.select_for_update().get(
+                    request_id=request_id,
+                )
+            except UIStyleChangeRequest.DoesNotExist:
+                raise StyleFinalizationError(
+                    f"mark_style_applied: UIStyleChangeRequest {request_id!r} not found"
+                )
+
+            if locked.status == "applied":
+                if locked.site_changeset_id == changeset_id:
+                    return  # idempotent success — already correctly applied
+                raise StyleFinalizationError(
+                    f"mark_style_applied: request {request_id!r} is already applied "
+                    f"to changeset {locked.site_changeset_id!r}, not {changeset_id!r}"
+                )
+
+            if locked.status != "approved":
+                raise StyleFinalizationError(
+                    f"mark_style_applied: UIStyleChangeRequest {request_id!r} has "
+                    f"unexpected status {locked.status!r}; expected 'approved'"
+                )
+
+            locked.status = "applied"
+            locked.apply_lease = ""
+            locked.applied_at = timezone.now()
+            locked.site_changeset_id = changeset_id
+            if committed_hash:
+                locked.proposed_hash = committed_hash
+            locked.save(update_fields=[
+                "status", "apply_lease", "applied_at", "proposed_hash", "site_changeset_id",
+            ])
+            UIStyleAuditEvent.objects.create(
+                change_request=locked,
+                sequence=_next_sequence_locked(locked),
+                event_type="applied",
+                actor=applied_by,
+                detail={"new_hash": committed_hash, "via_changeset": changeset_id},
+            )
 
 
 _service = UIStyleChangeService()

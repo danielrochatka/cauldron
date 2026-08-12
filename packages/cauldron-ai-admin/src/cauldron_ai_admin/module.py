@@ -50,6 +50,8 @@ _manifest = ModuleManifest(
         "cauldron_ai_admin.views",
         "cauldron_ai_admin.service",
         "cauldron_ai_admin.builtin_tools",
+        "cauldron_ai_admin.models",
+        "cauldron_ai_admin.style_service",
     ),
     settings_declarations=(
         ModuleSettingsDeclaration(

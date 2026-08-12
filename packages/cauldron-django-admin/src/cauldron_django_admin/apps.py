@@ -11,6 +11,15 @@ class CauldronDjangoAdminConfig(AppConfig):
         from . import checks  # noqa: F401 — registers @checks.register decorators
         self._configure_admin_site()
         self._register_navigation()
+        self._register_pages_style_provider()
+
+    def _register_pages_style_provider(self) -> None:
+        try:
+            from cauldron_content.pages_style import register_pages_style_provider
+            from cauldron_django_admin.pages_style_provider import UIOverrideStorePagesProvider
+            register_pages_style_provider(UIOverrideStorePagesProvider())
+        except ImportError:
+            pass
 
     def _configure_admin_site(self) -> None:
         from django.contrib import admin

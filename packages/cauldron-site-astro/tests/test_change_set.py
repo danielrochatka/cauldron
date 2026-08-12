@@ -46,10 +46,10 @@ def test_site_change_set_publish_build_result_default_empty():
     assert cs.publish_build_result == {}
 
 
-def test_site_change_set_staged_theme_css_blank():
+def test_site_change_set_staged_theme_css_default_is_none():
     from cauldron_site_astro.models import SiteChangeSet
     cs = SiteChangeSet.objects.create()
-    assert cs.staged_theme_css == ""
+    assert cs.staged_theme_css is None
 
 
 def test_site_change_set_status_choices():

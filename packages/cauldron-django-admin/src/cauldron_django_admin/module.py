@@ -28,6 +28,7 @@ _manifest = ModuleManifest(
         "django.contrib.messages.context_processors.messages",
     ),
     requires=(ModuleRequirement(slug="cauldron.django.auth"),),
+    optional=(ModuleRequirement(slug="cauldron.content", kind="module"),),
     provides=(
         "admin.interface",
         "admin.users",
@@ -45,6 +46,7 @@ _manifest = ModuleManifest(
         "cauldron_django_admin.module_settings",
         "cauldron_django_admin.views",
         "cauldron_django_admin.urls",
+        "cauldron_django_admin.pages_style_provider",
     ),
     settings_declarations=(
         ModuleSettingsDeclaration(

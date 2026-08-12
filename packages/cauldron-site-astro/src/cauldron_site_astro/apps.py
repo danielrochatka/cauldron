@@ -24,6 +24,7 @@ class CauldronSiteAstroConfig(AppConfig):
         _register_site_tool_prompts()
         _register_public_url_provider()
         _register_site_tools()
+        _connect_style_publication_handler()
 
 
 def _register_site_tools() -> None:
@@ -56,6 +57,47 @@ def _connect_signals() -> None:
         canonical_content_changed.connect(_handle_content_changed, weak=False)
     except ImportError:
         pass
+
+
+def _connect_style_publication_handler() -> None:
+    """Connect the style-request post-publication handler (optional ai-admin integration)."""
+    try:
+        from cauldron_site_astro.signals import site_changeset_published
+        site_changeset_published.connect(_handle_changeset_published, weak=False)
+    except Exception:
+        pass
+
+
+def _handle_changeset_published(
+    sender, changeset_id, staged_theme_css, style_request_id,
+    style_committed_hash="", **kwargs
+):
+    """Mark a pages-scope style request applied after its changeset publishes.
+
+    When style_request_id is empty, returns immediately — no dependency on
+    cauldron-ai-admin is required for non-style changesets.
+
+    When style_request_id is present, the UIStyleChangeRequest lifecycle
+    transition is required.  All failures propagate — including ImportError
+    (style lifecycle owner unavailable) and any error from mark_style_applied()
+    — so send_robust() in publish() captures them and rolls back the full
+    coordinated publication.
+    """
+    if not style_request_id:
+        return
+
+    try:
+        from cauldron_ai_admin.style_service import get_style_service
+    except ImportError as exc:
+        raise RuntimeError(
+            f"cauldron-ai-admin unavailable; cannot finalize style request {style_request_id!r}"
+        ) from exc
+
+    get_style_service().mark_style_applied(
+        request_id=style_request_id,
+        changeset_id=changeset_id,
+        committed_hash=style_committed_hash,
+    )
 
 
 def _handle_content_changed(sender, change_type, change_id, provider_name, changed_by, **kwargs):

@@ -531,3 +531,410 @@ def test_apply_uses_persisted_base_state():
         proposal.refresh_from_db()
         assert proposal.status == "conflicted"
         assert proposal.error_code == "HASH_CONFLICT"
+
+
+# ---------------------------------------------------------------------------
+# Pages-style publication lifecycle (acceptance criteria 1, 10, 14)
+# ---------------------------------------------------------------------------
+
+_FAKE_HASH = "a" * 64  # valid 64-char hex digest satisfying uiscr_proposed_hash_format
+
+
+def test_admin_scope_apply_is_direct_not_via_changeset():
+    """For scope='admin', UIStyleChangeService.apply() writes directly to the
+    UIOverrideStore without creating a SiteChangeSet."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+
+    actor = _make_user(username="admin-scope-actor", perms=[])
+    svc = UIStyleChangeService()
+    fake_store = MagicMock()
+    fake_store.inspect_state.return_value = {"exists": False, "hash": None, "size": 0}
+    fake_store.write_file_atomic.return_value = _FAKE_HASH
+
+    with patch("cauldron_ai_admin.style_service._get_override_store", return_value=fake_store):
+        proposal = svc.create_proposal(
+            scope="admin",
+            target_path="overrides.css",
+            proposed_content=".foo { color: red; }",
+            description="Test admin override",
+        )
+        approved = svc.approve(proposal, reviewed_by=actor)
+        result = svc.apply(approved, applied_by=actor)
+
+    assert result.status == "applied"
+    fake_store.write_file_atomic.assert_called_once()
+
+
+def test_mark_style_applied_transitions_to_applied():
+    """mark_style_applied() transitions an approved pages proposal to applied
+    (DB-only — the CSS source was already written atomically in publish() Step 2.5).
+    No UIOverrideStore write should happen here."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from cauldron_ai_admin.models import UIStyleChangeRequest
+
+    reviewer = _make_user(username="pages-reviewer", perms=[])
+    svc = UIStyleChangeService()
+    fake_store = MagicMock()
+    fake_store.inspect_state.return_value = {"exists": False, "hash": None, "size": 0}
+
+    with patch("cauldron_ai_admin.style_service._get_override_store", return_value=fake_store):
+        proposal = svc.create_proposal(
+            scope="pages",
+            target_path="90-site.css",
+            proposed_content="nav { display: flex; }",
+            description="Pages nav proposal",
+        )
+        approved = svc.approve(proposal, reviewed_by=reviewer)
+        svc.mark_style_applied(
+            request_id=str(approved.request_id),
+            changeset_id="changeset-xyz",
+            committed_hash=_FAKE_HASH,
+        )
+
+    fresh = UIStyleChangeRequest.objects.get(pk=approved.pk)
+    assert fresh.status == "applied"
+    assert fresh.proposed_hash == _FAKE_HASH
+    # mark_style_applied is now DB-only — no filesystem write
+    fake_store.write_file_atomic.assert_not_called()
+
+
+def test_mark_style_applied_without_committed_hash():
+    """mark_style_applied() with no committed_hash still transitions to applied;
+    proposed_hash is not updated when hash is empty."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from cauldron_ai_admin.models import UIStyleChangeRequest
+
+    reviewer = _make_user(username="pages-reviewer-nohash", perms=[])
+    svc = UIStyleChangeService()
+    fake_store = MagicMock()
+    fake_store.inspect_state.return_value = {"exists": False, "hash": None, "size": 0}
+
+    with patch("cauldron_ai_admin.style_service._get_override_store", return_value=fake_store):
+        proposal = svc.create_proposal(
+            scope="pages",
+            target_path="90-site.css",
+            proposed_content="nav {}",
+            description="No committed hash test",
+        )
+        approved = svc.approve(proposal, reviewed_by=reviewer)
+        svc.mark_style_applied(
+            request_id=str(approved.request_id),
+            changeset_id="changeset-nohash",
+        )
+
+    fresh = UIStyleChangeRequest.objects.get(pk=approved.pk)
+    assert fresh.status == "applied"
+
+
+def test_mark_style_applied_conflict_is_no_longer_possible():
+    """mark_style_applied is now DB-only; HashConflictError from UIOverrideStore
+    is no longer triggered here (the conflict is detected in publish() Step 2.5
+    before any live mutation)."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from cauldron_ai_admin.models import UIStyleChangeRequest
+
+    reviewer = _make_user(username="hash-conflict-reviewer", perms=[])
+    svc = UIStyleChangeService()
+    fake_store = MagicMock()
+    fake_store.inspect_state.return_value = {"exists": False, "hash": None, "size": 0}
+
+    with patch("cauldron_ai_admin.style_service._get_override_store", return_value=fake_store):
+        proposal = svc.create_proposal(
+            scope="pages",
+            target_path="90-site.css",
+            proposed_content="nav { display: flex; }",
+            description="Stale hash test",
+        )
+        approved = svc.approve(proposal, reviewed_by=reviewer)
+        # mark_style_applied never calls write_file_atomic — so no HashConflictError
+        svc.mark_style_applied(
+            request_id=str(approved.request_id),
+            changeset_id="changeset-stale",
+        )
+
+    fresh = UIStyleChangeRequest.objects.get(pk=approved.pk)
+    # Applied successfully — no conflict from this path
+    assert fresh.status == "applied"
+
+
+def test_mark_style_applied_not_found_raises():
+    """mark_style_applied() raises StyleFinalizationError when the request does not exist."""
+    import uuid as _uuid
+    from cauldron_ai_admin.style_service import UIStyleChangeService, StyleFinalizationError
+
+    svc = UIStyleChangeService()
+    with pytest.raises(StyleFinalizationError, match="not found"):
+        svc.mark_style_applied(request_id=str(_uuid.uuid4()))
+
+
+def test_mark_style_applied_wrong_status_raises():
+    """mark_style_applied() raises StyleFinalizationError for non-approved, non-applied status."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService, StyleFinalizationError
+    from cauldron_ai_admin.models import UIStyleChangeRequest
+
+    svc = UIStyleChangeService()
+    fake_store = MagicMock()
+    fake_store.inspect_state.return_value = {"exists": False, "hash": None, "size": 0}
+
+    with patch("cauldron_ai_admin.style_service._get_override_store", return_value=fake_store):
+        proposal = svc.create_proposal(
+            scope="pages",
+            target_path="90-site.css",
+            proposed_content="nav {}",
+            description="Wrong status test",
+        )
+        # proposal.status == "proposed" — not approved
+
+    with pytest.raises(StyleFinalizationError, match="unexpected status"):
+        svc.mark_style_applied(request_id=str(proposal.request_id))
+
+
+def test_mark_style_applied_idempotent_same_changeset():
+    """mark_style_applied() succeeds without error when already applied to the same changeset."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from cauldron_ai_admin.models import UIStyleChangeRequest
+
+    reviewer = _make_user(username="idem-reviewer", perms=[])
+    svc = UIStyleChangeService()
+    fake_store = MagicMock()
+    fake_store.inspect_state.return_value = {"exists": False, "hash": None, "size": 0}
+
+    with patch("cauldron_ai_admin.style_service._get_override_store", return_value=fake_store):
+        proposal = svc.create_proposal(
+            scope="pages",
+            target_path="90-site.css",
+            proposed_content="h1 {}",
+            description="Idempotent test",
+        )
+        approved = svc.approve(proposal, reviewed_by=reviewer)
+        svc.mark_style_applied(request_id=str(approved.request_id), changeset_id="cs-abc")
+        # Second call with same changeset — must not raise
+        svc.mark_style_applied(request_id=str(approved.request_id), changeset_id="cs-abc")
+
+    fresh = UIStyleChangeRequest.objects.get(pk=approved.pk)
+    assert fresh.status == "applied"
+    assert fresh.site_changeset_id == "cs-abc"
+
+
+def test_mark_style_applied_conflict_different_changeset_raises():
+    """mark_style_applied() raises StyleFinalizationError when already applied to a different changeset."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService, StyleFinalizationError
+    from cauldron_ai_admin.models import UIStyleChangeRequest
+
+    reviewer = _make_user(username="conflict-cs-reviewer", perms=[])
+    svc = UIStyleChangeService()
+    fake_store = MagicMock()
+    fake_store.inspect_state.return_value = {"exists": False, "hash": None, "size": 0}
+
+    with patch("cauldron_ai_admin.style_service._get_override_store", return_value=fake_store):
+        proposal = svc.create_proposal(
+            scope="pages",
+            target_path="90-site.css",
+            proposed_content="p {}",
+            description="Conflict changeset test",
+        )
+        approved = svc.approve(proposal, reviewed_by=reviewer)
+        svc.mark_style_applied(request_id=str(approved.request_id), changeset_id="cs-first")
+
+    with pytest.raises(StyleFinalizationError, match="already applied"):
+        svc.mark_style_applied(request_id=str(approved.request_id), changeset_id="cs-second")
+
+
+def test_mark_style_applied_persists_site_changeset_id():
+    """mark_style_applied() persists the changeset_id on the proposal row."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from cauldron_ai_admin.models import UIStyleChangeRequest
+
+    reviewer = _make_user(username="cs-id-reviewer", perms=[])
+    svc = UIStyleChangeService()
+    fake_store = MagicMock()
+    fake_store.inspect_state.return_value = {"exists": False, "hash": None, "size": 0}
+
+    with patch("cauldron_ai_admin.style_service._get_override_store", return_value=fake_store):
+        proposal = svc.create_proposal(
+            scope="pages",
+            target_path="90-site.css",
+            proposed_content="footer {}",
+            description="Changeset ID persistence test",
+        )
+        approved = svc.approve(proposal, reviewed_by=reviewer)
+        svc.mark_style_applied(
+            request_id=str(approved.request_id),
+            changeset_id="cs-persist-me",
+        )
+
+    fresh = UIStyleChangeRequest.objects.get(pk=approved.pk)
+    assert fresh.site_changeset_id == "cs-persist-me"
+
+
+# ---------------------------------------------------------------------------
+# Blocker 5: apply() refuses pages-scope proposals (direct bypass closed)
+# ---------------------------------------------------------------------------
+
+def test_apply_raises_for_pages_scope():
+    """UIStyleChangeService.apply() raises ValueError for pages-scope proposals.
+    Pages proposals must go through the Astro changeset workflow (Review &
+    Preview → SiteChangeSet.publish()); direct apply is refused so the atomic
+    pre-promotion CSS source write in publish() Step 2.5 is never bypassed."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from cauldron_ai_admin.models import UIStyleChangeRequest
+
+    reviewer = _make_user(username="apply-pages-reviewer", perms=[])
+    applier = _make_user(username="apply-pages-applier", perms=[])
+
+    fake_store = MagicMock()
+    fake_store.inspect_state.return_value = {"exists": False, "hash": None, "size": 0}
+
+    svc = UIStyleChangeService()
+    with patch("cauldron_ai_admin.style_service._get_override_store", return_value=fake_store):
+        proposal = svc.create_proposal(
+            scope="pages",
+            target_path="90-site.css",
+            proposed_content="nav {}",
+            description="Pages apply bypass test",
+        )
+        approved = svc.approve(proposal, reviewed_by=reviewer)
+
+    with pytest.raises(ValueError, match="pages-scope"):
+        svc.apply(approved, applied_by=applier)
+
+    # Proposal must remain approved — apply didn't touch it
+    approved.refresh_from_db()
+    assert approved.status == "approved"
+
+
+def test_http_apply_action_blocked_for_pages_scope():
+    """POST action=apply to style-detail view returns an error message for
+    pages-scope proposals — the button should not appear, but the view also
+    guards against direct HTTP POST manipulation."""
+    from cauldron_ai_admin.models import UIStyleChangeRequest
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+
+    approver = _make_user(
+        username="pages-http-apply-approver",
+        perms=["cauldron_ai_admin.approve_ui_style_changes",
+               "cauldron_ai_admin.view_ui_styles"],
+    )
+
+    fake_store = MagicMock()
+    fake_store.inspect_state.return_value = {"exists": False, "hash": None, "size": 0}
+    svc = UIStyleChangeService()
+    with patch("cauldron_ai_admin.style_service._get_override_store", return_value=fake_store):
+        proposal = svc.create_proposal(
+            scope="pages", target_path="90-site.css",
+            proposed_content="nav {}", description="HTTP apply test",
+        )
+        approved = svc.approve(proposal, reviewed_by=approver)
+
+    from django.urls import reverse
+    url = reverse("cauldron_ai_admin:style-detail", kwargs={"request_id": approved.request_id})
+    client = Client()
+    client.force_login(approver)
+    response = client.post(
+        url,
+        {"action": "apply"},
+        follow=True,
+    )
+
+    assert response.status_code == 200
+    # Proposal status must NOT have changed to applied
+    approved.refresh_from_db()
+    assert approved.status == "approved"
+
+
+# ---------------------------------------------------------------------------
+# Blocker 6 + 7: StylePublicationPrepareView GET/reuse (uses both DB tables)
+# ---------------------------------------------------------------------------
+
+def test_style_prepare_view_get_does_not_create_changeset():
+    """GET on StylePublicationPrepareView must not create a SiteChangeSet —
+    it should only redirect back (no changeset creation on GET)."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from django.apps import apps
+    from django.urls import reverse as django_reverse
+
+    SiteChangeSet = apps.get_model("cauldron_site_astro", "SiteChangeSet")
+
+    user = _make_user(
+        username="get-nocs-user",
+        perms=["cauldron_content_operations.apply_content_changes",
+               "cauldron_ai_admin.view_ui_styles"],
+    )
+    reviewer = _make_user(username="get-nocs-reviewer", perms=[])
+
+    fake_store = MagicMock()
+    fake_store.inspect_state.return_value = {"exists": False, "hash": None, "size": 0}
+    svc = UIStyleChangeService()
+    with patch("cauldron_ai_admin.style_service._get_override_store", return_value=fake_store):
+        proposal = svc.create_proposal(
+            scope="pages", target_path="90-site.css",
+            proposed_content="nav {}", description="get test",
+        )
+        approved = svc.approve(proposal, reviewed_by=reviewer)
+
+    initial_count = SiteChangeSet.objects.count()
+
+    url = django_reverse(
+        "cauldron_site_astro:style-prepare",
+        kwargs={"request_id": str(approved.request_id)},
+    )
+    client = Client()
+    client.force_login(user)
+    client.get(url, follow=False)
+
+    # No new SiteChangeSet should have been created
+    assert SiteChangeSet.objects.count() == initial_count
+
+
+def test_style_prepare_view_post_reuses_draft_ready_changeset():
+    """When the proposal already has a DRAFT_READY SiteChangeSet linked via
+    site_changeset_id, POST to StylePublicationPrepareView redirects to it
+    without creating a new SiteChangeSet."""
+    from cauldron_ai_admin.style_service import UIStyleChangeService
+    from django.apps import apps
+    from django.urls import reverse as django_reverse
+    import uuid as _uuid
+
+    SiteChangeSet = apps.get_model("cauldron_site_astro", "SiteChangeSet")
+
+    user = _make_user(
+        username="reuse-dr-user",
+        perms=["cauldron_content_operations.apply_content_changes",
+               "cauldron_ai_admin.view_ui_styles"],
+    )
+    reviewer = _make_user(username="reuse-dr-reviewer", perms=[])
+
+    fake_store = MagicMock()
+    fake_store.inspect_state.return_value = {"exists": False, "hash": None, "size": 0}
+    svc = UIStyleChangeService()
+    with patch("cauldron_ai_admin.style_service._get_override_store", return_value=fake_store):
+        proposal = svc.create_proposal(
+            scope="pages", target_path="90-site.css",
+            proposed_content="nav {}", description="reuse test",
+        )
+        approved = svc.approve(proposal, reviewed_by=reviewer)
+
+    existing_cs = SiteChangeSet.objects.create(
+        status=SiteChangeSet.DRAFT_READY,
+        content_request_ids=[],
+        style_request_id=str(approved.request_id),
+    )
+    approved.site_changeset_id = str(existing_cs.id)
+    approved.save(update_fields=["site_changeset_id"])
+
+    initial_count = SiteChangeSet.objects.count()
+
+    url = django_reverse(
+        "cauldron_site_astro:style-prepare",
+        kwargs={"request_id": str(approved.request_id)},
+    )
+    client = Client()
+    client.force_login(user)
+
+    with patch("cauldron_site_astro.views.reverse", return_value=f"/review/{existing_cs.id}/"):
+        response = client.post(url, follow=False)
+
+    # No new changeset created
+    assert SiteChangeSet.objects.count() == initial_count
+    # Redirects (302) — the existing changeset was found
+    assert response.status_code == 302

@@ -320,6 +320,10 @@ class UIStyleChangeRequest(models.Model):
     error_code = models.CharField(max_length=64, blank=True, default="")
     error_summary = models.TextField(blank=True, default="")
     apply_lease = models.CharField(max_length=36, blank=True, default="")
+    # UUID of the SiteChangeSet that will publish this pages-scope proposal.
+    # Empty for admin-scope proposals and for pages proposals that have not
+    # yet been routed through the controlled-publication flow.
+    site_changeset_id = models.CharField(max_length=36, blank=True, default="", db_index=True)
 
     def __str__(self) -> str:
         return f"UIStyleChangeRequest({self.request_id}, {self.status}, {self.target_path})"

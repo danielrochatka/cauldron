@@ -122,20 +122,35 @@ class Command(BaseCommand):
     def _reset_content(self, router) -> int:
         """Delete every content item via the router's contract.
 
-        Uses each item's enumerated hash for optimistic concurrency so that
-        a concurrent edit between enumeration and apply causes a conflict
-        rather than being silently overwritten.
+        Uses strict enumeration so that a provider that cannot enumerate its
+        collections causes an immediate abort rather than a silent partial reset.
+        Uses each item's enumerated hash for optimistic concurrency so that a
+        concurrent edit between enumeration and apply causes a conflict rather
+        than being silently overwritten.
 
-        Raises SystemExit(1) if the changeset is not fully applied.
+        Raises SystemExit(1) if enumeration fails or the changeset is not fully
+        applied.  In both cases zero mutations have been committed.
         """
         from cauldron_content.contracts import (
             ContentChangeSet,
             ContentOperation,
             ContentOperationKind,
         )
+        from cauldron_content.router import RouterError
+
+        try:
+            collections = router.list_collections(strict=True)
+        except RouterError as exc:
+            self.stderr.write(
+                self.style.ERROR(
+                    f"Cannot enumerate all content providers; reset aborted "
+                    f"before any mutation.\n{exc}"
+                )
+            )
+            raise SystemExit(1)
 
         operations: list[ContentOperation] = []
-        for coll_info in router.list_collections():
+        for coll_info in collections:
             items = router.list_items(coll_info.name, include_drafts=True)
             for item in items:
                 operations.append(

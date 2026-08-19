@@ -470,3 +470,44 @@ def test_registered_collection_missing_directory_still_listed():
     )
     result = router.list_collections()
     assert any(c.name == "pages" for c in result)
+
+
+# ---------------------------------------------------------------------------
+# list_collections — strict vs best-effort modes
+# ---------------------------------------------------------------------------
+
+class _ErroringRepo:
+    """A provider whose list_collections() always raises."""
+    def describe(self): ...
+    def list_collections(self):
+        raise RuntimeError("provider I/O error")
+    def list_items(self, c, *, include_drafts=False): return []
+    def get_by_id(self, i, *, include_drafts=False): return None
+    def get_by_slug(self, c, s, *, include_drafts=False): return None
+    def validate(self, item): ...
+    def apply(self, cs): ...
+    def health(self): ...
+
+
+def test_list_collections_default_silences_provider_error():
+    """Default (best-effort) mode: a failing provider is skipped, not propagated."""
+    reg = RepositoryRegistry()
+    reg.register("broken", _ErroringRepo())
+    router = ContentRouter(reg, RouterConfig(default_provider="broken"))
+
+    # Must not raise; returns registered collections only (none here).
+    result = router.list_collections()
+    assert isinstance(result, list)
+
+
+def test_list_collections_strict_raises_on_provider_error():
+    """strict=True: a provider that fails to enumerate raises RouterError."""
+    reg = RepositoryRegistry()
+    reg.register("broken", _ErroringRepo())
+    router = ContentRouter(reg, RouterConfig(default_provider="broken"))
+
+    with pytest.raises(RouterError) as exc_info:
+        router.list_collections(strict=True)
+
+    assert "broken" in str(exc_info.value)
+    assert "provider I/O error" in str(exc_info.value)

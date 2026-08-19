@@ -937,3 +937,87 @@ def test_integration_content_reset_with_real_flatfile_router(tmp_path):
     assert "2 content item(s) removed" in stdout
     assert stderr == ""
     assert "Website reset complete" in stdout
+
+
+# ---------------------------------------------------------------------------
+# 10. Strict enumeration — real ContentRouter with a failing provider
+# ---------------------------------------------------------------------------
+
+def test_strict_enumeration_failure_aborts_before_mutation_and_build(tmp_path):
+    """A provider that cannot enumerate its collections causes hard abort before
+    any router.apply(), style mutation, or build.
+
+    Uses a real ContentRouter wired to a fake provider whose list_collections()
+    raises, so the test exercises the actual strict-enumeration path rather than
+    a mocked router method.
+    """
+    from cauldron_content.registry import RepositoryRegistry
+    from cauldron_content.router import ContentRouter, RouterConfig
+    from cauldron_site_astro.service import BuildResult
+
+    class _FailingEnumProvider:
+        """Provider whose list_collections() always raises."""
+        def describe(self): ...
+        def list_collections(self):
+            raise RuntimeError("provider disk error")
+        def list_items(self, c, *, include_drafts=False): return []
+        def get_by_id(self, i, *, include_drafts=False): return None
+        def get_by_slug(self, c, s, *, include_drafts=False): return None
+        def validate(self, item): ...
+        def apply(self, cs): ...
+        def health(self): ...
+
+    registry = RepositoryRegistry()
+    registry.register("broken-provider", _FailingEnumProvider())
+    router = ContentRouter(registry, RouterConfig(default_provider="broken-provider"))
+
+    mock_svc = MagicMock()
+    mock_svc._router = router
+    mock_svc.build.return_value = BuildResult(ok=True, pages_built=0, output_dir="/out")
+
+    theme = MagicMock()
+    theme.get_active_css.return_value = ""
+    theme.get_staged_css.return_value = None
+
+    stderr = StringIO()
+    with (
+        _patch_build_service(mock_svc),
+        _patch_theme_service(theme),
+        _patch_site_config(theme_root="/theme"),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        call_command("cauldron_site_reset", yes=True, stderr=stderr)
+
+    assert exc_info.value.code == 1
+
+    # No build must have run.
+    mock_svc.build.assert_not_called()
+
+    # No style mutations must have been attempted.
+    theme.set_active_css.assert_not_called()
+    theme.discard_staged.assert_not_called()
+
+    # The error message must identify the provider.
+    error_text = stderr.getvalue()
+    assert "broken-provider" in error_text
+
+    # The success summary must not appear.
+    # (stdout is not captured here; the command raises before writing it)
+
+
+def test_strict_enumeration_failure_does_not_print_success():
+    """Strict enumeration failure must not print Website reset complete."""
+    # Use a mock router whose list_collections raises a RouterError to simulate
+    # the failure path (complements the real-router test above).
+    from cauldron_content.router import RouterError
+
+    router = MagicMock()
+    router.list_collections.side_effect = RouterError("Provider 'x' failed: disk error")
+    svc = _make_mock_build_service(router=router)
+    stdout = StringIO()
+
+    with _patch_build_service(svc), _patch_site_config():
+        with pytest.raises(SystemExit):
+            call_command("cauldron_site_reset", yes=True, content=True, stdout=stdout)
+
+    assert "Website reset complete" not in stdout.getvalue()

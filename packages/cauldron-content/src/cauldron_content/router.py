@@ -103,12 +103,21 @@ class ContentRouter:
         """
         return self._resolve_provider(collection)
 
-    def list_collections(self) -> list[CollectionInfo]:
+    def list_collections(self, *, strict: bool = False) -> list[CollectionInfo]:
         """Return all collections visible across registered configuration and providers.
 
         Registered collections always appear even when their backing store is empty
         or has not yet been created. Provider-discovered collections that are not
         already registered appear with empty schema and the provider name.
+
+        ``strict=False`` (default): a provider whose ``list_collections()`` raises
+        is silently skipped so a single misbehaving provider does not break
+        inventory or discovery callers.
+
+        ``strict=True``: a provider failure raises :class:`RouterError` identifying
+        the provider.  Use this when partial enumeration would be unsafe — for
+        example a destructive reset that must account for every provider's content
+        before making any mutations.
         """
         result: dict[str, CollectionInfo] = {}
 
@@ -128,7 +137,11 @@ class ContentRouter:
                 continue
             try:
                 discovered = repo.list_collections()
-            except Exception:
+            except Exception as exc:
+                if strict:
+                    raise RouterError(
+                        f"Provider {prov_name!r} failed to enumerate collections: {exc}"
+                    ) from exc
                 # A single misbehaving provider must not break enumeration.
                 continue
             for coll_name in discovered:

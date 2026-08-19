@@ -64,6 +64,57 @@ Then visit [http://localhost:8000](http://localhost:8000) and log in at [http://
 
 The generated site is written to `data/public/`. Build logs are at `logs/site_build.log`.
 
+### Resetting the site
+
+`cauldron_site_reset` deletes all content items and/or clears the active and staged CSS, then triggers a fresh rebuild.
+
+`--content` and `--styles` are logical Cauldron resource scopes, not references to any specific backing-storage implementation.
+
+```bash
+# Reset everything (content + styles) — prompts for confirmation
+./manage cauldron_site_reset
+
+# Explicit --all is equivalent to no scope flags
+./manage cauldron_site_reset --all --yes
+
+# Reset content only
+./manage cauldron_site_reset --content
+
+# Reset styles only
+./manage cauldron_site_reset --styles
+
+# Reset both scopes explicitly — same effect as --all
+./manage cauldron_site_reset --content --styles
+
+# Skip the confirmation prompt (automation / CI)
+./manage cauldron_site_reset --yes
+```
+
+The confirmation prompt accepts `y` or `yes` (case-insensitive). Everything else, including an empty Enter, aborts without making any changes.
+
+The command prints a scope-specific summary on success:
+
+```
+# Both scopes:
+Website reset complete: N content item(s) removed, styles reset, public site rebuilt.
+
+# Content only:
+Website reset complete: N content item(s) removed, public site rebuilt.
+
+# Styles only:
+Website reset complete: styles reset, public site rebuilt.
+```
+
+**What is preserved** — a site reset does not touch:
+
+- Django users, groups, and permissions
+- `config.env` and application configuration
+- AI provider settings
+- Admin AI conversation history and audit records
+- Application and frontend source files
+
+**Rebuild failure** — if the Astro rebuild fails after a style reset, the command restores the prior active CSS and staged CSS before exiting with code 1. Content cannot be automatically restored after a failed rebuild; if that matters for your deployment, take a backup before running the reset.
+
 ### Rerunning the installer
 
 `./install` is safe to rerun at any time. It skips steps that are already complete (e.g. an existing virtualenv or `node_modules/`) and repairs anything that is missing or broken. Your `config.env`, database, and content are never modified.

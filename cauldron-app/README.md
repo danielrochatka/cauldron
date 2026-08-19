@@ -64,6 +64,32 @@ Then visit [http://localhost:8000](http://localhost:8000) and log in at [http://
 
 The generated site is written to `data/public/`. Build logs are at `logs/site_build.log`.
 
+### Resetting the site
+
+`cauldron_site_reset` deletes all content, clears the active and staged CSS, and triggers a fresh rebuild.
+
+```bash
+# Reset everything (content + styles) — prompts for confirmation
+./manage cauldron_site_reset
+
+# Reset content only
+./manage cauldron_site_reset --content
+
+# Reset styles only
+./manage cauldron_site_reset --styles
+
+# Skip the confirmation prompt (for automation / CI)
+./manage cauldron_site_reset --yes
+```
+
+The command prints a summary on success:
+
+```
+Website reset complete: N content item(s) removed, styles reset, public site rebuilt.
+```
+
+If the rebuild fails after the reset, the command exits with code 1 and the error is written to stderr.
+
 ### Rerunning the installer
 
 `./install` is safe to rerun at any time. It skips steps that are already complete (e.g. an existing virtualenv or `node_modules/`) and repairs anything that is missing or broken. Your `config.env`, database, and content are never modified.

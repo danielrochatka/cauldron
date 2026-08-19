@@ -42,7 +42,9 @@ The attachment upload endpoint is also registered automatically when `cauldron-a
 4. Type your request in the text area (e.g. *"Build a personal site based on my resume and the design at https://example.com"*).
 5. Click **Send Request**.
 
-The AI receives the extracted text from every uploaded file automatically. You do not copy or paste any file IDs.
+The browser automatically associates your uploaded attachment IDs with the Admin AI request. You never copy or paste file IDs.
+
+During the AI run, the model retrieves attachment content through the `attachments.read` tool — the same permission-aware, audited tool loop used for all Admin AI tool calls. The attachment content enters the conversation as a tool result rather than being silently injected into the original request. Every retrieval is recorded in the `AdminAIToolInvocation` audit log.
 
 **Rate limit**: at most 20 files per user per hour.
 
@@ -67,9 +69,9 @@ Only publicly accessible URLs are permitted. Private network addresses (RFC 1918
 
 ## Content and style proposal flow
 
-The AI uses built-in tools to draft a site:
+The AI uses the registered tool set to draft a site:
 
-1. **`attachments.read`** — reads the extracted text from your uploaded file.
+1. **`attachments.read`** — retrieves the extracted text from an uploaded file via the normal permission-aware tool loop. Each call creates an audit record.
 2. **`web.inspect_url`** — fetches the reference site's design characteristics.
 3. **`content.create_proposal`** — proposes new or updated page content (title, body).
 4. **`ui.styles.create_proposal`** — proposes a CSS theme derived from the reference site.

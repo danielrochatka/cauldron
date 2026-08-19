@@ -22,6 +22,7 @@ test = [
     "cauldron-cms-flatfile>=0.1.0",
     "cauldron-workspace-flatfile>=0.1.0",
     "cauldron-django-admin>=0.1.0",
+    "cauldron-site-astro>=0.1.0",
     "pytest>=8.0",
     "pytest-django>=4.8",
     "pypdf>=4.0",

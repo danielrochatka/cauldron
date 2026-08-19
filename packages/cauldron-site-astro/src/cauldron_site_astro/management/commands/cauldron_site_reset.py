@@ -128,8 +128,12 @@ class Command(BaseCommand):
         concurrent edit between enumeration and apply causes a conflict rather
         than being silently overwritten.
 
-        Raises SystemExit(1) if enumeration fails or the changeset is not fully
-        applied.  In both cases zero mutations have been committed.
+        Raises SystemExit(1) if enumeration fails (zero mutations committed —
+        strict enumeration aborts before any apply) or if router.apply() does
+        not succeed (command aborts before styles, build, or success reporting).
+        With multiple providers, an earlier provider may have applied before a
+        later one fails; cross-provider rollback is outside this command's
+        contract.
         """
         from cauldron_content.contracts import (
             ContentChangeSet,

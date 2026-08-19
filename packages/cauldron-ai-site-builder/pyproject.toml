@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cauldron-ai-site-builder"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "cauldron>=0.1.0",
+    "django>=4.2",
+    "cauldron-ai>=0.1.0",
+    "cauldron-ai-admin>=0.1.0",
+    "cauldron-ai-attachments>=0.1.0",
+    "cauldron-ai-web>=0.1.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "cauldron-content-operations>=0.1.0",
+    "cauldron-content>=0.1.0",
+    "cauldron-cms-flatfile>=0.1.0",
+    "cauldron-workspace-flatfile>=0.1.0",
+    "cauldron-django-admin>=0.1.0",
+    "cauldron-site-astro>=0.1.0",
+    "pytest>=8.0",
+    "pytest-django>=4.8",
+    "pypdf>=4.0",
+    "python-docx>=1.1",
+]
+
+[project.entry-points."cauldron.modules"]
+"cauldron.ai.sitebuilder" = "cauldron_ai_site_builder.module:module"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "tests", "../../src", "../.."]
+addopts = "-ra"
+testpaths = ["tests"]

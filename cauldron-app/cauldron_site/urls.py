@@ -14,6 +14,14 @@ try:
 except ImportError:
     _module_tree_urls = []
 
+try:
+    import cauldron_ai_attachments  # noqa: F401
+    _attachment_urls = [
+        path("cauldron/admin/ai/attachments/", include("cauldron_ai_attachments.urls", namespace="cauldron_ai_attachments")),
+    ]
+except ImportError:
+    _attachment_urls = []
+
 urlpatterns = [
     # Technical admin interface (keep available)
     *get_admin_urls(),
@@ -27,6 +35,8 @@ urlpatterns = [
     path("cauldron/", include("cauldron_ai_admin.urls", namespace="cauldron_ai_admin")),
     # Cauldron shell: module dependency tree (optional — installed separately)
     *_module_tree_urls,
+    # Cauldron shell: Admin AI attachment upload (optional — installed separately)
+    *_attachment_urls,
     # Cauldron shell: site preview server (authenticated, per-change-set)
     path("cauldron/", include("cauldron_site_astro.urls", namespace="cauldron_site_astro")),
     # Content API

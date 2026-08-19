@@ -5,6 +5,72 @@
   var responseEl = document.getElementById('ai-response');
   if (!form) { return; }
 
+  // Attachment upload state.
+  var _uploadUrl = form.getAttribute('data-attachment-upload-url') || '';
+  var _attachmentIds = [];  // successfully uploaded attachment UUIDs
+  var _pendingUploads = 0;  // count of in-flight uploads
+
+  var fileInput = document.getElementById('ai-attachments');
+  var attachmentList = document.getElementById('ai-attachment-list');
+
+  function _addAttachmentItem(file) {
+    if (!attachmentList) { return null; }
+    var li = document.createElement('li');
+    li.className = 'cui-attachment-list__item';
+    li.textContent = file.name + ' — uploading…';
+    attachmentList.appendChild(li);
+    return li;
+  }
+
+  function _uploadFile(file) {
+    if (!_uploadUrl) { return; }
+    _pendingUploads += 1;
+    var li = _addAttachmentItem(file);
+    var csrfEl = form.querySelector('input[name=csrfmiddlewaretoken]');
+    var csrf = csrfEl ? csrfEl.value : '';
+    var formData = new FormData();
+    formData.append('file', file);
+    fetch(_uploadUrl, {
+      method: 'POST',
+      headers: { 'X-CSRFToken': csrf },
+      body: formData,
+      credentials: 'same-origin',
+    }).then(function (r) {
+      if (!r.ok) {
+        return r.json().then(function (body) {
+          var msg = (body && body.error) ? body.error : ('HTTP ' + r.status);
+          if (li) { li.textContent = file.name + ' — upload failed: ' + msg; }
+          _pendingUploads -= 1;
+        }).catch(function () {
+          if (li) { li.textContent = file.name + ' — upload failed (HTTP ' + r.status + ')'; }
+          _pendingUploads -= 1;
+        });
+      }
+      return r.json().then(function (body) {
+        if (body && body.attachment_id) {
+          _attachmentIds.push(body.attachment_id);
+          if (li) { li.textContent = file.name + ' — ready'; }
+        } else {
+          if (li) { li.textContent = file.name + ' — unexpected server response'; }
+        }
+        _pendingUploads -= 1;
+      });
+    }).catch(function (err) {
+      if (li) { li.textContent = file.name + ' — upload failed: ' + (err && err.message ? err.message : 'network error'); }
+      _pendingUploads -= 1;
+    });
+  }
+
+  if (fileInput) {
+    fileInput.addEventListener('change', function () {
+      var files = fileInput.files;
+      for (var i = 0; i < files.length; i++) {
+        _uploadFile(files[i]);
+      }
+      fileInput.value = '';  // allow re-selecting the same file
+    });
+  }
+
   // Maximum excerpt length to show for unexpected non-JSON bodies.
   // Never render full HTML — bound it to prevent leaking stack traces or secrets.
   var MAX_EXCERPT = 120;
@@ -98,19 +164,30 @@
 
   form.addEventListener('submit', function (event) {
     event.preventDefault();
+
+    if (_pendingUploads > 0) {
+      _show('Please wait — ' + _pendingUploads + ' file(s) are still uploading…');
+      if (responseArea) { responseArea.hidden = false; }
+      return;
+    }
+
     if (responseArea) { responseArea.hidden = false; }
     _show('Working…');
     var textEl = document.getElementById('ai-request');
     var text = textEl ? textEl.value : '';
     var csrfEl = form.querySelector('input[name=csrfmiddlewaretoken]');
     var csrf = csrfEl ? csrfEl.value : '';
+    var payload = { request: text };
+    if (_attachmentIds.length > 0) {
+      payload.attachment_ids = _attachmentIds.slice();
+    }
     fetch(window.location.pathname, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-CSRFToken': csrf,
       },
-      body: JSON.stringify({ request: text }),
+      body: JSON.stringify(payload),
       credentials: 'same-origin',
     }).then(_handleResponse).catch(function (err) {
       // Network error (no response received — DNS failure, connection refused, etc.)

@@ -190,3 +190,80 @@ def test_handler_empty_attachment_id_returns_error():
 
     assert isinstance(result, AdminAIToolError)
     assert result.error_code == "tool.invalid_arguments"
+
+
+# ---------------------------------------------------------------------------
+# Byte-safe truncation (ARF2)
+# ---------------------------------------------------------------------------
+
+def test_truncate_to_bytes_ascii_no_truncation():
+    from cauldron_ai_attachments.tools import _truncate_to_bytes
+    text = "hello world"
+    assert _truncate_to_bytes(text, 100) == text
+
+
+def test_truncate_to_bytes_ascii_truncation():
+    from cauldron_ai_attachments.tools import _truncate_to_bytes
+    text = "a" * 200
+    result = _truncate_to_bytes(text, 100)
+    assert result == "a" * 100
+    assert len(result.encode("utf-8")) == 100
+
+
+def test_truncate_to_bytes_cjk_does_not_split_sequence():
+    from cauldron_ai_attachments.tools import _truncate_to_bytes
+    # Each CJK char is 3 UTF-8 bytes; limit to 10 bytes — only 3 full chars fit.
+    text = "你好世界" * 10
+    result = _truncate_to_bytes(text, 10)
+    assert len(result.encode("utf-8")) <= 10
+    result.encode("utf-8")  # must not raise — no split sequence
+
+
+def test_truncate_to_bytes_emoji_does_not_split_sequence():
+    from cauldron_ai_attachments.tools import _truncate_to_bytes
+    # Each emoji is 4 UTF-8 bytes; limit to 10 bytes — 2 full emojis (8 bytes).
+    text = "😀" * 10
+    result = _truncate_to_bytes(text, 10)
+    assert len(result.encode("utf-8")) <= 10
+    result.encode("utf-8")  # must not raise
+
+
+def test_handler_text_bounded_by_bytes_not_characters(db):
+    """Handler must truncate by encoded bytes, not character count."""
+    from cauldron_ai_attachments.models import AttachmentRecord, ExtractionStatus
+    from cauldron_ai_attachments.tools import _MAX_TEXT_BYTES
+    from cauldron_ai_admin.tools import AdminAIToolContext
+    from django.contrib.auth import get_user_model
+    import uuid
+
+    # CJK chars are 3 bytes each. Build text where char count is within the old
+    # 40 000-char limit but byte count exceeds _MAX_TEXT_BYTES.
+    # _MAX_TEXT_BYTES is 65024; 65024 // 3 = 21674 full CJK chars.
+    # Add 200 extra chars to guarantee the byte limit is exceeded.
+    chars_at_limit = _MAX_TEXT_BYTES // 3
+    text = "你" * (chars_at_limit + 200)
+
+    User = get_user_model()
+    user, _ = User.objects.get_or_create(username="byte-trunc-test")
+    record = AttachmentRecord.objects.create(
+        id=uuid.uuid4(),
+        owner=user,
+        filename="cjk.txt",
+        content_type="text/plain",
+        size_bytes=len(text.encode("utf-8")),
+        checksum_sha256="c" * 64,
+        extraction_status=ExtractionStatus.EXTRACTED,
+        extracted_text=text,
+    )
+
+    reg = _fresh_registry()
+    _, handler = reg.get("attachments.read")
+    ctx = AdminAIToolContext(actor=user, run_id="r", correlation_id="c")
+    result = handler(ctx, attachment_id=str(record.id))
+
+    assert result.success is True
+    assert result.data["truncated"] is True
+    returned_bytes = len(result.data["text"].encode("utf-8"))
+    assert returned_bytes <= _MAX_TEXT_BYTES
+    # Verify no multibyte sequence was split
+    result.data["text"].encode("utf-8")

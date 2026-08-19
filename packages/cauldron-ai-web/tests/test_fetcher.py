@@ -283,3 +283,75 @@ class TestSsrfRedirectValidation:
             max_redirects=fetcher._max_redirects,
         )
         assert handler._max_redirects == 1  # not the urllib default of 10
+
+
+# ---------------------------------------------------------------------------
+# IPv4-mapped IPv6 SSRF protection (ARF1)
+# ---------------------------------------------------------------------------
+
+class TestIpv4MappedIpv6SsrfProtection:
+    """IPv4-mapped IPv6 (::ffff:x.x.x.x) must be checked against the embedded IPv4 address.
+
+    Without explicit ipv4_mapped handling, ::ffff:127.0.0.1 resolves to an
+    IPv6 representation that is_global may misclassify on some Python versions.
+    The fetcher must recursively validate the mapped IPv4 address.
+    """
+
+    @staticmethod
+    def _mapped_result(ipv4: str):
+        return [
+            (socket.AF_INET6, socket.SOCK_STREAM, 0, "", (f"::ffff:{ipv4}", 0, 0, 0))
+        ]
+
+    def test_blocks_ipv4_mapped_loopback(self):
+        fetcher = SafeUrlFetcher()
+        with mock.patch(
+            "cauldron_ai_web.fetcher.socket.getaddrinfo",
+            return_value=self._mapped_result("127.0.0.1"),
+        ):
+            with pytest.raises(UnsafeUrlError, match="private"):
+                fetcher._validate_host("example.com")
+
+    def test_blocks_ipv4_mapped_rfc1918_10(self):
+        fetcher = SafeUrlFetcher()
+        with mock.patch(
+            "cauldron_ai_web.fetcher.socket.getaddrinfo",
+            return_value=self._mapped_result("10.0.0.1"),
+        ):
+            with pytest.raises(UnsafeUrlError, match="private"):
+                fetcher._validate_host("example.com")
+
+    def test_blocks_ipv4_mapped_rfc1918_172(self):
+        fetcher = SafeUrlFetcher()
+        with mock.patch(
+            "cauldron_ai_web.fetcher.socket.getaddrinfo",
+            return_value=self._mapped_result("172.16.0.1"),
+        ):
+            with pytest.raises(UnsafeUrlError, match="private"):
+                fetcher._validate_host("example.com")
+
+    def test_blocks_ipv4_mapped_rfc1918_192(self):
+        fetcher = SafeUrlFetcher()
+        with mock.patch(
+            "cauldron_ai_web.fetcher.socket.getaddrinfo",
+            return_value=self._mapped_result("192.168.1.1"),
+        ):
+            with pytest.raises(UnsafeUrlError, match="private"):
+                fetcher._validate_host("example.com")
+
+    def test_blocks_ipv4_mapped_link_local(self):
+        fetcher = SafeUrlFetcher()
+        with mock.patch(
+            "cauldron_ai_web.fetcher.socket.getaddrinfo",
+            return_value=self._mapped_result("169.254.169.254"),
+        ):
+            with pytest.raises(UnsafeUrlError, match="private"):
+                fetcher._validate_host("example.com")
+
+    def test_allows_ipv4_mapped_public_address(self):
+        fetcher = SafeUrlFetcher()
+        with mock.patch(
+            "cauldron_ai_web.fetcher.socket.getaddrinfo",
+            return_value=self._mapped_result("93.184.216.34"),
+        ):
+            fetcher._validate_host("example.com")  # no exception

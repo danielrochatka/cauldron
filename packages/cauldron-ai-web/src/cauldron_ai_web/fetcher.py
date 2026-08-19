@@ -16,17 +16,28 @@ _MAX_REDIRECTS = 5
 _TIMEOUT_SECONDS = 10.0
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
 
-_PRIVATE_NETWORKS = [
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("169.254.0.0/16"),  # link-local
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),
-    ipaddress.ip_network("fe80::/10"),
-    ipaddress.ip_network("0.0.0.0/8"),
-]
+def _is_address_publicly_routable(
+    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> bool:
+    """Return True only if addr is globally routable and safe to fetch.
+
+    IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) are handled by recursing on
+    the embedded IPv4 address, so ::ffff:127.0.0.1 is correctly rejected even
+    though the outer IPv6 representation may appear globally-routable.
+    """
+    if isinstance(addr, ipaddress.IPv6Address):
+        mapped = addr.ipv4_mapped
+        if mapped is not None:
+            return _is_address_publicly_routable(mapped)
+
+    if not addr.is_global:
+        return False
+    # Belt-and-suspenders against is_global Python-version inconsistencies.
+    if addr.is_loopback or addr.is_private or addr.is_link_local:
+        return False
+    if addr.is_unspecified or addr.is_reserved:
+        return False
+    return True
 
 
 class _SSRFAwareRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -169,11 +180,10 @@ class SafeUrlFetcher:
                 addr = ipaddress.ip_address(addr_str)
             except ValueError:
                 continue
-            for network in _PRIVATE_NETWORKS:
-                if addr in network:
-                    raise UnsafeUrlError(
-                        f"Access to private/internal address {addr_str!r} is not permitted."
-                    )
+            if not _is_address_publicly_routable(addr):
+                raise UnsafeUrlError(
+                    f"Access to private/internal address {addr_str!r} is not permitted."
+                )
 
     def _validate_content_type(self, content_type: str, url: str) -> None:
         allowed = {"text/html", "text/plain", "text/css", "application/xhtml+xml"}

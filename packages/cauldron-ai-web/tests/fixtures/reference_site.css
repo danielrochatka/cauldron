@@ -1,0 +1,52 @@
+:root {
+  --color-bg: #ffffff;
+  --color-text: #111111;
+  --color-accent: #3b82f6;
+  --font-body: Inter, sans-serif;
+  --font-heading: "Playfair Display", serif;
+}
+
+body {
+  font-family: var(--font-body);
+  background-color: #ffffff;
+  color: #111111;
+  margin: 0;
+  padding: 0;
+}
+
+h1, h2, h3, h4 {
+  font-family: "Playfair Display", serif;
+  color: #111111;
+}
+
+nav {
+  padding: 16px 32px;
+  background-color: #f9f9f9;
+}
+
+nav a {
+  font-family: Inter, sans-serif;
+  color: #3b82f6;
+  margin-right: 24px;
+  text-decoration: none;
+}
+
+.card {
+  background-color: #ffffff;
+  border-radius: 8px;
+  padding: 24px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  margin-bottom: 16px;
+}
+
+main {
+  padding: 40px 32px;
+  max-width: 960px;
+  margin: 0 auto;
+}
+
+footer {
+  padding: 16px 32px;
+  color: #888888;
+  border-top: 1px solid #e5e7eb;
+}

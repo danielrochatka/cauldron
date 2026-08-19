@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cauldron-ai-web"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "cauldron>=0.1.0",
+    "django>=4.2",
+]
+
+[project.optional-dependencies]
+ai = [
+    "cauldron-ai>=0.1.0",
+    "cauldron-ai-admin>=0.1.0",
+]
+test = [
+    "cauldron-ai-admin>=0.1.0",
+    "cauldron-ai>=0.1.0",
+    "pytest>=8.0",
+    "pytest-django>=4.8",
+]
+
+[project.entry-points."cauldron.modules"]
+"cauldron.ai.web" = "cauldron_ai_web.module:module"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "tests", "../../src", "../.."]
+addopts = "-ra"
+testpaths = ["tests"]

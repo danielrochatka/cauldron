@@ -9,24 +9,19 @@ requires-python = ">=3.11"
 dependencies = [
     "cauldron>=0.1.0",
     "django>=4.2",
+    "cauldron-ai>=0.1.0",
+    "cauldron-ai-admin>=0.1.0",
+    "cauldron-ai-attachments>=0.1.0",
+    "cauldron-ai-web>=0.1.0",
 ]
 
 [project.optional-dependencies]
-full = [
-    "cauldron-ai>=0.1.0",
-    "cauldron-ai-admin>=0.1.0",
-    "cauldron-ai-attachments>=0.1.0",
-    "cauldron-ai-web>=0.1.0",
-]
 test = [
-    "cauldron-ai>=0.1.0",
-    "cauldron-ai-admin>=0.1.0",
-    "cauldron-ai-attachments>=0.1.0",
-    "cauldron-ai-web>=0.1.0",
     "cauldron-content-operations>=0.1.0",
     "cauldron-content>=0.1.0",
     "cauldron-cms-flatfile>=0.1.0",
     "cauldron-workspace-flatfile>=0.1.0",
+    "cauldron-django-admin>=0.1.0",
     "pytest>=8.0",
     "pytest-django>=4.8",
     "pypdf>=4.0",

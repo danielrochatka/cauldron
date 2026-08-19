@@ -15,8 +15,14 @@ def pytest_configure(config):
             INSTALLED_APPS=[
                 "django.contrib.contenttypes",
                 "django.contrib.auth",
+                "django.contrib.sessions",
                 "cauldron_ai_attachments",
                 "cauldron_ai_admin",
+            ],
+            SESSION_ENGINE="django.contrib.sessions.backends.db",
+            MIDDLEWARE=[
+                "django.contrib.sessions.middleware.SessionMiddleware",
+                "django.contrib.auth.middleware.AuthenticationMiddleware",
             ],
             DEFAULT_AUTO_FIELD="django.db.models.BigAutoField",
             AUTH_USER_MODEL="auth.User",
@@ -25,4 +31,5 @@ def pytest_configure(config):
                 "cauldron.ai.admin": {},
             },
             SECRET_KEY="test-secret-key-attachments",
+            ROOT_URLCONF="tests.urls",
         )

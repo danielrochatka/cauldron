@@ -7,7 +7,14 @@ from __future__ import annotations
 
 from django.core.checks import Warning, register
 
-_REQUIRED_TOOLS = ("attachments.read", "web.inspect_url")
+# Every tool the site-builder workflow depends on must be present.
+_REQUIRED_TOOLS = (
+    "attachments.read",
+    "web.inspect_url",
+    "content.create_proposal",
+    "ui.styles.create_proposal",
+    "site.prepare_change_set",
+)
 
 
 @register()
@@ -37,7 +44,7 @@ def check_required_tools_registered(app_configs, **kwargs):
             warnings.append(
                 Warning(
                     f"Admin AI tool '{tool_name}' is not registered. "
-                    f"The site-builder MVP requires this tool. "
+                    f"The site-builder MVP requires this tool to be present at runtime. "
                     f"Ensure the owning package is installed and its Django app is in INSTALLED_APPS.",
                     hint=f"Add the package that provides '{tool_name}' to INSTALLED_APPS.",
                     id="cauldron_ai_site_builder.W002",

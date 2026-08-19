@@ -27,8 +27,20 @@
 
   <section class="cui-card cui-card--workspace" aria-labelledby="workspace-heading">
     <h2 id="workspace-heading" class="cui-card__title">Ask the Admin AI</h2>
-    <form id="ai-form" method="post" class="cui-form">
+    <form id="ai-form" method="post" class="cui-form"
+          {% if attachment_upload_url %}data-attachment-upload-url="{{ attachment_upload_url }}"{% endif %}>
       {% csrf_token %}
+      {% if attachment_upload_url %}
+      <div class="cui-form-field">
+        <label for="ai-attachments">Attachments <span class="cui-text-muted">(PDF, DOCX, TXT — optional)</span></label>
+        <input type="file" id="ai-attachments" accept=".pdf,.docx,.txt,.md"
+               aria-describedby="ai-attachments-hint">
+        <p id="ai-attachments-hint" class="cui-text-muted">
+          Upload a resume or brief and the AI will read it automatically. You do not need to paste any IDs.
+        </p>
+        <ul id="ai-attachment-list" class="cui-attachment-list" aria-live="polite"></ul>
+      </div>
+      {% endif %}
       <div class="cui-form-field">
         <label for="ai-request">Request</label>
         <textarea id="ai-request" name="request" rows="6" required

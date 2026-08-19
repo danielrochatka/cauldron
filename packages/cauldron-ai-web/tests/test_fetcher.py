@@ -206,3 +206,80 @@ class TestFetch:
         fetcher = SafeUrlFetcher()
         with pytest.raises(UnsafeUrlError):
             fetcher.fetch("http://localhost/admin")
+
+
+# ---------------------------------------------------------------------------
+# SSRF redirect validation
+# ---------------------------------------------------------------------------
+
+class TestSsrfRedirectValidation:
+    """Every redirect target must be SSRF-validated before following."""
+
+    def _make_handler(self, max_redirects: int = 5):
+        from cauldron_ai_web.fetcher import _SSRFAwareRedirectHandler
+        fetcher = SafeUrlFetcher(max_redirects=max_redirects)
+        return _SSRFAwareRedirectHandler(
+            validate_url=fetcher._validate_url,
+            validate_host=fetcher._validate_host,
+            max_redirects=max_redirects,
+        )
+
+    def test_redirect_to_private_ip_blocked(self):
+        handler = self._make_handler()
+        with mock.patch(
+            "cauldron_ai_web.fetcher.socket.getaddrinfo",
+            return_value=[(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.1", 0))],
+        ):
+            with pytest.raises(UnsafeUrlError, match="private"):
+                handler.redirect_request(
+                    mock.MagicMock(), mock.MagicMock(), 302, "Found",
+                    mock.MagicMock(), "http://internal.corp/secret",
+                )
+
+    def test_redirect_to_localhost_blocked(self):
+        handler = self._make_handler()
+        with pytest.raises(UnsafeUrlError, match="not permitted"):
+            handler.redirect_request(
+                mock.MagicMock(), mock.MagicMock(), 302, "Found",
+                mock.MagicMock(), "http://localhost/admin",
+            )
+
+    def test_redirect_to_link_local_blocked(self):
+        handler = self._make_handler()
+        with mock.patch(
+            "cauldron_ai_web.fetcher.socket.getaddrinfo",
+            return_value=[(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("169.254.169.254", 0))],
+        ):
+            with pytest.raises(UnsafeUrlError, match="private"):
+                handler.redirect_request(
+                    mock.MagicMock(), mock.MagicMock(), 302, "Found",
+                    mock.MagicMock(), "http://metadata.internal/latest/",
+                )
+
+    def test_redirect_with_ftp_scheme_blocked(self):
+        handler = self._make_handler()
+        with pytest.raises(UnsafeUrlError, match="not allowed"):
+            handler.redirect_request(
+                mock.MagicMock(), mock.MagicMock(), 302, "Found",
+                mock.MagicMock(), "ftp://files.example.com/",
+            )
+
+    def test_too_many_redirects_raises_fetch_error(self):
+        # max_redirects=0 means the very first redirect attempt must raise.
+        handler = self._make_handler(max_redirects=0)
+        with pytest.raises(UrlFetchError, match="redirects"):
+            handler.redirect_request(
+                mock.MagicMock(), mock.MagicMock(), 302, "Found",
+                mock.MagicMock(), "https://example.com/hop1",
+            )
+
+    def test_max_redirects_is_enforced_not_library_default(self):
+        """_max_redirects must be from SafeUrlFetcher, not the urllib library default."""
+        fetcher = SafeUrlFetcher(max_redirects=1)
+        from cauldron_ai_web.fetcher import _SSRFAwareRedirectHandler
+        handler = _SSRFAwareRedirectHandler(
+            validate_url=fetcher._validate_url,
+            validate_host=fetcher._validate_host,
+            max_redirects=fetcher._max_redirects,
+        )
+        assert handler._max_redirects == 1  # not the urllib default of 10

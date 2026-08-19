@@ -12,13 +12,13 @@ _manifest = ModuleManifest(
     version="0.1.0",
     cauldron_version=">=0.1.0",
     django_apps=("cauldron_ai_site_builder",),
-    requires=(),
-    optional=(
+    requires=(
         ModuleRequirement(slug="cauldron.ai", kind="module"),
         ModuleRequirement(slug="cauldron.ai.admin", kind="module"),
         ModuleRequirement(slug="cauldron.ai.attachments", kind="module"),
         ModuleRequirement(slug="cauldron.ai.web", kind="module"),
     ),
+    optional=(),
     provides=("admin.ai.sitebuilder",),
     namespaces=("cauldron_ai_site_builder",),
     public_api=(

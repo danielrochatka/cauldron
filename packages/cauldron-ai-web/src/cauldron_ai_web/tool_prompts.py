@@ -27,7 +27,7 @@ def register_tool_prompts() -> None:
                 "design characteristic extraction",
                 "brand research for site-builder workflow",
             ),
-            required_permission="cauldron_ai_web.inspect_url",
+            required_permission="cauldron_ai_admin.use_admin_ai",
             risk_level="READ_ONLY",
             read_scope=(
                 "Publicly accessible HTTP/HTTPS URL only. "
@@ -38,7 +38,7 @@ def register_tool_prompts() -> None:
             ),
             write_scope="None",
             preconditions=(
-                "Actor has cauldron_ai_web.inspect_url permission.",
+                "Actor has cauldron_ai_admin.use_admin_ai permission.",
                 "URL must use http or https scheme.",
                 "URL must resolve to a public IP address.",
             ),

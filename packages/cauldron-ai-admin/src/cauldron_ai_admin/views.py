@@ -601,6 +601,14 @@ class AdminAIPageView(View):
         recent = list(
             AdminAIRun.objects.filter(actor=request.user).order_by("-created_at")[:10]
         )
+
+        attachment_upload_url = ""
+        try:
+            from django.urls import reverse as _reverse
+            attachment_upload_url = _reverse("cauldron_ai_attachments:attachment-upload")
+        except Exception:
+            pass
+
         return render(request, self.template_name, {
             "allowed_tools": [
                 {
@@ -619,6 +627,7 @@ class AdminAIPageView(View):
                 }
                 for r in recent
             ],
+            "attachment_upload_url": attachment_upload_url,
         })
 
     def post(self, request: HttpRequest) -> HttpResponse:
@@ -631,6 +640,7 @@ class AdminAIPageView(View):
             )
         request_text = payload.get("request", "")
         correlation_id = payload.get("correlation_id", "")
+        attachment_ids = payload.get("attachment_ids", [])
         if not isinstance(request_text, str) or not request_text.strip():
             return JsonResponse(
                 {
@@ -642,6 +652,11 @@ class AdminAIPageView(View):
                 },
                 status=400,
             )
+        if isinstance(attachment_ids, list) and attachment_ids:
+            request_text = _prepend_attachment_context(
+                request_text, attachment_ids, request.user
+            )
+
         try:
             service = _get_service()
         except Exception:
@@ -916,6 +931,35 @@ class AdminAIInvocationDetailView(View):
                 {"label": str(invocation_id)[:8] + "…", "url": ""},
             ],
         })
+
+
+def _prepend_attachment_context(request_text: str, attachment_ids: list, actor) -> str:
+    """Fetch uploaded attachment texts and prepend them as context to the request."""
+    _MAX_ATTACHMENTS = 5
+    _MAX_CHARS_PER_ATTACHMENT = 8_000
+    parts: list[str] = []
+    try:
+        from cauldron_ai_attachments.service import AttachmentService
+        svc = AttachmentService()
+        for aid in attachment_ids[:_MAX_ATTACHMENTS]:
+            if not isinstance(aid, str) or not aid:
+                continue
+            try:
+                record = svc.get_attachment(aid, actor)
+                text = (record.extracted_text or "").strip()
+                if text:
+                    parts.append(
+                        f"[Attached file: {record.filename}]\n"
+                        f"{text[:_MAX_CHARS_PER_ATTACHMENT]}"
+                    )
+            except LookupError:
+                logger.debug("Attachment %r not accessible for actor %s", aid, actor)
+    except ImportError:
+        pass
+    if not parts:
+        return request_text
+    context_block = "\n\n---\n\n".join(parts)
+    return f"{context_block}\n\n---\n\n{request_text}"
 
 
 def _parse_json_body(request: HttpRequest) -> dict[str, Any]:

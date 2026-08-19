@@ -29,6 +29,14 @@ class AttachmentUploadView(View):
         if uploaded_file is None:
             return JsonResponse({"error": "No file uploaded. Use field name 'file'."}, status=400)
 
+        from .service import _MAX_FILE_SIZE_BYTES
+        if uploaded_file.size > _MAX_FILE_SIZE_BYTES:
+            mb = _MAX_FILE_SIZE_BYTES // (1024 * 1024)
+            return JsonResponse(
+                {"error": f"File exceeds maximum size of {mb} MB."},
+                status=413,
+            )
+
         filename = uploaded_file.name or "upload"
         content_type = uploaded_file.content_type or "application/octet-stream"
         data = uploaded_file.read()

@@ -20,6 +20,9 @@ dependencies = [
 flatfile = [
     "cauldron-cms-flatfile>=0.1.0",
 ]
+attachments = [
+    "cauldron-ai-attachments>=0.1.0",
+]
 test = [
     "cauldron-workspace-flatfile>=0.1.0",
     "cauldron-site-astro>=0.1.0",

@@ -83,6 +83,12 @@ CAULDRON_MODULES = {
     },
     # Optional module dependency graph viewer (requires cauldron-module-tree package).
     "cauldron.module.tree": {},
+    # Admin AI file attachments (PDF/DOCX/TXT — resume/brief ingestion).
+    "cauldron.ai.attachments": {},
+    # Admin AI web inspection (public URL → design characteristics).
+    "cauldron.ai.web": {},
+    # Admin AI site-builder orchestration (requires attachments + web).
+    "cauldron.ai.sitebuilder": {},
     # Astro static-site builder — generates public HTML from published pages.
     # output_root is served by Django at / and /<slug>/.
     "cauldron.site.astro": {

@@ -29,6 +29,27 @@ _PRIVATE_NETWORKS = [
 ]
 
 
+class _SSRFAwareRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Redirect handler that SSRF-validates every Location target before following it."""
+
+    def __init__(self, validate_url, validate_host, max_redirects: int) -> None:
+        self._validate_url = validate_url
+        self._validate_host = validate_host
+        self._max_redirects = max_redirects
+        self._redirect_count = 0
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self._redirect_count += 1
+        if self._redirect_count > self._max_redirects:
+            raise UrlFetchError(
+                f"Exceeded maximum of {self._max_redirects} redirects."
+            )
+        self._validate_url(newurl)
+        parsed = urlparse(newurl)
+        self._validate_host(parsed.hostname or "")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 @dataclass(frozen=True)
 class FetchResult:
     url: str
@@ -63,9 +84,12 @@ class SafeUrlFetcher:
         parsed = urlparse(url)
         self._validate_host(parsed.hostname or "")
 
-        opener = urllib.request.build_opener(
-            urllib.request.HTTPRedirectHandler(),
+        redirect_handler = _SSRFAwareRedirectHandler(
+            validate_url=self._validate_url,
+            validate_host=self._validate_host,
+            max_redirects=self._max_redirects,
         )
+        opener = urllib.request.build_opener(redirect_handler)
 
         headers = {
             "User-Agent": "CauldronAI/1.0 (+https://cauldron.invalid/bot)",

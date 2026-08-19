@@ -13,7 +13,6 @@ _MAX_ATTACHMENTS_PER_USER_PER_HOUR = 20
 ALLOWED_CONTENT_TYPES = frozenset({
     "application/pdf",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "application/msword",
     "text/plain",
     "text/markdown",
     "text/x-markdown",
@@ -37,6 +36,7 @@ class AttachmentService:
     ) -> "AttachmentRecord":
         from .models import AttachmentRecord, ExtractionStatus
 
+        self._check_rate_limit(owner)
         self._validate_file(filename=filename, content_type=content_type, data=data)
 
         checksum = hashlib.sha256(data).hexdigest()
@@ -53,6 +53,20 @@ class AttachmentService:
         self._extract_and_populate(record, data, filename=filename, content_type=content_type)
         record.save()
         return record
+
+    def _check_rate_limit(self, owner) -> None:
+        from django.utils import timezone
+        from .models import AttachmentRecord
+
+        one_hour_ago = timezone.now() - timezone.timedelta(hours=1)
+        recent_count = AttachmentRecord.objects.filter(
+            owner=owner, created_at__gte=one_hour_ago
+        ).count()
+        if recent_count >= _MAX_ATTACHMENTS_PER_USER_PER_HOUR:
+            raise AttachmentValidationError(
+                f"Upload limit reached: at most {_MAX_ATTACHMENTS_PER_USER_PER_HOUR} "
+                "attachments may be uploaded per hour."
+            )
 
     def _validate_file(self, *, filename: str, content_type: str, data: bytes) -> None:
         import os

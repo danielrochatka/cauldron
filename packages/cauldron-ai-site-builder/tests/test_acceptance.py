@@ -260,63 +260,93 @@ def test_web_inspect_url_returns_design_analysis():
 
 
 # ---------------------------------------------------------------------------
-# 7. Content proposals can be created using extracted resume context (mock)
+# 7. Content proposal created from extracted resume text via real ContentOperationService
 # ---------------------------------------------------------------------------
 
-def test_content_proposals_created_with_resume_context():
-    """Verify that extracted attachment text can be passed to a content service mock."""
+@pytest.mark.django_db
+def test_content_proposal_created_from_resume_text(content_service):
+    """Extracted attachment text drives a real content proposal — no MagicMock."""
     from cauldron_ai_attachments.service import AttachmentService
 
-    pdf_bytes = _make_minimal_pdf("Sarah Chen UX Designer Portfolio")
     user = _make_user()
+    docx_bytes = _make_docx("Sarah Chen\nUX Designer\nPortfolio: Figma, CSS, Branding")
     record = AttachmentService().create_from_bytes(
         owner=user,
-        filename="portfolio.pdf",
-        content_type="application/pdf",
-        data=pdf_bytes,
+        filename="portfolio.docx",
+        content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        data=docx_bytes,
     )
 
-    # Simulate what the Admin AI orchestrator does: extract text, then call
-    # a content service to create a proposal.
     extracted_text = record.extracted_text
-    assert extracted_text  # non-empty
+    assert extracted_text, "attachment extraction must yield non-empty text"
 
-    content_service = mock.MagicMock()
-    content_service.create_proposal.return_value = mock.MagicMock(id="prop-123")
-
-    proposal = content_service.create_proposal(
-        title="Homepage",
-        body=f"Based on your resume: {extracted_text[:200]}",
-        owner=user,
+    result = content_service.create_change_request(
+        user=user,
+        operations=[
+            {
+                "kind": "create",
+                "collection": "pages",
+                "slug": "about",
+                "provider_name": "flatfile",
+                "fields": {
+                    "title": "About Sarah Chen",
+                    "body": f"Portfolio summary (AI-generated): {extracted_text[:500]}",
+                },
+            }
+        ],
+        provider_name="flatfile",
+        description="Homepage from portfolio.docx",
     )
-    content_service.create_proposal.assert_called_once()
-    assert proposal.id == "prop-123"
+
+    assert result.ok is True, f"create_change_request failed: {result.error}"
+    assert result.request_id, "result must include a non-empty request_id"
 
 
 # ---------------------------------------------------------------------------
-# 8. Style proposal through ui.styles.create_proposal path (mock)
+# 8. Style proposal created from design characteristics via real UIStyleChangeService
 # ---------------------------------------------------------------------------
 
-def test_style_proposal_created_via_mock():
-    """Verify that design characteristics can feed a style service mock."""
+@pytest.mark.django_db
+def test_style_proposal_created_from_design_characteristics(style_service):
+    """Design characteristics extracted from a real URL feed a real style proposal."""
     from cauldron_ai_web.analyzer import analyze_html, analyze_css
 
     html_chars = analyze_html(SAMPLE_HTML.decode())
     full_chars = analyze_css(SAMPLE_CSS.decode(), existing=html_chars)
 
-    style_service = mock.MagicMock()
-    style_service.create_style_proposal.return_value = mock.MagicMock(
-        id="style-456",
-        font_families=full_chars.font_families,
+    font = next(
+        (f for f in full_chars.font_families if f),
+        "sans-serif",
+    )
+    bg_color = next(
+        (c for c in full_chars.color_hints if c.startswith("#")),
+        "#ffffff",
+    )
+    radius = full_chars.border_radius_hint or "none"
+
+    proposed_css = (
+        f":root {{\n"
+        f"  --font-body: {font};\n"
+        f"  --color-bg: {bg_color};\n"
+        f"  --border-radius: {'8px' if radius in ('medium', 'rounded') else '4px'};\n"
+        f"}}\n"
+        f"body {{ font-family: var(--font-body); background: var(--color-bg); }}\n"
     )
 
-    proposal = style_service.create_style_proposal(
-        font_families=full_chars.font_families,
-        color_hints=full_chars.color_hints,
-        border_radius=full_chars.border_radius_hint,
+    user = _make_user()
+    proposal = style_service.create_proposal(
+        scope="pages",
+        target_path="theme.css",
+        proposed_content=proposed_css,
+        description="Theme generated from Acme Design Studio reference site",
+        created_by=user,
     )
-    style_service.create_style_proposal.assert_called_once()
-    assert proposal.id == "style-456"
+
+    assert proposal.pk is not None
+    assert proposal.status == "proposed"
+    assert proposal.scope == "pages"
+    assert proposal.target_path == "theme.css"
+    assert "font-body" in proposal.proposed_content
 
 
 # ---------------------------------------------------------------------------
@@ -423,3 +453,192 @@ def test_unsupported_file_type_rejected():
             content_type="image/jpeg",
             data=b"\xff\xd8\xff\xe0" + b"x" * 100,
         )
+
+
+# ---------------------------------------------------------------------------
+# PR #88 style guarantee tests (Findings 11)
+#
+# These tests verify the publication lifecycle coherence guaranteed by PR #88:
+#   - A CSS proposal in "proposed" or "approved" state does NOT write any
+#     file to disk. The override store is only touched during publication.
+#   - mark_style_applied() is a DB-only operation; it does not write CSS.
+#   - The DB transition from proposed → approved → applied is atomic and
+#     sequential; status can never skip steps.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.django_db
+def test_pages_css_proposal_does_not_write_to_disk(style_service, override_root):
+    """Creating a pages-scope style proposal MUST NOT write the CSS file to disk.
+
+    PR #88 guarantee: the disk write happens only during SiteChangeSet.publish()
+    Step 2.5, never during create_proposal() or approve(). If this test fails,
+    it means create_proposal() is eagerly writing the file — a regression.
+    """
+    from pathlib import Path
+
+    user = _make_user()
+    proposed_css = "body { background: #f0f; }"
+    proposal = style_service.create_proposal(
+        scope="pages",
+        target_path="theme.css",
+        proposed_content=proposed_css,
+        description="PR #88 regression: must not touch disk on proposal",
+        created_by=user,
+    )
+
+    css_path = Path(override_root) / "pages" / "theme.css"
+    assert not css_path.exists(), (
+        "create_proposal() must not write CSS to disk; "
+        "disk writes happen only during publication (PR #88 guarantee)."
+    )
+    assert proposal.status == "proposed"
+
+
+@pytest.mark.django_db
+def test_pages_css_approved_state_does_not_write_to_disk(style_service, override_root):
+    """Approving a pages-scope proposal MUST NOT write the CSS file to disk."""
+    from pathlib import Path
+
+    user = _make_user()
+    proposal = style_service.create_proposal(
+        scope="pages",
+        target_path="approved-theme.css",
+        proposed_content=":root { --color: blue; }",
+        description="PR #88 regression: approved state must not touch disk",
+        created_by=user,
+    )
+    style_service.approve(proposal, reviewed_by=user)
+
+    css_path = Path(override_root) / "pages" / "approved-theme.css"
+    assert not css_path.exists(), (
+        "approve() must not write CSS to disk; "
+        "disk writes happen only during publication (PR #88 guarantee)."
+    )
+
+
+@pytest.mark.django_db
+def test_mark_style_applied_is_db_only_no_disk_write(style_service, override_root):
+    """mark_style_applied() is a pure DB transition — it must not write CSS to disk.
+
+    This models the post-publication signal handler: the Astro build has already
+    committed the CSS at publication time; mark_style_applied() only updates the
+    DB lifecycle state. A disk write here would be a double-write regression.
+    """
+    from pathlib import Path
+
+    user = _make_user()
+    proposal = style_service.create_proposal(
+        scope="pages",
+        target_path="signal-test.css",
+        proposed_content="body { color: green; }",
+        description="PR #88: mark_style_applied is DB-only",
+        created_by=user,
+    )
+    style_service.approve(proposal, reviewed_by=user)
+    style_service.mark_style_applied(
+        request_id=str(proposal.request_id),
+        changeset_id="changeset-abc123",
+        committed_hash="a" * 64,
+        applied_by=user,
+    )
+
+    proposal.refresh_from_db()
+    assert proposal.status == "applied"
+    assert proposal.site_changeset_id == "changeset-abc123"
+
+    css_path = Path(override_root) / "pages" / "signal-test.css"
+    assert not css_path.exists(), (
+        "mark_style_applied() must not write CSS to disk — "
+        "the publication step already wrote it (PR #88 guarantee)."
+    )
+
+
+@pytest.mark.django_db
+def test_mark_style_applied_is_idempotent(style_service):
+    """Calling mark_style_applied() twice with the same changeset_id is idempotent."""
+    user = _make_user()
+    proposal = style_service.create_proposal(
+        scope="pages",
+        target_path="idempotent.css",
+        proposed_content=".x { display: block; }",
+        description="idempotency check",
+        created_by=user,
+    )
+    style_service.approve(proposal, reviewed_by=user)
+
+    style_service.mark_style_applied(
+        request_id=str(proposal.request_id),
+        changeset_id="cs-idem",
+        committed_hash="b" * 64,
+    )
+    # Second call with same changeset_id must not raise.
+    style_service.mark_style_applied(
+        request_id=str(proposal.request_id),
+        changeset_id="cs-idem",
+        committed_hash="b" * 64,
+    )
+    proposal.refresh_from_db()
+    assert proposal.status == "applied"
+
+
+@pytest.mark.django_db
+def test_mark_style_applied_wrong_changeset_raises(style_service):
+    """mark_style_applied() with a different changeset_id on an applied proposal raises."""
+    from cauldron_ai_admin.style_service import StyleFinalizationError
+
+    user = _make_user()
+    proposal = style_service.create_proposal(
+        scope="pages",
+        target_path="conflict-check.css",
+        proposed_content="h1 { font-size: 2rem; }",
+        description="conflict changeset test",
+        created_by=user,
+    )
+    style_service.approve(proposal, reviewed_by=user)
+    style_service.mark_style_applied(
+        request_id=str(proposal.request_id),
+        changeset_id="cs-first",
+        committed_hash="c" * 64,
+    )
+
+    with pytest.raises(StyleFinalizationError):
+        style_service.mark_style_applied(
+            request_id=str(proposal.request_id),
+            changeset_id="cs-second",  # different changeset — must raise
+            committed_hash="d" * 64,
+        )
+
+
+@pytest.mark.django_db
+def test_propose_approve_lifecycle_is_sequential(style_service):
+    """Status transitions must follow proposed → approved → applied order."""
+    from cauldron_ai_admin.style_service import StyleFinalizationError
+
+    user = _make_user()
+    proposal = style_service.create_proposal(
+        scope="pages",
+        target_path="lifecycle.css",
+        proposed_content="p { line-height: 1.6; }",
+        description="lifecycle ordering test",
+        created_by=user,
+    )
+    assert proposal.status == "proposed"
+
+    # Cannot apply before approval.
+    with pytest.raises(StyleFinalizationError):
+        style_service.mark_style_applied(
+            request_id=str(proposal.request_id),
+            changeset_id="cs-x",
+        )
+
+    style_service.approve(proposal, reviewed_by=user)
+    proposal.refresh_from_db()
+    assert proposal.status == "approved"
+
+    style_service.mark_style_applied(
+        request_id=str(proposal.request_id),
+        changeset_id="cs-y",
+        committed_hash="e" * 64,
+    )
+    proposal.refresh_from_db()
+    assert proposal.status == "applied"

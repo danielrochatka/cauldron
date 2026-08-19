@@ -36,6 +36,7 @@ _manifest = ModuleManifest(
     ),
     optional=(
         ModuleRequirement(slug="cauldron.cms.flatfile", kind="module"),
+        ModuleRequirement(slug="cauldron.ai.attachments", kind="module"),
     ),
     provides=(
         "admin.ai",

@@ -209,3 +209,43 @@ def test_get_attachment_wrong_owner_raises():
     )
     with pytest.raises(LookupError):
         svc.get_attachment(str(record.id), other)
+
+
+# ---------------------------------------------------------------------------
+# Rate limit
+# ---------------------------------------------------------------------------
+
+def test_rate_limit_blocks_after_threshold():
+    from cauldron_ai_attachments.service import (
+        AttachmentService,
+        AttachmentValidationError,
+        _MAX_ATTACHMENTS_PER_USER_PER_HOUR,
+    )
+    from cauldron_ai_attachments.models import AttachmentRecord
+    from django.utils import timezone
+
+    user = _make_user("rate-limit-user")
+    svc = AttachmentService()
+
+    # Seed the DB with records up to the limit (without going through the full
+    # service to keep the test fast — we're testing the counter, not extraction).
+    one_hour_ago = timezone.now() - timezone.timedelta(hours=1)
+    for i in range(_MAX_ATTACHMENTS_PER_USER_PER_HOUR):
+        AttachmentRecord.objects.create(
+            owner=user,
+            filename=f"file-{i}.txt",
+            content_type="text/plain",
+            size_bytes=10,
+            checksum_sha256="a" * 64,
+            extraction_status="extracted",
+            extracted_text="text",
+            word_count=1,
+        )
+
+    with pytest.raises(AttachmentValidationError, match="Upload limit"):
+        svc.create_from_bytes(
+            owner=user,
+            filename="overflow.txt",
+            content_type="text/plain",
+            data=b"extra",
+        )

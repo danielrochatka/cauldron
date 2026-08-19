@@ -133,7 +133,6 @@ class PdfExtractor:
 class DocxExtractor:
     SUPPORTED_TYPES = frozenset({
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "application/msword",
     })
     SUPPORTED_EXTENSIONS = frozenset({".docx"})
 
